@@ -15,7 +15,7 @@ use common::{
     approve_plan, covered_requirement, proposal, simple_plan, ParseTask, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{Engine, EngineServices};
-use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
+use lionclaw::mission_type::{MissionType, MissionTypeDefinition, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, Handoff, OracleName, OutputSemantics, Plan,
     PlanProposal, PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
@@ -203,9 +203,8 @@ fn execution_mission_type(
             },
         );
     }
-    let mt = MissionType {
+    let mt = MissionType::for_testing(MissionTypeDefinition {
         name: "skill-exec-test".to_string(),
-        digest: "test-digest".to_string(),
         stop: StopBar::Verified,
         image: "img".to_string(),
         planning: PlanningDag::default(),
@@ -224,7 +223,7 @@ fn execution_mission_type(
             OracleName::new("cargo-test").unwrap(),
             PathBuf::from("/nonexistent/oracles/cargo-test"),
         )]),
-    };
+    });
     (mt, skills)
 }
 
@@ -395,9 +394,8 @@ fn planning_mission_type(skill_dir: &std::path::Path) -> MissionType {
     roles.get_mut(&rn("strategist")).unwrap().skills = vec!["planning-method".to_string()];
     roles.get_mut(&rn("strategist")).unwrap().runtime = Some("opencode".to_string());
 
-    MissionType {
+    MissionType::for_testing(MissionTypeDefinition {
         name: "skill-plan-test".to_string(),
-        digest: "test-digest".to_string(),
         stop: StopBar::Verified,
         image: "img".to_string(),
         planning: PlanningDag {
@@ -436,7 +434,7 @@ fn planning_mission_type(skill_dir: &std::path::Path) -> MissionType {
             OracleName::new("cargo-test").unwrap(),
             PathBuf::from("/nonexistent/oracles/cargo-test"),
         )]),
-    }
+    })
 }
 
 fn proposed_plan() -> PlanProposal {
@@ -572,20 +570,22 @@ async fn terminal_review_prompt_lists_assigned_skills() {
     let skill_root = write_skill(dir.path(), "gap-check", "Hunt gaps in the product");
 
     let mut mission_type = common::review_mission_type();
-    mission_type.skills.insert(
-        "gap-check".to_string(),
-        SkillPackage {
-            name: "gap-check".to_string(),
-            root: skill_root,
-            description: "Hunt gaps in the product".to_string(),
-        },
-    );
-    mission_type
-        .roles
-        .get_mut(&rn("gap-reviewer"))
-        .unwrap()
-        .skills
-        .push("gap-check".to_string());
+    mission_type.edit_for_testing(|definition| {
+        definition.skills.insert(
+            "gap-check".to_string(),
+            SkillPackage {
+                name: "gap-check".to_string(),
+                root: skill_root,
+                description: "Hunt gaps in the product".to_string(),
+            },
+        );
+        definition
+            .roles
+            .get_mut(&rn("gap-reviewer"))
+            .unwrap()
+            .skills
+            .push("gap-check".to_string());
+    });
 
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == lionclaw::engine::TERMINAL_REVIEW_TASK_TAG {
@@ -688,11 +688,10 @@ async fn a_role_referencing_a_missing_skill_fails_closed_at_mission_creation() {
     // Build a mission type where a role references a skill that is NOT in
     // the skills map — simulating a stale or corrupt mission type closure.
     let mut mission_type = common::test_mission_type();
-    mission_type
-        .roles
-        .get_mut(&rn("implementer"))
-        .unwrap()
-        .skills = vec!["ghost-skill".to_string()];
+    mission_type.edit_for_testing(|definition| {
+        definition.roles.get_mut(&rn("implementer")).unwrap().skills =
+            vec!["ghost-skill".to_string()];
+    });
 
     let runner = MockRoleRunner::happy(HEAD_SHA);
     let store = MissionStore::open(dir.path()).await.expect("store");

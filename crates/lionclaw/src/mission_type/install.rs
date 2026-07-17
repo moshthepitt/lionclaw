@@ -50,7 +50,7 @@ pub fn install_mission_type(
     let destination = destination_dir.join(&source_type.name);
     if destination.exists() && !force {
         return Ok(InstallOutcome {
-            name: source_type.name,
+            name: source_type.name.clone(),
             installed: false,
         });
     }
@@ -66,7 +66,7 @@ pub fn install_mission_type(
     }
     replace_directory(&staging, &destination)?;
     Ok(InstallOutcome {
-        name: source_type.name,
+        name: source_type.name.clone(),
         installed: true,
     })
 }

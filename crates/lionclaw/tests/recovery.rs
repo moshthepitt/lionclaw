@@ -381,9 +381,11 @@ async fn stopping_one_scheduled_oracle_retry_does_not_interrupt_its_sibling() {
     let dir = tempfile::tempdir().unwrap();
     let mut mission_type = test_mission_type();
     let lint = OracleName::new("lint").unwrap();
-    mission_type
-        .oracles
-        .insert(lint.clone(), "/nonexistent/oracles/lint".into());
+    mission_type.edit_for_testing(|definition| {
+        definition
+            .oracles
+            .insert(lint.clone(), "/nonexistent/oracles/lint".into());
+    });
     let attempts = Arc::new(Mutex::new(std::collections::BTreeMap::<String, u32>::new()));
     let seen = attempts.clone();
     let oracle = MockOracleRunner::new(Box::new(move |request| {

@@ -2104,7 +2104,7 @@ async fn cmd_doctor() -> Result<std::process::ExitCode> {
                     &format!("mission type '{name}'"),
                     img,
                     &if img {
-                        short_hex(&mt.digest)
+                        short_hex(mt.digest())
                     } else {
                         format!("image '{}' not present", mt.image)
                     },
@@ -2192,7 +2192,7 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
             serde_json::json!({
                 "ok": true,
                 "name": mt.name,
-                "digest": mt.digest,
+                "digest": mt.digest(),
                 "stop": mt.stop.slug(),
                 "image": mt.image,
                 "roles": mt.roles.keys().map(|role| role.as_str()).collect::<Vec<_>>(),
@@ -2218,7 +2218,7 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
         return;
     }
     println!("mission type '{}' is valid", mt.name);
-    println!("  digest: {}", short_hex(&mt.digest));
+    println!("  digest: {}", short_hex(mt.digest()));
     println!("  stop:  {:?}", mt.stop);
     println!("  image: {}", mt.image);
     if let Some(tr) = &mt.terminal_review {
@@ -2951,13 +2951,12 @@ mod tests {
     }
 
     fn mission_type_with_runtime(runtime: Option<&str>) -> MissionType {
-        use crate::mission_type::RoleDefinition;
+        use crate::mission_type::{MissionTypeDefinition, RoleDefinition};
         use crate::model::{OutputSemantics, RoleName, StopBar};
 
         let name = RoleName::new("worker").expect("role name");
-        MissionType {
+        MissionType::for_testing(MissionTypeDefinition {
             name: "runtime-test".to_string(),
-            digest: "digest".to_string(),
             stop: StopBar::Verified,
             image: "image".to_string(),
             planning: Default::default(),
@@ -2981,7 +2980,7 @@ mod tests {
             skills: BTreeMap::new(),
             inputs: BTreeMap::new(),
             oracles: BTreeMap::new(),
-        }
+        })
     }
 
     fn mid() -> MissionId {
@@ -3872,7 +3871,7 @@ mod tests {
 
         std::fs::remove_dir_all(&source).unwrap();
         let loaded = load_mission_type_snapshot(&store, &id, &AuthorityCeiling::default()).unwrap();
-        assert_eq!(loaded.digest, snapshotted.digest);
+        assert_eq!(loaded.digest(), snapshotted.digest());
         assert!(create_mission_dir(&store, &id).is_err());
         assert!(store.mission_type_dir(&id).is_dir());
 

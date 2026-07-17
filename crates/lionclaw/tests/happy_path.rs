@@ -3,14 +3,18 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
+
 use common::{
     approve_plan, covered_requirement, harness, proposal, simple_plan, test_mission_type, BASE_SHA,
     HEAD_SHA,
 };
 use lionclaw::engine::MissionDisposition;
+use lionclaw::mission_type::PreparedInput;
 use lionclaw::model::{
-    Assertion, AssertionId, FinishClass, MissionPhase, OracleName, OutputSemantics, PlanningDag,
-    PlanningTask, RoleName, TaskId, TaskStatus,
+    Assertion, AssertionId, FinishClass, InputName, MissionPhase, OracleName, OutputSemantics,
+    PlanningDag, PlanningTask, RoleName, TaskId, TaskStatus,
 };
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
@@ -68,7 +72,7 @@ async fn passing_oracle_yields_verified_finish() {
 async fn direct_engine_creation_rejects_invalid_mission_type_policy() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mission_type = test_mission_type();
-    mission_type.recovery.max_attempts = 0;
+    mission_type.edit_for_testing(|definition| definition.recovery.max_attempts = 0);
     let h = common::harness_with_type(
         dir.path(),
         mission_type,
@@ -85,15 +89,17 @@ async fn direct_engine_creation_rejects_invalid_mission_type_policy() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mission_type = test_mission_type();
-    mission_type.planning = PlanningDag {
-        tasks: vec![PlanningTask {
-            id: TaskId::new("author").expect("task id"),
-            role: RoleName::new("missing-planner").expect("role name"),
-            output: OutputSemantics::ProposesPlan,
-            body: "Propose the plan.".into(),
-            depends_on: Vec::new(),
-        }],
-    };
+    mission_type.edit_for_testing(|definition| {
+        definition.planning = PlanningDag {
+            tasks: vec![PlanningTask {
+                id: TaskId::new("author").expect("task id"),
+                role: RoleName::new("missing-planner").expect("role name"),
+                output: OutputSemantics::ProposesPlan,
+                body: "Propose the plan.".into(),
+                depends_on: Vec::new(),
+            }],
+        };
+    });
     let h = common::harness_with_type(
         dir.path(),
         mission_type,
@@ -113,11 +119,13 @@ async fn direct_engine_creation_rejects_invalid_mission_type_policy() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mission_type = test_mission_type();
-    mission_type
-        .roles
-        .get_mut(&RoleName::new("reviewer").expect("role name"))
-        .expect("reviewer role")
-        .secrets = true;
+    mission_type.edit_for_testing(|definition| {
+        definition
+            .roles
+            .get_mut(&RoleName::new("reviewer").expect("role name"))
+            .expect("reviewer role")
+            .secrets = true;
+    });
     let h = common::harness_with_type(
         dir.path(),
         mission_type,
@@ -132,6 +140,42 @@ async fn direct_engine_creation_rejects_invalid_mission_type_policy() {
         .expect_err("direct creation must enforce the non-writer authority moat");
     assert!(
         error.to_string().contains("may not mount runtime secrets"),
+        "got {error:#}"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let program = dir.path().join("prepared-input");
+    std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("write input program");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("make input executable");
+    let input_name = InputName::new("prepared-input").expect("input name");
+    let mut mission_type = test_mission_type();
+    mission_type.edit_for_testing(|definition| {
+        definition.inputs.insert(
+            input_name.clone(),
+            PreparedInput {
+                name: input_name,
+                program,
+                network: false,
+                key_files: vec!["../outside".into()],
+                environment: BTreeMap::new(),
+            },
+        );
+    });
+    let h = common::harness_with_type(
+        dir.path(),
+        mission_type,
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let error = h
+        .engine
+        .create_mission("/repo", "invalid prepared input", BASE_SHA)
+        .await
+        .expect_err("direct creation must enforce prepared-input path safety");
+    assert!(
+        error.to_string().contains("without traversal"),
         "got {error:#}"
     );
 }
@@ -194,11 +238,13 @@ async fn durable_role_outcomes_bound_adapter_configuration_evidence() {
 async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mission_type = test_mission_type();
-    mission_type.oracles.insert(
-        OracleName::new("lint").unwrap(),
-        "/nonexistent-mission-type/oracles/lint".into(),
-    );
-    mission_type.execution.auto_continue_proof = false;
+    mission_type.edit_for_testing(|definition| {
+        definition.oracles.insert(
+            OracleName::new("lint").unwrap(),
+            "/nonexistent-mission-type/oracles/lint".into(),
+        );
+        definition.execution.auto_continue_proof = false;
+    });
     let h = common::harness_with_type(
         dir.path(),
         mission_type,

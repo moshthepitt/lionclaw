@@ -281,7 +281,7 @@ impl Engine {
     fn mission_type_ref(&self) -> crate::model::MissionTypeRef {
         crate::model::MissionTypeRef {
             name: self.mission_type.name.clone(),
-            digest: self.mission_type.digest.clone(),
+            digest: self.mission_type.digest().to_string(),
         }
     }
 
@@ -380,13 +380,13 @@ impl Engine {
         // funnels here. `decide`/`record_decision` are deliberately store-only
         // (no type loaded): a decision mints no verdict, and the next `advance`
         // re-verifies the digest before any oracle can run.
-        if state.mission_type.digest != self.mission_type.digest {
+        if state.mission_type.digest != self.mission_type.digest() {
             bail!(
                 "mission type '{}' changed since this mission started \
                  (recorded {}, on-disk {}); start a fresh mission",
                 state.mission_type.name,
                 crate::model::short_hex(&state.mission_type.digest),
-                crate::model::short_hex(&self.mission_type.digest),
+                crate::model::short_hex(self.mission_type.digest()),
             );
         }
         Ok(state)
@@ -1059,20 +1059,6 @@ impl Engine {
                     Ok(outcome) => outcome,
                     Err(failure) => return Ok(completed(Err(failure))),
                 };
-                let incomplete = match &outcome.handoff {
-                    Handoff::Work { done: false, .. } => Some("role reported done=false"),
-                    Handoff::Plan { done: false, .. } => {
-                        Some("planning author reported done=false")
-                    }
-                    _ => None,
-                };
-                if let Some(detail) = incomplete {
-                    return Ok(completed(Err(invalid_role_outcome(
-                        "handoff.incomplete",
-                        detail,
-                        &outcome,
-                    ))));
-                }
                 // A planning author's proposal is validated fail-closed before
                 // it is recorded, exactly like a manually proposed plan — an
                 // invalid proposal is a failed attempt, never a bad contract.
@@ -2179,7 +2165,7 @@ pub async fn record_control(
             if *automatic {
                 bail!("automatic controls are engine-owned");
             }
-            if !state.parked_effects.contains_key(effect_id) {
+            if !state.parked_effect_is_continuable(effect_id) {
                 bail!("effect '{effect_id}' is not parked; control is stale");
             }
         }

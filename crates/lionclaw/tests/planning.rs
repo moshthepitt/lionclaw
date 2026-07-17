@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use common::{covered_requirement, BASE_SHA};
 use lionclaw::engine::{Engine, EngineServices};
-use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
+use lionclaw::mission_type::{MissionType, MissionTypeDefinition, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionEvent,
     MissionPhase, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, PlanningDag,
@@ -72,9 +72,8 @@ fn planning_mission_type() -> MissionType {
     let strategist = roles.get_mut(&rn("strategist")).unwrap();
     strategist.skills = vec!["planning-method".to_string()];
     strategist.runtime = Some("opencode".to_string());
-    MissionType {
+    MissionType::for_testing(MissionTypeDefinition {
         name: "planning-test".to_string(),
-        digest: "test-digest".to_string(),
         stop: StopBar::Verified,
         image: "img".to_string(),
         planning: planning_dag(),
@@ -96,7 +95,7 @@ fn planning_mission_type() -> MissionType {
             OracleName::new("cargo-test").unwrap(),
             PathBuf::from("/nonexistent/oracles/cargo-test"),
         )]),
-    }
+    })
 }
 
 fn planning_dag() -> PlanningDag {

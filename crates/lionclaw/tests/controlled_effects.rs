@@ -489,13 +489,15 @@ async fn abort_cancels_an_active_oracle_while_the_driver_drains_its_batch() {
     let blocked_started = Arc::new(Notify::new());
     let abort_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut mission_type = test_mission_type();
-    mission_type.oracles.clear();
-    for name in ["oracle-a", "oracle-b"] {
-        mission_type.oracles.insert(
-            OracleName::new(name).unwrap(),
-            format!("/nonexistent-mission-type/oracles/{name}").into(),
-        );
-    }
+    mission_type.edit_for_testing(|definition| {
+        definition.oracles.clear();
+        for name in ["oracle-a", "oracle-b"] {
+            definition.oracles.insert(
+                OracleName::new(name).unwrap(),
+                format!("/nonexistent-mission-type/oracles/{name}").into(),
+            );
+        }
+    });
     let engine = Arc::new(Engine::new(
         store.clone(),
         mission_type,
@@ -760,8 +762,10 @@ async fn deadline_is_durably_linearized_before_one_adapter_cancellation() {
     let store = MissionStore::open(dir.path()).await.unwrap();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut mission_type = test_mission_type();
-    mission_type.execution.default_timeout_secs = 1;
-    mission_type.execution.max_task_time_secs = 1;
+    mission_type.edit_for_testing(|definition| {
+        definition.execution.default_timeout_secs = 1;
+        definition.execution.max_task_time_secs = 1;
+    });
     let engine = Engine::new(
         store.clone(),
         mission_type,
@@ -820,13 +824,15 @@ async fn finite_policy_budget_extends_before_the_initial_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let mut mission_type = test_mission_type();
-    mission_type.execution = lionclaw::model::ExecutionPolicy {
-        default_timeout_secs: 1,
-        max_task_time_secs: 2,
-        extension_step_secs: 1,
-        auto_continue_candidate: false,
-        auto_continue_proof: false,
-    };
+    mission_type.edit_for_testing(|definition| {
+        definition.execution = lionclaw::model::ExecutionPolicy {
+            default_timeout_secs: 1,
+            max_task_time_secs: 2,
+            extension_step_secs: 1,
+            auto_continue_candidate: false,
+            auto_continue_proof: false,
+        };
+    });
     let engine = Engine::new(
         store.clone(),
         mission_type,
@@ -975,7 +981,9 @@ async fn direct_mission_creation_rejects_an_invalid_execution_policy() {
     let dir = tempfile::tempdir().unwrap();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let mut mission_type = test_mission_type();
-    mission_type.execution.default_timeout_secs = 0;
+    mission_type.edit_for_testing(|definition| {
+        definition.execution.default_timeout_secs = 0;
+    });
     let engine = Engine::new(
         store,
         mission_type,
@@ -1004,7 +1012,9 @@ async fn direct_mission_creation_rejects_an_invalid_execution_policy() {
 async fn mission_creation_rejects_deadlines_unrepresentable_at_its_epoch() {
     let dir = tempfile::tempdir().unwrap();
     let mut mission_type = test_mission_type();
-    mission_type.execution.max_task_time_secs = lionclaw::model::MAX_EXECUTION_DURATION_SECS;
+    mission_type.edit_for_testing(|definition| {
+        definition.execution.max_task_time_secs = lionclaw::model::MAX_EXECUTION_DURATION_SECS;
+    });
     let store = MissionStore::open(dir.path()).await.unwrap();
     let engine = Engine::new(
         store,
@@ -1036,8 +1046,10 @@ async fn mission_creation_rejects_deadlines_unrepresentable_at_its_epoch() {
 async fn mission_creation_rejects_unrepresentable_role_deadlines() {
     let dir = tempfile::tempdir().unwrap();
     let mut mission_type = test_mission_type();
-    mission_type.roles.values_mut().next().unwrap().timeout_secs =
-        Some(lionclaw::model::MAX_EXECUTION_DURATION_SECS);
+    mission_type.edit_for_testing(|definition| {
+        definition.roles.values_mut().next().unwrap().timeout_secs =
+            Some(lionclaw::model::MAX_EXECUTION_DURATION_SECS);
+    });
     let store = MissionStore::open(dir.path()).await.unwrap();
     let engine = Engine::new(
         store,
@@ -1070,7 +1082,9 @@ async fn mission_creation_rejects_unrepresentable_role_deadlines() {
 async fn mission_creation_rejects_zero_second_role_deadlines() {
     let dir = tempfile::tempdir().unwrap();
     let mut mission_type = test_mission_type();
-    mission_type.roles.values_mut().next().unwrap().timeout_secs = Some(0);
+    mission_type.edit_for_testing(|definition| {
+        definition.roles.values_mut().next().unwrap().timeout_secs = Some(0);
+    });
     let store = MissionStore::open(dir.path()).await.unwrap();
     let engine = Engine::new(
         store,

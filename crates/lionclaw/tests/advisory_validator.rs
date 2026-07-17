@@ -62,7 +62,7 @@ async fn drive(role_runner: MockRoleRunner) -> (MissionState, Vec<lionclaw::mode
     let dir = tempfile::tempdir().expect("tempdir");
     let store = MissionStore::open(dir.path()).await.expect("store");
     let mut mission_type = review_mission_type();
-    mission_type.stop = StopBar::Reviewed;
+    mission_type.edit_for_testing(|definition| definition.stop = StopBar::Reviewed);
     let engine = Engine::new(
         store.clone(),
         mission_type,

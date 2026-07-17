@@ -91,7 +91,9 @@ async fn started_with_recovery(
     max_attempts: u32,
 ) -> (common::TestHarness, lionclaw::model::MissionId) {
     let mut mission_type = review_mission_type();
-    mission_type.recovery.max_attempts = max_attempts;
+    mission_type.edit_for_testing(|definition| {
+        definition.recovery.max_attempts = max_attempts;
+    });
     let h = harness_with_type(
         dir.path(),
         mission_type,
@@ -339,20 +341,22 @@ async fn terminal_review_receives_its_declared_skill_packages() {
     std::fs::write(skill_root.join("SKILL.md"), "gap check").expect("skill file");
 
     let mut mission_type = review_mission_type();
-    mission_type.skills.insert(
-        "gap-check".to_string(),
-        lionclaw::mission_type::SkillPackage {
-            name: "gap-check".to_string(),
-            root: skill_root.clone(),
-            description: "gap check".to_string(),
-        },
-    );
-    mission_type
-        .roles
-        .get_mut(&lionclaw::model::RoleName::new("gap-reviewer").unwrap())
-        .unwrap()
-        .skills
-        .push("gap-check".to_string());
+    mission_type.edit_for_testing(|definition| {
+        definition.skills.insert(
+            "gap-check".to_string(),
+            lionclaw::mission_type::SkillPackage {
+                name: "gap-check".to_string(),
+                root: skill_root.clone(),
+                description: "gap check".to_string(),
+            },
+        );
+        definition
+            .roles
+            .get_mut(&lionclaw::model::RoleName::new("gap-reviewer").unwrap())
+            .unwrap()
+            .skills
+            .push("gap-check".to_string());
+    });
 
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == REVIEW_TAG {
@@ -726,8 +730,10 @@ async fn a_reviewed_bar_mission_type_without_a_review_is_refused_at_creation() {
     // loaded bundles; there is no caller-owned config that can weaken it.
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mission_type = review_mission_type();
-    mission_type.stop = lionclaw::model::StopBar::Reviewed;
-    mission_type.terminal_review = None;
+    mission_type.edit_for_testing(|definition| {
+        definition.stop = lionclaw::model::StopBar::Reviewed;
+        definition.terminal_review = None;
+    });
     let h = harness_with_type(
         dir.path(),
         mission_type,
@@ -825,8 +831,10 @@ async fn a_mission_type_naming_an_unknown_or_non_verdict_reviewer_is_refused_at_
     ] {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut mission_type = review_mission_type();
-        mission_type.terminal_review = Some(lionclaw::model::TerminalReviewConfig {
-            role: lionclaw::model::RoleName::new(role).expect("role name"),
+        mission_type.edit_for_testing(|definition| {
+            definition.terminal_review = Some(lionclaw::model::TerminalReviewConfig {
+                role: lionclaw::model::RoleName::new(role).expect("role name"),
+            });
         });
         let h = harness_with_type(
             dir.path(),

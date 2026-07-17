@@ -49,7 +49,8 @@ fn the_digest_tracks_role_and_oracle_content() {
     let digest = || {
         load_mission_type(&root, &AuthorityCeiling::default())
             .expect("loads")
-            .digest
+            .digest()
+            .to_string()
     };
     let base = digest();
 
@@ -100,7 +101,8 @@ fn the_digest_tracks_recursive_skill_content() {
     let digest = || {
         load_mission_type(&root, &AuthorityCeiling::default())
             .expect("loads")
-            .digest
+            .digest()
+            .to_string()
     };
     let base = digest();
     std::fs::write(root.join("skills/rust/references/guide.md"), "second\n").unwrap();
@@ -119,7 +121,7 @@ async fn opening_a_mission_whose_type_digest_changed_is_refused() {
     let store = MissionStore::open(dir.path()).await.unwrap();
     let engine_a = Engine::new(
         store,
-        test_mission_type(), // digest "test-digest"
+        test_mission_type(),
         "codex".to_string(),
         "img".to_string(),
         EngineServices::new(
@@ -129,6 +131,7 @@ async fn opening_a_mission_whose_type_digest_changed_is_refused() {
             Arc::new(MockClock::default()),
         ),
     );
+    let original_digest = engine_a.mission_type().digest().to_string();
     let id = engine_a
         .create_mission(&dir.path().to_string_lossy(), "obj", BASE_SHA)
         .await
@@ -142,7 +145,16 @@ async fn opening_a_mission_whose_type_digest_changed_is_refused() {
     // Engine B over the SAME store, but its mission type's digest differs (as if
     // a role or oracle was edited on disk between start and advance).
     let mut changed = test_mission_type();
-    changed.digest = "a-different-digest".to_string();
+    changed.edit_for_testing(|definition| {
+        definition
+            .roles
+            .values_mut()
+            .next()
+            .expect("test role")
+            .prompt_body
+            .push_str(" changed");
+    });
+    assert_ne!(changed.digest(), original_digest);
     let store = MissionStore::open(dir.path()).await.unwrap();
     let engine_b = Engine::new(
         store,

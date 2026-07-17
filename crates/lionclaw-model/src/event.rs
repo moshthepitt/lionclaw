@@ -380,6 +380,11 @@ pub fn role_success_contract_error(
     if !handoff.matches_output(output) {
         return Some("role handoff does not match the effect output contract");
     }
+    match handoff {
+        Handoff::Work { done: false, .. } => return Some("role reported done=false"),
+        Handoff::Plan { done: false, .. } => return Some("planning author reported done=false"),
+        _ => {}
+    }
     let artifact = artifact?;
     if output != OutputSemantics::ProducesArtifact {
         return Some("only a produces-artifact role may return an artifact");

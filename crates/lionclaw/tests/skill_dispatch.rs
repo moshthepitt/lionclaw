@@ -16,20 +16,22 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
     std::fs::write(package_root.join("SKILL.md"), "fixture").unwrap();
 
     let mut mission_type = test_mission_type();
-    mission_type.skills.insert(
-        "engineering".to_string(),
-        SkillPackage {
-            name: "engineering".to_string(),
-            root: package_root.clone(),
-            description: "engineering skill".to_string(),
-        },
-    );
-    let implementer = mission_type
-        .roles
-        .get_mut(&RoleName::new("implementer").unwrap())
-        .unwrap();
-    implementer.runtime = Some("opencode".to_string());
-    implementer.skills = vec!["engineering".to_string()];
+    mission_type.edit_for_testing(|definition| {
+        definition.skills.insert(
+            "engineering".to_string(),
+            SkillPackage {
+                name: "engineering".to_string(),
+                root: package_root.clone(),
+                description: "engineering skill".to_string(),
+            },
+        );
+        let implementer = definition
+            .roles
+            .get_mut(&RoleName::new("implementer").unwrap())
+            .unwrap();
+        implementer.runtime = Some("opencode".to_string());
+        implementer.skills = vec!["engineering".to_string()];
+    });
 
     let expected_root = package_root.clone();
     let runner = MockRoleRunner::new(Box::new(move |request| {

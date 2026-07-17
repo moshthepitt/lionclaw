@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use super::digest::ContentDigest;
 use super::loader::MissionTypeError;
 use super::manifest::{MissionLockFile, MISSION_LOCK_FILE};
-use super::SkillPackage;
+use super::{is_executable, SkillPackage};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedSkillPackage {
@@ -19,6 +19,7 @@ pub(crate) fn load_skills(
     let lock = load_lock(mission_root)?;
     let skills_root = mission_root.join("skills");
     let mut packages = BTreeMap::new();
+    let mut package_digests = BTreeMap::new();
 
     match std::fs::symlink_metadata(&skills_root) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -77,6 +78,7 @@ pub(crate) fn load_skills(
                         ),
                     });
                 }
+                package_digests.insert(name.clone(), validated.digest);
                 packages.insert(
                     name.clone(),
                     SkillPackage {
@@ -89,7 +91,7 @@ pub(crate) fn load_skills(
         }
     }
 
-    validate_lock(&lock, &packages)?;
+    validate_lock(&lock, &package_digests)?;
     Ok(packages)
 }
 
@@ -197,16 +199,15 @@ pub(crate) fn load_lock(root: &Path) -> Result<MissionLockFile, MissionTypeError
 
 fn validate_lock(
     lock: &MissionLockFile,
-    packages: &BTreeMap<String, SkillPackage>,
+    package_digests: &BTreeMap<String, String>,
 ) -> Result<(), MissionTypeError> {
     for (name, locked) in &lock.skills {
-        let package = packages.get(name).ok_or_else(|| {
+        let actual = package_digests.get(name).ok_or_else(|| {
             MissionTypeError::Manifest(format!(
                 "{MISSION_LOCK_FILE} references missing skill '{name}'"
             ))
         })?;
-        let actual = package_digest(name, &package.root)?;
-        if actual != locked.digest {
+        if actual != &locked.digest {
             return Err(MissionTypeError::Manifest(format!(
                 "{MISSION_LOCK_FILE} digest for skill '{name}' does not match its package"
             )));
@@ -224,11 +225,12 @@ fn package_digest(name: &str, root: &Path) -> Result<String, MissionTypeError> {
                 skill: name.to_string(),
                 detail: format!("package entry '{}' escaped its root", path.display()),
             })?;
-        let bytes = std::fs::read(&path).map_err(|source| MissionTypeError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        digest.feed(&relative.to_string_lossy(), &bytes, is_executable(&path));
+        digest
+            .feed_file(&relative.to_string_lossy(), &path, is_executable(&path))
+            .map_err(|source| MissionTypeError::Io {
+                path: path.clone(),
+                source,
+            })?;
     }
     Ok(digest.finish())
 }
@@ -329,9 +331,31 @@ fn read_dir(directory: &Path) -> Result<Vec<std::fs::DirEntry>, MissionTypeError
     Ok(entries)
 }
 
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_skill_resources_are_hashed_by_the_streaming_package_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("large-resource");
+        std::fs::create_dir_all(root.join("references")).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            "---\nname: large-resource\ndescription: Streams resources.\n---\n\n# Instructions\n",
+        )
+        .unwrap();
+        let resource = root.join("references/data.bin");
+        std::fs::File::create(&resource)
+            .unwrap()
+            .set_len(65 * 1024 * 1024)
+            .unwrap();
+
+        let validated = validate_skill_package(&root).expect("large package validates");
+        assert_eq!(validated.digest.len(), 64);
+        assert_eq!(
+            validated.digest,
+            package_digest("large-resource", &root).unwrap()
+        );
+    }
 }

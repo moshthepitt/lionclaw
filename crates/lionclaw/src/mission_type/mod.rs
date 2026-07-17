@@ -20,6 +20,7 @@ mod install;
 mod loader;
 mod locator;
 mod manifest;
+mod prepared_input;
 mod skill_install;
 mod skills;
 
@@ -32,7 +33,7 @@ pub use locator::MissionTypeLocator;
 pub use skill_install::{add_skill, remove_skill, SkillChange, SkillSource};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::model::{
     InputName, OracleName, OutputSemantics, PlanInventory, PlanningDag, RoleName, StopBar,
@@ -42,6 +43,21 @@ use crate::model::{
 /// Aggregate program and declared-key content admitted to one prepared-input
 /// cache identity.
 pub(crate) const MAX_PREPARED_INPUT_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
+
+pub(crate) fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+pub(crate) fn has_shebang(path: &Path) -> bool {
+    use std::io::Read;
+    let mut bytes = [0_u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok_and(|_| &bytes == b"#!")
+}
 
 /// A role is property-composed data: open fields (name, prompt, runtime) plus
 /// the closed engine-understood axes (`output`, and the plain `network`/
@@ -81,12 +97,12 @@ pub struct PreparedInput {
     pub environment: BTreeMap<String, String>,
 }
 
+/// Untrusted mission-type data. Production callers obtain a sealed
+/// [`MissionType`] from [`load_mission_type`]; keeping the definition separate
+/// makes a stale or caller-selected content pin unrepresentable.
 #[derive(Debug, Clone)]
-pub struct MissionType {
+pub struct MissionTypeDefinition {
     pub name: String,
-    /// Content digest over the loaded files (`loader::compute_digest`),
-    /// recorded at start and verified on every engine open.
-    pub digest: String,
     pub stop: StopBar,
     /// The confinement image every role and oracle runs in (from `mission.toml`).
     pub image: String,
@@ -106,7 +122,44 @@ pub struct MissionType {
     pub oracles: BTreeMap<OracleName, PathBuf>,
 }
 
+/// One validated mission-type closure sealed to its content identity.
+#[derive(Debug, Clone)]
+pub struct MissionType {
+    definition: MissionTypeDefinition,
+    digest: String,
+}
+
+impl std::ops::Deref for MissionType {
+    type Target = MissionTypeDefinition;
+
+    fn deref(&self) -> &Self::Target {
+        &self.definition
+    }
+}
+
 impl MissionType {
+    pub(crate) fn from_loaded(definition: MissionTypeDefinition, digest: String) -> Self {
+        Self { definition, digest }
+    }
+
+    /// Content digest over the complete loaded bundle, recorded at mission
+    /// creation and verified on every engine open.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_testing(definition: MissionTypeDefinition) -> Self {
+        let digest = test_definition_digest(&definition);
+        Self { definition, digest }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn edit_for_testing(&mut self, edit: impl FnOnce(&mut MissionTypeDefinition)) {
+        edit(&mut self.definition);
+        self.digest = test_definition_digest(&self.definition);
+    }
+
     /// Validate the complete semantic mission-type contract at the clock epoch
     /// where immutable effect deadlines will be derived. Bundle loading and
     /// direct engine creation use this same boundary.
@@ -142,6 +195,8 @@ impl MissionType {
                 }
             }
         }
+        prepared_input::validate_prepared_inputs(&self.inputs)
+            .map_err(|error| anyhow::anyhow!(error))?;
         let planning_errors =
             crate::model::validate_planning_dag(&self.planning, &self.inventory());
         if !planning_errors.is_empty() {
@@ -201,4 +256,11 @@ impl MissionType {
             oracles: self.oracles.keys().cloned().collect::<BTreeSet<_>>(),
         }
     }
+}
+
+#[cfg(any(test, feature = "testing"))]
+fn test_definition_digest(definition: &MissionTypeDefinition) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(format!("{definition:#?}").as_bytes()))
 }

@@ -520,7 +520,10 @@ fn a_terminal_review_declaration_loads_and_pins_the_role() {
     .unwrap();
     let mission_type = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("loads");
     assert_eq!(
-        mission_type.terminal_review.map(|tr| tr.role.to_string()),
+        mission_type
+            .terminal_review
+            .as_ref()
+            .map(|tr| tr.role.to_string()),
         Some("gap-reviewer".to_string())
     );
 }
@@ -579,7 +582,8 @@ fn editing_the_terminal_review_declaration_changes_the_digest() {
     write_reviewer_role(dir.path());
     let before = load_mission_type(dir.path(), &AuthorityCeiling::default())
         .expect("loads")
-        .digest;
+        .digest()
+        .to_string();
     std::fs::write(
         dir.path().join("mission.toml"),
         "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
@@ -588,7 +592,8 @@ fn editing_the_terminal_review_declaration_changes_the_digest() {
     .unwrap();
     let after = load_mission_type(dir.path(), &AuthorityCeiling::default())
         .expect("loads")
-        .digest;
+        .digest()
+        .to_string();
     // The declaration is part of the pinned instrument: adding it mid-mission
     // trips the digest check on the next engine open.
     assert_ne!(before, after);

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lionclaw::engine::{Engine, EngineServices};
-use lionclaw::mission_type::{MissionType, RoleDefinition};
+use lionclaw::mission_type::{MissionType, MissionTypeDefinition, RoleDefinition};
 use lionclaw::model::{
     Assertion, AssertionId, OracleName, OutputSemantics, Plan, PlanProposal, Requirement,
     RequirementDisposition, RequirementId, RequirementKind, RoleName, StopBar, Task, TaskKind,
@@ -93,9 +93,8 @@ pub async fn approve_plan(engine: &Engine, mission_id: &lionclaw::model::Mission
 pub fn test_mission_type() -> MissionType {
     let implementer = RoleName::new("implementer").expect("role name");
     let cargo_test = OracleName::new("cargo-test").expect("oracle name");
-    MissionType {
+    MissionType::for_testing(MissionTypeDefinition {
         name: "software-dev-test".to_string(),
-        digest: "test-digest".to_string(),
         stop: StopBar::Verified,
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
         planning: Default::default(),
@@ -141,7 +140,7 @@ pub fn test_mission_type() -> MissionType {
             cargo_test,
             "/nonexistent-mission-type/oracles/cargo-test".into(),
         )]),
-    }
+    })
 }
 
 /// `test_mission_type` plus a declared closing review: a fresh-context
@@ -149,21 +148,23 @@ pub fn test_mission_type() -> MissionType {
 pub fn review_mission_type() -> MissionType {
     let gap_reviewer = RoleName::new("gap-reviewer").expect("role name");
     let mut mission_type = test_mission_type();
-    mission_type.roles.insert(
-        gap_reviewer.clone(),
-        RoleDefinition {
-            name: gap_reviewer.clone(),
-            output: OutputSemantics::EmitsGapVerdict,
-            runtime: Some("opencode".to_string()),
-            timeout_secs: None,
-            network: false,
-            secrets: false,
-            skills: Vec::new(),
-            prompt_body: "Hunt product gaps against the objective.".to_string(),
-        },
-    );
-    mission_type.terminal_review =
-        Some(lionclaw::model::TerminalReviewConfig { role: gap_reviewer });
+    mission_type.edit_for_testing(|definition| {
+        definition.roles.insert(
+            gap_reviewer.clone(),
+            RoleDefinition {
+                name: gap_reviewer.clone(),
+                output: OutputSemantics::EmitsGapVerdict,
+                runtime: Some("opencode".to_string()),
+                timeout_secs: None,
+                network: false,
+                secrets: false,
+                skills: Vec::new(),
+                prompt_body: "Hunt product gaps against the objective.".to_string(),
+            },
+        );
+        definition.terminal_review =
+            Some(lionclaw::model::TerminalReviewConfig { role: gap_reviewer });
+    });
     mission_type
 }
 

@@ -16,9 +16,11 @@ use super::install::validate_closed_tree;
 use super::manifest::{
     is_path_safe_name, ManifestFile, ManifestInput, ManifestPlanningDag, MISSION_LOCK_FILE,
 };
+use super::prepared_input::{validate_prepared_inputs, PreparedInputContractError};
 use super::skills::{load_skills, package_files};
 use super::{
-    MissionType, PreparedInput, RoleDefinition, SkillPackage, MAX_PREPARED_INPUT_CONTENT_BYTES,
+    has_shebang, is_executable, MissionType, MissionTypeDefinition, PreparedInput, RoleDefinition,
+    SkillPackage,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -108,9 +110,8 @@ pub fn load_mission_type(
     }
     let digest = compute_digest(root, &skills)?;
 
-    let mission_type = MissionType {
+    let definition = MissionTypeDefinition {
         name: manifest.mission_type.name,
-        digest,
         stop,
         image: manifest.mission_type.image,
         planning,
@@ -123,6 +124,7 @@ pub fn load_mission_type(
         inputs,
         oracles,
     };
+    let mission_type = MissionType::from_loaded(definition, digest);
     mission_type
         .validate_at(0)
         .map_err(|error| MissionTypeError::Manifest(error.to_string()))?;
@@ -163,78 +165,12 @@ fn load_inputs(
     declared: Vec<ManifestInput>,
 ) -> Result<BTreeMap<InputName, PreparedInput>, MissionTypeError> {
     let mut inputs = BTreeMap::new();
-    let mut environment_owners = BTreeMap::<String, InputName>::new();
     for input in declared {
         let name = InputName::new(&input.name).map_err(|error| MissionTypeError::Input {
             input: input.name.clone(),
             detail: error.to_string(),
         })?;
-        if input.key_files.is_empty() {
-            return Err(MissionTypeError::Input {
-                input: input.name,
-                detail: "key-files must contain at least one workspace path".to_string(),
-            });
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        for path in &input.key_files {
-            if !safe_relative_path(path) {
-                return Err(MissionTypeError::Input {
-                    input: input.name.clone(),
-                    detail: format!(
-                        "key-file '{}' must be a non-empty relative path without traversal",
-                        path.display()
-                    ),
-                });
-            }
-            if !seen.insert(path) {
-                return Err(MissionTypeError::Input {
-                    input: input.name.clone(),
-                    detail: format!("key-file '{}' is declared more than once", path.display()),
-                });
-            }
-        }
-        for variable in input.environment.keys() {
-            if !valid_environment_name(variable) {
-                return Err(MissionTypeError::Input {
-                    input: input.name.clone(),
-                    detail: format!("environment key '{variable}' is invalid"),
-                });
-            }
-            if let Some(owner) = environment_owners.insert(variable.clone(), name.clone()) {
-                return Err(MissionTypeError::Input {
-                    input: input.name.clone(),
-                    detail: format!(
-                        "environment key '{variable}' is already provided by input '{owner}'"
-                    ),
-                });
-            }
-        }
         let program = root.join("inputs").join(name.as_str());
-        let metadata =
-            std::fs::symlink_metadata(&program).map_err(|source| MissionTypeError::Io {
-                path: program.clone(),
-                source,
-            })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(MissionTypeError::Input {
-                input: input.name,
-                detail: "program must be a regular file (no symlinks)".to_string(),
-            });
-        }
-        if metadata.len() > MAX_PREPARED_INPUT_CONTENT_BYTES {
-            return Err(MissionTypeError::Input {
-                input: input.name,
-                detail: format!(
-                    "program exceeds the {MAX_PREPARED_INPUT_CONTENT_BYTES} byte limit"
-                ),
-            });
-        }
-        if !is_executable(&program) || !has_shebang(&program) {
-            return Err(MissionTypeError::Input {
-                input: name.to_string(),
-                detail: "program must be executable and start with a #! shebang".to_string(),
-            });
-        }
         if inputs
             .insert(
                 name.clone(),
@@ -254,24 +190,17 @@ fn load_inputs(
             });
         }
     }
+    validate_prepared_inputs(&inputs).map_err(map_prepared_input_error)?;
     Ok(inputs)
 }
 
-fn safe_relative_path(path: &Path) -> bool {
-    use std::path::Component;
-    !path.as_os_str().is_empty()
-        && !path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-}
-
-fn valid_environment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
-        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+fn map_prepared_input_error(error: PreparedInputContractError) -> MissionTypeError {
+    match error {
+        PreparedInputContractError::Invalid { input, detail } => {
+            MissionTypeError::Input { input, detail }
+        }
+        PreparedInputContractError::Io { path, source } => MissionTypeError::Io { path, source },
+    }
 }
 
 fn load_roles(
@@ -398,22 +327,6 @@ fn load_oracles(dir: &Path) -> Result<BTreeMap<OracleName, PathBuf>, MissionType
         oracles.insert(name, path);
     }
     Ok(oracles)
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-fn has_shebang(path: &Path) -> bool {
-    use std::io::Read;
-    let mut buf = [0u8; 2];
-    std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .map(|_| &buf == b"#!")
-        .unwrap_or(false)
 }
 
 fn read(path: &Path) -> Result<String, MissionTypeError> {

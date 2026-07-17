@@ -26,7 +26,9 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 19;
+/// Bumped because incomplete role successes and stale parked effects are now
+/// rejected by replay-authoritative model predicates.
+pub const REDUCER_VERSION: u32 = 20;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -475,7 +477,11 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 }
             }
             ControlAction::Continue { .. } => {
-                if let Some(parked) = state.parked_effects.remove(effect_id) {
+                if state.parked_effect_is_continuable(effect_id) {
+                    let parked = state
+                        .parked_effects
+                        .remove(effect_id)
+                        .expect("continuable parked effect exists");
                     match parked {
                         ParkedEffect::RoleRun { namespace, task_id } => {
                             if let Some(task) = state.tasks_in_mut(namespace).get_mut(&task_id) {
@@ -519,7 +525,6 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             justification,
         } => {
             apply_decision(state, attention_id, action, justification);
-            prune_reopened_parked_effects(state);
         }
         MissionEvent::EffectCleanupFailed {
             effect_id,
@@ -542,6 +547,7 @@ fn finish_apply(state: &mut MissionState, seq: u64) {
     // before gates/attention/phase are derived this same fold (a plan whose only
     // sink is a gate would otherwise hang one event behind).
     derive_promotion(state);
+    prune_uncontinuable_parked_effects(state);
     derive_gates(state);
     derive_attention(state);
     derive_phase(state);
@@ -773,21 +779,11 @@ fn apply_role_failure(
     }
 }
 
-fn prune_reopened_parked_effects(state: &mut MissionState) {
+fn prune_uncontinuable_parked_effects(state: &mut MissionState) {
     let parked = core::mem::take(&mut state.parked_effects);
     state.parked_effects = parked
         .into_iter()
-        .filter(|(_, effect)| match effect {
-            ParkedEffect::RoleRun { namespace, task_id } => state
-                .tasks_in(*namespace)
-                .get(task_id)
-                .is_some_and(|task| task.status == TaskStatus::Failed),
-            ParkedEffect::OracleRun { oracle } => state.oracle_failures.contains_key(oracle),
-            ParkedEffect::TerminalReview => matches!(
-                state.terminal_review.outcome,
-                Some(ReviewOutcome::Failed { .. })
-            ),
-        })
+        .filter(|(_, effect)| state.parked_effect_remains_continuable(effect))
         .collect();
 }
 
@@ -1478,25 +1474,16 @@ fn apply_handoff(
             report,
             request_attention,
         } => {
-            let status = if *done {
-                TaskStatus::Cleared
-            } else {
-                TaskStatus::Failed
-            };
+            debug_assert!(*done, "incomplete work was rejected at effect settlement");
             // Work runs in either era (a planning report role or an execution
             // artifact role), so route by era; Plan is planning-only and Validate
             // execution-only, and address their maps directly below.
             if let Some(task) = state.tasks_in_mut(namespace).get_mut(task_id) {
-                task.status = status;
+                task.status = TaskStatus::Cleared;
                 task.last_report = Some(report.clone());
-                task.last_failure = (!done).then(|| {
-                    TypedFailure::invalid("handoff.incomplete", "role reported done=false")
-                });
+                task.last_failure = None;
             }
-            // A done task that asks for a look is flagged (derived into a
-            // node_attention item); a not-done task is Failed (derived into a
-            // node_failed item).
-            if *done && *request_attention {
+            if *request_attention {
                 state
                     .flagged_tasks
                     .insert(TaskAddress::new(namespace, task_id.clone()));
@@ -1508,30 +1495,20 @@ fn apply_handoff(
             proposal,
             request_attention,
         } => {
+            debug_assert!(*done, "incomplete plan was rejected at effect settlement");
             // Planning-only: the author's handoff. A complete valid proposal
             // becomes the gradeless `state.proposal`; it seeds the contract
             // only after approval (`derive_promotion`).
-            let proposal_error = if !done {
-                None
-            } else {
-                match proposal {
-                    None => Some("planning author completed without a plan proposal".to_string()),
-                    Some(proposal)
-                        if state.planning_base_revision != Some(proposal.base_revision) =>
-                    {
-                        Some(
-                            "plan proposal does not target the active planning revision"
-                                .to_string(),
-                        )
-                    }
-                    Some(proposal) => {
-                        super::plan_validation::validate_plan_proposal(state, proposal)
-                            .err()
-                            .map(|error| error.to_string())
-                    }
+            let proposal_error = match proposal {
+                None => Some("planning author completed without a plan proposal".to_string()),
+                Some(proposal) if state.planning_base_revision != Some(proposal.base_revision) => {
+                    Some("plan proposal does not target the active planning revision".to_string())
                 }
+                Some(proposal) => super::plan_validation::validate_plan_proposal(state, proposal)
+                    .err()
+                    .map(|error| error.to_string()),
             };
-            let succeeded = *done && proposal_error.is_none();
+            let succeeded = proposal_error.is_none();
             let status = if succeeded {
                 TaskStatus::Cleared
             } else {
@@ -1540,16 +1517,9 @@ fn apply_handoff(
             if let Some(task) = state.planning.tasks.get_mut(task_id) {
                 task.status = status;
                 task.last_report = Some(report.clone());
-                task.last_failure = if !done {
-                    Some(TypedFailure::invalid(
-                        "handoff.incomplete",
-                        "planning author reported done=false",
-                    ))
-                } else {
-                    proposal_error
-                        .as_ref()
-                        .map(|detail| TypedFailure::invalid("handoff.invalid_plan", detail.clone()))
-                };
+                task.last_failure = proposal_error
+                    .as_ref()
+                    .map(|detail| TypedFailure::invalid("handoff.invalid_plan", detail.clone()));
             }
             if succeeded {
                 if let Some(proposal) = proposal {
@@ -3518,6 +3488,88 @@ mod tests {
         .expect("writer state");
         assert_eq!(writer.tasks[&tid("writer")].status, TaskStatus::Failed);
         assert_eq!(writer.current_sha, "base");
+    }
+
+    #[test]
+    fn incomplete_writer_outcomes_cannot_advance_the_deliverable_head() {
+        let effect_id = EffectId::for_parts(&["test", "incomplete-writer"]);
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("writer")]),
+            role_requested("writer", "incomplete-writer"),
+            MissionEvent::RoleRunCompleted {
+                namespace: crate::TaskNamespace::Execution,
+                task_id: tid("writer"),
+                attempt_no: 1,
+                effect_id: effect_id.clone(),
+                outcome: Ok(RoleRunSuccess {
+                    handoff: work_handoff(false, false),
+                    artifact: Some(ArtifactOutcome {
+                        base_sha: "base".into(),
+                        head_sha: "must-not-promote".into(),
+                    }),
+                    final_response: PayloadRef::inline("work is incomplete"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
+                }),
+            },
+        ])
+        .expect("state");
+
+        assert_eq!(state.tasks[&tid("writer")].status, TaskStatus::Failed);
+        assert_eq!(state.current_sha, "base");
+        assert!(state.parked_effects.contains_key(&effect_id));
+    }
+
+    #[test]
+    fn stale_continue_cannot_resurrect_a_task_retired_by_plan_promotion() {
+        let parked_effect = EffectId::for_parts(&["test", "retired-writer"]);
+        let MissionEvent::PlanProposed {
+            proposal: mut replacement,
+            ..
+        } = plan_proposed(
+            vec![assertion("AA", Some("cargo-test"))],
+            vec![work_task("replacement")],
+        )
+        else {
+            unreachable!("plan_proposed() builds PlanProposed");
+        };
+        replacement.base_revision = 1;
+
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(
+                vec![assertion("AA", Some("cargo-test"))],
+                vec![
+                    work_task("retired"),
+                    validate_task("v"),
+                    gate_task("g", &["AA"], &["v"]),
+                ],
+            ),
+            role_requested("retired", "retired-writer"),
+            MissionEvent::RoleRunCompleted {
+                namespace: crate::TaskNamespace::Execution,
+                task_id: tid("retired"),
+                attempt_no: 1,
+                effect_id: parked_effect.clone(),
+                outcome: Err(TypedFailure::permanent("runtime.failed", "failed")),
+            },
+            role_completed("v", "validator", validate_handoff(&[("AA", false)]), None),
+            decision("gate_failed:g", super::super::event::DecisionAction::Revise),
+            MissionEvent::PlanProposed {
+                proposal: replacement,
+                plan_hash: "replacement".into(),
+            },
+            MissionEvent::ControlRequested {
+                effect_id: parked_effect.clone(),
+                action: super::super::event::ControlAction::Continue { automatic: false },
+                reason: "stale operator view".into(),
+            },
+        ])
+        .expect("state");
+
+        assert_eq!(state.tasks[&tid("retired")].status, TaskStatus::Superseded);
+        assert!(!state.parked_effects.contains_key(&parked_effect));
+        assert_eq!(state.tasks[&tid("replacement")].status, TaskStatus::Pending);
     }
 
     #[test]

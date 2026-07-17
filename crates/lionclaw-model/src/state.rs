@@ -766,6 +766,44 @@ impl MissionState {
         &self.current_sha
     }
 
+    /// Whether the exact parked effect still belongs to live mission work.
+    /// Controls and replay share this query so a stale operator view cannot
+    /// reopen a task era retired by a later plan promotion.
+    pub fn parked_effect_is_continuable(&self, effect_id: &super::EffectId) -> bool {
+        self.parked_effects
+            .get(effect_id)
+            .is_some_and(|effect| self.parked_effect_remains_continuable(effect))
+    }
+
+    pub(crate) fn parked_effect_remains_continuable(&self, effect: &ParkedEffect) -> bool {
+        match effect {
+            ParkedEffect::RoleRun { namespace, task_id } => {
+                let task_failed = self
+                    .tasks_in(*namespace)
+                    .get(task_id)
+                    .is_some_and(|task| task.status == TaskStatus::Failed);
+                let task_is_live = match namespace {
+                    super::TaskNamespace::Planning => self
+                        .config
+                        .planning
+                        .tasks
+                        .iter()
+                        .any(|task| &task.id == task_id),
+                    super::TaskNamespace::Execution => self
+                        .plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.tasks.iter().any(|task| &task.id == task_id)),
+                };
+                task_failed && task_is_live
+            }
+            ParkedEffect::OracleRun { oracle } => self.oracle_failures.contains_key(oracle),
+            ParkedEffect::TerminalReview => matches!(
+                self.terminal_review.outcome,
+                Some(ReviewOutcome::Failed { .. })
+            ),
+        }
+    }
+
     pub fn active_task_namespace(&self) -> super::TaskNamespace {
         if self.planning_base_revision.is_some() {
             super::TaskNamespace::Planning
