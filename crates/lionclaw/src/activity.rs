@@ -541,8 +541,14 @@ fn task_workspace_applicable(
     namespace: TaskNamespace,
     task_id: &TaskId,
 ) -> bool {
-    namespace == TaskNamespace::Execution
-        && state.plan.as_ref().is_some_and(|plan| {
+    if namespace != TaskNamespace::Execution {
+        return false;
+    }
+    state
+        .tasks
+        .get(task_id)
+        .is_some_and(|task| task.workspace_base_sha.is_some())
+        || state.plan.as_ref().is_some_and(|plan| {
             plan.tasks
                 .iter()
                 .any(|task| task.id == *task_id && task.kind == TaskKind::Work)
