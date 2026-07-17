@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{OutputSemantics, PlanInventory, PlanProposal, PlanningDag};
 use crate::prelude::*;
-use crate::{AppliedRuntimeConfiguration, TypedFailure};
+use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
 
 /// Bumped for the replay-authoritative plan inventory in `MissionConfig`.
 pub const SCHEMA_VERSION: u32 = 16;
@@ -714,6 +714,79 @@ impl MissionEvent {
             | Self::TerminalReviewCompleted { effect_id, .. } => Some(effect_id),
             _ => None,
         }
+    }
+
+    /// The typed failure already carried by an outcome, if it has one.
+    pub fn outcome_failure(&self) -> Option<&TypedFailure> {
+        match self {
+            Self::RoleRunCompleted {
+                outcome: Err(failure),
+                ..
+            }
+            | Self::OracleRunCompleted {
+                outcome: Err(failure),
+                ..
+            }
+            | Self::TerminalReviewCompleted {
+                outcome: Err(failure),
+                ..
+            } => Some(failure),
+            _ => None,
+        }
+    }
+
+    /// Canonical bounded evidence available at an effect outcome boundary.
+    /// Blob payloads stay referenced by the success event; pure replay cannot
+    /// resolve storage and therefore does not duplicate them into a failure.
+    pub fn outcome_failure_evidence(&self) -> Option<TypedFailureEvidence> {
+        match self {
+            Self::RoleRunCompleted { outcome, .. } => Some(match outcome {
+                Ok(success) => TypedFailureEvidence {
+                    final_response: inline_payload(&success.final_response),
+                    configuration: success.runtime_configuration.clone(),
+                    ..Default::default()
+                },
+                Err(failure) => failure.evidence().clone(),
+            }),
+            Self::OracleRunCompleted { outcome, .. } => Some(match outcome {
+                Ok(success) => TypedFailureEvidence {
+                    exit_code: Some(success.exit_code),
+                    stderr: inline_payload(&success.stderr),
+                    ..Default::default()
+                },
+                Err(failure) => failure.evidence().clone(),
+            }),
+            Self::TerminalReviewCompleted { outcome, .. } => Some(match outcome {
+                Ok(success) => TypedFailureEvidence {
+                    final_response: inline_payload(&success.final_response),
+                    configuration: success.runtime_configuration.clone(),
+                    ..Default::default()
+                },
+                Err(failure) => failure.evidence().clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn outcome_final_response(&self) -> Option<&PayloadRef> {
+        match self {
+            Self::RoleRunCompleted {
+                outcome: Ok(success),
+                ..
+            } => Some(&success.final_response),
+            Self::TerminalReviewCompleted {
+                outcome: Ok(success),
+                ..
+            } => Some(&success.final_response),
+            _ => None,
+        }
+    }
+}
+
+fn inline_payload(payload: &PayloadRef) -> String {
+    match payload {
+        PayloadRef::Inline { text } => text.clone(),
+        PayloadRef::Blob(_) => String::new(),
     }
 }
 

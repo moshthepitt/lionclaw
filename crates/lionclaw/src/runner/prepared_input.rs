@@ -1,3 +1,4 @@
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -145,7 +146,7 @@ async fn input_cache_key(
     budget.account_bytes("program", &input.program, program_metadata.len())?;
     feed_regular_file(
         &mut digest,
-        "program",
+        b"program",
         &input.program,
         &program_metadata,
         true,
@@ -181,7 +182,8 @@ fn feed_key_path<'a>(
                 relative.display()
             );
         }
-        let logical = format!("key/{}", relative.to_string_lossy());
+        let mut logical = b"key/".to_vec();
+        logical.extend_from_slice(relative.as_os_str().as_bytes());
         if metadata.is_file() {
             use std::os::unix::fs::PermissionsExt;
             budget.account(declared, relative, depth, metadata.len())?;
@@ -204,7 +206,8 @@ fn feed_key_path<'a>(
             );
         }
         budget.account(declared, relative, depth, 0)?;
-        digest.feed(&format!("{logical}/"), b"directory", false);
+        logical.push(b'/');
+        digest.feed_bytes(&logical, b"directory", false);
         let mut directory = tokio::fs::read_dir(&path).await?;
         let mut entries = Vec::new();
         while let Some(entry) = directory.next_entry().await? {
@@ -228,7 +231,7 @@ fn feed_key_path<'a>(
 
 async fn feed_regular_file(
     digest: &mut ContentDigest,
-    logical: &str,
+    logical: &[u8],
     path: &Path,
     expected: &std::fs::Metadata,
     executable: bool,
@@ -251,7 +254,7 @@ async fn feed_regular_file(
             path.display()
         );
     }
-    digest.feed_header(logical, opened.len(), executable);
+    digest.feed_bytes_header(logical, opened.len(), executable);
     let mut file = tokio::fs::File::from_std(file);
     let mut buffer = [0_u8; HASH_BUFFER_BYTES];
     let mut read = 0_u64;
@@ -400,6 +403,7 @@ fn preparation_environment() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::os::unix::ffi::OsStringExt;
 
     use super::*;
     use crate::config::RuntimeProfiles;
@@ -451,6 +455,31 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("symlink"));
+    }
+
+    #[tokio::test]
+    async fn cache_key_distinguishes_raw_non_utf8_descendant_names() {
+        let checkout = tempfile::tempdir().unwrap();
+        let program_dir = tempfile::tempdir().unwrap();
+        let program = program_dir.path().join("prepare");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        let tree = checkout.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let raw = tree.join(std::ffi::OsString::from_vec(vec![0x80]));
+        std::fs::write(&raw, "same").unwrap();
+        let profile = profile();
+        let input = input(program, "tree");
+        let raw_digest = input_cache_key(&profile, checkout.path(), &input)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(raw).unwrap();
+        std::fs::write(tree.join("\u{fffd}"), "same").unwrap();
+        let utf8_digest = input_cache_key(&profile, checkout.path(), &input)
+            .await
+            .unwrap();
+
+        assert_ne!(raw_digest, utf8_digest, "path identity must be byte-exact");
     }
 
     #[tokio::test]

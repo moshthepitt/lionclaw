@@ -10,16 +10,16 @@ use lionclaw_runtime_api::TypedFailure;
 use std::sync::Mutex;
 
 use common::{
-    approve_plan, blocking_gap, effect_id, fault_append_events, harness_with_type, proposal,
+    approve_plan, blocking_gap, fault_append_events, harness_with_type, proposal,
     review_mission_type, review_runner, simple_plan, test_mission_type, ParseTask, BASE_SHA,
     HEAD_SHA,
 };
 use lionclaw::engine::{MissionDisposition, MissionView, TERMINAL_REVIEW_TASK_TAG as REVIEW_TAG};
 use lionclaw::model::{
-    ArtifactOutcome, BlobRef, DecisionAction, FinishClass, Gap, Handoff, MissionEvent,
-    MissionPhase, PayloadRef, ReviewAcceptanceKind, ReviewOutcome, Task, TaskKind,
+    BlobRef, DecisionAction, FinishClass, Gap, Handoff, MissionEvent, MissionPhase, PayloadRef,
+    ReviewAcceptanceKind, ReviewOutcome, Task, TaskKind,
 };
-use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
+use lionclaw::ports::{CapturedArtifact, RoleRunOutcome, RoleRunRequest};
 use lionclaw::testing::{review_verdict, MockOracleRunner, MockRoleRunner};
 
 fn parked(view: &MissionView) -> Vec<&lionclaw::model::AttentionItem> {
@@ -42,10 +42,10 @@ fn work_outcome(request: &RoleRunRequest, head_sha: &str) -> RoleRunOutcome {
             report: PayloadRef::inline("WORKER-REPORT-PROBE: everything is definitely finished"),
             request_attention: false,
         },
-        artifact: Some(ArtifactOutcome {
-            base_sha: request.base_sha.clone(),
-            head_sha: head_sha.to_string(),
-        }),
+        artifact: Some(CapturedArtifact::for_testing(
+            request.base_sha.clone(),
+            head_sha,
+        )),
         runtime_configuration: Default::default(),
         final_response: String::new(),
     }
@@ -217,7 +217,7 @@ async fn terminal_review_uses_the_shared_role_output_boundary() {
         (Fault::BlobReportWithInvalidGap, "handoff.schema"),
         (Fault::OversizedReport, "handoff.report_too_large"),
         (Fault::OversizedGaps, "handoff.schema"),
-        (Fault::Artifact, "role.success_contract"),
+        (Fault::Artifact, "workspace.capture_authority"),
     ] {
         let dir = tempfile::tempdir().expect("tempdir");
         let runner = MockRoleRunner::new(Box::new(move |request| {
@@ -276,10 +276,10 @@ async fn terminal_review_uses_the_shared_role_output_boundary() {
                     });
                 }
                 Fault::Artifact => {
-                    outcome.artifact = Some(ArtifactOutcome {
-                        base_sha: request.base_sha.clone(),
-                        head_sha: HEAD_SHA.into(),
-                    });
+                    outcome.artifact = Some(CapturedArtifact::for_testing(
+                        request.base_sha.clone(),
+                        HEAD_SHA,
+                    ));
                 }
             }
             Ok(outcome)
@@ -460,7 +460,7 @@ async fn a_revision_resumes_work_and_re_reviews_at_the_new_head() {
     let dir = tempfile::tempdir().expect("tempdir");
     // First verdict blocks; the re-review after remediation is clean. The
     // worker commits a NEW head on its second run so the verdict stales.
-    let work_heads = Mutex::new(vec![HEAD_SHA.to_string(), format!("{:040}", 3)]);
+    let work_heads = Mutex::new(vec![HEAD_SHA.to_string(), "second-worker-commit".into()]);
     let reviews = Mutex::new(0usize);
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == REVIEW_TAG {
@@ -485,6 +485,7 @@ async fn a_revision_resumes_work_and_re_reviews_at_the_new_head() {
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    let first_head = outcome.state.current_sha.clone();
 
     // Remediation is a complete next plan; the park auto-clears.
     let mut next = simple_plan();
@@ -515,7 +516,13 @@ async fn a_revision_resumes_work_and_re_reviews_at_the_new_head() {
     let Some(ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome else {
         panic!("verdict recorded");
     };
-    assert_eq!(v.judged_sha, format!("{:040}", 3));
+    assert_eq!(v.judged_sha, state.current_sha);
+    assert_ne!(state.current_sha, first_head);
+    assert!(
+        lionclaw::workspace::is_ancestor(dir.path(), &first_head, &state.current_sha)
+            .await
+            .expect("repaired head descends from the prior deliverable")
+    );
 }
 
 #[tokio::test]
@@ -614,14 +621,15 @@ async fn a_crashed_review_is_interrupted_without_rerunning_the_llm() {
 
     // Record the owed second request with no outcome, as left by a dead driver.
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    let id = effect_id("crashed-review");
+    let judged_sha = state.current_sha.clone();
+    let id = lionclaw::model::EffectId::for_terminal_review_request(&mission_id, &judged_sha, 2);
     let event = lionclaw::store::NewEvent::new(MissionEvent::TerminalReviewRequested {
         attempt_no: 2,
         effect_id: id.clone(),
         role: lionclaw::model::RoleName::new("gap-reviewer").expect("role"),
         runtime: "codex".to_string(),
         prompt: PayloadRef::inline("prompt"),
-        judged_sha: HEAD_SHA.to_string(),
+        judged_sha,
         nonce: "n0".to_string(),
         requested_at_ms: 0,
         not_before_ms: 0,
@@ -686,14 +694,15 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_review() {
     reopen_failed_review(&h, &mission_id).await;
 
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    let id = effect_id("crash-review");
+    let judged_sha = state.current_sha.clone();
+    let id = lionclaw::model::EffectId::for_terminal_review_request(&mission_id, &judged_sha, 2);
     let event = lionclaw::store::NewEvent::new(MissionEvent::TerminalReviewRequested {
         attempt_no: 2,
         effect_id: id.clone(),
         role: lionclaw::model::RoleName::new("gap-reviewer").expect("role"),
         runtime: "codex".to_string(),
         prompt: PayloadRef::inline("p"),
-        judged_sha: HEAD_SHA.to_string(),
+        judged_sha,
         nonce: "n0".to_string(),
         requested_at_ms: 0,
         not_before_ms: 0,
@@ -757,7 +766,7 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
     // moves the head, the waiver goes stale, and the review re-dispatches at
     // the new head instead of the mission closing reviewless.
     let dir = tempfile::tempdir().expect("tempdir");
-    let work_heads = Mutex::new(vec![HEAD_SHA.to_string(), format!("{:040}", 3)]);
+    let work_heads = Mutex::new(vec![HEAD_SHA.to_string(), "second-worker-commit".into()]);
     let reviews = Mutex::new(0usize);
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == REVIEW_TAG {
@@ -785,7 +794,8 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
     let (h, mission_id) = started_with_recovery(&dir, runner, 1).await;
 
     // Park on the review failure; propose follow-up work while parked.
-    h.engine.advance(&mission_id).await.expect("advance");
+    let initial = h.engine.advance(&mission_id).await.expect("advance");
+    let waived_head = initial.state.current_sha.clone();
     let mut next = simple_plan();
     next.tasks = vec![Task {
         id: "more".parse_task(),
@@ -820,7 +830,13 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
     let Some(ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome else {
         panic!("verdict recorded after the waiver staled");
     };
-    assert_eq!(v.judged_sha, format!("{:040}", 3));
+    assert_eq!(v.judged_sha, state.current_sha);
+    assert_ne!(state.current_sha, waived_head);
+    assert!(
+        lionclaw::workspace::is_ancestor(dir.path(), &waived_head, &state.current_sha)
+            .await
+            .expect("post-waiver work descends from the waived deliverable")
+    );
 }
 
 #[tokio::test]

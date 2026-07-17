@@ -19,8 +19,43 @@ use lionclaw::model::{
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
-pub const BASE_SHA: &str = "0000000000000000000000000000000000000001";
-pub const HEAD_SHA: &str = "0000000000000000000000000000000000000002";
+pub const BASE_SHA: &str = "68416f3db8602142a2b732a91cfb8cc86b898f17";
+pub const HEAD_SHA: &str = "27c714953fa5f62e2d627b2cd0e7a7e67aabba37";
+
+pub fn initialize_repository(workspace: &Path) {
+    if workspace.join(".git").is_dir() {
+        return;
+    }
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(workspace)
+            .args(args)
+            .status()
+            .expect("run Git for integration repository");
+        assert!(status.success(), "git {} failed", args.join(" "));
+    };
+    run(&["init", "--quiet"]);
+    run(&["config", "user.name", "LionClaw Test Base"]);
+    run(&["config", "user.email", "test@lionclaw.local"]);
+    run(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(workspace.join("fixture.txt"), "base\n").expect("write base fixture");
+    run(&["add", "fixture.txt"]);
+    let status = std::process::Command::new("git")
+        .current_dir(workspace)
+        .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+        .args(["commit", "--quiet", "-m", "LionClaw test base"])
+        .status()
+        .expect("commit integration repository base");
+    assert!(status.success(), "git commit failed");
+    let actual = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("resolve integration repository base");
+    assert!(actual.status.success());
+    assert_eq!(String::from_utf8(actual.stdout).unwrap().trim(), BASE_SHA);
+}
 
 /// Test-only fault injection that writes directly to the on-disk log. Raw
 /// production append is kernel-private; crash/replay tests deliberately bypass
@@ -269,6 +304,7 @@ pub async fn harness_with_type(
     role_runner: MockRoleRunner,
     oracle_runner: MockOracleRunner,
 ) -> TestHarness {
+    initialize_repository(workspace);
     let store = MissionStore::open(workspace).await.expect("open store");
     let role_runner = Arc::new(role_runner);
     let oracle_runner = Arc::new(oracle_runner);
@@ -307,8 +343,8 @@ pub fn blocking_gap() -> lionclaw::model::Gap {
 /// are scripted per invocation (the last one repeats). The reviewer echoes
 /// the prompt's nonce, exactly as a real agent must.
 pub fn review_runner(verdicts: Vec<(bool, Vec<lionclaw::model::Gap>)>) -> MockRoleRunner {
-    use lionclaw::model::{ArtifactOutcome, Handoff, PayloadRef};
-    use lionclaw::ports::RoleRunOutcome;
+    use lionclaw::model::{Handoff, PayloadRef};
+    use lionclaw::ports::{CapturedArtifact, RoleRunOutcome};
     let reviews = std::sync::Mutex::new(0usize);
     MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == lionclaw::engine::TERMINAL_REVIEW_TASK_TAG {
@@ -324,10 +360,10 @@ pub fn review_runner(verdicts: Vec<(bool, Vec<lionclaw::model::Gap>)>) -> MockRo
                     report: PayloadRef::inline("committed the change"),
                     request_attention: false,
                 },
-                artifact: Some(ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha: HEAD_SHA.to_string(),
-                }),
+                artifact: Some(CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    HEAD_SHA,
+                )),
                 runtime_configuration: Default::default(),
                 final_response: String::new(),
             })

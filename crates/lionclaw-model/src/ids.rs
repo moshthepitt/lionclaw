@@ -154,6 +154,52 @@ impl EffectId {
         )))
     }
 
+    pub fn for_role_request(
+        namespace: crate::event::TaskNamespace,
+        mission_id: &MissionId,
+        task_id: &TaskId,
+        attempt_no: u32,
+        assignment_epoch: u32,
+        prompt_hash: &str,
+    ) -> Self {
+        Self::for_parts(&[
+            namespace.slug(),
+            mission_id.as_str(),
+            task_id.as_str(),
+            &attempt_no.to_string(),
+            &assignment_epoch.to_string(),
+            prompt_hash,
+        ])
+    }
+
+    pub fn for_oracle_request(
+        mission_id: &MissionId,
+        oracle: &OracleName,
+        judged_sha: &str,
+        attempt_no: u32,
+    ) -> Self {
+        Self::for_parts(&[
+            "oracle",
+            mission_id.as_str(),
+            oracle.as_str(),
+            judged_sha,
+            &attempt_no.to_string(),
+        ])
+    }
+
+    pub fn for_terminal_review_request(
+        mission_id: &MissionId,
+        judged_sha: &str,
+        attempt_no: u32,
+    ) -> Self {
+        Self::for_parts(&[
+            "terminal-review",
+            mission_id.as_str(),
+            judged_sha,
+            &attempt_no.to_string(),
+        ])
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -309,5 +355,79 @@ mod tests {
         assert!(EffectId::parse(id.as_str()).is_ok());
         assert!(EffectId::parse("ABC").is_err());
         assert!(EffectId::parse("../escape").is_err());
+    }
+
+    #[test]
+    fn canonical_effect_ids_bind_every_authority_dimension() {
+        let mission = MissionId::parse("mabc123def456").unwrap();
+        let other_mission = MissionId::parse("mdef456abc123").unwrap();
+        let task = TaskId::new("work").unwrap();
+        let oracle = OracleName::new("cargo-test").unwrap();
+        let role = EffectId::for_role_request(
+            crate::event::TaskNamespace::Execution,
+            &mission,
+            &task,
+            1,
+            1,
+            "prompt-a",
+        );
+
+        let variants = [
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Planning,
+                &mission,
+                &task,
+                1,
+                1,
+                "prompt-a",
+            ),
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Execution,
+                &other_mission,
+                &task,
+                1,
+                1,
+                "prompt-a",
+            ),
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Execution,
+                &mission,
+                &task,
+                2,
+                1,
+                "prompt-a",
+            ),
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Execution,
+                &mission,
+                &task,
+                1,
+                2,
+                "prompt-a",
+            ),
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Execution,
+                &mission,
+                &task,
+                1,
+                1,
+                "prompt-b",
+            ),
+            EffectId::for_oracle_request(&mission, &oracle, "head", 1),
+            EffectId::for_terminal_review_request(&mission, "head", 1),
+        ];
+
+        assert!(variants.iter().all(|variant| variant != &role));
+        assert_eq!(
+            role,
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Execution,
+                &mission,
+                &task,
+                1,
+                1,
+                "prompt-a",
+            )
+        );
     }
 }

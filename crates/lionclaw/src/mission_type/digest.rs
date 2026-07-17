@@ -1,7 +1,5 @@
-use std::io::{self, Read};
-use std::path::Path;
-
 use sha2::{Digest, Sha256};
+use std::io::{self, Read};
 
 const FILE_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -14,13 +12,17 @@ impl ContentDigest {
     }
 
     pub(crate) fn feed(&mut self, logical_path: &str, bytes: &[u8], executable: bool) {
-        self.feed_header(logical_path, bytes.len() as u64, executable);
+        self.feed_bytes(logical_path.as_bytes(), bytes, executable);
+    }
+
+    pub(crate) fn feed_bytes(&mut self, logical_path: &[u8], bytes: &[u8], executable: bool) {
+        self.feed_bytes_header(logical_path, bytes.len() as u64, executable);
         self.feed_chunk(bytes);
     }
 
-    pub(crate) fn feed_header(&mut self, logical_path: &str, len: u64, executable: bool) {
+    pub(crate) fn feed_bytes_header(&mut self, logical_path: &[u8], len: u64, executable: bool) {
         self.0.update((logical_path.len() as u64).to_le_bytes());
-        self.0.update(logical_path.as_bytes());
+        self.0.update(logical_path);
         self.0.update([executable as u8]);
         self.0.update(len.to_le_bytes());
     }
@@ -29,17 +31,20 @@ impl ContentDigest {
         self.0.update(bytes);
     }
 
-    /// Hash one regular file with fixed auxiliary memory. The caller owns the
-    /// file-tree and size policy; this method owns exact-length streaming.
-    pub(crate) fn feed_file(
+    /// Hash an already-opened regular file. Descriptor-rooted callers use
+    /// this form so path replacement cannot redirect content identity.
+    pub(crate) fn feed_opened_file(
         &mut self,
-        logical_path: &str,
-        path: &Path,
+        logical_path: &[u8],
+        file: &mut std::fs::File,
+        metadata: &std::fs::Metadata,
         executable: bool,
     ) -> io::Result<()> {
-        let mut file = std::fs::File::open(path)?;
-        let expected = file.metadata()?.len();
-        self.feed_header(logical_path, expected, executable);
+        if !metadata.is_file() {
+            return Err(io::Error::other("digest input is not a regular file"));
+        }
+        let expected = metadata.len();
+        self.feed_bytes_header(logical_path, expected, executable);
         let mut buffer = [0_u8; FILE_BUFFER_BYTES];
         let mut read = 0_u64;
         loop {
@@ -77,8 +82,12 @@ mod tests {
 
         let mut direct = ContentDigest::new();
         direct.feed("logical/path", bytes, true);
+        let mut file = std::fs::File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
         let mut streamed = ContentDigest::new();
-        streamed.feed_file("logical/path", &path, true).unwrap();
+        streamed
+            .feed_opened_file(b"logical/path", &mut file, &metadata, true)
+            .unwrap();
 
         assert_eq!(streamed.finish(), direct.finish());
     }

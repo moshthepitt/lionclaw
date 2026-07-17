@@ -6,13 +6,16 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{advisory_plan, approve_plan, proposal, review_mission_type, BASE_SHA, HEAD_SHA};
+use common::{
+    advisory_plan, approve_plan, initialize_repository, proposal, review_mission_type, BASE_SHA,
+    HEAD_SHA,
+};
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::model::{
     AdvisoryStatus, FinishClass, Handoff, MissionEvent, MissionPhase, MissionState,
     OutputSemantics, PayloadRef, StopBar, ValidationItem,
 };
-use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
+use lionclaw::ports::{CapturedArtifact, RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
@@ -45,10 +48,10 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
                     report: PayloadRef::inline("wrote it"),
                     request_attention: false,
                 },
-                artifact: Some(lionclaw::model::ArtifactOutcome {
-                    base_sha: req.base_sha.clone(),
-                    head_sha: HEAD_SHA.to_string(),
-                }),
+                artifact: Some(CapturedArtifact::for_testing(
+                    req.base_sha.clone(),
+                    HEAD_SHA,
+                )),
                 runtime_configuration: Default::default(),
                 final_response: String::new(),
             },
@@ -60,6 +63,7 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
 
 async fn drive(role_runner: MockRoleRunner) -> (MissionState, Vec<lionclaw::model::EventEnvelope>) {
     let dir = tempfile::tempdir().expect("tempdir");
+    initialize_repository(dir.path());
     let store = MissionStore::open(dir.path()).await.expect("store");
     let mut mission_type = review_mission_type();
     mission_type.edit_for_testing(|definition| definition.stop = StopBar::Reviewed);
@@ -140,10 +144,10 @@ async fn read_only_validator_artifacts_are_rejected_before_the_fold() {
                     report: PayloadRef::inline("wrote it"),
                     request_attention: false,
                 },
-                Some(lionclaw::model::ArtifactOutcome {
-                    base_sha: req.base_sha.clone(),
-                    head_sha: HEAD_SHA.to_string(),
-                }),
+                Some(CapturedArtifact::for_testing(
+                    req.base_sha.clone(),
+                    HEAD_SHA,
+                )),
             ),
             OutputSemantics::EmitsVerdict => (
                 Handoff::Validate {
@@ -156,10 +160,10 @@ async fn read_only_validator_artifacts_are_rejected_before_the_fold() {
                     passed: true,
                     request_attention: false,
                 },
-                Some(lionclaw::model::ArtifactOutcome {
-                    base_sha: req.base_sha.clone(),
-                    head_sha: "forged-validator-head".to_string(),
-                }),
+                Some(CapturedArtifact::for_testing(
+                    req.base_sha.clone(),
+                    "forged-validator-head",
+                )),
             ),
             output => panic!("unexpected output contract {output:?}"),
         };
@@ -179,7 +183,7 @@ async fn read_only_validator_artifacts_are_rejected_before_the_fold() {
         matches!(
             &event.event,
             MissionEvent::RoleRunCompleted { outcome: Err(failure), .. }
-                if failure.evidence().code.as_deref() == Some("role.success_contract")
+                if failure.evidence().code.as_deref() == Some("workspace.capture_authority")
         )
     }));
 }

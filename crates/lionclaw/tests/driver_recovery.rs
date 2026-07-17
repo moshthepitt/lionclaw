@@ -7,19 +7,21 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use common::{
-    approve_plan, fault_append_events, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
+    approve_plan, fault_append_events, initialize_repository, proposal, simple_plan,
+    test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
 use lionclaw::model::{
-    ArtifactOutcome, EffectResource, Handoff, MissionEvent, PayloadRef,
-    RuntimeConfigurationEvidence,
+    EffectResource, Handoff, MissionEvent, PayloadRef, RuntimeConfigurationEvidence,
 };
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, RoleRunOutcome, RoleRunRequest,
     RoleRunner,
 };
 use lionclaw::store::{MissionStore, NewEvent};
-use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
+use lionclaw::testing::{
+    capture_test_artifact, MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner,
+};
 use lionclaw_runtime_api::TypedFailure;
 use tokio::sync::Barrier;
 
@@ -29,22 +31,26 @@ struct BlockingRunner {
     calls: Arc<AtomicUsize>,
 }
 
+fn test_repository() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    initialize_repository(dir.path());
+    dir
+}
+
 #[async_trait]
 impl RoleRunner for BlockingRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.wait().await;
         self.release.wait().await;
+        let artifact = capture_test_artifact(&request, HEAD_SHA).await?;
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("done"),
                 request_attention: false,
             },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha,
-                head_sha: HEAD_SHA.to_string(),
-            }),
+            artifact: Some(artifact),
             runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
                 requested_model: Some("blocking-test".to_string()),
                 applied_model: Some("blocking-test".to_string()),
@@ -113,7 +119,7 @@ async fn create_approved_mission(
 
 #[tokio::test]
 async fn concurrent_advance_reports_running_and_never_double_dispatches() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let started = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -156,7 +162,7 @@ async fn concurrent_advance_reports_running_and_never_double_dispatches() {
 
 #[tokio::test]
 async fn detached_startup_waits_out_a_short_observer_lock_probe() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let engine = Arc::new(Engine::new(
         MissionStore::open(dir.path()).await.unwrap(),
         test_mission_type(),
@@ -212,7 +218,7 @@ async fn detached_startup_waits_out_a_short_observer_lock_probe() {
 
 #[tokio::test]
 async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let runner = Arc::new(MockRoleRunner::happy(HEAD_SHA));
     let cleaner = Arc::new(FailOnceCleaner::default());
     let engine = Engine::new(
@@ -306,7 +312,7 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
 
 #[tokio::test]
 async fn persistent_cleanup_failure_never_settles_or_replays_the_effect() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let runner = Arc::new(MockRoleRunner::happy(HEAD_SHA));
     let cleaner = Arc::new(AlwaysFailCleaner::default());
     let engine = Engine::new(

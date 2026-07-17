@@ -117,18 +117,22 @@ pub struct TaskDirs {
 }
 
 impl TaskDirs {
-    pub fn prepare(state_dir: &Path, mission_id: &str, task_id: &TaskId) -> std::io::Result<Self> {
+    pub fn new(state_dir: &Path, mission_id: &str, task_id: &TaskId) -> Self {
         let root = state_dir
             .join("missions")
             .join(mission_id)
             .join("tasks")
             .join(task_id.as_str());
-        let dirs = Self {
+        Self {
             work: root.join("work"),
             scratch: root.join("scratch"),
             observer_index: root.join("observer.index"),
             root,
-        };
+        }
+    }
+
+    pub fn prepare(state_dir: &Path, mission_id: &str, task_id: &TaskId) -> std::io::Result<Self> {
+        let dirs = Self::new(state_dir, mission_id, task_id);
         std::fs::create_dir_all(&dirs.scratch)?;
         Ok(dirs)
     }

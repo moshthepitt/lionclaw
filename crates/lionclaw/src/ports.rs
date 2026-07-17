@@ -14,9 +14,10 @@ use tokio::sync::{mpsc, watch};
 
 use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
 use crate::model::{
-    ArtifactOutcome, EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
+    EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
     RuntimeConfigurationEvidence, TaskId,
 };
+pub use crate::workspace::{ArtifactCapture, CapturedArtifact};
 
 /// One full autonomous agent run — the engine never micromanages how a role
 /// works. The engine guarantees an effect ID with a recorded outcome
@@ -54,6 +55,9 @@ pub struct RoleRunRequest {
     pub workspace_dir: PathBuf,
     /// Mission state root (attempt dirs, worktrees) — `<workspace>/.lionclaw`.
     pub state_dir: PathBuf,
+    /// Present only for artifact-producing roles and bound to this request's
+    /// exact task checkout and durable capture ref.
+    pub artifact_capture: Option<ArtifactCapture>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +76,7 @@ pub struct RoleRunOutcome {
     /// only when a clean committed head was captured; work that was already
     /// satisfied may legitimately return `None`. Read-only roles never return
     /// an artifact.
-    pub artifact: Option<ArtifactOutcome>,
+    pub artifact: Option<CapturedArtifact>,
     pub runtime_configuration: RuntimeConfigurationEvidence,
     pub final_response: String,
 }

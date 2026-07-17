@@ -16,28 +16,18 @@ pub(crate) fn acp_permission_denial(params: Option<&Value>) -> Value {
         .and_then(|params| params.get("options"))
         .and_then(Value::as_array)
         .and_then(|options| {
-            options.iter().find_map(|option| {
-                let kind = option
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let name = option
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if kind.contains("reject")
-                    || kind.contains("deny")
-                    || name.to_ascii_lowercase().contains("reject")
-                    || name.to_ascii_lowercase().contains("deny")
-                {
-                    option
+            let mut denials = options.iter().filter_map(|option| {
+                match option.get("kind").and_then(Value::as_str) {
+                    Some("reject_once" | "reject_always") => option
                         .get("optionId")
                         .or_else(|| option.get("id"))
                         .and_then(Value::as_str)
-                } else {
-                    None
+                        .filter(|option_id| !option_id.is_empty()),
+                    _ => None,
                 }
-            })
+            });
+            let denial = denials.next()?;
+            denials.next().is_none().then_some(denial)
         });
 
     match reject_option {

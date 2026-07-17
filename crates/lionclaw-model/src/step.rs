@@ -277,6 +277,31 @@ mod tests {
     use crate::verdict::FinishClass;
     use crate::{TypedFailure, TypedFailureEvidence};
 
+    const TEST_PROMPT_HASH: &str = "test-prompt-hash";
+
+    fn mission_id() -> MissionId {
+        MissionId::parse("mabc123abc123").expect("valid mission id")
+    }
+
+    fn role_effect(task: &str, attempt_no: u32) -> EffectId {
+        EffectId::for_role_request(
+            TaskNamespace::Execution,
+            &mission_id(),
+            &tid(task),
+            attempt_no,
+            1,
+            TEST_PROMPT_HASH,
+        )
+    }
+
+    fn oracle_effect(name: &str, judged_sha: &str, attempt_no: u32) -> EffectId {
+        EffectId::for_oracle_request(&mission_id(), &oname(name), judged_sha, attempt_no)
+    }
+
+    fn review_effect(judged_sha: &str, attempt_no: u32) -> EffectId {
+        EffectId::for_terminal_review_request(&mission_id(), judged_sha, attempt_no)
+    }
+
     fn aid(raw: &str) -> AssertionId {
         AssertionId::new(raw).expect("valid assertion id")
     }
@@ -441,7 +466,7 @@ mod tests {
     fn role_requested_at_base(
         task: &str,
         attempt_no: u32,
-        key: &str,
+        _key: &str,
         role: &str,
         output: crate::OutputSemantics,
         base_sha: &str,
@@ -450,14 +475,14 @@ mod tests {
             namespace: TaskNamespace::Execution,
             task_id: tid(task),
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: role_effect(task, attempt_no),
             role: rname(role),
             output,
             runtime: "codex".to_string(),
             prompt: PayloadRef::inline("assembled prompt"),
             base_sha: base_sha.to_string(),
             assignment_epoch: 1,
-            recreate_workspace: true,
+            recreate_workspace: attempt_no == 1,
             requested_at_ms: 0,
             not_before_ms: 0,
             deadline_ms: 100_000,
@@ -472,14 +497,14 @@ mod tests {
     fn work_done_at(
         task: &str,
         attempt_no: u32,
-        key: &str,
+        _key: &str,
         artifact: Option<(&str, &str)>,
     ) -> MissionEvent {
         MissionEvent::RoleRunCompleted {
             namespace: TaskNamespace::Execution,
             task_id: tid(task),
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: role_effect(task, attempt_no),
             outcome: Ok(RoleRunSuccess {
                 handoff: Handoff::Work {
                     done: true,
@@ -496,12 +521,12 @@ mod tests {
         }
     }
 
-    fn role_failed(task: &str, key: &str) -> MissionEvent {
+    fn role_failed(task: &str, _key: &str) -> MissionEvent {
         MissionEvent::RoleRunCompleted {
             namespace: TaskNamespace::Execution,
             task_id: tid(task),
             attempt_no: 1,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: role_effect(task, 1),
             outcome: Err(TypedFailure::DeadlineExhausted {
                 evidence: Box::new(TypedFailureEvidence::new(None, "runner timed out")),
             }),
@@ -513,14 +538,14 @@ mod tests {
         oracle: &str,
         judged_sha: &str,
         attempt_no: u32,
-        key: &str,
+        _key: &str,
     ) -> MissionEvent {
         MissionEvent::OracleRunRequested {
             assertion_ids: ids.iter().map(|a| aid(a)).collect(),
             oracle: oname(oracle),
             judged_sha: judged_sha.to_string(),
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: oracle_effect(oracle, judged_sha, attempt_no),
             requested_at_ms: 0,
             not_before_ms: 0,
             deadline_ms: 100_000,
@@ -532,7 +557,7 @@ mod tests {
         oracle: &str,
         judged_sha: &str,
         attempt_no: u32,
-        key: &str,
+        _key: &str,
         exit_code: i32,
     ) -> MissionEvent {
         MissionEvent::OracleRunCompleted {
@@ -540,7 +565,7 @@ mod tests {
             oracle: oname(oracle),
             judged_sha: judged_sha.to_string(),
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: oracle_effect(oracle, judged_sha, attempt_no),
             outcome: Ok(OracleRunSuccess {
                 exit_code,
                 exit_signal: None,
@@ -565,12 +590,18 @@ mod tests {
             });
             std::iter::once(event).chain(approve)
         });
-        fold(events.enumerate().map(|(i, event)| EventEnvelope {
-            mission_id: MissionId::parse("mabc123abc123").expect("valid mission id"),
-            sequence_no: i as u64 + 1,
-            recorded_at_ms: 0,
-            stamps: VersionStamps::default(),
-            event,
+        fold(events.enumerate().map(|(i, event)| {
+            let mut stamps = VersionStamps::default();
+            if matches!(event, MissionEvent::RoleRunRequested { .. }) {
+                stamps.prompt_hash = Some(TEST_PROMPT_HASH.to_string());
+            }
+            EventEnvelope {
+                mission_id: mission_id(),
+                sequence_no: i as u64 + 1,
+                recorded_at_ms: 0,
+                stamps,
+                event,
+            }
         }))
         .expect("log begins with MissionCreated")
     }
@@ -761,7 +792,7 @@ mod tests {
                 "sha-1",
             ),
         ]);
-        let effect_id = EffectId::for_parts(&["test", "k-v1-1"]);
+        let effect_id = role_effect("v1", 1);
         assert!(matches!(
             state.inflight.get(&effect_id),
             Some(crate::InflightEffect::RoleRun { task_id, .. }) if task_id == &tid("v1")
@@ -955,10 +986,10 @@ mod tests {
         event
     }
 
-    fn review_requested(attempt_no: u32, key: &str, judged_sha: &str) -> MissionEvent {
+    fn review_requested(attempt_no: u32, _key: &str, judged_sha: &str) -> MissionEvent {
         MissionEvent::TerminalReviewRequested {
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: review_effect(judged_sha, attempt_no),
             role: rname("gap-reviewer"),
             runtime: "codex".to_string(),
             prompt: PayloadRef::inline("review prompt"),
@@ -972,7 +1003,7 @@ mod tests {
     }
 
     fn review_completed(
-        key: &str,
+        _key: &str,
         judged_sha: &str,
         passed: bool,
         blocking_gaps: usize,
@@ -980,7 +1011,7 @@ mod tests {
         use crate::event::{Gap, GapSeverity};
         MissionEvent::TerminalReviewCompleted {
             attempt_no: 1,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: review_effect(judged_sha, 1),
             judged_sha: judged_sha.to_string(),
             outcome: Ok(TerminalReviewSuccess {
                 passed,

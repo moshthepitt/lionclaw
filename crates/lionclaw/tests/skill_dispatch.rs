@@ -4,8 +4,8 @@ use common::{
     approve_plan, harness_with_type, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::mission_type::SkillPackage;
-use lionclaw::model::{ArtifactOutcome, Handoff, PayloadRef, RoleName};
-use lionclaw::ports::RoleRunOutcome;
+use lionclaw::model::{Handoff, PayloadRef, RoleName};
+use lionclaw::ports::{CapturedArtifact, RoleRunOutcome};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 #[tokio::test]
@@ -45,10 +45,10 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
                 report: PayloadRef::inline("done"),
                 request_attention: false,
             },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha.clone(),
-                head_sha: HEAD_SHA.to_string(),
-            }),
+            artifact: Some(CapturedArtifact::for_testing(
+                request.base_sha.clone(),
+                HEAD_SHA,
+            )),
             runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
                 requested_model: Some("mock".to_string()),
                 applied_model: Some("mock".to_string()),
@@ -105,10 +105,10 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
                 report: PayloadRef::inline("done"),
                 request_attention: false,
             },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha.clone(),
-                head_sha: HEAD_SHA.to_string(),
-            }),
+            artifact: Some(CapturedArtifact::for_testing(
+                request.base_sha.clone(),
+                HEAD_SHA,
+            )),
             runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
                 requested_model: Some("mock".to_string()),
                 applied_model: Some("mock".to_string()),

@@ -4,19 +4,20 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use common::{
-    approve_plan, covered_requirement, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
+    approve_plan, covered_requirement, initialize_repository, proposal, simple_plan,
+    test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{record_control, Engine, EngineServices, MissionDisposition};
 use lionclaw::model::{
-    ArtifactOutcome, Assertion, AssertionId, ControlAction, DecisionAction, Handoff, OracleName,
-    PayloadRef, TaskStatus,
+    Assertion, AssertionId, ControlAction, DecisionAction, Handoff, OracleName, PayloadRef,
+    TaskStatus,
 };
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, OracleOutcome,
     OracleRunRequest, OracleRunner, RoleRunOutcome, RoleRunRequest, RoleRunner,
 };
 use lionclaw::store::MissionStore;
-use lionclaw::testing::{MockClock, MockOracleRunner, NoopEffectCleaner};
+use lionclaw::testing::{capture_test_artifact, MockClock, MockOracleRunner, NoopEffectCleaner};
 use lionclaw_runtime_api::{RuntimeEvent, TurnEvent, TypedFailure, TypedFailureEvidence};
 use tokio::sync::{Barrier, Notify};
 
@@ -46,6 +47,12 @@ struct ArtifactlessWriter;
 
 struct DeadlineRunner {
     calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn test_repository() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    initialize_repository(dir.path());
+    dir
 }
 
 struct AbortOracleRunner {
@@ -168,16 +175,14 @@ impl RoleRunner for DeadlineRunner {
 impl RoleRunner for SleepingRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        let artifact = capture_test_artifact(&request, HEAD_SHA).await?;
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("worked beyond initial deadline"),
                 request_attention: false,
             },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha,
-                head_sha: HEAD_SHA.into(),
-            }),
+            artifact: Some(artifact),
             runtime_configuration: Default::default(),
             final_response: String::new(),
         })
@@ -242,16 +247,14 @@ impl RoleRunner for ControlledRunner {
                 request.control.changed().await.unwrap();
             }
         }
+        let artifact = capture_test_artifact(&request, HEAD_SHA).await?;
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("continued in the same task workspace"),
                 request_attention: false,
             },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha,
-                head_sha: HEAD_SHA.into(),
-            }),
+            artifact: Some(artifact),
             runtime_configuration: Default::default(),
             final_response: "completed after continue".into(),
         })
@@ -260,7 +263,7 @@ impl RoleRunner for ControlledRunner {
 
 #[tokio::test]
 async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let started = Arc::new(Barrier::new(2));
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -484,7 +487,7 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
 
 #[tokio::test]
 async fn abort_cancels_an_active_oracle_while_the_driver_drains_its_batch() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let blocked_started = Arc::new(Notify::new());
     let abort_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -589,7 +592,7 @@ async fn abort_cancels_an_active_oracle_while_the_driver_drains_its_batch() {
 
 #[tokio::test]
 async fn durable_stop_wins_the_outcome_append_race_and_discards_the_candidate() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -676,7 +679,7 @@ async fn durable_stop_wins_the_outcome_append_race_and_discards_the_candidate() 
 
 #[tokio::test]
 async fn settlement_retains_bounded_blob_backed_oracle_stderr() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -758,7 +761,7 @@ async fn settlement_retains_bounded_blob_backed_oracle_stderr() {
 
 #[tokio::test]
 async fn deadline_is_durably_linearized_before_one_adapter_cancellation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut mission_type = test_mission_type();
@@ -821,7 +824,7 @@ async fn deadline_is_durably_linearized_before_one_adapter_cancellation() {
 
 #[tokio::test]
 async fn finite_policy_budget_extends_before_the_initial_deadline() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let mut mission_type = test_mission_type();
     mission_type.edit_for_testing(|definition| {
@@ -876,7 +879,7 @@ async fn finite_policy_budget_extends_before_the_initial_deadline() {
 
 #[tokio::test]
 async fn policy_auto_continues_candidate_and_proof_with_recorded_controls() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let engine = Engine::new(
         store.clone(),
@@ -926,7 +929,7 @@ async fn policy_auto_continues_candidate_and_proof_with_recorded_controls() {
 
 #[tokio::test]
 async fn policy_auto_continues_an_artifactless_writer_success() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let engine = Engine::new(
         store.clone(),
@@ -978,7 +981,7 @@ async fn policy_auto_continues_an_artifactless_writer_success() {
 
 #[tokio::test]
 async fn direct_mission_creation_rejects_an_invalid_execution_policy() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let mut mission_type = test_mission_type();
     mission_type.edit_for_testing(|definition| {
@@ -1010,7 +1013,7 @@ async fn direct_mission_creation_rejects_an_invalid_execution_policy() {
 
 #[tokio::test]
 async fn mission_creation_rejects_deadlines_unrepresentable_at_its_epoch() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let mut mission_type = test_mission_type();
     mission_type.edit_for_testing(|definition| {
         definition.execution.max_task_time_secs = lionclaw::model::MAX_EXECUTION_DURATION_SECS;
@@ -1044,7 +1047,7 @@ async fn mission_creation_rejects_deadlines_unrepresentable_at_its_epoch() {
 
 #[tokio::test]
 async fn mission_creation_rejects_unrepresentable_role_deadlines() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let mut mission_type = test_mission_type();
     mission_type.edit_for_testing(|definition| {
         definition.roles.values_mut().next().unwrap().timeout_secs =
@@ -1080,7 +1083,7 @@ async fn mission_creation_rejects_unrepresentable_role_deadlines() {
 
 #[tokio::test]
 async fn mission_creation_rejects_zero_second_role_deadlines() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let mut mission_type = test_mission_type();
     mission_type.edit_for_testing(|definition| {
         definition.roles.values_mut().next().unwrap().timeout_secs = Some(0);

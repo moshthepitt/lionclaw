@@ -13,7 +13,7 @@ use super::event::{
     RuntimeConfigurationEvidence,
 };
 use super::ids::{AssertionId, TaskId};
-use super::plan::{Assertion, OutputSemantics};
+use super::plan::Assertion;
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
     MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState, ReviewAcceptance,
@@ -26,9 +26,9 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-/// Bumped because incomplete role successes and stale parked effects are now
-/// rejected by replay-authoritative model predicates.
-pub const REDUCER_VERSION: u32 = 20;
+/// Bumped because durable request ingress now verifies model-derived effect
+/// identity and task-assignment generation before reserving an effect.
+pub const REDUCER_VERSION: u32 = 22;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -118,6 +118,28 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             finish_apply(state, seq);
             return;
         }
+        if let Some(cancellation) = state.durable_cancellation(effect_id) {
+            let already_classified = envelope
+                .event
+                .outcome_failure()
+                .is_some_and(|failure| cancellation.matches_failure(failure));
+            if !already_classified {
+                let evidence = envelope
+                    .event
+                    .outcome_failure_evidence()
+                    .unwrap_or_default();
+                let final_response = envelope.event.outcome_final_response();
+                settle_effect_failure(
+                    state,
+                    effect_id,
+                    effect,
+                    cancellation.into_failure(evidence),
+                    final_response,
+                );
+                finish_apply(state, seq);
+                return;
+            }
+        }
     }
     match &envelope.event {
         MissionEvent::MissionCreated { .. } => {}
@@ -132,21 +154,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             namespace,
             task_id,
             attempt_no,
-            role,
-            output,
-            base_sha,
             ..
         } => {
-            let request_matches = role_request_matches_dispatch(
-                state,
-                *namespace,
-                task_id,
-                *attempt_no,
-                role,
-                *output,
-                base_sha,
-            );
-            if !request_matches {
+            if !role_request_matches_dispatch(state, envelope) {
                 finish_apply(state, seq);
                 return;
             }
@@ -323,6 +333,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             oracle,
             judged_sha,
             attempt_no,
+            effect_id,
             ..
         } => {
             if !oracle_request_matches_obligation(
@@ -331,6 +342,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 oracle,
                 judged_sha,
                 *attempt_no,
+                effect_id,
             ) {
                 finish_apply(state, seq);
                 return;
@@ -390,11 +402,18 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         // filtered at ingress and cannot advance recovery identity.
         MissionEvent::TerminalReviewRequested {
             attempt_no,
+            effect_id,
             role,
             judged_sha,
             ..
         } => {
-            if !terminal_review_request_matches_obligation(state, *attempt_no, role, judged_sha) {
+            if !terminal_review_request_matches_obligation(
+                state,
+                *attempt_no,
+                effect_id,
+                role,
+                judged_sha,
+            ) {
                 finish_apply(state, seq);
                 return;
             }
@@ -455,7 +474,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             reason,
         } => match action {
             ControlAction::Stop => {
-                if state.inflight.contains_key(effect_id) {
+                if state.inflight.contains_key(effect_id)
+                    && !state.reached_deadlines.contains_key(effect_id)
+                {
                     state
                         .stop_requests
                         .insert(effect_id.clone(), reason.clone());
@@ -504,10 +525,11 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             effect_id,
             deadline_ms,
         } => {
-            if state
-                .inflight
-                .get(effect_id)
-                .is_some_and(|effect| effect.deadline_ms() == *deadline_ms)
+            if !state.stop_requests.contains_key(effect_id)
+                && state
+                    .inflight
+                    .get(effect_id)
+                    .is_some_and(|effect| effect.deadline_ms() == *deadline_ms)
             {
                 state
                     .reached_deadlines
@@ -558,28 +580,29 @@ fn reject_mismatched_outcome(
     effect_id: &super::EffectId,
     effect: InflightEffect,
 ) {
-    state.inflight.remove(effect_id);
-    state.stop_requests.remove(effect_id);
-    state.reached_deadlines.remove(effect_id);
-    clear_cleanup_failure(state, effect_id);
-    let observed_configuration = match &effect {
-        InflightEffect::RoleRun {
-            runtime_configuration,
-            ..
-        }
-        | InflightEffect::TerminalReview {
-            runtime_configuration,
-            ..
-        } => runtime_configuration.clone(),
-        InflightEffect::OracleRun { .. } => None,
-    };
     let mut failure = TypedFailure::permanent(
         "kernel.effect_identity",
         "effect outcome identity does not match its request",
     );
-    if let Some(configuration) = observed_configuration {
-        failure.evidence_mut().configuration = configuration;
+    if let Some(configuration) = effect.runtime_configuration() {
+        failure.evidence_mut().configuration = configuration.clone();
     }
+    settle_effect_failure(state, effect_id, effect, failure, None);
+}
+
+fn settle_effect_failure(
+    state: &mut MissionState,
+    effect_id: &super::EffectId,
+    effect: InflightEffect,
+    failure: TypedFailure,
+    final_response: Option<&PayloadRef>,
+) {
+    state.inflight.remove(effect_id);
+    state.stop_requests.remove(effect_id);
+    state.reached_deadlines.remove(effect_id);
+    clear_cleanup_failure(state, effect_id);
+    let observed_configuration = effect.runtime_configuration().cloned();
+    let failure = merge_failure_configuration(&failure, observed_configuration.as_ref());
     match effect {
         InflightEffect::RoleRun {
             namespace,
@@ -593,7 +616,7 @@ fn reject_mismatched_outcome(
             effect_id,
             failure,
             None,
-            None,
+            final_response,
         ),
         InflightEffect::OracleRun { oracle, .. } => {
             state.oracle_failures.insert(oracle.clone(), failure);
@@ -654,15 +677,22 @@ fn merge_failure_configuration(
     failure
 }
 
-fn role_request_matches_dispatch(
-    state: &MissionState,
-    namespace: super::TaskNamespace,
-    task_id: &TaskId,
-    attempt_no: u32,
-    role: &RoleName,
-    output: OutputSemantics,
-    base_sha: &str,
-) -> bool {
+fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope) -> bool {
+    let MissionEvent::RoleRunRequested {
+        namespace,
+        task_id,
+        attempt_no,
+        effect_id,
+        role,
+        output,
+        base_sha,
+        assignment_epoch,
+        recreate_workspace,
+        ..
+    } = &envelope.event
+    else {
+        return false;
+    };
     let output_matches = match namespace {
         super::TaskNamespace::Planning => state
             .config
@@ -670,7 +700,7 @@ fn role_request_matches_dispatch(
             .tasks
             .iter()
             .find(|task| &task.id == task_id)
-            .is_some_and(|task| &task.role == role && task.output == output),
+            .is_some_and(|task| &task.role == role && task.output == *output),
         super::TaskNamespace::Execution => state
             .plan
             .as_ref()
@@ -682,12 +712,31 @@ fn role_request_matches_dispatch(
     let super::step::StepDecision::DispatchRole(intent) = super::step::step(state) else {
         return false;
     };
+    let (expected_base, expected_epoch, expected_recreate) = super::state::resolve_task_assignment(
+        state.tasks_in(*namespace).get(task_id),
+        &intent.base_sha,
+        state.config.recovery.max_attempts,
+    );
+    let Some(prompt_hash) = envelope.stamps.prompt_hash.as_deref() else {
+        return false;
+    };
+    let expected_effect = super::EffectId::for_role_request(
+        *namespace,
+        &state.mission_id,
+        task_id,
+        *attempt_no,
+        *assignment_epoch,
+        prompt_hash,
+    );
     output_matches
-        && intent.namespace == namespace
+        && intent.namespace == *namespace
         && &intent.task_id == task_id
-        && intent.attempt_no == attempt_no
+        && intent.attempt_no == *attempt_no
         && &intent.role == role
-        && intent.base_sha == base_sha
+        && expected_base.as_str() == base_sha
+        && expected_epoch == *assignment_epoch
+        && expected_recreate == *recreate_workspace
+        && expected_effect == *effect_id
 }
 
 fn oracle_request_matches_obligation(
@@ -696,6 +745,7 @@ fn oracle_request_matches_obligation(
     oracle: &super::OracleName,
     judged_sha: &str,
     attempt_no: u32,
+    effect_id: &super::EffectId,
 ) -> bool {
     let owed_assertions = state.owed_assertions_for_oracle(oracle);
     let only_oracles_inflight = state
@@ -718,11 +768,19 @@ fn oracle_request_matches_obligation(
                 + 1
         && !owed_assertions.is_empty()
         && assertion_ids == owed_assertions
+        && effect_id
+            == &super::EffectId::for_oracle_request(
+                &state.mission_id,
+                oracle,
+                judged_sha,
+                attempt_no,
+            )
 }
 
 fn terminal_review_request_matches_obligation(
     state: &MissionState,
     attempt_no: u32,
+    effect_id: &super::EffectId,
     role: &RoleName,
     judged_sha: &str,
 ) -> bool {
@@ -736,6 +794,12 @@ fn terminal_review_request_matches_obligation(
             .is_some_and(|config| &config.role == role)
         && judged_sha == state.deliverable_head()
         && attempt_no == state.terminal_review.attempts + 1
+        && effect_id
+            == &super::EffectId::for_terminal_review_request(
+                &state.mission_id,
+                judged_sha,
+                attempt_no,
+            )
 }
 
 fn apply_role_failure(
@@ -1658,12 +1722,46 @@ mod tests {
     };
     use super::super::ids::{AssertionId, EffectId, MissionId, OracleName, RoleName, TaskId};
     use super::super::plan::{
-        Assertion, Plan, PlanInventory, PlanProposal, PlanningTask, Requirement,
+        Assertion, OutputSemantics, Plan, PlanInventory, PlanProposal, PlanningTask, Requirement,
         RequirementDisposition, RequirementKind, Task, TaskKind,
     };
     use super::super::verdict::FinishClass;
     use super::*;
     use crate::TypedFailureEvidence;
+
+    const TEST_PROMPT_HASH: &str = "test-prompt-hash";
+
+    fn mission_id() -> MissionId {
+        MissionId::from_digest_prefix("abcdef0123456789")
+    }
+
+    fn role_effect(
+        namespace: crate::TaskNamespace,
+        task: &str,
+        attempt_no: u32,
+        assignment_epoch: u32,
+    ) -> EffectId {
+        EffectId::for_role_request(
+            namespace,
+            &mission_id(),
+            &tid(task),
+            attempt_no,
+            assignment_epoch,
+            TEST_PROMPT_HASH,
+        )
+    }
+
+    fn oracle_effect(judged: &str, attempt_no: u32) -> EffectId {
+        oracle_effect_for("cargo-test", judged, attempt_no)
+    }
+
+    fn oracle_effect_for(name: &str, judged: &str, attempt_no: u32) -> EffectId {
+        EffectId::for_oracle_request(&mission_id(), &oracle(name), judged, attempt_no)
+    }
+
+    fn review_effect(judged: &str, attempt_no: u32) -> EffectId {
+        EffectId::for_terminal_review_request(&mission_id(), judged, attempt_no)
+    }
 
     fn tid(raw: &str) -> TaskId {
         TaskId::new(raw).expect("task id")
@@ -1678,11 +1776,15 @@ mod tests {
     }
 
     fn envelope(sequence_no: u64, event: MissionEvent) -> EventEnvelope {
+        let mut stamps = super::super::event::VersionStamps::default();
+        if matches!(event, MissionEvent::RoleRunRequested { .. }) {
+            stamps.prompt_hash = Some(TEST_PROMPT_HASH.to_string());
+        }
         EventEnvelope {
-            mission_id: MissionId::from_digest_prefix("abcdef0123456789"),
+            mission_id: mission_id(),
             sequence_no,
             recorded_at_ms: 0,
-            stamps: Default::default(),
+            stamps,
             event,
         }
     }
@@ -1978,6 +2080,122 @@ mod tests {
         );
     }
 
+    #[test]
+    fn noncanonical_effect_id_cannot_reserve_a_future_generation() {
+        let mut request = role_requested("w", "noncanonical");
+        let MissionEvent::RoleRunRequested { effect_id, .. } = &mut request else {
+            unreachable!("role_requested returns a role request")
+        };
+        *effect_id = EffectId::for_parts(&[
+            "oracle",
+            MissionId::from_digest_prefix("abcdef0123456789").as_str(),
+            "cargo-test",
+            "future-head",
+            "1",
+        ]);
+
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            request,
+        ])
+        .expect("state");
+
+        assert!(state.inflight.is_empty());
+        assert_eq!(state.tasks[&tid("w")].status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn a_future_assignment_epoch_cannot_reserve_its_canonical_effect_id() {
+        let mut request = role_requested("w", "future-epoch");
+        let MissionEvent::RoleRunRequested {
+            assignment_epoch,
+            effect_id,
+            ..
+        } = &mut request
+        else {
+            unreachable!("role_requested returns a role request")
+        };
+        *assignment_epoch = 2;
+        *effect_id = role_effect(crate::TaskNamespace::Execution, "w", 1, 2);
+
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            request,
+        ])
+        .expect("state");
+
+        assert!(state.inflight.is_empty());
+        assert_eq!(state.tasks[&tid("w")].assignment_epoch, 0);
+        assert_eq!(state.tasks[&tid("w")].status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn a_role_request_without_its_prompt_stamp_is_inert() {
+        let events = vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            decision(
+                "plan_proposal:mission",
+                super::super::event::DecisionAction::Approve,
+            ),
+            role_requested("w", "unstamped"),
+        ];
+        let state = fold(events.into_iter().enumerate().map(|(sequence, event)| {
+            let mut envelope = envelope(sequence as u64, event);
+            if matches!(&envelope.event, MissionEvent::RoleRunRequested { .. }) {
+                envelope.stamps.prompt_hash = None;
+            }
+            envelope
+        }))
+        .expect("state");
+
+        assert!(state.inflight.is_empty());
+        assert_eq!(state.tasks[&tid("w")].status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn noncanonical_oracle_and_review_ids_cannot_enter_inflight_state() {
+        let mut oracle_events = vec![
+            created(),
+            plan_proposed(
+                vec![assertion("TESTS-PASS", Some("cargo-test"))],
+                vec![work_task("fix")],
+            ),
+            role_completed(
+                "fix",
+                "writer",
+                work_handoff(true, false),
+                Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "h1".into(),
+                }),
+            ),
+        ];
+        let mut oracle_request = oracle_requested("TESTS-PASS", "h1", "forged");
+        let MissionEvent::OracleRunRequested { effect_id, .. } = &mut oracle_request else {
+            unreachable!("oracle_requested returns an oracle request")
+        };
+        *effect_id = EffectId::for_parts(&["forged", "oracle"]);
+        oracle_events.push(oracle_request);
+        let oracle_state = fold_log(oracle_events).expect("oracle state");
+        assert!(oracle_state.inflight.is_empty());
+        assert!(oracle_state.oracle_attempts.is_empty());
+
+        let mut review_events = events_to_the_brink();
+        let mut review_request = review_requested(1, "forged", "h1");
+        let MissionEvent::TerminalReviewRequested { effect_id, .. } = &mut review_request else {
+            unreachable!("review_requested returns a review request")
+        };
+        *effect_id = EffectId::for_parts(&["forged", "terminal-review"]);
+        review_events.push(review_request);
+        let review_state = fold_log(review_events).expect("review state");
+        assert!(review_state.inflight.is_empty());
+        assert_eq!(review_state.terminal_review.attempts, 0);
+        assert!(terminal_review_outstanding(&review_state));
+    }
+
     fn validate_handoff(items: &[(&str, bool)]) -> Handoff {
         Handoff::Validate {
             done: true,
@@ -2017,7 +2235,7 @@ mod tests {
     fn role_requested_in(
         namespace: crate::TaskNamespace,
         task: &str,
-        key: &str,
+        _key: &str,
         role: RoleName,
         output: OutputSemantics,
     ) -> MissionEvent {
@@ -2025,7 +2243,7 @@ mod tests {
             namespace,
             task_id: tid(task),
             attempt_no: 1,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: role_effect(namespace, task, 1, 1),
             role,
             output,
             runtime: "codex".into(),
@@ -2076,7 +2294,7 @@ mod tests {
         namespace: crate::TaskNamespace,
         task: &str,
         attempt_no: u32,
-        key: &str,
+        _key: &str,
         handoff: Handoff,
         artifact: Option<ArtifactOutcome>,
     ) -> MissionEvent {
@@ -2084,7 +2302,7 @@ mod tests {
             namespace,
             task_id: tid(task),
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: role_effect(namespace, task, attempt_no, 1),
             outcome: Ok(RoleRunSuccess {
                 handoff,
                 artifact,
@@ -2094,13 +2312,13 @@ mod tests {
         }
     }
 
-    fn oracle_requested(assertion_id: &str, judged: &str, key: &str) -> MissionEvent {
+    fn oracle_requested(assertion_id: &str, judged: &str, _key: &str) -> MissionEvent {
         MissionEvent::OracleRunRequested {
             assertion_ids: vec![aid(assertion_id)],
             oracle: oracle("cargo-test"),
             judged_sha: judged.into(),
             attempt_no: 1,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: oracle_effect(judged, 1),
             requested_at_ms: 0,
             not_before_ms: 0,
             deadline_ms: 100_000,
@@ -2120,7 +2338,7 @@ mod tests {
         assertion_id: &str,
         judged: &str,
         attempt_no: u32,
-        key: &str,
+        _key: &str,
         exit_code: i32,
     ) -> MissionEvent {
         MissionEvent::OracleRunCompleted {
@@ -2128,7 +2346,7 @@ mod tests {
             oracle: oracle("cargo-test"),
             judged_sha: judged.into(),
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: oracle_effect(judged, attempt_no),
             outcome: Ok(OracleRunSuccess {
                 exit_code,
                 exit_signal: None,
@@ -2161,7 +2379,7 @@ mod tests {
 
     #[test]
     fn workspace_provenance_advances_only_after_the_exact_runner_confirmation() {
-        let effect_id = EffectId::for_parts(&["test", "workspace"]);
+        let effect_id = role_effect(crate::TaskNamespace::Execution, "w", 1, 1);
         let requested = role_requested("w", "workspace");
         let requested_state = fold_log(vec![
             created(),
@@ -2209,8 +2427,8 @@ mod tests {
 
     #[test]
     fn pre_checkout_failure_preserves_the_last_confirmed_workspace_base() {
-        let first_effect = EffectId::for_parts(&["test", "workspace-first"]);
-        let second_effect = EffectId::for_parts(&["test", "workspace-second"]);
+        let first_effect = role_effect(crate::TaskNamespace::Execution, "w", 1, 1);
+        let second_effect = role_effect(crate::TaskNamespace::Execution, "w", 2, 2);
         let state = fold_log(vec![
             created(),
             plan_proposed(vec![], vec![work_task("w")]),
@@ -2258,7 +2476,7 @@ mod tests {
 
     #[test]
     fn deadline_and_extension_linearize_by_event_order_without_replay() {
-        let effect_id = EffectId::for_parts(&["test", "deadline-race"]);
+        let effect_id = role_effect(crate::TaskNamespace::Execution, "w", 1, 1);
         let base = vec![
             created(),
             plan_proposed(vec![], vec![work_task("w")]),
@@ -2291,6 +2509,131 @@ mod tests {
         let deadline_first = fold_log(base.into_iter().chain([reached, extend]).collect()).unwrap();
         assert_eq!(deadline_first.inflight[&effect_id].deadline_ms(), 100_000);
         assert_eq!(deadline_first.reached_deadlines[&effect_id], 100_000);
+
+        let stop = MissionEvent::ControlRequested {
+            effect_id: effect_id.clone(),
+            action: ControlAction::Stop,
+            reason: "stop".into(),
+        };
+        let stop_first = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "deadline-race"),
+            stop.clone(),
+            MissionEvent::EffectDeadlineReached {
+                effect_id: effect_id.clone(),
+                deadline_ms: 100_000,
+            },
+        ])
+        .unwrap();
+        assert_eq!(stop_first.stop_requests[&effect_id], "stop");
+        assert!(!stop_first.reached_deadlines.contains_key(&effect_id));
+
+        let deadline_first = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "deadline-race"),
+            MissionEvent::EffectDeadlineReached {
+                effect_id: effect_id.clone(),
+                deadline_ms: 100_000,
+            },
+            stop,
+        ])
+        .unwrap();
+        assert_eq!(deadline_first.reached_deadlines[&effect_id], 100_000);
+        assert!(!deadline_first.stop_requests.contains_key(&effect_id));
+    }
+
+    #[test]
+    fn durable_stop_dominates_a_later_exact_role_success() {
+        let effect_id = role_effect(crate::TaskNamespace::Execution, "w", 1, 1);
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "stopped-role"),
+            MissionEvent::ControlRequested {
+                effect_id: effect_id.clone(),
+                action: ControlAction::Stop,
+                reason: "operator stop".into(),
+            },
+            role_completed(
+                "w",
+                "stopped-role",
+                work_handoff(true, false),
+                Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "must-not-promote".into(),
+                }),
+            ),
+        ])
+        .expect("state");
+
+        assert_eq!(state.deliverable_head(), "base");
+        let failure = state.tasks[&tid("w")]
+            .last_failure
+            .as_ref()
+            .expect("stopped role failure");
+        assert!(matches!(failure, TypedFailure::OperatorStopped { .. }));
+        assert!(state.parked_effects.contains_key(&effect_id));
+    }
+
+    #[test]
+    fn durable_deadline_dominates_a_later_exact_oracle_success() {
+        let effect_id = oracle_effect("h1", 1);
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(
+                vec![assertion("A1", Some("cargo-test"))],
+                vec![work_task("w")],
+            ),
+            role_completed(
+                "w",
+                "work",
+                work_handoff(true, false),
+                Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "h1".into(),
+                }),
+            ),
+            oracle_requested("A1", "h1", "deadline-oracle"),
+            MissionEvent::EffectDeadlineReached {
+                effect_id: effect_id.clone(),
+                deadline_ms: 100_000,
+            },
+            oracle_completed("A1", "h1", "deadline-oracle", 0),
+        ])
+        .expect("state");
+
+        assert!(state.contract[&aid("A1")].last_authoritative.is_none());
+        let failure = &state.oracle_failures[&oracle("cargo-test")];
+        assert!(matches!(failure, TypedFailure::DeadlineExhausted { .. }));
+        assert!(state.parked_effects.contains_key(&effect_id));
+    }
+
+    #[test]
+    fn durable_abort_dominates_a_later_exact_terminal_review_success() {
+        let effect_id = review_effect("h1", 1);
+        let mut events = events_to_the_brink();
+        events.extend([
+            review_requested(1, "aborted-review", "h1"),
+            MissionEvent::MissionAborted {
+                reason: "operator abort".into(),
+            },
+            review_completed_at(1, "aborted-review", "h1", true, vec![]),
+        ]);
+        let state = fold_log(events).expect("state");
+
+        assert_eq!(
+            state.phase,
+            MissionPhase::Aborted {
+                reason: "operator abort".into()
+            }
+        );
+        let Some(ReviewOutcome::Failed { failure }) = state.terminal_review.outcome else {
+            panic!("aborted review must settle as a failure");
+        };
+        assert!(matches!(failure, TypedFailure::OperatorAborted { .. }));
+        assert!(state.parked_effects.contains_key(&effect_id));
     }
 
     // Regression (review): a fresh authoritative FAIL must dominate a green
@@ -2463,7 +2806,7 @@ mod tests {
                 oracle: oracle("cargo-test"),
                 judged_sha: "sha-1".into(),
                 attempt_no: 1,
-                effect_id: EffectId::for_parts(&["test", "ko"]),
+                effect_id: oracle_effect("sha-1", 1),
                 outcome: Err(TypedFailure::permanent("oracle.spawn", "binary missing")),
             },
         ];
@@ -2921,7 +3264,7 @@ mod tests {
                 namespace: crate::TaskNamespace::Execution,
                 task_id: tid("t1"),
                 attempt_no: 1,
-                effect_id: EffectId::for_parts(&["test", "k1"]),
+                effect_id: role_effect(crate::TaskNamespace::Execution, "t1", 1, 1),
                 outcome: Err(TypedFailure::DeadlineExhausted {
                     evidence: Box::new(TypedFailureEvidence {
                         detail: "took too long".into(),
@@ -3000,7 +3343,7 @@ mod tests {
                     namespace: crate::TaskNamespace::Execution,
                     task_id: tid("t1"),
                     attempt_no: 1,
-                    effect_id: EffectId::for_parts(&["test", &format!("request-{index}")]),
+                    effect_id: role_effect(crate::TaskNamespace::Execution, "t1", 1, 1),
                     outcome: Err(failure.clone()),
                 },
             ])
@@ -3048,7 +3391,7 @@ mod tests {
                 namespace: crate::TaskNamespace::Execution,
                 task_id: tid("same-id"),
                 attempt_no: 1,
-                effect_id: EffectId::for_parts(&["test", "execution"]),
+                effect_id: role_effect(crate::TaskNamespace::Execution, "same-id", 1, 1),
                 outcome: Err(TypedFailure::DeadlineExhausted {
                     evidence: Box::new(TypedFailureEvidence::new(None, "took too long")),
                 }),
@@ -3153,7 +3496,7 @@ mod tests {
             unreachable!("plan_proposed() builds PlanProposed");
         };
         replacement.base_revision = 1;
-        let parked_effect = EffectId::for_parts(&["test", "planning-failure"]);
+        let parked_effect = role_effect(crate::TaskNamespace::Planning, "same-id", 1, 1);
         let state = fold_log(vec![
             mission_created,
             plan_proposed(
@@ -3225,7 +3568,7 @@ mod tests {
                 namespace: crate::TaskNamespace::Execution,
                 task_id: tid("work"),
                 attempt_no: 1,
-                effect_id: EffectId::for_parts(&["test", "wrong-namespace"]),
+                effect_id: role_effect(crate::TaskNamespace::Execution, "work", 1, 1),
                 outcome: Ok(RoleRunSuccess {
                     handoff: Handoff::Plan {
                         done: true,
@@ -3388,7 +3731,7 @@ mod tests {
                 namespace,
                 task_id: tid(task_id),
                 attempt_no,
-                effect_id: EffectId::for_parts(&["test", "identity"]),
+                effect_id: role_effect(crate::TaskNamespace::Execution, "original", 1, 1),
                 outcome: Ok(RoleRunSuccess {
                     handoff: work_handoff(true, false),
                     artifact: None,
@@ -3411,7 +3754,12 @@ mod tests {
             assert!(matches!(
                 state
                     .parked_effects
-                    .get(&EffectId::for_parts(&["test", "identity"])),
+                    .get(&role_effect(
+                        crate::TaskNamespace::Execution,
+                        "original",
+                        1,
+                        1,
+                    )),
                 Some(ParkedEffect::RoleRun {
                     namespace: crate::TaskNamespace::Execution,
                     task_id,
@@ -3480,7 +3828,7 @@ mod tests {
 
     #[test]
     fn artifacts_are_bound_to_writer_output_and_the_request_base() {
-        let validator_effect = EffectId::for_parts(&["test", "validator-artifact"]);
+        let validator_effect = role_effect(crate::TaskNamespace::Execution, "validator", 1, 1);
         let mut validator_request = role_requested_in(
             crate::TaskNamespace::Execution,
             "validator",
@@ -3541,7 +3889,7 @@ mod tests {
 
     #[test]
     fn incomplete_writer_outcomes_cannot_advance_the_deliverable_head() {
-        let effect_id = EffectId::for_parts(&["test", "incomplete-writer"]);
+        let effect_id = role_effect(crate::TaskNamespace::Execution, "writer", 1, 1);
         let state = fold_log(vec![
             created(),
             plan_proposed(vec![], vec![work_task("writer")]),
@@ -3571,7 +3919,7 @@ mod tests {
 
     #[test]
     fn stale_continue_cannot_resurrect_a_task_retired_by_plan_promotion() {
-        let parked_effect = EffectId::for_parts(&["test", "retired-writer"]);
+        let parked_effect = role_effect(crate::TaskNamespace::Execution, "retired", 1, 1);
         let MissionEvent::PlanProposed {
             proposal: mut replacement,
             ..
@@ -3623,7 +3971,7 @@ mod tests {
 
     #[test]
     fn oracle_completion_identity_is_bound_to_its_request() {
-        let effect_id = EffectId::for_parts(&["test", "oracle-identity"]);
+        let effect_id = oracle_effect("base", 1);
         let state = fold_log(vec![
             created(),
             plan_proposed(
@@ -3666,7 +4014,7 @@ mod tests {
 
     #[test]
     fn oracle_requests_cannot_substitute_another_oracles_assertions() {
-        let forged_effect = EffectId::for_parts(&["test", "substituted-oracle"]);
+        let forged_effect = oracle_effect_for("lint", "h1", 1);
         let forged_request = MissionEvent::OracleRunRequested {
             assertion_ids: vec![aid("TESTS-PASS")],
             oracle: oracle("lint"),
@@ -3769,7 +4117,7 @@ mod tests {
 
     #[test]
     fn terminal_review_completion_identity_is_bound_to_its_request() {
-        let effect_id = EffectId::for_parts(&["test", "review-identity"]);
+        let effect_id = review_effect("h1", 1);
         let observed = RuntimeConfigurationEvidence {
             applied_model: Some("observed-model".into()),
             ..Default::default()
@@ -3781,7 +4129,18 @@ mod tests {
                 effect_id: effect_id.clone(),
                 configuration: observed.clone(),
             },
-            review_completed_at(2, "review-identity", "different-head", true, vec![]),
+            MissionEvent::TerminalReviewCompleted {
+                attempt_no: 2,
+                effect_id: effect_id.clone(),
+                judged_sha: "different-head".into(),
+                outcome: Ok(TerminalReviewSuccess {
+                    passed: true,
+                    gaps: vec![],
+                    report: PayloadRef::inline("mismatched review"),
+                    final_response: PayloadRef::inline("mismatched review"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
+                }),
+            },
         ]);
         let state = fold_log(events).expect("state");
 
@@ -3842,8 +4201,7 @@ mod tests {
             events.push(oracle_requested("TESTS-PASS", "base", "ko"));
             let mid = fold_log(events.clone()).expect("mid state");
             assert!(
-                mid.inflight
-                    .contains_key(&EffectId::for_parts(&["test", "ko"])),
+                mid.inflight.contains_key(&oracle_effect("base", 1)),
                 "request is inflight"
             );
             assert_eq!(mid.phase, MissionPhase::Running);
@@ -3918,7 +4276,7 @@ mod tests {
                 oracle: oracle("cargo-test"),
                 judged_sha: "base".into(),
                 attempt_no: 1,
-                effect_id: EffectId::for_parts(&["test", "ko"]),
+                effect_id: oracle_effect("base", 1),
                 outcome: Ok(OracleRunSuccess {
                     exit_code: 0,
                     exit_signal: Some(9),
@@ -3954,7 +4312,7 @@ mod tests {
                 oracle: oracle("cargo-test"),
                 judged_sha: "base".into(),
                 attempt_no: 1,
-                effect_id: EffectId::for_parts(&["test", "ko"]),
+                effect_id: oracle_effect("base", 1),
                 outcome: Err(TypedFailure::permanent("oracle.spawn", "spawn failed")),
             },
         ])
@@ -4098,10 +4456,10 @@ mod tests {
         }
     }
 
-    fn review_requested(attempt_no: u32, key: &str, judged: &str) -> MissionEvent {
+    fn review_requested(attempt_no: u32, _key: &str, judged: &str) -> MissionEvent {
         MissionEvent::TerminalReviewRequested {
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: review_effect(judged, attempt_no),
             role: RoleName::new("gap-reviewer").expect("role name"),
             runtime: "codex".into(),
             prompt: PayloadRef::inline("review prompt"),
@@ -4116,14 +4474,14 @@ mod tests {
 
     fn review_completed_at(
         attempt_no: u32,
-        key: &str,
+        _key: &str,
         judged: &str,
         passed: bool,
         gaps: Vec<Gap>,
     ) -> MissionEvent {
         MissionEvent::TerminalReviewCompleted {
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: review_effect(judged, attempt_no),
             judged_sha: judged.into(),
             outcome: Ok(TerminalReviewSuccess {
                 passed,
@@ -4139,10 +4497,10 @@ mod tests {
         review_completed_at(1, key, judged, passed, gaps)
     }
 
-    fn review_failed_at(attempt_no: u32, key: &str, judged: &str, detail: &str) -> MissionEvent {
+    fn review_failed_at(attempt_no: u32, _key: &str, judged: &str, detail: &str) -> MissionEvent {
         MissionEvent::TerminalReviewCompleted {
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: review_effect(judged, attempt_no),
             judged_sha: judged.into(),
             outcome: Err(TypedFailure::DeadlineExhausted {
                 evidence: Box::new(TypedFailureEvidence::new(None, detail)),
@@ -4156,13 +4514,13 @@ mod tests {
 
     fn review_transient_failed_at(
         attempt_no: u32,
-        key: &str,
+        _key: &str,
         judged: &str,
         detail: &str,
     ) -> MissionEvent {
         MissionEvent::TerminalReviewCompleted {
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: review_effect(judged, attempt_no),
             judged_sha: judged.into(),
             outcome: Err(TypedFailure::transient("runtime.busy", detail, None)),
         }
@@ -4271,7 +4629,7 @@ mod tests {
     #[test]
     fn terminal_review_request_cannot_substitute_the_configured_reviewer() {
         let mut events = events_to_the_brink();
-        let effect_id = EffectId::for_parts(&["test", "substituted-reviewer"]);
+        let effect_id = review_effect("h1", 1);
         events.push(MissionEvent::TerminalReviewRequested {
             attempt_no: 1,
             effect_id: effect_id.clone(),
@@ -4466,7 +4824,7 @@ mod tests {
         let mut events = events_to_the_brink();
         events.push(review_requested(1, "kr", "h1"));
         events.push(MissionEvent::EffectRuntimeConfigured {
-            effect_id: EffectId::for_parts(&["test", "kr"]),
+            effect_id: review_effect("h1", 1),
             configuration: RuntimeConfigurationEvidence {
                 requested_model: Some("requested".into()),
                 applied_model: Some("applied".into()),

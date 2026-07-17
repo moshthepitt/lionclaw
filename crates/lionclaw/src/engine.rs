@@ -24,15 +24,15 @@ use crate::model::{
     TaskId, TaskNamespace, TerminalReviewDispatchIntent, TerminalReviewSuccess,
 };
 use crate::ports::{
-    Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl, OracleRunRequest, OracleRunner,
-    RoleRunRequest, RoleRunUpdate, RoleRunner,
+    ArtifactCapture, Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl,
+    OracleRunRequest, OracleRunner, RoleRunRequest, RoleRunUpdate, RoleRunner,
 };
 use crate::prompt::{
     assemble_planning_prompt, assemble_role_prompt, assemble_terminal_review_prompt,
     PlanningPromptContext, PlanningPromptInput, PlanningPromptRefinement, PromptContext,
     TerminalReviewPromptContext,
 };
-use crate::runner::MAX_HANDOFF_REPORT_BYTES;
+use crate::runner::{TaskDirs, MAX_HANDOFF_REPORT_BYTES};
 use crate::store::{AppendError, MissionStore, NewEvent};
 
 pub struct Engine {
@@ -1030,6 +1030,22 @@ impl Engine {
             }
         };
         let (updates, update_rx) = tokio::sync::mpsc::channel(8);
+        let artifact_capture =
+            (*output == crate::model::OutputSemantics::ProducesArtifact).then(|| {
+                let checkout = TaskDirs::new(
+                    self.store.lionclaw_dir(),
+                    state.mission_id.as_str(),
+                    task_id,
+                )
+                .work;
+                ArtifactCapture::new(
+                    state.workspace_dir.clone().into(),
+                    checkout,
+                    base_sha.to_string(),
+                    state.mission_id.clone(),
+                    effect_id.clone(),
+                )
+            });
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
             task_id: task_id.clone(),
@@ -1048,6 +1064,7 @@ impl Engine {
             activity,
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
+            artifact_capture,
         };
         let previous_task = state.tasks_in(*namespace).get(task_id);
         match self
@@ -1055,7 +1072,13 @@ impl Engine {
             .await?
         {
             Ok(outcome) => {
-                let outcome = match validated_role_success(outcome, *output, base_sha) {
+                let outcome = match validated_role_success(
+                    outcome,
+                    *output,
+                    base_sha,
+                    &state.mission_id,
+                    effect_id,
+                ) {
                     Ok(outcome) => outcome,
                     Err(failure) => return Ok(completed(Err(failure))),
                 };
@@ -1108,7 +1131,9 @@ impl Engine {
                 };
                 Ok(completed(Ok(RoleRunSuccess {
                     handoff,
-                    artifact: outcome.artifact,
+                    artifact: outcome
+                        .artifact
+                        .map(crate::ports::CapturedArtifact::into_outcome),
                     final_response,
                     runtime_configuration: outcome.runtime_configuration,
                 }))
@@ -1277,6 +1302,7 @@ impl Engine {
             activity,
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
+            artifact_capture: None,
         };
         let outcome = match self
             .run_role_observed(state, effect_id, request, update_rx, false)
@@ -1286,6 +1312,8 @@ impl Engine {
                 outcome,
                 crate::model::OutputSemantics::EmitsGapVerdict,
                 judged_sha,
+                &state.mission_id,
+                effect_id,
             ) {
                 Ok(outcome) => outcome,
                 Err(failure) => return Ok(completed(Err(failure))),
@@ -1535,34 +1563,29 @@ impl Engine {
         // Planning and execution assemble prompts and namespace effect IDs
         // separately, so a planning report can never reach an execution judge and
         // a planning effect can never collide with an execution one.
-        let (prompt_text, effect_namespace) = match intent.namespace {
-            TaskNamespace::Planning => (
-                self.assemble_planning_request(state, role, &intent)?,
-                TaskNamespace::Planning.slug(),
-            ),
-            TaskNamespace::Execution => (
-                self.assemble_execution_request(state, role, &intent)?,
-                TaskNamespace::Execution.slug(),
-            ),
+        let prompt_text = match intent.namespace {
+            TaskNamespace::Planning => self.assemble_planning_request(state, role, &intent)?,
+            TaskNamespace::Execution => self.assemble_execution_request(state, role, &intent)?,
         };
         let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));
         let prompt = self
             .store
             .blobs()
             .externalize(PayloadRef::inline(prompt_text))?;
-        let (base_sha, assignment_epoch, recreate_workspace) = resolve_task_assignment(
-            state.tasks_in(intent.namespace).get(&intent.task_id),
-            &intent.base_sha,
-            state.config.recovery.max_attempts,
-        );
-        let effect_id = effect_id_for(&[
-            effect_namespace,
-            state.mission_id.as_str(),
-            intent.task_id.as_str(),
-            &intent.attempt_no.to_string(),
-            &assignment_epoch.to_string(),
+        let (base_sha, assignment_epoch, recreate_workspace) =
+            crate::model::resolve_task_assignment(
+                state.tasks_in(intent.namespace).get(&intent.task_id),
+                &intent.base_sha,
+                state.config.recovery.max_attempts,
+            );
+        let effect_id = EffectId::for_role_request(
+            intent.namespace,
+            &state.mission_id,
+            &intent.task_id,
+            intent.attempt_no,
+            assignment_epoch,
             &prompt_hash,
-        ]);
+        );
         let requested_at_ms = self.clock.now_ms();
         let not_before_ms = retry_not_before(
             requested_at_ms,
@@ -1615,12 +1638,11 @@ impl Engine {
         state: &MissionState,
         intent: TerminalReviewDispatchIntent,
     ) -> Result<()> {
-        let effect_id = effect_id_for(&[
-            "terminal-review",
-            state.mission_id.as_str(),
+        let effect_id = EffectId::for_terminal_review_request(
+            &state.mission_id,
             &intent.judged_sha,
-            &intent.attempt_no.to_string(),
-        ]);
+            intent.attempt_no,
+        );
         let role = self.mission_type.roles.get(&intent.role).with_context(|| {
             format!(
                 "terminal-review role '{}' is not provided by the pinned mission type",
@@ -1702,13 +1724,12 @@ impl Engine {
         let events: Vec<NewEvent> = intents
             .into_iter()
             .map(|intent| {
-                let effect_id = effect_id_for(&[
-                    "oracle",
-                    state.mission_id.as_str(),
-                    intent.oracle.as_str(),
+                let effect_id = EffectId::for_oracle_request(
+                    &state.mission_id,
+                    &intent.oracle,
                     &intent.judged_sha,
-                    &intent.attempt_no.to_string(),
-                ]);
+                    intent.attempt_no,
+                );
                 let requested_at_ms = self.clock.now_ms();
                 let not_before_ms =
                     retry_not_before(requested_at_ms, state.oracle_failures.get(&intent.oracle));
@@ -1814,38 +1835,6 @@ impl Engine {
             )
         })
     }
-}
-
-fn resolve_task_assignment(
-    previous: Option<&crate::model::TaskRuntimeState>,
-    required_base: &str,
-    max_attempts: u32,
-) -> (String, u32, bool) {
-    let retrying_failure =
-        previous.is_some_and(|task| task.automatic_retry_remaining(max_attempts));
-    let base_sha = if retrying_failure {
-        previous
-            .and_then(|task| task.workspace_base_sha.clone())
-            .unwrap_or_else(|| required_base.to_string())
-    } else {
-        required_base.to_string()
-    };
-    let previous_epoch = previous.map_or(0, |task| task.assignment_epoch);
-    let recreate = previous.and_then(|task| task.workspace_base_sha.as_deref())
-        != Some(base_sha.as_str())
-        && !retrying_failure;
-    let epoch = match (previous_epoch, recreate) {
-        (0, _) => 1,
-        (epoch, true) => epoch.saturating_add(1),
-        (epoch, false) => epoch,
-    };
-    (base_sha, epoch, recreate)
-}
-
-/// Content-derived effect identity: stable across resume, unique per
-/// logical effect.
-fn effect_id_for(parts: &[&str]) -> EffectId {
-    EffectId::for_parts(parts)
 }
 
 fn interrupted_outcome(effect_id: &EffectId, effect: &InflightEffect) -> NewEvent {
@@ -1955,130 +1944,25 @@ fn aborted_before_start_outcome(
     )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SettlementKind {
-    Abort,
-    Stop,
-    Deadline,
-}
-
 fn settlement_failure(
     state: &MissionState,
     effect_id: &EffectId,
     outcome: &NewEvent,
 ) -> Option<TypedFailure> {
-    let (code, detail, reason, category) = match &state.phase {
-        MissionPhase::Aborted { reason } => (
-            "control.aborted_before_settlement",
-            "mission abort became durable before the effect outcome",
-            reason.clone(),
-            SettlementKind::Abort,
-        ),
-        _ => {
-            if let Some(reason) = state.stop_requests.get(effect_id) {
-                (
-                    "control.stopped_before_settlement",
-                    "operator stop became durable before the effect outcome",
-                    reason.clone(),
-                    SettlementKind::Stop,
-                )
-            } else if let Some(deadline_ms) = state.reached_deadlines.get(effect_id) {
-                (
-                    "control.deadline_before_settlement",
-                    "the recorded effect deadline became durable before the effect outcome",
-                    format!("deadline reached at {deadline_ms}"),
-                    SettlementKind::Deadline,
-                )
-            } else {
-                return None;
-            }
-        }
-    };
-    if outcome_settlement_kind(&outcome.event) == Some(category) {
+    let cancellation = state.durable_cancellation(effect_id)?;
+    if outcome
+        .event
+        .outcome_failure()
+        .is_some_and(|failure| cancellation.matches_failure(failure))
+    {
         return None;
     }
-    let mut evidence = outcome
+    let evidence = outcome
         .settlement_evidence
         .clone()
-        .unwrap_or_else(|| outcome_failure_evidence(&outcome.event));
-    evidence.code = Some(code.into());
-    evidence.detail = detail.into();
-    evidence.stop_reason = Some(reason);
-    Some(
-        match category {
-            SettlementKind::Abort => TypedFailure::OperatorAborted {
-                evidence: Box::new(evidence),
-            },
-            SettlementKind::Stop => TypedFailure::OperatorStopped {
-                evidence: Box::new(evidence),
-            },
-            SettlementKind::Deadline => TypedFailure::DeadlineExhausted {
-                evidence: Box::new(evidence),
-            },
-        }
-        .projected(),
-    )
-}
-
-fn outcome_settlement_kind(outcome: &MissionEvent) -> Option<SettlementKind> {
-    let failure = match outcome {
-        MissionEvent::RoleRunCompleted {
-            outcome: Err(failure),
-            ..
-        }
-        | MissionEvent::OracleRunCompleted {
-            outcome: Err(failure),
-            ..
-        }
-        | MissionEvent::TerminalReviewCompleted {
-            outcome: Err(failure),
-            ..
-        } => failure,
-        _ => return None,
-    };
-    match failure {
-        TypedFailure::OperatorAborted { .. } => Some(SettlementKind::Abort),
-        TypedFailure::OperatorStopped { .. } => Some(SettlementKind::Stop),
-        TypedFailure::DeadlineExhausted { .. } => Some(SettlementKind::Deadline),
-        _ => None,
-    }
-}
-
-fn outcome_failure_evidence(outcome: &MissionEvent) -> lionclaw_runtime_api::TypedFailureEvidence {
-    match outcome {
-        MissionEvent::RoleRunCompleted { outcome, .. } => match outcome {
-            Ok(success) => lionclaw_runtime_api::TypedFailureEvidence {
-                final_response: inline_payload(&success.final_response),
-                configuration: runtime_configuration_evidence(&success.runtime_configuration),
-                ..Default::default()
-            },
-            Err(failure) => failure.evidence().clone(),
-        },
-        MissionEvent::OracleRunCompleted { outcome, .. } => match outcome {
-            Ok(success) => lionclaw_runtime_api::TypedFailureEvidence {
-                exit_code: Some(success.exit_code),
-                stderr: inline_payload(&success.stderr),
-                ..Default::default()
-            },
-            Err(failure) => failure.evidence().clone(),
-        },
-        MissionEvent::TerminalReviewCompleted { outcome, .. } => match outcome {
-            Ok(success) => lionclaw_runtime_api::TypedFailureEvidence {
-                final_response: inline_payload(&success.final_response),
-                configuration: runtime_configuration_evidence(&success.runtime_configuration),
-                ..Default::default()
-            },
-            Err(failure) => failure.evidence().clone(),
-        },
-        _ => lionclaw_runtime_api::TypedFailureEvidence::default(),
-    }
-}
-
-fn inline_payload(payload: &PayloadRef) -> String {
-    match payload {
-        PayloadRef::Inline { text } => text.clone(),
-        PayloadRef::Blob(_) => String::new(),
-    }
+        .or_else(|| outcome.event.outcome_failure_evidence())
+        .unwrap_or_default();
+    Some(cancellation.into_failure(evidence))
 }
 
 /// Record a decision without a full engine (the CLI's `decide` needs
@@ -2280,15 +2164,29 @@ fn validated_role_success(
     outcome: crate::ports::RoleRunOutcome,
     output: crate::model::OutputSemantics,
     base_sha: &str,
+    mission_id: &crate::model::MissionId,
+    effect_id: &crate::model::EffectId,
 ) -> std::result::Result<crate::ports::RoleRunOutcome, TypedFailure> {
     let outcome = outcome.projected();
     if let Err(failure) = crate::runner::validate_handoff(&outcome.handoff) {
         return Err(with_role_outcome_evidence(failure, &outcome));
     }
+    if let Some(artifact) = &outcome.artifact {
+        if let Err(detail) = artifact.validate_binding(mission_id, effect_id, base_sha) {
+            return Err(invalid_role_outcome(
+                "workspace.capture_authority",
+                detail,
+                &outcome,
+            ));
+        }
+    }
     if let Some(detail) = crate::model::role_success_contract_error(
         output,
         &outcome.handoff,
-        outcome.artifact.as_ref(),
+        outcome
+            .artifact
+            .as_ref()
+            .map(crate::ports::CapturedArtifact::as_outcome),
         base_sha,
     ) {
         return Err(invalid_role_outcome(
@@ -2321,7 +2219,7 @@ fn with_role_outcome_evidence(
 #[cfg(test)]
 mod assignment_tests {
     use super::*;
-    use crate::model::{TaskRuntimeState, TaskStatus};
+    use crate::model::{resolve_task_assignment, TaskRuntimeState, TaskStatus};
 
     fn task(status: TaskStatus, base: &str, epoch: u32) -> TaskRuntimeState {
         TaskRuntimeState {

@@ -12,6 +12,7 @@
 //! └─ oracles/<name>          # executable; exit 0 = pass
 //! ```
 
+mod bounded_tree;
 mod bundled;
 mod digest;
 mod frontmatter;
@@ -28,6 +29,7 @@ pub use bundled::BundledMissionTypes;
 pub(crate) use digest::ContentDigest;
 pub use home::Home;
 pub use install::{install_mission_type, materialize_mission_type, InstallOutcome};
+pub(crate) use loader::load_materialized_mission_type;
 pub use loader::{load_mission_type, MissionTypeError};
 pub use locator::MissionTypeLocator;
 pub use skill_install::{add_skill, remove_skill, SkillChange, SkillSource};
@@ -127,6 +129,7 @@ pub struct MissionTypeDefinition {
 pub struct MissionType {
     definition: MissionTypeDefinition,
     digest: String,
+    source_owner: Option<std::sync::Arc<tempfile::TempDir>>,
 }
 
 impl std::ops::Deref for MissionType {
@@ -139,7 +142,16 @@ impl std::ops::Deref for MissionType {
 
 impl MissionType {
     pub(crate) fn from_loaded(definition: MissionTypeDefinition, digest: String) -> Self {
-        Self { definition, digest }
+        Self {
+            definition,
+            digest,
+            source_owner: None,
+        }
+    }
+
+    pub(crate) fn with_source_owner(mut self, owner: std::sync::Arc<tempfile::TempDir>) -> Self {
+        self.source_owner = Some(owner);
+        self
     }
 
     /// Content digest over the complete loaded bundle, recorded at mission
@@ -151,7 +163,11 @@ impl MissionType {
     #[cfg(any(test, feature = "testing"))]
     pub fn for_testing(definition: MissionTypeDefinition) -> Self {
         let digest = test_definition_digest(&definition);
-        Self { definition, digest }
+        Self {
+            definition,
+            digest,
+            source_owner: None,
+        }
     }
 
     #[cfg(any(test, feature = "testing"))]

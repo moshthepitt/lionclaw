@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use super::bounded_tree::{BoundedTree, ControlTextBudget, TreeEntryKind};
 use super::digest::ContentDigest;
 use super::loader::MissionTypeError;
 use super::manifest::{MissionLockFile, MISSION_LOCK_FILE};
-use super::{is_executable, SkillPackage};
+use super::SkillPackage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedSkillPackage {
@@ -15,79 +16,60 @@ pub(crate) struct ValidatedSkillPackage {
 
 pub(crate) fn load_skills(
     mission_root: &Path,
+    mission_tree: &BoundedTree,
+    text_budget: &mut ControlTextBudget,
 ) -> Result<BTreeMap<String, SkillPackage>, MissionTypeError> {
-    let lock = load_lock(mission_root)?;
-    let skills_root = mission_root.join("skills");
+    let lock = load_lock_with_budget(mission_tree, text_budget)?;
     let mut packages = BTreeMap::new();
     let mut package_digests = BTreeMap::new();
 
-    match std::fs::symlink_metadata(&skills_root) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(MissionTypeError::Io {
-                path: skills_root,
-                source,
-            })
-        }
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(MissionTypeError::Skill {
-                skill: "skills".to_string(),
-                detail: "skills root must be a directory, not a symlink".to_string(),
-            })
-        }
-        Ok(metadata) if !metadata.is_dir() => {
-            return Err(MissionTypeError::Skill {
-                skill: "skills".to_string(),
-                detail: "skills root must be a directory".to_string(),
-            })
-        }
-        Ok(_) => {
-            for entry in read_dir(&skills_root)? {
-                let path = entry.path();
-                let name =
-                    entry
-                        .file_name()
-                        .into_string()
-                        .map_err(|_| MissionTypeError::Skill {
-                            skill: path.display().to_string(),
-                            detail: "package directory name must be UTF-8".to_string(),
-                        })?;
-                let file_type = entry.file_type().map_err(|source| MissionTypeError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
-                if file_type.is_symlink() {
-                    return Err(MissionTypeError::Skill {
-                        skill: name,
-                        detail: "skill package must be a directory, not a symlink".to_string(),
-                    });
-                }
-                if !file_type.is_dir() {
-                    return Err(MissionTypeError::Skill {
-                        skill: name,
-                        detail: "every entry under skills/ must be a package directory".to_string(),
-                    });
-                }
-                let validated = validate_skill_package(&path)?;
-                if validated.name != name {
-                    return Err(MissionTypeError::Skill {
-                        skill: name.clone(),
-                        detail: format!(
-                            "SKILL.md name '{}' must match package directory '{name}'",
-                            validated.name
-                        ),
-                    });
-                }
-                package_digests.insert(name.clone(), validated.digest);
-                packages.insert(
-                    name.clone(),
-                    SkillPackage {
-                        name,
-                        root: path,
-                        description: validated.description,
-                    },
-                );
+    if mission_tree.contains(Path::new("skills"), TreeEntryKind::File) {
+        return Err(MissionTypeError::Skill {
+            skill: "skills".to_string(),
+            detail: "skills root must be a directory".to_string(),
+        });
+    }
+    if mission_tree.contains(Path::new("skills"), TreeEntryKind::Directory) {
+        for entry in mission_tree
+            .entries()
+            .iter()
+            .filter(|entry| entry.relative.parent() == Some(Path::new("skills")))
+        {
+            let path = mission_root.join(&entry.relative);
+            let name = entry
+                .relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| MissionTypeError::Skill {
+                    skill: entry.relative.display().to_string(),
+                    detail: "non-UTF-8 package directory name is not allowed".to_string(),
+                })?
+                .to_string();
+            if entry.kind != TreeEntryKind::Directory {
+                return Err(MissionTypeError::Skill {
+                    skill: name,
+                    detail: "every entry under skills/ must be a package directory".to_string(),
+                });
             }
+            let validated = validate_skill_package_with_budget(&path, text_budget)?;
+            if validated.name != name {
+                return Err(MissionTypeError::Skill {
+                    skill: name.clone(),
+                    detail: format!(
+                        "SKILL.md name '{}' must match package directory '{name}'",
+                        validated.name
+                    ),
+                });
+            }
+            package_digests.insert(name.clone(), validated.digest);
+            packages.insert(
+                name.clone(),
+                SkillPackage {
+                    name,
+                    root: path,
+                    description: validated.description,
+                },
+            );
         }
     }
 
@@ -98,33 +80,29 @@ pub(crate) fn load_skills(
 pub(crate) fn validate_skill_package(
     root: &Path,
 ) -> Result<ValidatedSkillPackage, MissionTypeError> {
-    let metadata = std::fs::symlink_metadata(root).map_err(|source| MissionTypeError::Io {
-        path: root.to_path_buf(),
-        source,
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(MissionTypeError::Skill {
-            skill: root.display().to_string(),
-            detail: "package root must be a directory, not a symlink".to_string(),
-        });
-    }
+    validate_skill_package_with_budget(root, &mut ControlTextBudget::default())
+}
 
-    let skill_md = root.join("SKILL.md");
-    let metadata = std::fs::symlink_metadata(&skill_md).map_err(|source| MissionTypeError::Io {
-        path: skill_md.clone(),
-        source,
+fn validate_skill_package_with_budget(
+    root: &Path,
+    text_budget: &mut ControlTextBudget,
+) -> Result<ValidatedSkillPackage, MissionTypeError> {
+    let tree = BoundedTree::open(root).map_err(|error| MissionTypeError::Skill {
+        skill: root.display().to_string(),
+        detail: error.to_string(),
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if !tree.contains(Path::new("SKILL.md"), TreeEntryKind::File) {
         return Err(MissionTypeError::Skill {
             skill: root.display().to_string(),
             detail: "SKILL.md must be a regular file".to_string(),
         });
     }
-
-    let text = std::fs::read_to_string(&skill_md).map_err(|source| MissionTypeError::Io {
-        path: skill_md.clone(),
-        source,
-    })?;
+    let text = text_budget
+        .read(&tree, Path::new("SKILL.md"))
+        .map_err(|error| MissionTypeError::Skill {
+            skill: root.display().to_string(),
+            detail: error.to_string(),
+        })?;
     let (yaml, body) =
         split_skill_frontmatter(&text).map_err(|detail| MissionTypeError::Skill {
             skill: root.display().to_string(),
@@ -159,7 +137,7 @@ pub(crate) fn validate_skill_package(
         });
     }
 
-    let digest = package_digest(&metadata.name, root)?;
+    let digest = package_digest(&metadata.name, &tree)?;
     Ok(ValidatedSkillPackage {
         name: metadata.name,
         description: description.to_string(),
@@ -167,27 +145,28 @@ pub(crate) fn validate_skill_package(
     })
 }
 
-pub(crate) fn package_files(
-    name: &str,
-    package_root: &Path,
-) -> Result<Vec<PathBuf>, MissionTypeError> {
-    walk_skill_files(name, package_root, package_root)
+pub(crate) fn load_lock(root: &Path) -> Result<MissionLockFile, MissionTypeError> {
+    let tree =
+        BoundedTree::open(root).map_err(|error| MissionTypeError::Manifest(error.to_string()))?;
+    load_lock_with_budget(&tree, &mut ControlTextBudget::default())
 }
 
-pub(crate) fn load_lock(root: &Path) -> Result<MissionLockFile, MissionTypeError> {
-    let path = root.join(MISSION_LOCK_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(MissionLockFile {
-                version: 1,
-                skills: BTreeMap::new(),
-            })
-        }
-        Err(source) => return Err(MissionTypeError::Io { path, source }),
-    };
+fn load_lock_with_budget(
+    tree: &BoundedTree,
+    text_budget: &mut ControlTextBudget,
+) -> Result<MissionLockFile, MissionTypeError> {
+    let path = Path::new(MISSION_LOCK_FILE);
+    if !tree.contains(path, TreeEntryKind::File) {
+        return Ok(MissionLockFile {
+            version: 1,
+            skills: BTreeMap::new(),
+        });
+    }
+    let text = text_budget
+        .read(tree, path)
+        .map_err(|error| MissionTypeError::Manifest(error.to_string()))?;
     let lock: MissionLockFile = toml::from_str(&text)
-        .map_err(|err| MissionTypeError::Manifest(format!("{}: {err}", path.display())))?;
+        .map_err(|err| MissionTypeError::Manifest(format!("{MISSION_LOCK_FILE}: {err}")))?;
     if lock.version != 1 {
         return Err(MissionTypeError::Manifest(format!(
             "unsupported {MISSION_LOCK_FILE} version {}",
@@ -216,22 +195,13 @@ fn validate_lock(
     Ok(())
 }
 
-fn package_digest(name: &str, root: &Path) -> Result<String, MissionTypeError> {
+fn package_digest(name: &str, tree: &BoundedTree) -> Result<String, MissionTypeError> {
     let mut digest = ContentDigest::new();
-    for path in package_files(name, root)? {
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| MissionTypeError::Skill {
-                skill: name.to_string(),
-                detail: format!("package entry '{}' escaped its root", path.display()),
-            })?;
-        digest
-            .feed_file(&relative.to_string_lossy(), &path, is_executable(&path))
-            .map_err(|source| MissionTypeError::Io {
-                path: path.clone(),
-                source,
-            })?;
-    }
+    tree.feed_digest(&mut digest, "")
+        .map_err(|error| MissionTypeError::Skill {
+            skill: name.to_string(),
+            detail: error.to_string(),
+        })?;
     Ok(digest.finish())
 }
 
@@ -275,62 +245,6 @@ fn validate_standard_skill_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn walk_skill_files(
-    name: &str,
-    package_root: &Path,
-    directory: &Path,
-) -> Result<Vec<PathBuf>, MissionTypeError> {
-    let mut files = Vec::new();
-    for entry in read_dir(directory)? {
-        if entry.file_name() == ".git" {
-            continue;
-        }
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|source| MissionTypeError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if file_type.is_symlink() {
-            return Err(MissionTypeError::Skill {
-                skill: name.to_string(),
-                detail: format!(
-                    "package entry '{}' must not be a symlink",
-                    path.strip_prefix(package_root).unwrap_or(&path).display()
-                ),
-            });
-        }
-        if file_type.is_dir() {
-            files.extend(walk_skill_files(name, package_root, &path)?);
-        } else if file_type.is_file() {
-            files.push(path);
-        } else {
-            return Err(MissionTypeError::Skill {
-                skill: name.to_string(),
-                detail: format!(
-                    "package entry '{}' must be a regular file or directory",
-                    path.strip_prefix(package_root).unwrap_or(&path).display()
-                ),
-            });
-        }
-    }
-    Ok(files)
-}
-
-fn read_dir(directory: &Path) -> Result<Vec<std::fs::DirEntry>, MissionTypeError> {
-    let mut entries = std::fs::read_dir(directory)
-        .map_err(|source| MissionTypeError::Io {
-            path: directory.to_path_buf(),
-            source,
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| MissionTypeError::Io {
-            path: directory.to_path_buf(),
-            source,
-        })?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    Ok(entries)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,9 +267,10 @@ mod tests {
 
         let validated = validate_skill_package(&root).expect("large package validates");
         assert_eq!(validated.digest.len(), 64);
+        let tree = BoundedTree::open(&root).unwrap();
         assert_eq!(
             validated.digest,
-            package_digest("large-resource", &root).unwrap()
+            package_digest("large-resource", &tree).unwrap()
         );
     }
 }

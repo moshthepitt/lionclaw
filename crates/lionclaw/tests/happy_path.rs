@@ -193,10 +193,10 @@ async fn durable_role_outcomes_bound_adapter_configuration_evidence() {
                     report: lionclaw::model::PayloadRef::inline("done"),
                     request_attention: false,
                 },
-                artifact: Some(lionclaw::model::ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha: HEAD_SHA.into(),
-                }),
+                artifact: Some(lionclaw::ports::CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    HEAD_SHA,
+                )),
                 runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
                     applied_model: Some(oversized.clone()),
                     ..Default::default()
@@ -443,10 +443,10 @@ async fn role_runner_cannot_inject_a_durable_blob_reference() {
                     }),
                     request_attention: false,
                 },
-                artifact: Some(lionclaw::model::ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha: HEAD_SHA.into(),
-                }),
+                artifact: Some(lionclaw::ports::CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    HEAD_SHA,
+                )),
                 runtime_configuration: Default::default(),
                 final_response: "attempted injection".into(),
             })
@@ -502,10 +502,10 @@ async fn role_runner_oversized_report_is_a_durable_invalid_output() {
                     ),
                     request_attention: false,
                 },
-                artifact: Some(lionclaw::model::ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha: HEAD_SHA.into(),
-                }),
+                artifact: Some(lionclaw::ports::CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    HEAD_SHA,
+                )),
                 runtime_configuration: Default::default(),
                 final_response: "oversized report".into(),
             })

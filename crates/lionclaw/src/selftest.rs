@@ -25,10 +25,10 @@ use crate::config::RuntimeProfiles;
 use crate::engine::{Engine, EngineServices, MissionDisposition, ProposeError};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
-    ArtifactOutcome, Assertion, AssertionId, DecisionAction, EffectId, FinishClass, Gap,
-    GapSeverity, Handoff, MissionEvent, MissionId, MissionPhase, OracleName, PayloadRef, Plan,
-    PlanProposal, ProposalError, Requirement, RequirementDisposition, RequirementId,
-    RequirementKind, ReviewAcceptanceKind, RoleName, Task, TaskId, TaskKind, TaskStatus,
+    Assertion, AssertionId, DecisionAction, EffectId, FinishClass, Gap, GapSeverity, Handoff,
+    MissionEvent, MissionId, MissionPhase, OracleName, PayloadRef, Plan, PlanProposal,
+    ProposalError, Requirement, RequirementDisposition, RequirementId, RequirementKind,
+    ReviewAcceptanceKind, RoleName, Task, TaskId, TaskKind, TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
@@ -66,9 +66,9 @@ impl RoleRunner for NoopRoleRunner {
     }
 }
 
-/// A worker that "commits" a fixed head, plus a terminal reviewer that
-/// returns one blocking gap (echoing the prompt's nonce, as a real agent
-/// must). Drives check (6) without a model or a container.
+/// An already-satisfied worker plus a terminal reviewer that returns one
+/// blocking gap (echoing the prompt's nonce, as a real agent must). Drives
+/// check (6) without a model or a container.
 struct ReviewParkRoleRunner;
 
 #[async_trait]
@@ -103,10 +103,7 @@ impl RoleRunner for ReviewParkRoleRunner {
                     report: PayloadRef::inline("self-test worker"),
                     request_attention: false,
                 },
-                artifact: Some(ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha: request.base_sha,
-                }),
+                artifact: None,
                 runtime_configuration: Default::default(),
                 final_response: "self-test worker".to_string(),
             })
@@ -490,8 +487,8 @@ async fn approve_plan(engine: &Engine, mission_id: &MissionId) -> Result<()> {
 /// A real writable worker without a model: it checks out the repo, writes a
 /// known-good fix and commits it **inside a real read-write container**, and
 /// returns the captured commit — proving the allow-side of confinement (writes
-/// land) and that the engine records the commit. Reuses the same checkout/capture
-/// helpers as the production `OciRoleRunner`.
+/// land) and that the engine records the commit. Reuses the exact engine-issued
+/// capture authority as the production `OciRoleRunner`.
 struct ScriptedRoleRunner {
     fixed_lib: &'static str,
 }
@@ -507,9 +504,20 @@ impl RoleRunner for ScriptedRoleRunner {
 
 impl ScriptedRoleRunner {
     async fn run_inner(&self, request: RoleRunRequest) -> Result<RoleRunOutcome> {
-        let attempt_tag = request.effect_id.as_str();
-        let dest = request.state_dir.join("selftest-work").join(attempt_tag);
+        let capture = request
+            .artifact_capture
+            .as_ref()
+            .context("scripted writer received no artifact capture authority")?;
+        let dest = capture.checkout_dir().to_path_buf();
         workspace::create_checkout(&request.workspace_dir, &dest, &request.base_sha).await?;
+        request
+            .updates
+            .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
+                base_sha: request.base_sha.clone(),
+                assignment_epoch: request.assignment_epoch,
+            })
+            .await
+            .context("engine role update receiver closed")?;
         // The produces-artifact role compiles to a writable workspace.
         let authority = compile_authority(&request.role, &AuthorityCeiling::default())
             .map_err(|e| anyhow::anyhow!("authority refused to compile: {e}"))?;
@@ -527,25 +535,14 @@ impl ScriptedRoleRunner {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let head = workspace::capture_worker_result(
-            &request.workspace_dir,
-            &dest,
-            &request.base_sha,
-            request.mission_id.as_str(),
-            &request.effect_id,
-        )
-        .await?;
-        workspace::remove_dir(&dest).await?;
+        let artifact = capture.capture().await?;
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("self-test scripted fix"),
                 request_attention: false,
             },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha.clone(),
-                head_sha: head,
-            }),
+            artifact: Some(artifact),
             runtime_configuration: Default::default(),
             final_response: "self-test scripted fix".to_string(),
         })

@@ -6,13 +6,14 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA};
+use common::{initialize_repository, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
 use lionclaw::model::{DecisionAction, FinishClass, MissionEvent, MissionPhase};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
 async fn gated_engine(dir: &std::path::Path) -> Engine {
+    initialize_repository(dir);
     let store = MissionStore::open(dir).await.expect("store");
     Engine::new(
         store,

@@ -15,8 +15,9 @@ use crate::engine::{
     load_mission_view, record_control, Engine, EngineServices, MissionDisposition, MissionView,
 };
 use crate::mission_type::{
-    add_skill, install_mission_type, load_mission_type, materialize_mission_type, remove_skill,
-    BundledMissionTypes, Home, MissionType, MissionTypeLocator, SkillSource,
+    add_skill, install_mission_type, load_materialized_mission_type, load_mission_type,
+    materialize_mission_type, remove_skill, BundledMissionTypes, Home, MissionType,
+    MissionTypeLocator, SkillSource,
 };
 use crate::model::{
     fold, short_hex, ControlAction, DecisionAction, EffectId, FinishClass, MissionId, MissionPhase,
@@ -780,7 +781,7 @@ fn load_mission_type_snapshot(
     mission_id: &MissionId,
     ceiling: &AuthorityCeiling,
 ) -> Result<MissionType> {
-    load_mission_type(&store.mission_type_dir(mission_id), ceiling)
+    load_materialized_mission_type(&store.mission_type_dir(mission_id), ceiling)
         .with_context(|| format!("mission type snapshot for '{mission_id}'"))
 }
 
@@ -2750,7 +2751,7 @@ fn review_line(state: &crate::model::MissionState) -> Option<String> {
 mod tests {
     use super::*;
     use crate::model::{
-        EffectId, OracleRunSuccess, PayloadRef, RuntimeConfigurationEvidence, TerminalReviewSuccess,
+        OracleRunSuccess, PayloadRef, RuntimeConfigurationEvidence, TerminalReviewSuccess,
     };
     use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
     use std::collections::{BTreeMap, BTreeSet};
@@ -3076,6 +3077,36 @@ mod tests {
 
     /// Fold a hand-built review mission to a state, for summary rendering
     /// tests (sequence numbers assigned by position).
+    const REVIEW_PROMPT_HASH: &str = "review-fixture-prompt-hash";
+
+    fn review_mission_id() -> crate::model::MissionId {
+        crate::model::MissionId::parse("mabc123def456").unwrap()
+    }
+
+    fn review_role_effect() -> crate::model::EffectId {
+        crate::model::EffectId::for_role_request(
+            crate::model::TaskNamespace::Execution,
+            &review_mission_id(),
+            &crate::model::TaskId::new("fix").unwrap(),
+            1,
+            1,
+            REVIEW_PROMPT_HASH,
+        )
+    }
+
+    fn review_oracle_effect() -> crate::model::EffectId {
+        crate::model::EffectId::for_oracle_request(
+            &review_mission_id(),
+            &crate::model::OracleName::new("cargo-test").unwrap(),
+            "h1",
+            1,
+        )
+    }
+
+    fn terminal_review_effect() -> crate::model::EffectId {
+        crate::model::EffectId::for_terminal_review_request(&review_mission_id(), "h1", 1)
+    }
+
     fn review_state(tail: Vec<crate::model::MissionEvent>) -> crate::model::MissionState {
         use crate::model::*;
         let mut events = vec![
@@ -3149,7 +3180,7 @@ mod tests {
                 namespace: TaskNamespace::Execution,
                 task_id: TaskId::new("fix").unwrap(),
                 attempt_no: 1,
-                effect_id: EffectId::for_parts(&["test", "k1"]),
+                effect_id: review_role_effect(),
                 role: RoleName::new("implementer").unwrap(),
                 output: OutputSemantics::ProducesArtifact,
                 runtime: "codex".into(),
@@ -3166,7 +3197,7 @@ mod tests {
                 namespace: crate::model::TaskNamespace::Execution,
                 task_id: TaskId::new("fix").unwrap(),
                 attempt_no: 1,
-                effect_id: EffectId::for_parts(&["test", "k1"]),
+                effect_id: review_role_effect(),
                 outcome: Ok(RoleRunSuccess {
                     handoff: Handoff::Work {
                         done: true,
@@ -3223,18 +3254,19 @@ mod tests {
             }
             events.push(event);
         }
-        fold(
-            events
-                .into_iter()
-                .enumerate()
-                .map(|(i, event)| EventEnvelope {
-                    mission_id: MissionId::parse("mabc123def456").unwrap(),
-                    sequence_no: i as u64 + 1,
-                    recorded_at_ms: 0,
-                    stamps: Default::default(),
-                    event,
-                }),
-        )
+        fold(events.into_iter().enumerate().map(|(i, event)| {
+            let mut stamps = VersionStamps::default();
+            if matches!(&event, MissionEvent::RoleRunRequested { .. }) {
+                stamps.prompt_hash = Some(REVIEW_PROMPT_HASH.into());
+            }
+            EventEnvelope {
+                mission_id: review_mission_id(),
+                sequence_no: i as u64 + 1,
+                recorded_at_ms: 0,
+                stamps,
+                event,
+            }
+        }))
         .expect("state")
     }
 
@@ -3245,7 +3277,7 @@ mod tests {
             oracle: OracleName::new("cargo-test").unwrap(),
             judged_sha: "h1".into(),
             attempt_no: 1,
-            effect_id: EffectId::for_parts(&["test", "ko"]),
+            effect_id: review_oracle_effect(),
             outcome: Ok(OracleRunSuccess {
                 exit_code,
                 exit_signal: None,
@@ -3280,7 +3312,7 @@ mod tests {
             oracle: OracleName::new("cargo-test").unwrap(),
             judged_sha: "h1".into(),
             attempt_no: 1,
-            effect_id: EffectId::for_parts(&["test", "ko"]),
+            effect_id: review_oracle_effect(),
             outcome: Ok(OracleRunSuccess {
                 exit_code: 1,
                 exit_signal: None,
@@ -3754,7 +3786,7 @@ mod tests {
             oracle_completed(0),
             MissionEvent::TerminalReviewCompleted {
                 attempt_no: 1,
-                effect_id: EffectId::for_parts(&["test", "kr"]),
+                effect_id: terminal_review_effect(),
                 judged_sha: "h1".into(),
                 outcome: Ok(TerminalReviewSuccess {
                     passed: false,
@@ -3781,7 +3813,7 @@ mod tests {
             oracle_completed(0),
             MissionEvent::TerminalReviewCompleted {
                 attempt_no: 1,
-                effect_id: EffectId::for_parts(&["test", "kr"]),
+                effect_id: terminal_review_effect(),
                 judged_sha: "h1".into(),
                 outcome: Err(TypedFailure::DeadlineExhausted {
                     evidence: Box::new(TypedFailureEvidence::new(None, "boom")),
@@ -3817,7 +3849,7 @@ mod tests {
             oracle_completed(0),
             MissionEvent::TerminalReviewCompleted {
                 attempt_no: 1,
-                effect_id: EffectId::for_parts(&["test", "kr"]),
+                effect_id: terminal_review_effect(),
                 judged_sha: "h1".into(),
                 outcome: Ok(TerminalReviewSuccess {
                     passed: false,

@@ -928,6 +928,30 @@ fn acp_permission_requests_are_denied_by_default() {
         acp_permission_denial(Some(&json!({ "options": [] }))),
         json!({ "outcome": { "outcome": "cancelled" } })
     );
+
+    assert_eq!(
+        acp_permission_denial(Some(&json!({
+            "options": [
+                {
+                    "optionId": "allow",
+                    "kind": "allow_once",
+                    "name": "Do not deny this request"
+                }
+            ]
+        }))),
+        json!({ "outcome": { "outcome": "cancelled" } }),
+        "display prose must never turn an allow option into a structured denial"
+    );
+    assert_eq!(
+        acp_permission_denial(Some(&json!({
+            "options": [
+                { "optionId": "one", "kind": "reject_once" },
+                { "optionId": "always", "kind": "reject_always" }
+            ]
+        }))),
+        json!({ "outcome": { "outcome": "cancelled" } }),
+        "multiple structured denial choices are ambiguous"
+    );
 }
 
 #[tokio::test]

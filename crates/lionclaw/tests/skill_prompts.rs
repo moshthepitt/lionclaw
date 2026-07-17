@@ -17,10 +17,10 @@ use common::{
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::{MissionType, MissionTypeDefinition, RoleDefinition, SkillPackage};
 use lionclaw::model::{
-    ArtifactOutcome, Assertion, AssertionId, Handoff, OracleName, OutputSemantics, Plan,
-    PlanProposal, PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
+    Assertion, AssertionId, Handoff, OracleName, OutputSemantics, Plan, PlanProposal, PlanningDag,
+    PlanningTask, RoleName, StopBar, Task, TaskKind,
 };
-use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
+use lionclaw::ports::{CapturedArtifact, RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
@@ -41,10 +41,10 @@ fn work_outcome(request: &RoleRunRequest) -> RoleRunOutcome {
             report: lionclaw::model::PayloadRef::inline("done"),
             request_attention: false,
         },
-        artifact: Some(ArtifactOutcome {
-            base_sha: request.base_sha.clone(),
-            head_sha: HEAD_SHA.to_string(),
-        }),
+        artifact: Some(CapturedArtifact::for_testing(
+            request.base_sha.clone(),
+            HEAD_SHA,
+        )),
         runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
             requested_model: Some("mock".to_string()),
             applied_model: Some("mock".to_string()),
@@ -230,6 +230,7 @@ fn execution_mission_type(
 #[tokio::test]
 async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
     let dir = tempfile::tempdir().unwrap();
+    common::initialize_repository(dir.path());
     let (mission_type, _skills) = execution_mission_type(dir.path());
 
     let runner = MockRoleRunner::new(Box::new(move |request| Ok(work_outcome(request))));
@@ -278,6 +279,7 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
 #[tokio::test]
 async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
     let dir = tempfile::tempdir().unwrap();
+    common::initialize_repository(dir.path());
     let (mission_type, _skills) = execution_mission_type(dir.path());
 
     let runner = MockRoleRunner::new(Box::new(move |request| {
@@ -287,10 +289,10 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
                 report: lionclaw::model::PayloadRef::inline("done"),
                 request_attention: false,
             },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha.clone(),
-                head_sha: HEAD_SHA.to_string(),
-            }),
+            artifact: Some(CapturedArtifact::for_testing(
+                request.base_sha.clone(),
+                HEAD_SHA,
+            )),
             runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
                 requested_model: Some("mock".to_string()),
                 applied_model: Some("mock".to_string()),
@@ -597,10 +599,10 @@ async fn terminal_review_prompt_lists_assigned_skills() {
                     report: lionclaw::model::PayloadRef::inline("done"),
                     request_attention: false,
                 },
-                artifact: Some(ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha: HEAD_SHA.to_string(),
-                }),
+                artifact: Some(CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    HEAD_SHA,
+                )),
                 runtime_configuration: Default::default(),
                 final_response: String::new(),
             })
@@ -647,10 +649,10 @@ async fn terminal_review_prompt_for_unassigned_role_has_no_skill_section() {
                     report: lionclaw::model::PayloadRef::inline("done"),
                     request_attention: false,
                 },
-                artifact: Some(ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha: HEAD_SHA.to_string(),
-                }),
+                artifact: Some(CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    HEAD_SHA,
+                )),
                 runtime_configuration: Default::default(),
                 final_response: String::new(),
             })

@@ -23,7 +23,7 @@ use crate::authority::{
     compile_authority, compile_role_plan, AuthorityCeiling, MissionMounts, RolePlanRequest,
 };
 use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig, RuntimeProfiles};
-use crate::model::{ArtifactOutcome, OutputSemantics};
+use crate::model::OutputSemantics;
 use crate::ports::{ExecutionControl, RoleRunOutcome, RoleRunRequest, RoleRunner};
 
 use super::executor::{mission_execution_context, MissionProgramExecutor};
@@ -342,18 +342,31 @@ impl RoleRunner for OciRoleRunner {
                 .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
             let is_writer = authority.output() == OutputSemantics::ProducesArtifact;
             let (workspace_source, scratch_source, observer_index) = if is_writer {
+                let capture = request.artifact_capture.as_ref().ok_or_else(|| {
+                    launch("artifact-producing role has no capture authority".into())
+                })?;
                 let task_dirs = TaskDirs::prepare(
                     &request.state_dir,
                     request.mission_id.as_str(),
                     &request.task_id,
                 )
                 .map_err(|e| launch(format!("failed to prepare task dirs: {e}")))?;
+                if capture.checkout_dir() != task_dirs.work {
+                    return Err(launch(
+                        "artifact capture authority names a different task checkout".into(),
+                    ));
+                }
                 (
-                    task_dirs.work.clone(),
+                    capture.checkout_dir().to_path_buf(),
                     task_dirs.scratch.clone(),
                     Some(task_dirs.observer_index.clone()),
                 )
             } else {
+                if request.artifact_capture.is_some() {
+                    return Err(launch(
+                        "read-only role received artifact capture authority".into(),
+                    ));
+                }
                 (dirs.root.join("work"), dirs.read_scratch.clone(), None)
             };
             {
@@ -404,13 +417,12 @@ impl RoleRunner for OciRoleRunner {
                 environment,
             })
             .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
-            Ok((is_writer, workspace_source, compiled.plan().clone()))
+            Ok((is_writer, compiled.plan().clone()))
         };
-        let (is_writer, workspace_source, plan) =
-            await_controlled(setup, request.control.clone(), |control| {
-                setup_control_failure(&profile, control)
-            })
-            .await?;
+        let (is_writer, plan) = await_controlled(setup, request.control.clone(), |control| {
+            setup_control_failure(&profile, control)
+        })
+        .await?;
 
         // The adapter owns cancellation acknowledgement while its turn is
         // live. Setup and capture use the same engine control, but are simply
@@ -427,34 +439,29 @@ impl RoleRunner for OciRoleRunner {
                 })?;
             let artifact = if is_writer {
                 let _guard = self.repo_lock.lock().await;
-                let head_sha = workspace::capture_worker_result(
-                    &request.workspace_dir,
-                    &workspace_source,
-                    &request.base_sha,
-                    request.mission_id.as_str(),
-                    &request.effect_id,
-                )
-                .await
-                .map_err(|e| {
-                    let mut failure = match e {
-                        workspace::CaptureError::DirtyWorktree(_) => {
-                            TypedFailure::invalid("workspace.dirty", e.to_string())
-                        }
-                        workspace::CaptureError::HistoryDiverged { .. } => {
-                            TypedFailure::permanent("workspace.history", e.to_string())
-                        }
-                        workspace::CaptureError::Infra(_) => {
-                            TypedFailure::permanent("workspace.capture", e.to_string())
-                        }
-                    };
-                    failure.evidence_mut().final_response = final_response.clone();
-                    failure.evidence_mut().configuration = applied.clone();
-                    failure
-                })?;
-                Some(ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha,
-                })
+                let artifact = request
+                    .artifact_capture
+                    .as_ref()
+                    .expect("writer capture authority was checked during setup")
+                    .capture()
+                    .await
+                    .map_err(|e| {
+                        let mut failure = match e {
+                            workspace::CaptureError::DirtyWorktree(_) => {
+                                TypedFailure::invalid("workspace.dirty", e.to_string())
+                            }
+                            workspace::CaptureError::HistoryDiverged { .. } => {
+                                TypedFailure::permanent("workspace.history", e.to_string())
+                            }
+                            workspace::CaptureError::Infra(_) => {
+                                TypedFailure::permanent("workspace.capture", e.to_string())
+                            }
+                        };
+                        failure.evidence_mut().final_response = final_response.clone();
+                        failure.evidence_mut().configuration = applied.clone();
+                        failure
+                    })?;
+                Some(artifact)
             } else {
                 None
             };

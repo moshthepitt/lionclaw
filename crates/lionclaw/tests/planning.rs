@@ -14,11 +14,11 @@ use common::{covered_requirement, BASE_SHA};
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::{MissionType, MissionTypeDefinition, RoleDefinition, SkillPackage};
 use lionclaw::model::{
-    ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionEvent,
-    MissionPhase, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, PlanningDag,
-    PlanningRefinement, PlanningTask, RoleName, StopBar, Task, TaskKind, TaskStatus,
+    Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionEvent, MissionPhase,
+    OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, PlanningDag, PlanningRefinement,
+    PlanningTask, RoleName, StopBar, Task, TaskKind, TaskStatus,
 };
-use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
+use lionclaw::ports::{CapturedArtifact, RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
@@ -219,11 +219,8 @@ fn successful_role_outcome(req: &RoleRunRequest) -> RoleRunOutcome {
             panic!("terminal-review roles are never plan tasks")
         }
     };
-    let artifact =
-        (req.role.output == OutputSemantics::ProducesArtifact).then(|| ArtifactOutcome {
-            base_sha: req.base_sha.clone(),
-            head_sha: "head-1".to_string(),
-        });
+    let artifact = (req.role.output == OutputSemantics::ProducesArtifact)
+        .then(|| CapturedArtifact::for_testing(req.base_sha.clone(), "head-1"));
     RoleRunOutcome {
         handoff,
         artifact,
@@ -240,6 +237,7 @@ async fn planning_engine_with_runner(
     workspace: &std::path::Path,
     runner: MockRoleRunner,
 ) -> Engine {
+    common::initialize_repository(workspace);
     let store = MissionStore::open(workspace).await.expect("store");
     Engine::new(
         store,

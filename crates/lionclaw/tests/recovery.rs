@@ -9,10 +9,10 @@ use common::{
 };
 use lionclaw::engine::{record_control, MissionDisposition};
 use lionclaw::model::{
-    ArtifactOutcome, Assertion, AssertionId, ControlAction, DecisionAction, Handoff, MissionEvent,
-    MissionPhase, OracleName, OutputSemantics, PayloadRef, RoleName, TaskNamespace,
+    Assertion, AssertionId, ControlAction, DecisionAction, Handoff, MissionEvent, MissionPhase,
+    OracleName, OutputSemantics, PayloadRef, RoleName, TaskNamespace,
 };
-use lionclaw::ports::{OracleOutcome, RoleRunOutcome};
+use lionclaw::ports::{CapturedArtifact, OracleOutcome, RoleRunOutcome};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 fn completed_work(base_sha: &str) -> RoleRunOutcome {
@@ -22,10 +22,7 @@ fn completed_work(base_sha: &str) -> RoleRunOutcome {
             report: PayloadRef::inline("completed"),
             request_attention: false,
         },
-        artifact: Some(ArtifactOutcome {
-            base_sha: base_sha.to_string(),
-            head_sha: HEAD_SHA.to_string(),
-        }),
+        artifact: Some(CapturedArtifact::for_testing(base_sha, HEAD_SHA)),
         runtime_configuration: Default::default(),
         final_response: String::new(),
     }
@@ -42,7 +39,7 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
     .await;
     let mission_id = h
         .engine
-        .create_mission("/repo", "collided recovery", BASE_SHA)
+        .create_mission(dir.path().to_str().unwrap(), "collided recovery", BASE_SHA)
         .await
         .expect("create");
     h.engine
@@ -51,7 +48,16 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
 
-    let effect_id = common::effect_id("collided-recovery");
+    let prompt_hash = "fault-injected-prompt-hash";
+    let task_id = lionclaw::model::TaskId::new("fix").expect("task id");
+    let effect_id = lionclaw::model::EffectId::for_role_request(
+        TaskNamespace::Execution,
+        &mission_id,
+        &task_id,
+        1,
+        1,
+        prompt_hash,
+    );
     let interrupted = TypedFailure::Interrupted {
         evidence: Box::new(lionclaw_runtime_api::TypedFailureEvidence {
             code: Some("driver.interrupted".into()),
@@ -62,7 +68,7 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
     };
     let orphan = lionclaw::store::NewEvent::new(MissionEvent::RoleRunCompleted {
         namespace: TaskNamespace::Execution,
-        task_id: lionclaw::model::TaskId::new("fix").expect("task id"),
+        task_id: task_id.clone(),
         attempt_no: 1,
         effect_id: effect_id.clone(),
         outcome: Err(interrupted),
@@ -87,7 +93,7 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
     .expect("reserve the orphan outcome identity");
     let request = lionclaw::store::NewEvent::new(MissionEvent::RoleRunRequested {
         namespace: TaskNamespace::Execution,
-        task_id: lionclaw::model::TaskId::new("fix").expect("task id"),
+        task_id,
         attempt_no: 1,
         effect_id: effect_id.clone(),
         role: RoleName::new("implementer").expect("role name"),
@@ -101,7 +107,8 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
         not_before_ms: 0,
         deadline_ms: 100_000,
         budget_deadline_ms: 100_000,
-    });
+    })
+    .with_prompt_hash(prompt_hash);
     fault_append_events(dir.path(), &mission_id, head, &[request], 1).await;
     assert!(h
         .engine
@@ -151,7 +158,7 @@ async fn invalid_handoff_is_reworked_automatically_with_exact_feedback() {
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let id = h
         .engine
-        .create_mission("/repo", "recover output", BASE_SHA)
+        .create_mission(dir.path().to_str().unwrap(), "recover output", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -191,10 +198,10 @@ async fn wrong_handoff_schema_is_recorded_as_invalid_and_reworked() {
                     passed: true,
                     request_attention: false,
                 },
-                artifact: Some(ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha: HEAD_SHA.to_string(),
-                }),
+                artifact: Some(CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    HEAD_SHA,
+                )),
                 runtime_configuration: Default::default(),
                 final_response: "wrong schema response".into(),
             });
@@ -204,7 +211,11 @@ async fn wrong_handoff_schema_is_recorded_as_invalid_and_reworked() {
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let id = h
         .engine
-        .create_mission("/repo", "recover wrong schema", BASE_SHA)
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "recover wrong schema",
+            BASE_SHA,
+        )
         .await
         .unwrap();
     h.engine
@@ -251,7 +262,7 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let id = h
         .engine
-        .create_mission("/repo", "retry transient", BASE_SHA)
+        .create_mission(dir.path().to_str().unwrap(), "retry transient", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -275,7 +286,7 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let id = h
         .engine
-        .create_mission("/repo", "fail launch", BASE_SHA)
+        .create_mission(dir.path().to_str().unwrap(), "fail launch", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -311,7 +322,11 @@ async fn a_scheduled_transient_retry_can_be_stopped_before_runtime_launch() {
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let id = h
         .engine
-        .create_mission("/repo", "stop scheduled retry", BASE_SHA)
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "stop scheduled retry",
+            BASE_SHA,
+        )
         .await
         .unwrap();
     h.engine
@@ -428,7 +443,11 @@ async fn stopping_one_scheduled_oracle_retry_does_not_interrupt_its_sibling() {
         .push(AssertionId::new("LINT-PASS").unwrap());
     let id = h
         .engine
-        .create_mission("/repo", "stop one scheduled oracle", BASE_SHA)
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "stop one scheduled oracle",
+            BASE_SHA,
+        )
         .await
         .unwrap();
     h.engine.propose_plan(&id, proposal(0, plan)).await.unwrap();
@@ -519,7 +538,11 @@ async fn structured_transient_oracle_failure_uses_the_shared_retry_budget() {
     let h = harness(dir.path(), MockRoleRunner::happy(HEAD_SHA), oracle).await;
     let id = h
         .engine
-        .create_mission("/repo", "retry transient oracle", BASE_SHA)
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "retry transient oracle",
+            BASE_SHA,
+        )
         .await
         .unwrap();
     h.engine
@@ -571,7 +594,7 @@ async fn oracle_repair_reopens_the_owner_with_both_evidence_streams() {
     let h = harness(dir.path(), worker, oracle).await;
     let id = h
         .engine
-        .create_mission("/repo", "repair failure", BASE_SHA)
+        .create_mission(dir.path().to_str().unwrap(), "repair failure", BASE_SHA)
         .await
         .unwrap();
     h.engine

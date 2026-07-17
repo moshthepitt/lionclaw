@@ -4,8 +4,7 @@
 mod common;
 
 use common::{
-    approve_plan, effect_id, fault_append_events, harness, proposal, simple_plan, BASE_SHA,
-    HEAD_SHA,
+    approve_plan, fault_append_events, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{
@@ -14,6 +13,22 @@ use lionclaw::model::{
 };
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
+
+const CRASHED_PROMPT_HASH: &str = "crash-injection-prompt-hash";
+
+fn role_effect(
+    mission_id: &lionclaw::model::MissionId,
+    task_id: &TaskId,
+) -> lionclaw::model::EffectId {
+    lionclaw::model::EffectId::for_role_request(
+        lionclaw::model::TaskNamespace::Execution,
+        mission_id,
+        task_id,
+        1,
+        1,
+        CRASHED_PROMPT_HASH,
+    )
+}
 
 #[tokio::test]
 async fn rerun_after_finish_appends_nothing_and_invokes_nothing() {
@@ -74,7 +89,8 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
-    let id = effect_id("crashed-role");
+    let task_id = TaskId::new("fix").expect("task id");
+    let id = role_effect(&mission_id, &task_id);
     let state = h.engine.load_state(&mission_id).await.expect("state");
     fault_append_events(
         dir.path(),
@@ -82,7 +98,7 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
         state.head,
         &[NewEvent::new(MissionEvent::RoleRunRequested {
             namespace: lionclaw::model::TaskNamespace::Execution,
-            task_id: lionclaw::model::TaskId::new("fix").expect("task id"),
+            task_id,
             attempt_no: 1,
             effect_id: id.clone(),
             role: lionclaw::model::RoleName::new("implementer").expect("role"),
@@ -96,7 +112,8 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
             not_before_ms: 0,
             deadline_ms: 100_000,
             budget_deadline_ms: 100_000,
-        })],
+        })
+        .with_prompt_hash(CRASHED_PROMPT_HASH)],
         1,
     )
     .await;
@@ -146,9 +163,10 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
     approve_plan(&h.engine, &mission_id).await;
 
     let task_id = TaskId::new("fix").expect("task id");
-    let role_effect = effect_id("completed-role");
-    let oracle_effect = effect_id("crashed-oracle");
     let oracle = OracleName::new("cargo-test").expect("oracle");
+    let role_effect = role_effect(&mission_id, &task_id);
+    let oracle_effect =
+        lionclaw::model::EffectId::for_oracle_request(&mission_id, &oracle, HEAD_SHA, 1);
     let state = h.engine.load_state(&mission_id).await.expect("state");
     fault_append_events(
         dir.path(),
@@ -171,7 +189,8 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                 not_before_ms: 0,
                 deadline_ms: 100_000,
                 budget_deadline_ms: 100_000,
-            }),
+            })
+            .with_prompt_hash(CRASHED_PROMPT_HASH),
             NewEvent::new(MissionEvent::RoleRunCompleted {
                 namespace: lionclaw::model::TaskNamespace::Execution,
                 task_id,
@@ -247,7 +266,8 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
-    let id = effect_id("rebuild-crash");
+    let task_id = TaskId::new("fix").unwrap();
+    let id = role_effect(&mission_id, &task_id);
     let state = h.engine.load_state(&mission_id).await.expect("state");
     fault_append_events(
         dir.path(),
@@ -255,7 +275,7 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
         state.head,
         &[NewEvent::new(MissionEvent::RoleRunRequested {
             namespace: lionclaw::model::TaskNamespace::Execution,
-            task_id: lionclaw::model::TaskId::new("fix").unwrap(),
+            task_id,
             attempt_no: 1,
             effect_id: id.clone(),
             role: lionclaw::model::RoleName::new("implementer").unwrap(),
@@ -269,7 +289,8 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
             not_before_ms: 0,
             deadline_ms: 100_000,
             budget_deadline_ms: 100_000,
-        })],
+        })
+        .with_prompt_hash(CRASHED_PROMPT_HASH)],
         1,
     )
     .await;

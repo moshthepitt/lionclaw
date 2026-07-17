@@ -12,7 +12,66 @@ use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{Plan, PlanProposal};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
-use crate::TypedFailure;
+use crate::{TypedFailure, TypedFailureEvidence};
+
+/// A durable cancellation fact that dominates any later effect outcome.
+/// Event order chooses one cause; both the live engine and pure replay use
+/// this value so the shell cannot grant success that the reducer rejects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableCancellation {
+    Aborted { reason: String },
+    Stopped { reason: String },
+    DeadlineReached { deadline_ms: i64 },
+}
+
+impl DurableCancellation {
+    pub fn matches_failure(&self, failure: &TypedFailure) -> bool {
+        matches!(
+            (self, failure),
+            (Self::Aborted { .. }, TypedFailure::OperatorAborted { .. })
+                | (Self::Stopped { .. }, TypedFailure::OperatorStopped { .. })
+                | (
+                    Self::DeadlineReached { .. },
+                    TypedFailure::DeadlineExhausted { .. }
+                )
+        )
+    }
+
+    pub fn into_failure(self, mut evidence: TypedFailureEvidence) -> TypedFailure {
+        let (code, detail, reason) = match &self {
+            Self::Aborted { reason } => (
+                "control.aborted_before_settlement",
+                "mission abort became durable before the effect outcome",
+                reason.clone(),
+            ),
+            Self::Stopped { reason } => (
+                "control.stopped_before_settlement",
+                "operator stop became durable before the effect outcome",
+                reason.clone(),
+            ),
+            Self::DeadlineReached { deadline_ms } => (
+                "control.deadline_before_settlement",
+                "the recorded effect deadline became durable before the effect outcome",
+                format!("deadline reached at {deadline_ms}"),
+            ),
+        };
+        evidence.code = Some(code.into());
+        evidence.detail = detail.into();
+        evidence.stop_reason = Some(reason);
+        match self {
+            Self::Aborted { .. } => TypedFailure::OperatorAborted {
+                evidence: Box::new(evidence),
+            },
+            Self::Stopped { .. } => TypedFailure::OperatorStopped {
+                evidence: Box::new(evidence),
+            },
+            Self::DeadlineReached { .. } => TypedFailure::DeadlineExhausted {
+                evidence: Box::new(evidence),
+            },
+        }
+        .projected()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
@@ -113,6 +172,35 @@ pub struct TaskRuntimeState {
     pub assignment_epoch: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_response: Option<PayloadRef>,
+}
+
+/// Resolve one fresh or retry assignment from durable task state. Both the
+/// engine and replay fold use this function; request intent never becomes
+/// authority merely because it was recorded.
+pub fn resolve_task_assignment(
+    previous: Option<&TaskRuntimeState>,
+    required_base: &str,
+    max_attempts: u32,
+) -> (String, u32, bool) {
+    let retrying_failure =
+        previous.is_some_and(|task| task.automatic_retry_remaining(max_attempts));
+    let base_sha = if retrying_failure {
+        previous
+            .and_then(|task| task.workspace_base_sha.clone())
+            .unwrap_or_else(|| required_base.to_string())
+    } else {
+        required_base.to_string()
+    };
+    let previous_epoch = previous.map_or(0, |task| task.assignment_epoch);
+    let recreate = previous.and_then(|task| task.workspace_base_sha.as_deref())
+        != Some(base_sha.as_str())
+        && !retrying_failure;
+    let epoch = match (previous_epoch, recreate) {
+        (0, _) => 1,
+        (epoch, true) => epoch.saturating_add(1),
+        (epoch, false) => epoch,
+    };
+    (base_sha, epoch, recreate)
 }
 
 impl TaskRuntimeState {
@@ -505,6 +593,20 @@ impl InflightEffect {
         }
     }
 
+    pub fn runtime_configuration(&self) -> Option<&super::RuntimeConfigurationEvidence> {
+        match self {
+            Self::RoleRun {
+                runtime_configuration,
+                ..
+            }
+            | Self::TerminalReview {
+                runtime_configuration,
+                ..
+            } => runtime_configuration.as_ref(),
+            Self::OracleRun { .. } => None,
+        }
+    }
+
     /// Build the inflight entry for a `…Requested` event.
     pub fn from_request(
         event: &super::event::MissionEvent,
@@ -764,6 +866,25 @@ impl MissionState {
     /// this value is produced; proof and closure consumers use this boundary.
     pub fn deliverable_head(&self) -> &str {
         &self.current_sha
+    }
+
+    /// The cancellation fact, if any, that became durable before settlement
+    /// of this exact effect. Abort dominates stop, which dominates deadline.
+    pub fn durable_cancellation(&self, effect_id: &super::EffectId) -> Option<DurableCancellation> {
+        if let MissionPhase::Aborted { reason } = &self.phase {
+            return Some(DurableCancellation::Aborted {
+                reason: reason.clone(),
+            });
+        }
+        if let Some(reason) = self.stop_requests.get(effect_id) {
+            return Some(DurableCancellation::Stopped {
+                reason: reason.clone(),
+            });
+        }
+        self.reached_deadlines
+            .get(effect_id)
+            .copied()
+            .map(|deadline_ms| DurableCancellation::DeadlineReached { deadline_ms })
     }
 
     /// Whether the exact parked effect still belongs to live mission work.

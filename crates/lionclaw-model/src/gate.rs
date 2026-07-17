@@ -111,6 +111,19 @@ mod tests {
     };
     use crate::MissionConfig;
 
+    const TEST_PROMPT_HASH: &str = "test-prompt-hash";
+
+    fn role_effect(mission_id: &MissionId, task_id: &TaskId) -> EffectId {
+        EffectId::for_role_request(
+            crate::TaskNamespace::Execution,
+            mission_id,
+            task_id,
+            1,
+            1,
+            TEST_PROMPT_HASH,
+        )
+    }
+
     fn aid(s: &str) -> AssertionId {
         AssertionId::new(s).unwrap()
     }
@@ -228,7 +241,7 @@ mod tests {
         ];
         let mut seq = 4;
         for task in plan.tasks.iter().filter(|task| task.kind == TaskKind::Work) {
-            let effect_id = EffectId::for_parts(&["test", task.id.as_str()]);
+            let effect_id = role_effect(&mission_id, &task.id);
             events.push(env(
                 &mission_id,
                 seq,
@@ -281,7 +294,7 @@ mod tests {
                     namespace: crate::TaskNamespace::Execution,
                     task_id: tid(validator),
                     attempt_no: 1,
-                    effect_id: EffectId::for_parts(&["test", validator]),
+                    effect_id: role_effect(&mission_id, &tid(validator)),
                     role: RoleName::new("reviewer").unwrap(),
                     output: crate::OutputSemantics::EmitsVerdict,
                     runtime: "codex".into(),
@@ -303,7 +316,7 @@ mod tests {
                     namespace: crate::TaskNamespace::Execution,
                     task_id: tid(validator),
                     attempt_no: 1,
-                    effect_id: EffectId::for_parts(&["test", validator]),
+                    effect_id: role_effect(&mission_id, &tid(validator)),
                     outcome: Ok(crate::RoleRunSuccess {
                         handoff: Handoff::Validate {
                             done: true,
@@ -330,11 +343,15 @@ mod tests {
     }
 
     fn env(mission_id: &MissionId, seq: u64, event: MissionEvent) -> EventEnvelope {
+        let mut stamps = VersionStamps::default();
+        if matches!(event, MissionEvent::RoleRunRequested { .. }) {
+            stamps.prompt_hash = Some(TEST_PROMPT_HASH.to_string());
+        }
         EventEnvelope {
             mission_id: mission_id.clone(),
             sequence_no: seq,
             recorded_at_ms: 0,
-            stamps: VersionStamps::default(),
+            stamps,
             event,
         }
     }

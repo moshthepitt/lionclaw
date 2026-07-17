@@ -4,8 +4,7 @@
 mod common;
 
 use common::{
-    approve_plan, effect_id, fault_append_events, harness, proposal, simple_plan, BASE_SHA,
-    HEAD_SHA,
+    approve_plan, fault_append_events, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::model::{MissionEvent, OutputSemantics, PayloadRef, RoleName, TaskId};
 use lionclaw::store::NewEvent;
@@ -30,7 +29,16 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
-    let id = effect_id("unfinished");
+    let prompt_hash = "unfinished-request-prompt-hash";
+    let task_id = TaskId::new("fix").unwrap();
+    let id = lionclaw::model::EffectId::for_role_request(
+        lionclaw::model::TaskNamespace::Execution,
+        &mission_id,
+        &task_id,
+        1,
+        1,
+        prompt_hash,
+    );
     let state = h.engine.load_state(&mission_id).await.expect("state");
     fault_append_events(
         dir.path(),
@@ -38,7 +46,7 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
         state.head,
         &[NewEvent::new(MissionEvent::RoleRunRequested {
             namespace: lionclaw::model::TaskNamespace::Execution,
-            task_id: TaskId::new("fix").unwrap(),
+            task_id,
             attempt_no: 1,
             effect_id: id.clone(),
             role: RoleName::new("implementer").unwrap(),
@@ -52,7 +60,8 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
             not_before_ms: 0,
             deadline_ms: 100_000,
             budget_deadline_ms: 100_000,
-        })],
+        })
+        .with_prompt_hash(prompt_hash)],
         1,
     )
     .await;

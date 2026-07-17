@@ -22,6 +22,211 @@ use rustix::io::Errno;
 use crate::model::EffectId;
 use tokio::process::Command;
 
+/// Proof that LionClaw observed and fetched one clean worker HEAD for one exact
+/// effect. The durable event payload and binding are intentionally hidden.
+///
+/// ```compile_fail
+/// use lionclaw::model::ArtifactOutcome;
+/// use lionclaw::ports::CapturedArtifact;
+/// let _ = CapturedArtifact(ArtifactOutcome {
+///     base_sha: "base".into(),
+///     head_sha: "claimed".into(),
+/// });
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedArtifact(CapturedArtifactInner);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapturedArtifactInner {
+    Verified {
+        mission_id: crate::model::MissionId,
+        effect_id: EffectId,
+        outcome: crate::model::ArtifactOutcome,
+    },
+    #[cfg(any(test, feature = "testing"))]
+    TestRequest(crate::model::ArtifactOutcome),
+}
+
+impl CapturedArtifact {
+    fn verified(
+        mission_id: crate::model::MissionId,
+        effect_id: EffectId,
+        base_sha: String,
+        head_sha: String,
+    ) -> Self {
+        Self(CapturedArtifactInner::Verified {
+            mission_id,
+            effect_id,
+            outcome: crate::model::ArtifactOutcome { base_sha, head_sha },
+        })
+    }
+
+    pub fn base_sha(&self) -> &str {
+        &self.outcome().base_sha
+    }
+
+    pub fn head_sha(&self) -> &str {
+        &self.outcome().head_sha
+    }
+
+    fn outcome(&self) -> &crate::model::ArtifactOutcome {
+        match &self.0 {
+            CapturedArtifactInner::Verified { outcome, .. } => outcome,
+            #[cfg(any(test, feature = "testing"))]
+            CapturedArtifactInner::TestRequest(outcome) => outcome,
+        }
+    }
+
+    pub(crate) fn validate_binding(
+        &self,
+        mission_id: &crate::model::MissionId,
+        effect_id: &EffectId,
+        base_sha: &str,
+    ) -> Result<(), String> {
+        match &self.0 {
+            CapturedArtifactInner::Verified {
+                mission_id: captured_mission,
+                effect_id: captured_effect,
+                outcome,
+            } if captured_mission == mission_id
+                && captured_effect == effect_id
+                && outcome.base_sha == base_sha =>
+            {
+                Ok(())
+            }
+            CapturedArtifactInner::Verified { .. } => {
+                Err("captured artifact belongs to a different effect request".to_string())
+            }
+            #[cfg(any(test, feature = "testing"))]
+            CapturedArtifactInner::TestRequest(_) => {
+                Err("unverified testing artifact reached engine settlement".to_string())
+            }
+        }
+    }
+
+    pub(crate) fn as_outcome(&self) -> &crate::model::ArtifactOutcome {
+        self.outcome()
+    }
+
+    pub(crate) fn into_outcome(self) -> crate::model::ArtifactOutcome {
+        match self.0 {
+            CapturedArtifactInner::Verified { outcome, .. } => outcome,
+            #[cfg(any(test, feature = "testing"))]
+            CapturedArtifactInner::TestRequest(_) => {
+                unreachable!("testing requests are rejected before conversion")
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_testing(base_sha: impl Into<String>, head_sha: impl Into<String>) -> Self {
+        Self(CapturedArtifactInner::TestRequest(
+            crate::model::ArtifactOutcome {
+                base_sha: base_sha.into(),
+                head_sha: head_sha.into(),
+            },
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn test_request(&self) -> Option<&crate::model::ArtifactOutcome> {
+        match &self.0 {
+            CapturedArtifactInner::TestRequest(outcome) => Some(outcome),
+            CapturedArtifactInner::Verified { .. } => None,
+        }
+    }
+}
+
+/// Engine-issued authority to capture one exact task checkout into one exact
+/// mission effect. A runner may change the checkout, but cannot redirect the
+/// target repository, base, mission, or effect identity.
+#[derive(Debug, Clone)]
+pub struct ArtifactCapture {
+    repo: PathBuf,
+    checkout: PathBuf,
+    required_base: String,
+    mission_id: crate::model::MissionId,
+    effect_id: EffectId,
+}
+
+impl ArtifactCapture {
+    pub(crate) fn new(
+        repo: PathBuf,
+        checkout: PathBuf,
+        required_base: String,
+        mission_id: crate::model::MissionId,
+        effect_id: EffectId,
+    ) -> Self {
+        Self {
+            repo,
+            checkout,
+            required_base,
+            mission_id,
+            effect_id,
+        }
+    }
+
+    pub fn checkout_dir(&self) -> &Path {
+        &self.checkout
+    }
+
+    pub async fn capture(&self) -> Result<CapturedArtifact, CaptureError> {
+        capture_worker_result(
+            &self.repo,
+            &self.checkout,
+            &self.required_base,
+            &self.mission_id,
+            &self.effect_id,
+        )
+        .await
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub async fn prepare_for_testing(&self, recreate: bool) -> Result<()> {
+        if recreate || !self.checkout.is_dir() {
+            replace_checkout(&self.repo, &self.checkout, &self.required_base).await?;
+        } else {
+            let head = head_sha(&self.checkout).await?;
+            if !is_ancestor(&self.checkout, &self.required_base, &head).await? {
+                bail!(
+                    "retained test checkout HEAD {head} diverges from required base {}",
+                    self.required_base
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub async fn capture_test_commit(
+        &self,
+        _label: &str,
+    ) -> Result<CapturedArtifact, CaptureError> {
+        let current = head_sha(&self.checkout)
+            .await
+            .map_err(CaptureError::Infra)?;
+        if current != self.required_base {
+            return self.capture().await;
+        }
+        git(&self.checkout, &["add", "-A"])
+            .await
+            .map_err(CaptureError::Infra)?;
+        let mut commit = managed_git_command();
+        commit
+            .current_dir(&self.checkout)
+            .env("GIT_AUTHOR_DATE", "2000-01-02T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2000-01-02T00:00:00Z")
+            .args(["commit", "--quiet", "--allow-empty", "-m"])
+            .arg("LionClaw test artifact");
+        run(&mut commit, "creating test artifact commit")
+            .await
+            .map_err(CaptureError::Infra)?;
+        self.capture().await
+    }
+}
+
 pub async fn head_sha(repo: &Path) -> Result<String> {
     let out = resolve_managed_commit(repo, "HEAD").await?;
     Ok(out.trim().to_string())
@@ -308,13 +513,13 @@ pub enum CaptureError {
 /// Post-run artifact capture: the tree must be committed clean; the head
 /// commit is fetched back into the target repo under `refs/mission/…` so it
 /// survives checkout teardown.
-pub async fn capture_worker_result(
+async fn capture_worker_result(
     repo: &Path,
     checkout: &Path,
     required_base: &str,
-    mission_id: &str,
+    mission_id: &crate::model::MissionId,
     effect_id: &EffectId,
-) -> Result<String, CaptureError> {
+) -> Result<crate::ports::CapturedArtifact, CaptureError> {
     let observer = TaskGitObserver::open(checkout).await?;
     let status = observer.output(&["status", "--porcelain"]).await?;
     if !status.trim().is_empty() {
@@ -357,7 +562,12 @@ pub async fn capture_worker_result(
             stored.trim()
         )));
     }
-    Ok(head)
+    Ok(CapturedArtifact::verified(
+        mission_id.clone(),
+        effect_id.clone(),
+        required_base.to_string(),
+        head,
+    ))
 }
 
 /// Delete the captured ref for an effect whose outcome was never committed.
@@ -979,6 +1189,10 @@ fn synthetic_repository_config(head: &str) -> &'static [u8] {
 mod tests {
     use super::*;
 
+    fn test_mission_id() -> crate::model::MissionId {
+        crate::model::MissionId::parse("mabc123def456").unwrap()
+    }
+
     async fn init_repo(dir: &Path) -> String {
         std::fs::write(dir.join("f.txt"), "base\n").unwrap();
         git(dir, &["init", "-q"]).await.unwrap();
@@ -1039,14 +1253,19 @@ mod tests {
         assert_ne!(detached, base);
 
         let effect_id = EffectId::for_parts(&["test", "fix-a1"]);
-        let recorded =
-            capture_worker_result(repo.path(), &checkout, &base, "mabc123def456", &effect_id)
-                .await
-                .unwrap();
+        let recorded = capture_worker_result(
+            repo.path(),
+            &checkout,
+            &base,
+            &test_mission_id(),
+            &effect_id,
+        )
+        .await
+        .unwrap();
         // The recorded head is the worker's actual HEAD, and it really landed
         // in the target repo (so a later checkout succeeds).
-        assert_eq!(recorded, detached);
-        assert!(commit_exists(repo.path(), &recorded).await);
+        assert_eq!(recorded.head_sha(), detached);
+        assert!(commit_exists(repo.path(), recorded.head_sha()).await);
         assert_eq!(
             std::fs::read_to_string(fetch_head).unwrap(),
             "source sentinel\n",
@@ -1060,10 +1279,58 @@ mod tests {
         );
 
         let replay = work.path().join("replay");
-        create_checkout(repo.path(), &replay, &recorded)
+        create_checkout(repo.path(), &replay, recorded.head_sha())
             .await
             .unwrap();
-        assert_eq!(head_sha(&replay).await.unwrap(), recorded);
+        assert_eq!(head_sha(&replay).await.unwrap(), recorded.head_sha());
+    }
+
+    #[tokio::test]
+    async fn captured_artifacts_are_bound_to_the_issuing_effect() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let work = tempfile::tempdir().unwrap();
+        let checkout = work.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        let mission_id = test_mission_id();
+        let effect_id = EffectId::for_parts(&["test", "bound-capture"]);
+        let capture = ArtifactCapture::new(
+            repo.path().to_path_buf(),
+            checkout,
+            base.clone(),
+            mission_id.clone(),
+            effect_id.clone(),
+        );
+        let captured = capture.capture().await.unwrap();
+
+        assert_eq!(
+            captured.validate_binding(&mission_id, &effect_id, &base),
+            Ok(())
+        );
+        assert!(captured
+            .validate_binding(
+                &crate::model::MissionId::parse("mdef456abc123").unwrap(),
+                &effect_id,
+                &base,
+            )
+            .is_err());
+        assert!(captured
+            .validate_binding(
+                &mission_id,
+                &EffectId::for_parts(&["test", "different-effect"]),
+                &base,
+            )
+            .is_err());
+        assert!(captured
+            .validate_binding(&mission_id, &effect_id, "different-base")
+            .is_err());
+
+        let unverified = CapturedArtifact::for_testing(base.clone(), base);
+        assert!(unverified
+            .validate_binding(&mission_id, &effect_id, unverified.base_sha())
+            .is_err());
     }
 
     #[tokio::test]
@@ -1085,7 +1352,7 @@ mod tests {
             repo.path(),
             &checkout,
             &required_base,
-            "mabc123def456",
+            &test_mission_id(),
             &effect_id,
         )
         .await
@@ -1116,11 +1383,16 @@ mod tests {
         assert!(!checkout.join(".git/refs/heads/worker").exists());
 
         let effect_id = EffectId::for_parts(&["test", "packed-head"]);
-        let captured =
-            capture_worker_result(repo.path(), &checkout, &base, "mabc123def456", &effect_id)
-                .await
-                .expect("a valid packed symbolic HEAD remains capturable");
-        assert_eq!(captured, head);
+        let captured = capture_worker_result(
+            repo.path(),
+            &checkout,
+            &base,
+            &test_mission_id(),
+            &effect_id,
+        )
+        .await
+        .expect("a valid packed symbolic HEAD remains capturable");
+        assert_eq!(captured.head_sha(), head);
     }
 
     #[tokio::test]
@@ -1137,7 +1409,14 @@ mod tests {
         // bucket, which would mislabel the persisted failure.
         let effect_id = EffectId::for_parts(&["test", "a1"]);
         assert!(matches!(
-            capture_worker_result(repo.path(), &checkout, &base, "mabc123def456", &effect_id).await,
+            capture_worker_result(
+                repo.path(),
+                &checkout,
+                &base,
+                &test_mission_id(),
+                &effect_id
+            )
+            .await,
             Err(CaptureError::DirtyWorktree(_))
         ));
     }
@@ -1159,10 +1438,15 @@ mod tests {
         symlink(repo.path().join(".git/objects/pack"), &pack).unwrap();
 
         let effect_id = EffectId::for_parts(&["test", "object-pack-symlink"]);
-        let error =
-            capture_worker_result(repo.path(), &checkout, &base, "mabc123def456", &effect_id)
-                .await
-                .expect_err("capture must not pass descendant object symlinks to host Git");
+        let error = capture_worker_result(
+            repo.path(),
+            &checkout,
+            &base,
+            &test_mission_id(),
+            &effect_id,
+        )
+        .await
+        .expect_err("capture must not pass descendant object symlinks to host Git");
         assert!(error.to_string().contains("symlink"));
     }
 
@@ -1201,9 +1485,15 @@ mod tests {
         .unwrap();
 
         let effect_id = EffectId::for_parts(&["test", "hostile-config"]);
-        capture_worker_result(repo.path(), &checkout, &base, "mabc123def456", &effect_id)
-            .await
-            .unwrap();
+        capture_worker_result(
+            repo.path(),
+            &checkout,
+            &base,
+            &test_mission_id(),
+            &effect_id,
+        )
+        .await
+        .unwrap();
         assert!(
             !marker.exists(),
             "capture must not execute worker status or upload-pack configuration"
@@ -1652,10 +1942,15 @@ mod tests {
             .await
             .unwrap();
         let effect_id = EffectId::for_parts(&["test", "sha256-capture"]);
-        let captured =
-            capture_worker_result(&repo, &checkout, base.trim(), "mabc123def456", &effect_id)
-                .await
-                .unwrap();
-        assert_eq!(captured, base.trim());
+        let captured = capture_worker_result(
+            &repo,
+            &checkout,
+            base.trim(),
+            &test_mission_id(),
+            &effect_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(captured.head_sha(), base.trim());
     }
 }
