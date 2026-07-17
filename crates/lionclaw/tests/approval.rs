@@ -6,7 +6,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{default_config, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA};
+use common::{proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
 use lionclaw::model::{DecisionAction, FinishClass, MissionEvent, MissionPhase};
 use lionclaw::store::MissionStore;
@@ -33,12 +33,7 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = gated_engine(dir.path()).await;
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "gated mission",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "gated mission", BASE_SHA)
         .await
         .expect("create");
     engine
@@ -106,12 +101,7 @@ async fn abort_decision_terminates_the_mission() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = gated_engine(dir.path()).await;
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "gated",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "gated", BASE_SHA)
         .await
         .expect("create");
     engine

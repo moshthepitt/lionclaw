@@ -12,14 +12,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::{
-    approve_plan, covered_requirement, default_config, proposal, simple_plan, ParseTask, BASE_SHA,
-    HEAD_SHA,
+    approve_plan, covered_requirement, proposal, simple_plan, ParseTask, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
-    ArtifactOutcome, Assertion, AssertionId, Handoff, MissionConfig, OracleName, OutputSemantics,
-    Plan, PlanProposal, PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
+    ArtifactOutcome, Assertion, AssertionId, Handoff, OracleName, OutputSemantics, Plan,
+    PlanProposal, PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -211,7 +210,11 @@ fn execution_mission_type(
         image: "img".to_string(),
         planning: PlanningDag::default(),
         recovery: Default::default(),
-        execution: Default::default(),
+        execution: lionclaw::model::ExecutionPolicy {
+            auto_continue_candidate: true,
+            auto_continue_proof: true,
+            ..Default::default()
+        },
         terminal_review: None,
         playbook: None,
         roles,
@@ -245,12 +248,7 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
         ),
     );
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "fix the bug",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "fix the bug", BASE_SHA)
         .await
         .unwrap();
     engine
@@ -268,7 +266,7 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
             ("zebra-skill", "Zebra comes first in declaration"),
             ("alpha-skill", "Alpha comes second in declaration"),
         ],
-        "lionclaw.mission.work-handoff.v1",
+        "lionclaw.mission.work-handoff.v2",
     );
     // Declaration order: zebra before alpha (NOT BTreeMap order where alpha < zebra).
     let zebra_pos = prompt.find("zebra-skill").unwrap();
@@ -316,12 +314,7 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
         ),
     );
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "fix the bug",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "fix the bug", BASE_SHA)
         .await
         .unwrap();
     // A plan with a validate task so the reviewer runs. The assertion is
@@ -508,35 +501,7 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
         ),
     );
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "plan the work",
-            BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: PlanningDag {
-                    tasks: vec![
-                        PlanningTask {
-                            id: tid("strategist"),
-                            role: rn("strategist"),
-                            output: OutputSemantics::ProducesReport,
-                            body: "draft".to_string(),
-                            depends_on: vec![],
-                        },
-                        PlanningTask {
-                            id: tid("author"),
-                            role: rn("author"),
-                            output: OutputSemantics::ProposesPlan,
-                            body: "propose".to_string(),
-                            depends_on: vec![tid("strategist")],
-                        },
-                    ],
-                },
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
-        )
+        .create_mission(dir.path().to_str().unwrap(), "plan the work", BASE_SHA)
         .await
         .unwrap();
     engine.advance(&mission_id).await.unwrap();
@@ -545,7 +510,7 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
     assert_skill_section(
         &prompt,
         &[("planning-method", "A methodical planning approach")],
-        "lionclaw.mission.work-handoff.v1",
+        "lionclaw.mission.work-handoff.v2",
     );
 }
 
@@ -589,35 +554,7 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
         ),
     );
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "plan the work",
-            BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: PlanningDag {
-                    tasks: vec![
-                        PlanningTask {
-                            id: tid("strategist"),
-                            role: rn("strategist"),
-                            output: OutputSemantics::ProducesReport,
-                            body: "draft".to_string(),
-                            depends_on: vec![],
-                        },
-                        PlanningTask {
-                            id: tid("author"),
-                            role: rn("author"),
-                            output: OutputSemantics::ProposesPlan,
-                            body: "propose".to_string(),
-                            depends_on: vec![tid("strategist")],
-                        },
-                    ],
-                },
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
-        )
+        .create_mission(dir.path().to_str().unwrap(), "plan the work", BASE_SHA)
         .await
         .unwrap();
     engine.advance(&mission_id).await.unwrap();
@@ -678,12 +615,7 @@ async fn terminal_review_prompt_lists_assigned_skills() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "fix the tests",
-            BASE_SHA,
-            common::review_config(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "fix the tests", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -697,7 +629,7 @@ async fn terminal_review_prompt_lists_assigned_skills() {
     assert_skill_section(
         &prompt,
         &[("gap-check", "Hunt gaps in the product")],
-        "lionclaw.mission.review-handoff.v1",
+        "lionclaw.mission.review-handoff.v2",
     );
 }
 
@@ -733,12 +665,7 @@ async fn terminal_review_prompt_for_unassigned_role_has_no_skill_section() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "fix the tests",
-            BASE_SHA,
-            common::review_config(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "fix the tests", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -782,12 +709,7 @@ async fn a_role_referencing_a_missing_skill_fails_closed_at_prompt_materializati
         ),
     );
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "fix the bug",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "fix the bug", BASE_SHA)
         .await
         .unwrap();
     engine

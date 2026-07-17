@@ -4,8 +4,8 @@ use lionclaw_runtime_api::TypedFailure;
 use std::sync::{Arc, Mutex};
 
 use common::{
-    approve_plan, covered_requirement, default_config, harness, harness_with_type, proposal,
-    simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
+    approve_plan, covered_requirement, harness, harness_with_type, proposal, simple_plan,
+    test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{record_control, MissionDisposition};
 use lionclaw::model::{
@@ -59,7 +59,7 @@ async fn invalid_handoff_is_reworked_automatically_with_exact_feedback() {
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let id = h
         .engine
-        .create_mission("/repo", "recover output", BASE_SHA, default_config())
+        .create_mission("/repo", "recover output", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -112,7 +112,7 @@ async fn wrong_handoff_schema_is_recorded_as_invalid_and_reworked() {
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let id = h
         .engine
-        .create_mission("/repo", "recover wrong schema", BASE_SHA, default_config())
+        .create_mission("/repo", "recover wrong schema", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -159,7 +159,7 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let id = h
         .engine
-        .create_mission("/repo", "retry transient", BASE_SHA, default_config())
+        .create_mission("/repo", "retry transient", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -183,7 +183,7 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let id = h
         .engine
-        .create_mission("/repo", "fail launch", BASE_SHA, default_config())
+        .create_mission("/repo", "fail launch", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -219,7 +219,7 @@ async fn a_scheduled_transient_retry_can_be_stopped_before_runtime_launch() {
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let id = h
         .engine
-        .create_mission("/repo", "stop scheduled retry", BASE_SHA, default_config())
+        .create_mission("/repo", "stop scheduled retry", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -334,12 +334,7 @@ async fn stopping_one_scheduled_oracle_retry_does_not_interrupt_its_sibling() {
         .push(AssertionId::new("LINT-PASS").unwrap());
     let id = h
         .engine
-        .create_mission(
-            "/repo",
-            "stop one scheduled oracle",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission("/repo", "stop one scheduled oracle", BASE_SHA)
         .await
         .unwrap();
     h.engine.propose_plan(&id, proposal(0, plan)).await.unwrap();
@@ -430,12 +425,7 @@ async fn structured_transient_oracle_failure_uses_the_shared_retry_budget() {
     let h = harness(dir.path(), MockRoleRunner::happy(HEAD_SHA), oracle).await;
     let id = h
         .engine
-        .create_mission(
-            "/repo",
-            "retry transient oracle",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission("/repo", "retry transient oracle", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -487,7 +477,7 @@ async fn oracle_repair_reopens_the_owner_with_both_evidence_streams() {
     let h = harness(dir.path(), worker, oracle).await;
     let id = h
         .engine
-        .create_mission("/repo", "repair failure", BASE_SHA, default_config())
+        .create_mission("/repo", "repair failure", BASE_SHA)
         .await
         .unwrap();
     h.engine

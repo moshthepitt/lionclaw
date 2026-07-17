@@ -112,6 +112,7 @@ pub enum ExecutionControl {
     RunUntil(i64),
     DeadlineExhausted,
     Stop(String),
+    Abort(String),
 }
 
 #[derive(Debug, Clone)]

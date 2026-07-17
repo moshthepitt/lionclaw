@@ -4,13 +4,16 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use common::{
-    approve_plan, default_config, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
+    approve_plan, covered_requirement, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{record_control, Engine, EngineServices, MissionDisposition};
-use lionclaw::model::{ArtifactOutcome, ControlAction, Handoff, PayloadRef, TaskStatus};
+use lionclaw::model::{
+    ArtifactOutcome, Assertion, AssertionId, ControlAction, DecisionAction, Handoff, OracleName,
+    PayloadRef, TaskStatus,
+};
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, OracleOutcome,
-    RoleRunOutcome, RoleRunRequest, RoleRunner,
+    OracleRunRequest, OracleRunner, RoleRunOutcome, RoleRunRequest, RoleRunner,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, NoopEffectCleaner};
@@ -41,6 +44,62 @@ struct SleepingRunner;
 
 struct DeadlineRunner {
     calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct AbortOracleRunner {
+    blocked_started: Arc<Notify>,
+    abort_observed: Arc<std::sync::atomic::AtomicBool>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl OracleRunner for AbortOracleRunner {
+    async fn run(&self, mut request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Ok(OracleOutcome {
+                exit_code: 1,
+                exit_signal: None,
+                stdout: Vec::new(),
+                stderr: b"first oracle failed".to_vec(),
+                prepared_inputs: Vec::new(),
+                duration_ms: 1,
+            });
+        }
+
+        self.blocked_started.notify_one();
+        loop {
+            match request.control.borrow().clone() {
+                ExecutionControl::Abort(reason) => {
+                    self.abort_observed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    let mut evidence =
+                        TypedFailureEvidence::new(Some("test.aborted".into()), "mission aborted");
+                    evidence.stop_reason = Some(reason);
+                    return Err(TypedFailure::OperatorAborted {
+                        evidence: Box::new(evidence),
+                    });
+                }
+                ExecutionControl::DeadlineExhausted => {
+                    return Err(TypedFailure::DeadlineExhausted {
+                        evidence: Box::new(TypedFailureEvidence::new(
+                            Some("test.deadline".into()),
+                            "unexpected deadline",
+                        )),
+                    });
+                }
+                ExecutionControl::Stop(reason) => {
+                    let mut evidence =
+                        TypedFailureEvidence::new(Some("test.stop".into()), "unexpected stop");
+                    evidence.stop_reason = Some(reason);
+                    return Err(TypedFailure::OperatorStopped {
+                        evidence: Box::new(evidence),
+                    });
+                }
+                ExecutionControl::RunUntil(_) => {}
+            }
+            request.control.changed().await.unwrap();
+        }
+    }
 }
 
 struct SettlementCleaner {
@@ -85,6 +144,14 @@ impl RoleRunner for DeadlineRunner {
                         TypedFailureEvidence::new(Some("test.stop".into()), "unexpected stop");
                     evidence.stop_reason = Some(reason);
                     return Err(TypedFailure::OperatorStopped {
+                        evidence: Box::new(evidence),
+                    });
+                }
+                ExecutionControl::Abort(reason) => {
+                    let mut evidence =
+                        TypedFailureEvidence::new(Some("test.abort".into()), "mission aborted");
+                    evidence.stop_reason = Some(reason);
+                    return Err(TypedFailure::OperatorAborted {
                         evidence: Box::new(evidence),
                     });
                 }
@@ -191,7 +258,6 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
             dir.path().to_str().unwrap(),
             "control one exact effect",
             BASE_SHA,
-            default_config(),
         )
         .await
         .unwrap();
@@ -391,6 +457,109 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
 }
 
 #[tokio::test]
+async fn abort_cancels_an_active_oracle_while_the_driver_drains_its_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let blocked_started = Arc::new(Notify::new());
+    let abort_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut mission_type = test_mission_type();
+    mission_type.oracles.clear();
+    for name in ["oracle-a", "oracle-b"] {
+        mission_type.oracles.insert(
+            OracleName::new(name).unwrap(),
+            format!("/nonexistent-mission-type/oracles/{name}").into(),
+        );
+    }
+    let engine = Arc::new(Engine::new(
+        store.clone(),
+        mission_type,
+        "codex".into(),
+        "test-image".into(),
+        EngineServices::new(
+            Arc::new(lionclaw::testing::MockRoleRunner::happy(HEAD_SHA)),
+            Arc::new(AbortOracleRunner {
+                blocked_started: blocked_started.clone(),
+                abort_observed: abort_observed.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    ));
+    let mission_id = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "abort while draining proof",
+            BASE_SHA,
+        )
+        .await
+        .unwrap();
+    let mut plan = simple_plan();
+    plan.assertions[0].oracle = Some(OracleName::new("oracle-a").unwrap());
+    plan.requirements
+        .push(covered_requirement("SECOND-CHECK", "SECOND-PASS"));
+    plan.assertions.push(Assertion {
+        id: AssertionId::new("SECOND-PASS").unwrap(),
+        prose: "the second check passes".into(),
+        oracle: Some(OracleName::new("oracle-b").unwrap()),
+    });
+    plan.tasks[0]
+        .targets
+        .push(AssertionId::new("SECOND-PASS").unwrap());
+    engine
+        .propose_plan(&mission_id, proposal(0, plan))
+        .await
+        .unwrap();
+    approve_plan(&engine, &mission_id).await;
+
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let mission_id = mission_id.clone();
+        async move { engine.advance(&mission_id).await }
+    });
+    blocked_started.notified().await;
+    let attention_id = engine
+        .load_state(&mission_id)
+        .await
+        .unwrap()
+        .open_attention
+        .keys()
+        .find(|id| id.starts_with("oracle_verdict_failed:"))
+        .cloned()
+        .expect("the first oracle failure is durable before its sibling starts");
+    engine
+        .decide(
+            &mission_id,
+            &attention_id,
+            DecisionAction::Abort,
+            "operator aborted the mission",
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+        .await
+        .expect("abort must cancel the active sibling promptly")
+        .expect("driver task")
+        .expect("advance");
+
+    assert!(abort_observed.load(std::sync::atomic::Ordering::SeqCst));
+    let state = engine.load_state(&mission_id).await.unwrap();
+    assert!(matches!(
+        state.phase,
+        lionclaw::model::MissionPhase::Aborted { .. }
+    ));
+    assert!(state.inflight.is_empty());
+    let events = store.load(&mission_id).await.unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        lionclaw::model::MissionEvent::OracleRunCompleted {
+            outcome: Err(failure @ TypedFailure::OperatorAborted { .. }),
+            ..
+        } if failure.evidence().code.as_deref() == Some("test.aborted")
+    )));
+}
+
+#[tokio::test]
 async fn durable_stop_wins_the_outcome_append_race_and_discards_the_candidate() {
     let dir = tempfile::tempdir().unwrap();
     let store = MissionStore::open(dir.path()).await.unwrap();
@@ -419,7 +588,6 @@ async fn durable_stop_wins_the_outcome_append_race_and_discards_the_candidate() 
             dir.path().to_str().unwrap(),
             "linearize a stop against completion",
             BASE_SHA,
-            default_config(),
         )
         .await
         .unwrap();
@@ -517,7 +685,6 @@ async fn settlement_retains_bounded_blob_backed_oracle_stderr() {
             dir.path().to_str().unwrap(),
             "preserve large oracle evidence across settlement",
             BASE_SHA,
-            default_config(),
         )
         .await
         .unwrap();
@@ -566,9 +733,12 @@ async fn deadline_is_durably_linearized_before_one_adapter_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut mission_type = test_mission_type();
+    mission_type.execution.default_timeout_secs = 1;
+    mission_type.execution.max_task_time_secs = 1;
     let engine = Engine::new(
         store.clone(),
-        test_mission_type(),
+        mission_type,
         "codex".into(),
         "test-image".into(),
         EngineServices::new(
@@ -580,16 +750,8 @@ async fn deadline_is_durably_linearized_before_one_adapter_cancellation() {
             Arc::new(RealClock),
         ),
     );
-    let mut config = default_config();
-    config.execution.default_timeout_secs = 1;
-    config.execution.max_task_time_secs = 1;
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "linearize deadline",
-            BASE_SHA,
-            config,
-        )
+        .create_mission(dir.path().to_str().unwrap(), "linearize deadline", BASE_SHA)
         .await
         .unwrap();
     engine
@@ -631,9 +793,17 @@ async fn deadline_is_durably_linearized_before_one_adapter_cancellation() {
 async fn finite_policy_budget_extends_before_the_initial_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let store = MissionStore::open(dir.path()).await.unwrap();
+    let mut mission_type = test_mission_type();
+    mission_type.execution = lionclaw::model::ExecutionPolicy {
+        default_timeout_secs: 1,
+        max_task_time_secs: 2,
+        extension_step_secs: 1,
+        auto_continue_candidate: false,
+        auto_continue_proof: false,
+    };
     let engine = Engine::new(
         store.clone(),
-        test_mission_type(),
+        mission_type,
         "codex".into(),
         "test-image".into(),
         EngineServices::new(
@@ -648,16 +818,6 @@ async fn finite_policy_budget_extends_before_the_initial_deadline() {
             dir.path().to_str().unwrap(),
             "exercise finite policy extension",
             BASE_SHA,
-            lionclaw::model::MissionConfig {
-                execution: lionclaw::model::ExecutionPolicy {
-                    default_timeout_secs: 1,
-                    max_task_time_secs: 2,
-                    extension_step_secs: 1,
-                    auto_continue_candidate: false,
-                    auto_continue_proof: false,
-                },
-                ..default_config()
-            },
         )
         .await
         .unwrap();
@@ -703,14 +863,6 @@ async fn policy_auto_continues_candidate_and_proof_with_recorded_controls() {
             dir.path().to_str().unwrap(),
             "record automatic checkpoints",
             BASE_SHA,
-            lionclaw::model::MissionConfig {
-                execution: lionclaw::model::ExecutionPolicy {
-                    auto_continue_candidate: true,
-                    auto_continue_proof: true,
-                    ..Default::default()
-                },
-                ..default_config()
-            },
         )
         .await
         .unwrap();
@@ -744,9 +896,11 @@ async fn policy_auto_continues_candidate_and_proof_with_recorded_controls() {
 async fn direct_mission_creation_rejects_an_invalid_execution_policy() {
     let dir = tempfile::tempdir().unwrap();
     let store = MissionStore::open(dir.path()).await.unwrap();
+    let mut mission_type = test_mission_type();
+    mission_type.execution.default_timeout_secs = 0;
     let engine = Engine::new(
         store,
-        test_mission_type(),
+        mission_type,
         "codex".into(),
         "test-image".into(),
         EngineServices::new(
@@ -756,15 +910,11 @@ async fn direct_mission_creation_rejects_an_invalid_execution_policy() {
             Arc::new(MockClock::default()),
         ),
     );
-    let mut config = default_config();
-    config.execution.default_timeout_secs = 0;
-
     let error = engine
         .create_mission(
             dir.path().to_str().unwrap(),
             "reject invalid policy",
             BASE_SHA,
-            config,
         )
         .await
         .expect_err("direct callers must not persist invalid execution policy");
@@ -775,7 +925,8 @@ async fn direct_mission_creation_rejects_an_invalid_execution_policy() {
 #[tokio::test]
 async fn mission_creation_rejects_deadlines_unrepresentable_at_its_epoch() {
     let dir = tempfile::tempdir().unwrap();
-    let mission_type = test_mission_type();
+    let mut mission_type = test_mission_type();
+    mission_type.execution.max_task_time_secs = lionclaw::model::MAX_EXECUTION_DURATION_SECS;
     let store = MissionStore::open(dir.path()).await.unwrap();
     let engine = Engine::new(
         store,
@@ -789,15 +940,11 @@ async fn mission_creation_rejects_deadlines_unrepresentable_at_its_epoch() {
             Arc::new(MockClock::default()),
         ),
     );
-    let mut config = default_config();
-    config.execution.max_task_time_secs = lionclaw::model::MAX_EXECUTION_DURATION_SECS;
-
     let error = engine
         .create_mission(
             dir.path().to_str().unwrap(),
             "reject an impossible absolute deadline",
             BASE_SHA,
-            config,
         )
         .await
         .expect_err("policy deadline must fit at the mission epoch");
@@ -832,7 +979,6 @@ async fn mission_creation_rejects_unrepresentable_role_deadlines() {
             dir.path().to_str().unwrap(),
             "reject an impossible role deadline",
             BASE_SHA,
-            default_config(),
         )
         .await
         .expect_err("role deadline must fit at the mission epoch");

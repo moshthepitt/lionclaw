@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use common::{
-    approve_plan, default_config, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
+    approve_plan, fault_append_events, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
 use lionclaw::model::{
@@ -100,7 +100,6 @@ async fn create_approved_mission(
             repo.to_str().unwrap(),
             "exercise mission driver ownership",
             BASE_SHA,
-            default_config(),
         )
         .await
         .unwrap();
@@ -246,30 +245,28 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
 
     let state = engine.load_state(&mission_id).await.unwrap();
     let effect_id = state.inflight.keys().next().unwrap().clone();
-    engine
-        .store()
-        .append(
-            &mission_id,
-            state.head,
-            &[NewEvent::new(MissionEvent::EffectRuntimeConfigured {
-                effect_id,
-                configuration: RuntimeConfigurationEvidence {
-                    requested_model: Some("requested-model".into()),
-                    applied_model: Some("applied-model".into()),
-                    model_confirmation: Some(
-                        lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
-                    ),
-                    requested_mode: Some("build".into()),
-                    applied_mode: Some("build".into()),
-                    mode_confirmation: Some(
-                        lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
-                    ),
-                },
-            })],
-            1,
-        )
-        .await
-        .unwrap();
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        state.head,
+        &[NewEvent::new(MissionEvent::EffectRuntimeConfigured {
+            effect_id,
+            configuration: RuntimeConfigurationEvidence {
+                requested_model: Some("requested-model".into()),
+                applied_model: Some("applied-model".into()),
+                model_confirmation: Some(
+                    lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+                ),
+                requested_mode: Some("build".into()),
+                applied_mode: Some("build".into()),
+                mode_confirmation: Some(
+                    lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+                ),
+            },
+        })],
+        1,
+    )
+    .await;
 
     let parked = engine.advance(&mission_id).await.unwrap();
     assert_eq!(parked.disposition, MissionDisposition::Parked);

@@ -103,6 +103,19 @@ pub struct MissionType {
 }
 
 impl MissionType {
+    /// The complete revision-zero policy persisted at mission creation.
+    /// Mission types are the sole source; replay reads the resolved copy from
+    /// `MissionCreated` and never reopens bundle files.
+    pub fn mission_config(&self) -> crate::model::MissionConfig {
+        crate::model::MissionConfig {
+            stop: self.stop,
+            planning: self.planning.clone(),
+            recovery: self.recovery.clone(),
+            execution: self.execution.clone(),
+            terminal_review: self.terminal_review.clone(),
+        }
+    }
+
     /// The pure inventory plan validation runs against.
     pub fn inventory(&self) -> MissionTypeInventory {
         MissionTypeInventory {

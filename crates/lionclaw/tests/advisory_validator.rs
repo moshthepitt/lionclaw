@@ -6,11 +6,11 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{advisory_plan, approve_plan, proposal, test_mission_type, BASE_SHA, HEAD_SHA};
+use common::{advisory_plan, approve_plan, proposal, review_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::model::{
     AdvisoryStatus, FinishClass, Handoff, MissionEvent, MissionPhase, MissionState,
-    OutputSemantics, PayloadRef, ValidationItem,
+    OutputSemantics, PayloadRef, StopBar, ValidationItem,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -20,45 +20,52 @@ use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectC
 /// handoff that "commits" HEAD_SHA.
 fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
     MockRoleRunner::new(Box::new(move |req: &RoleRunRequest| {
-        let handoff = if req.role.output == OutputSemantics::EmitsVerdict {
-            Handoff::Validate {
-                done: true,
-                report: PayloadRef::inline("reviewed"),
-                items: vec![ValidationItem {
-                    item_id: lionclaw::model::AssertionId::new("STYLE-OK").unwrap(),
+        let outcome = match req.role.output {
+            OutputSemantics::EmitsVerdict => RoleRunOutcome {
+                handoff: Handoff::Validate {
+                    done: true,
+                    report: PayloadRef::inline("reviewed"),
+                    items: vec![ValidationItem {
+                        item_id: lionclaw::model::AssertionId::new("STYLE-OK").unwrap(),
+                        passed: reviewer_passes,
+                    }],
                     passed: reviewer_passes,
-                }],
-                passed: reviewer_passes,
-                request_attention: false,
+                    request_attention: false,
+                },
+                artifact: None,
+                runtime_configuration: Default::default(),
+                final_response: String::new(),
+            },
+            OutputSemantics::EmitsGapVerdict => {
+                lionclaw::testing::review_verdict(req, true, vec![])
             }
-        } else {
-            Handoff::Work {
-                done: true,
-                report: PayloadRef::inline("wrote it"),
-                request_attention: false,
-            }
+            OutputSemantics::ProducesArtifact => RoleRunOutcome {
+                handoff: Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("wrote it"),
+                    request_attention: false,
+                },
+                artifact: Some(lionclaw::model::ArtifactOutcome {
+                    base_sha: req.base_sha.clone(),
+                    head_sha: HEAD_SHA.to_string(),
+                }),
+                runtime_configuration: Default::default(),
+                final_response: String::new(),
+            },
+            output => panic!("unexpected output contract {output:?}"),
         };
-        let artifact = (req.role.output == OutputSemantics::ProducesArtifact).then(|| {
-            lionclaw::model::ArtifactOutcome {
-                base_sha: req.base_sha.clone(),
-                head_sha: HEAD_SHA.to_string(),
-            }
-        });
-        Ok(RoleRunOutcome {
-            handoff,
-            artifact,
-            runtime_configuration: Default::default(),
-            final_response: String::new(),
-        })
+        Ok(outcome)
     }))
 }
 
 async fn drive(role_runner: MockRoleRunner) -> (MissionState, Vec<lionclaw::model::EventEnvelope>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = MissionStore::open(dir.path()).await.expect("store");
+    let mut mission_type = review_mission_type();
+    mission_type.stop = StopBar::Reviewed;
     let engine = Engine::new(
         store.clone(),
-        test_mission_type(),
+        mission_type,
         "codex".to_string(),
         "test-image".to_string(),
         EngineServices::new(
@@ -73,7 +80,6 @@ async fn drive(role_runner: MockRoleRunner) -> (MissionState, Vec<lionclaw::mode
             dir.path().to_str().unwrap(),
             "advisory-only mission",
             BASE_SHA,
-            common::default_config(),
         )
         .await
         .expect("create");

@@ -815,6 +815,28 @@ impl MissionState {
                 .unwrap_or_default()
                 < self.config.recovery.max_attempts
     }
+
+    /// Assertions the named oracle still owes at the current deliverable.
+    /// This is the shared proof query used by scheduling and request ingress.
+    pub(crate) fn owed_assertions_for_oracle(&self, oracle: &OracleName) -> Vec<AssertionId> {
+        self.contract
+            .iter()
+            .filter(|(_, assertion)| {
+                assertion.oracle.as_ref() == Some(oracle)
+                    && assertion
+                        .last_authoritative
+                        .as_ref()
+                        .is_none_or(|verdict| !verdict.is_fresh_at(self.deliverable_head()))
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    pub(crate) fn oracle_dispatchable(&self, oracle: &OracleName) -> bool {
+        !self.waived_oracles.contains(oracle)
+            && (!self.oracle_failures.contains_key(oracle)
+                || self.oracle_automatic_retry_remaining(oracle))
+    }
 }
 
 #[cfg(test)]

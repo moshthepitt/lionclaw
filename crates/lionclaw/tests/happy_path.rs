@@ -4,8 +4,8 @@
 mod common;
 
 use common::{
-    approve_plan, covered_requirement, default_config, harness, proposal, simple_plan,
-    test_mission_type, BASE_SHA, HEAD_SHA,
+    approve_plan, covered_requirement, harness, proposal, simple_plan, test_mission_type, BASE_SHA,
+    HEAD_SHA,
 };
 use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{Assertion, AssertionId, FinishClass, MissionPhase, OracleName, TaskStatus};
@@ -26,7 +26,6 @@ async fn passing_oracle_yields_verified_finish() {
             dir.path().to_str().expect("utf8"),
             "make the tests pass",
             BASE_SHA,
-            default_config(),
         )
         .await
         .expect("create");
@@ -95,7 +94,6 @@ async fn durable_role_outcomes_bound_adapter_configuration_evidence() {
             dir.path().to_str().expect("utf8"),
             "bound runtime evidence",
             BASE_SHA,
-            default_config(),
         )
         .await
         .expect("create");
@@ -125,6 +123,7 @@ async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
         OracleName::new("lint").unwrap(),
         "/nonexistent-mission-type/oracles/lint".into(),
     );
+    mission_type.execution.auto_continue_proof = false;
     let h = common::harness_with_type(
         dir.path(),
         mission_type,
@@ -143,15 +142,12 @@ async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
     plan.tasks[0]
         .targets
         .push(AssertionId::new("LINT-PASS").unwrap());
-    let mut config = default_config();
-    config.execution.auto_continue_proof = false;
     let mission_id = h
         .engine
         .create_mission(
             dir.path().to_str().unwrap(),
             "run the complete proof batch",
             BASE_SHA,
-            config,
         )
         .await
         .unwrap();
@@ -200,7 +196,6 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
             dir.path().to_str().expect("utf8"),
             "confirm the existing implementation",
             BASE_SHA,
-            default_config(),
         )
         .await
         .expect("create");
@@ -241,7 +236,6 @@ async fn failing_oracle_never_reports_verified() {
             dir.path().to_str().expect("utf8"),
             "make the tests pass",
             BASE_SHA,
-            default_config(),
         )
         .await
         .expect("create");
@@ -296,7 +290,6 @@ async fn worker_reporting_not_done_parks_with_attention() {
             dir.path().to_str().expect("utf8"),
             "make the tests pass",
             BASE_SHA,
-            default_config(),
         )
         .await
         .expect("create");
@@ -310,5 +303,125 @@ async fn worker_reporting_not_done_parks_with_attention() {
     let attention: Vec<_> = outcome.state.open_attention.values().collect();
     assert_eq!(attention.len(), 1);
     // Parked means parked: no oracle ever ran.
+    assert!(h.oracle_runner.calls.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn role_runner_cannot_inject_a_durable_blob_reference() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::new(Box::new(|request| {
+            Ok(lionclaw::ports::RoleRunOutcome {
+                handoff: lionclaw::model::Handoff::Work {
+                    done: true,
+                    report: lionclaw::model::PayloadRef::Blob(lionclaw::model::BlobRef {
+                        algo: "sha256".into(),
+                        hex: "a".repeat(64),
+                        len: 1,
+                    }),
+                    request_attention: false,
+                },
+                artifact: Some(lionclaw::model::ArtifactOutcome {
+                    base_sha: request.base_sha.clone(),
+                    head_sha: HEAD_SHA.into(),
+                }),
+                runtime_configuration: Default::default(),
+                final_response: "attempted injection".into(),
+            })
+        })),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "reject blob refs",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+
+    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    assert_eq!(outcome.state.current_sha, BASE_SHA);
+    let failure = outcome
+        .state
+        .tasks
+        .values()
+        .next()
+        .unwrap()
+        .last_failure
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        failure.evidence().code.as_deref(),
+        Some("handoff.payload_ref")
+    );
+    assert!(h.oracle_runner.calls.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn role_runner_oversized_report_is_a_durable_invalid_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::new(Box::new(|request| {
+            Ok(lionclaw::ports::RoleRunOutcome {
+                handoff: lionclaw::model::Handoff::Work {
+                    done: true,
+                    report: lionclaw::model::PayloadRef::inline(
+                        "x".repeat(lionclaw::runner::MAX_HANDOFF_REPORT_BYTES + 1),
+                    ),
+                    request_attention: false,
+                },
+                artifact: Some(lionclaw::model::ArtifactOutcome {
+                    base_sha: request.base_sha.clone(),
+                    head_sha: HEAD_SHA.into(),
+                }),
+                runtime_configuration: Default::default(),
+                final_response: "oversized report".into(),
+            })
+        })),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "reject oversized reports",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+
+    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    assert_eq!(outcome.state.current_sha, BASE_SHA);
+    let failure = outcome
+        .state
+        .tasks
+        .values()
+        .next()
+        .unwrap()
+        .last_failure
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        failure.evidence().code.as_deref(),
+        Some("handoff.report_too_large")
+    );
     assert!(h.oracle_runner.calls.lock().expect("lock").is_empty());
 }

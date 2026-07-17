@@ -288,6 +288,16 @@ impl Handoff {
                 )
         )
     }
+
+    /// Narrative report carried by every role handoff variant.
+    pub const fn report(&self) -> &PayloadRef {
+        match self {
+            Self::Work { report, .. }
+            | Self::Validate { report, .. }
+            | Self::Review { report, .. }
+            | Self::Plan { report, .. } => report,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

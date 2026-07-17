@@ -188,6 +188,16 @@ impl OracleRunner for OciOracleRunner {
                     evidence: Box::new(evidence),
                 })
             }
+            ExecutionControl::Abort(reason) => {
+                let mut evidence = TypedFailureEvidence::new(
+                    Some("oracle.aborted".into()),
+                    "oracle cancelled because the mission was aborted",
+                );
+                evidence.stop_reason = Some(reason.clone());
+                Some(TypedFailure::OperatorAborted {
+                    evidence: Box::new(evidence),
+                })
+            }
         })
         .await
     }

@@ -200,25 +200,16 @@ fn step_running(state: &MissionState) -> StepDecision {
     // they park for a human (see `oracle_failures`) rather than loop.
     if oracle_obligation_outstanding(state) {
         let mut by_oracle: BTreeMap<OracleName, Vec<AssertionId>> = BTreeMap::new();
-        for (id, assertion) in &state.contract {
+        for assertion in state.contract.values() {
             let Some(oracle) = &assertion.oracle else {
                 continue;
             };
-            if (state.oracle_failures.contains_key(oracle)
-                && !state.oracle_automatic_retry_remaining(oracle))
-                || state.waived_oracles.contains(oracle)
-            {
+            if !state.oracle_dispatchable(oracle) || by_oracle.contains_key(oracle) {
                 continue;
             }
-            let fresh = assertion
-                .last_authoritative
-                .as_ref()
-                .is_some_and(|v| v.is_fresh_at(state.deliverable_head()));
-            if !fresh {
-                by_oracle
-                    .entry(oracle.clone())
-                    .or_default()
-                    .push(id.clone());
+            let owed = state.owed_assertions_for_oracle(oracle);
+            if !owed.is_empty() {
+                by_oracle.insert(oracle.clone(), owed);
             }
         }
         let intents = by_oracle
@@ -1027,27 +1018,25 @@ mod tests {
         let mut events = review_brink();
         events.push(review_requested(1, "k-tr-1", "sha-1"));
         events.push(review_completed("k-tr-1", "sha-1", true, 0));
-        // New work moves the head; the oracle re-judges; the clean sha-1
-        // verdict is stale — a second review dispatches at the new head.
-        events.push(role_requested_at_base(
-            "w1",
-            2,
-            "k-w1-2",
-            "implementer",
-            crate::OutputSemantics::ProducesArtifact,
-            "sha-1",
-        ));
-        events.push(work_done_at("w1", 2, "k-w1-2", Some(("sha-1", "sha-2"))));
-        events.push(oracle_requested(&["A1"], "tests", "sha-2", 2, "k-tests-2"));
-        events.push(oracle_completed(
-            &["A1"],
-            "tests",
-            "sha-2",
-            2,
-            "k-tests-2",
+        let mut state = fold_log(events);
+        // Later slices may produce a new deliverable through a different
+        // lineage. With proof fresh at sha-2, the sha-1 closing review is
+        // stale and must dispatch again.
+        state.current_sha = "sha-2".into();
+        state
+            .contract
+            .get_mut(&aid("A1"))
+            .expect("assertion")
+            .last_authoritative = Some(crate::AuthoritativeVerdict::from_oracle_outcome(
+            oname("tests"),
+            "sha-2".into(),
             0,
+            None,
+            PayloadRef::inline("pass"),
+            PayloadRef::inline(""),
+            Vec::new(),
         ));
-        let state = fold_log(events);
+        state.phase = MissionPhase::Running;
         let intent = review_dispatched(&state);
         assert_eq!(intent.attempt_no, 2);
         assert_eq!(intent.judged_sha, "sha-2");

@@ -32,6 +32,7 @@ use crate::prompt::{
     PlanningPromptContext, PlanningPromptInput, PlanningPromptRefinement, PromptContext,
     TerminalReviewPromptContext,
 };
+use crate::runner::MAX_HANDOFF_REPORT_BYTES;
 use crate::store::{AppendError, MissionStore, NewEvent};
 
 pub struct Engine {
@@ -292,19 +293,11 @@ impl Engine {
         workspace_dir: &str,
         objective: &str,
         base_sha: &str,
-        config: crate::model::MissionConfig,
     ) -> Result<MissionId> {
         let now_ms = self.clock.now_ms();
         let mission_id = MissionId::for_creation(workspace_dir, objective, now_ms);
-        self.create_mission_with_id(
-            mission_id,
-            now_ms,
-            workspace_dir,
-            objective,
-            base_sha,
-            config,
-        )
-        .await
+        self.create_mission_with_id(mission_id, now_ms, workspace_dir, objective, base_sha)
+            .await
     }
 
     pub(crate) async fn create_mission_with_id(
@@ -314,8 +307,8 @@ impl Engine {
         workspace_dir: &str,
         objective: &str,
         base_sha: &str,
-        config: crate::model::MissionConfig,
     ) -> Result<MissionId> {
+        let config = self.mission_type.mission_config();
         config
             .execution
             .validate_at(now_ms)
@@ -327,15 +320,9 @@ impl Engine {
                 })?;
             }
         }
-        if config.planning != self.mission_type.planning {
-            bail!(
-                "mission planning DAG must exactly match pinned mission type '{}'",
-                self.mission_type.name
-            );
-        }
-        // The loader enforces both rules for mission types; enforce them here
-        // too so no direct caller can mint a config the closing gate cannot
-        // honor (the fold is total and cannot refuse the config).
+        // The loader enforces both rules for bundles; enforce them here too
+        // for directly constructed MissionType values before the fold records
+        // their resolved revision-zero policy.
         if config.stop == crate::model::StopBar::Reviewed && config.terminal_review.is_none() {
             bail!(
                 "a reviewed-bar mission requires a terminal review: \
@@ -585,6 +572,24 @@ impl Engine {
             let Some(active) = current.inflight.get(effect_id) else {
                 return Ok(true);
             };
+            if let MissionPhase::Aborted { reason } = &current.phase {
+                if !self.cleanup_effect(&current, effect_id, true).await? {
+                    return Ok(false);
+                }
+                if self
+                    .append_outcome(
+                        &current.mission_id,
+                        effect_id,
+                        aborted_before_start_outcome(effect_id, active, reason),
+                        true,
+                    )
+                    .await?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
             if let Some(reason) = current.stop_requests.get(effect_id) {
                 if !self.cleanup_effect(&current, effect_id, true).await? {
                     return Ok(false);
@@ -642,6 +647,10 @@ impl Engine {
                     let Some(active) = current.inflight.get(effect_id) else {
                         bail!("active effect '{effect_id}' disappeared without an outcome");
                     };
+                    if let MissionPhase::Aborted { reason } = &current.phase {
+                        control_tx.send_replace(ExecutionControl::Abort(reason.clone()));
+                        continue;
+                    }
                     if current.reached_deadlines.contains_key(effect_id) {
                         control_tx.send_replace(ExecutionControl::DeadlineExhausted);
                         continue;
@@ -1070,7 +1079,24 @@ impl Engine {
                         ))));
                     }
                 }
-                let handoff = self.externalize_handoff(outcome.handoff)?;
+                let handoff = match self.externalize_handoff(&outcome.handoff) {
+                    Ok(handoff) => handoff,
+                    Err(failure) => {
+                        return Ok(completed(Err(with_role_outcome_evidence(
+                            failure, &outcome,
+                        ))));
+                    }
+                };
+                let final_response = match self
+                    .externalize_role_payload(PayloadRef::inline(outcome.final_response.clone()))
+                {
+                    Ok(response) => response,
+                    Err(failure) => {
+                        return Ok(completed(Err(with_role_outcome_evidence(
+                            failure, &outcome,
+                        ))));
+                    }
+                };
                 let settlement_evidence = lionclaw_runtime_api::TypedFailureEvidence {
                     final_response: outcome.final_response.clone(),
                     configuration: runtime_configuration_evidence(&outcome.runtime_configuration),
@@ -1079,10 +1105,7 @@ impl Engine {
                 Ok(completed(Ok(RoleRunSuccess {
                     handoff,
                     artifact: outcome.artifact,
-                    final_response: self
-                        .store
-                        .blobs()
-                        .externalize(PayloadRef::inline(outcome.final_response))?,
+                    final_response,
                     runtime_configuration: outcome.runtime_configuration,
                 }))
                 .with_settlement_evidence(settlement_evidence))
@@ -1323,10 +1346,19 @@ impl Engine {
         tasks: &std::collections::BTreeMap<crate::model::TaskId, crate::model::TaskRuntimeState>,
         depends_on: &[crate::model::TaskId],
     ) -> Result<Vec<String>> {
+        const MAX_UPSTREAM_REPORT_BYTES: usize =
+            crate::model::MAX_TASK_DEPENDENCIES * MAX_HANDOFF_REPORT_BYTES;
         let mut reports = Vec::new();
+        let mut remaining = MAX_UPSTREAM_REPORT_BYTES;
         for dep in depends_on {
             if let Some(report) = tasks.get(dep).and_then(|t| t.last_report.as_ref()) {
-                reports.push(self.store.blobs().resolve(report)?);
+                let resolved = self
+                    .store
+                    .blobs()
+                    .resolve_bounded(report, remaining)
+                    .context("accepted upstream reports exceeded their aggregate prompt budget")?;
+                remaining -= resolved.len();
+                reports.push(resolved);
             }
         }
         Ok(reports)
@@ -1673,16 +1705,16 @@ impl Engine {
             .await
     }
 
-    fn externalize_handoff(&self, handoff: Handoff) -> Result<Handoff> {
+    fn externalize_handoff(&self, handoff: &Handoff) -> Result<Handoff, TypedFailure> {
         Ok(match handoff {
             Handoff::Work {
                 done,
                 report,
                 request_attention,
             } => Handoff::Work {
-                done,
-                report: self.store.blobs().externalize(report)?,
-                request_attention,
+                done: *done,
+                report: self.externalize_handoff_report(report.clone())?,
+                request_attention: *request_attention,
             },
             Handoff::Validate {
                 done,
@@ -1691,11 +1723,11 @@ impl Engine {
                 passed,
                 request_attention,
             } => Handoff::Validate {
-                done,
-                report: self.store.blobs().externalize(report)?,
-                items,
-                passed,
-                request_attention,
+                done: *done,
+                report: self.externalize_handoff_report(report.clone())?,
+                items: items.clone(),
+                passed: *passed,
+                request_attention: *request_attention,
             },
             Handoff::Review {
                 done,
@@ -1704,12 +1736,12 @@ impl Engine {
                 gaps,
                 nonce,
             } => Handoff::Review {
-                done,
-                report: self.store.blobs().externalize(report)?,
-                passed,
+                done: *done,
+                report: self.externalize_handoff_report(report.clone())?,
+                passed: *passed,
                 // Typed and KB-scale, like `proposal` below — stays inline.
-                gaps,
-                nonce,
+                gaps: gaps.clone(),
+                nonce: nonce.clone(),
             },
             Handoff::Plan {
                 done,
@@ -1717,13 +1749,43 @@ impl Engine {
                 proposal,
                 request_attention,
             } => Handoff::Plan {
-                done,
-                report: self.store.blobs().externalize(report)?,
+                done: *done,
+                report: self.externalize_handoff_report(report.clone())?,
                 // The proposal stays inline (KB-scale, typed); only the prose
                 // report is externalized above the blob threshold.
-                proposal,
-                request_attention,
+                proposal: proposal.clone(),
+                request_attention: *request_attention,
             },
+        })
+    }
+
+    fn externalize_handoff_report(&self, payload: PayloadRef) -> Result<PayloadRef, TypedFailure> {
+        if let PayloadRef::Inline { text } = &payload {
+            if text.len() > MAX_HANDOFF_REPORT_BYTES {
+                return Err(TypedFailure::invalid(
+                    "handoff.report_too_large",
+                    format!(
+                        "handoff report is {} bytes; the limit is {MAX_HANDOFF_REPORT_BYTES}",
+                        text.len()
+                    ),
+                ));
+            }
+        }
+        self.externalize_role_payload(payload)
+    }
+
+    fn externalize_role_payload(&self, payload: PayloadRef) -> Result<PayloadRef, TypedFailure> {
+        if matches!(payload, PayloadRef::Blob(_)) {
+            return Err(TypedFailure::invalid(
+                "handoff.payload_ref",
+                "role output must provide inline text; only the engine may mint blob references",
+            ));
+        }
+        self.store.blobs().externalize(payload).map_err(|error| {
+            TypedFailure::permanent(
+                "kernel.blob_store",
+                format!("failed to persist role output: {error}"),
+            )
         })
     }
 }
@@ -1848,6 +1910,26 @@ fn stopped_before_start_outcome(
     failed_outcome(effect_id, effect, failure)
 }
 
+fn aborted_before_start_outcome(
+    effect_id: &EffectId,
+    effect: &InflightEffect,
+    reason: &str,
+) -> NewEvent {
+    let mut evidence = lionclaw_runtime_api::TypedFailureEvidence::new(
+        Some("control.aborted_before_start".into()),
+        "mission aborted before the effect runtime started",
+    );
+    evidence.stop_reason = Some(reason.to_string());
+    failed_outcome(
+        effect_id,
+        effect,
+        TypedFailure::OperatorAborted {
+            evidence: Box::new(evidence),
+        },
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SettlementKind {
     Abort,
     Stop,
@@ -1886,6 +1968,9 @@ fn settlement_failure(
             }
         }
     };
+    if outcome_settlement_kind(&outcome.event) == Some(category) {
+        return None;
+    }
     let mut evidence = outcome
         .settlement_evidence
         .clone()
@@ -1907,6 +1992,30 @@ fn settlement_failure(
         }
         .projected(),
     )
+}
+
+fn outcome_settlement_kind(outcome: &MissionEvent) -> Option<SettlementKind> {
+    let failure = match outcome {
+        MissionEvent::RoleRunCompleted {
+            outcome: Err(failure),
+            ..
+        }
+        | MissionEvent::OracleRunCompleted {
+            outcome: Err(failure),
+            ..
+        }
+        | MissionEvent::TerminalReviewCompleted {
+            outcome: Err(failure),
+            ..
+        } => failure,
+        _ => return None,
+    };
+    match failure {
+        TypedFailure::OperatorAborted { .. } => Some(SettlementKind::Abort),
+        TypedFailure::OperatorStopped { .. } => Some(SettlementKind::Stop),
+        TypedFailure::DeadlineExhausted { .. } => Some(SettlementKind::Deadline),
+        _ => None,
+    }
 }
 
 fn outcome_failure_evidence(outcome: &MissionEvent) -> lionclaw_runtime_api::TypedFailureEvidence {
@@ -2137,7 +2246,13 @@ fn invalid_role_outcome(
     detail: impl Into<String>,
     outcome: &crate::ports::RoleRunOutcome,
 ) -> TypedFailure {
-    let mut failure = TypedFailure::invalid(code, detail);
+    with_role_outcome_evidence(TypedFailure::invalid(code, detail), outcome)
+}
+
+fn with_role_outcome_evidence(
+    mut failure: TypedFailure,
+    outcome: &crate::ports::RoleRunOutcome,
+) -> TypedFailure {
     failure.evidence_mut().final_response = outcome.final_response.clone();
     failure.evidence_mut().configuration =
         runtime_configuration_evidence(&outcome.runtime_configuration);

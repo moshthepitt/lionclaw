@@ -60,7 +60,7 @@ pub use plan::{
 };
 pub use plan_validation::{
     validate_plan, validate_plan_proposal, validate_planning_dag, MissionTypeInventory,
-    PlanValidationError, ProposalError,
+    PlanValidationError, ProposalError, MAX_TASK_DEPENDENCIES,
 };
 pub use state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, EffectCleanupFailure,

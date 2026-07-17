@@ -3,15 +3,16 @@
 //! Every role and oracle gets the same self-contained checkout at its exact
 //! base commit. The authority compiler decides whether that checkout is mounted
 //! read-write or read-only; workspace materialization has no role policy of its
-//! own. `--no-hardlinks --dissociate` keeps confined Git objects independent
-//! from the user repository and any object store it borrows from, including
-//! under OCI relabeling. Artifact-producing output is a recorded commit fetched
-//! back under `refs/mission/…`, never auto-applied.
+//! own. `--no-local` uses Git's normal transport instead of copying or linking
+//! the source object store, keeping confined objects independent and packed.
+//! Artifact-producing output is a recorded commit fetched back under
+//! `refs/mission/…`, never auto-applied.
 
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -131,8 +132,7 @@ pub async fn create_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()> 
     clone.args([
         "clone",
         "--quiet",
-        "--no-hardlinks",
-        "--dissociate",
+        "--no-local",
         "--no-checkout",
         "-c",
         "core.untrackedCache=false",
@@ -148,6 +148,21 @@ pub async fn create_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()> 
     ]);
     clone.arg(repo).arg(dest);
     run(&mut clone, "git clone").await?;
+    // Normal clone refspecs do not retain LionClaw's private refs/mission/*
+    // namespace. Fetch the already-resolved object explicitly so a captured
+    // candidate remains materializable without copying the whole source object
+    // store.
+    git(
+        dest,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            "origin",
+            expected,
+        ],
+    )
+    .await?;
     git(dest, &["checkout", "--quiet", "--detach", expected]).await?;
     let actual = task_head_sha(dest).await?;
     if actual != expected {
@@ -314,6 +329,7 @@ pub async fn capture_worker_result(
         });
     }
     let fetch_source = observer.local_fetch_source()?;
+    let fetch_url = format!("file://{}", fetch_source.display());
     // Fetch the checkout's HEAD commit so the object we report is the object we
     // store, regardless of which refs the agent created or moved locally.
     let mission_ref = format!("refs/mission/{mission_id}/{effect_id}");
@@ -327,7 +343,7 @@ pub async fn capture_worker_result(
             "--no-write-fetch-head",
             "--no-auto-maintenance",
         ])
-        .arg(fetch_source)
+        .arg(&fetch_url)
         .arg(&refspec);
     run(&mut fetch, "git fetch from worker checkout").await?;
     // The engine observes the commit from Git, never trusts the agent: verify
@@ -533,12 +549,14 @@ struct TaskGitObserver {
 impl TaskGitObserver {
     async fn open(worktree: &Path) -> Result<Self> {
         let worktree = worktree.to_path_buf();
-        tokio::task::spawn_blocking(move || Self::open_blocking(&worktree))
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelBlockingTraversal(cancelled.clone());
+        tokio::task::spawn_blocking(move || Self::open_blocking(&worktree, &cancelled))
             .await
             .context("joining task Git metadata observer")?
     }
 
-    fn open_blocking(worktree: &Path) -> Result<Self> {
+    fn open_blocking(worktree: &Path, cancelled: &AtomicBool) -> Result<Self> {
         directory(worktree, "task worktree")?;
         let dot_git = worktree.join(".git");
         let git_dir = directory(&dot_git, "standalone task Git directory").with_context(|| {
@@ -559,7 +577,7 @@ impl TaskGitObserver {
         let head = resolve_task_head(&git_dir)?;
         let index = regular_file(&git_dir.join("index"), "Git index")?;
         let objects = directory(&git_dir.join("objects"), "Git object database")?;
-        validate_worker_object_database(&objects)?;
+        validate_worker_object_database(&objects, cancelled)?;
         Self::create(worktree, index, objects, &head)
     }
 
@@ -706,22 +724,39 @@ impl TaskGitObserver {
     }
 }
 
-const MAX_WORKER_OBJECT_ENTRIES: usize = 1_000_000;
+/// Fresh task clones are transferred as packs (`--no-local`), so this budget
+/// covers the bounded loose objects a worker can legitimately create while
+/// preventing capture/observation from becoming an unbounded host traversal.
+const MAX_WORKER_OBJECT_ENTRIES: usize = 16 * 1024;
 const MAX_WORKER_OBJECT_DEPTH: usize = 16;
+
+struct CancelBlockingTraversal(Arc<AtomicBool>);
+
+impl Drop for CancelBlockingTraversal {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 /// Capture runs only after the runtime is gone. Before passing the worker's
 /// object database to host Git, reject every indirection and special file so
 /// Git cannot escape into another host path.
-fn validate_worker_object_database(root: &Path) -> Result<()> {
+fn validate_worker_object_database(root: &Path, cancelled: &AtomicBool) -> Result<()> {
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
     let mut entries = 0_usize;
     while let Some((directory, depth)) = pending.pop() {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("worker Git object validation was cancelled");
+        }
         if depth > MAX_WORKER_OBJECT_DEPTH {
             bail!("worker Git object database exceeds the depth limit");
         }
         for entry in std::fs::read_dir(&directory)
             .with_context(|| format!("reading Git object directory '{}'", directory.display()))?
         {
+            if cancelled.load(Ordering::Acquire) {
+                bail!("worker Git object validation was cancelled");
+            }
             let entry = entry?;
             entries = entries.saturating_add(1);
             if entries > MAX_WORKER_OBJECT_ENTRIES {
@@ -1120,7 +1155,7 @@ mod tests {
             .await
             .unwrap();
         let pack = checkout.join(".git/objects/pack");
-        std::fs::remove_dir(&pack).unwrap();
+        std::fs::remove_dir_all(&pack).unwrap();
         symlink(repo.path().join(".git/objects/pack"), &pack).unwrap();
 
         let effect_id = EffectId::for_parts(&["test", "object-pack-symlink"]);
@@ -1223,6 +1258,25 @@ mod tests {
             .await
             .expect_err("task observation must not follow an external object database");
         assert!(error.to_string().contains("alternate"));
+    }
+
+    #[tokio::test]
+    async fn task_observer_construction_has_a_small_object_tree_budget() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let objects = repo.path().join(".git/objects/aa");
+        std::fs::create_dir_all(&objects).unwrap();
+        for index in 0..=MAX_WORKER_OBJECT_ENTRIES {
+            std::fs::write(objects.join(format!("{index:08x}")), b"x").unwrap();
+        }
+
+        let started = tokio::time::Instant::now();
+        let error = match TaskGitObserver::open(repo.path()).await {
+            Ok(_) => panic!("oversized worker object trees must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("entry limit"));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
@@ -1485,9 +1539,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn checkout_does_not_hardlink_git_objects_to_the_source() {
-        use std::os::unix::fs::MetadataExt;
-
+    async fn checkout_transfers_source_objects_into_an_independent_pack() {
         let repo = tempfile::tempdir().unwrap();
         let head = init_repo(repo.path()).await;
         let attempt = tempfile::tempdir().unwrap();
@@ -1497,13 +1549,22 @@ mod tests {
             .await
             .unwrap();
 
-        let object = Path::new("objects").join(&head[..2]).join(&head[2..]);
-        let source = std::fs::metadata(repo.path().join(".git").join(&object)).unwrap();
-        let isolated = std::fs::metadata(checkout.join(".git").join(&object)).unwrap();
-        assert_ne!(
-            (source.dev(), source.ino()),
-            (isolated.dev(), isolated.ino()),
-            "confined checkout objects must not share source-repository inodes"
+        let source_loose_object = Path::new("objects").join(&head[..2]).join(&head[2..]);
+        assert!(repo
+            .path()
+            .join(".git")
+            .join(&source_loose_object)
+            .is_file());
+        assert!(
+            !checkout.join(".git").join(&source_loose_object).exists(),
+            "normal transport must not copy the source's loose-object topology"
+        );
+        assert!(
+            std::fs::read_dir(checkout.join(".git/objects/pack"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("pack")),
+            "normal transport must materialize the reachable source history as a pack"
         );
     }
 

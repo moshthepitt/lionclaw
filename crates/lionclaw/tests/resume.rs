@@ -4,14 +4,15 @@
 mod common;
 
 use common::{
-    approve_plan, default_config, effect_id, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA,
+    approve_plan, effect_id, fault_append_events, harness, proposal, simple_plan, BASE_SHA,
+    HEAD_SHA,
 };
 use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{
     ArtifactOutcome, Handoff, MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef,
     RoleRunSuccess, RuntimeConfigurationEvidence, TaskId,
 };
-use lionclaw::store::{AppendError, NewEvent};
+use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 #[tokio::test]
@@ -25,12 +26,7 @@ async fn rerun_after_finish_appends_nothing_and_invokes_nothing() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().expect("utf8"),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA)
         .await
         .expect("create");
     h.engine
@@ -70,12 +66,7 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().expect("utf8"),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA)
         .await
         .expect("create");
     h.engine
@@ -85,32 +76,30 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
     approve_plan(&h.engine, &mission_id).await;
     let id = effect_id("crashed-role");
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    h.engine
-        .store()
-        .append(
-            &mission_id,
-            state.head,
-            &[NewEvent::new(MissionEvent::RoleRunRequested {
-                namespace: lionclaw::model::TaskNamespace::Execution,
-                task_id: lionclaw::model::TaskId::new("fix").expect("task id"),
-                attempt_no: 1,
-                effect_id: id.clone(),
-                role: lionclaw::model::RoleName::new("implementer").expect("role"),
-                output: OutputSemantics::ProducesArtifact,
-                runtime: "codex".to_string(),
-                prompt: lionclaw::model::PayloadRef::inline("prompt"),
-                base_sha: BASE_SHA.to_string(),
-                assignment_epoch: 1,
-                recreate_workspace: true,
-                requested_at_ms: 0,
-                not_before_ms: 0,
-                deadline_ms: 100_000,
-                budget_deadline_ms: 100_000,
-            })],
-            1,
-        )
-        .await
-        .expect("append request");
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        state.head,
+        &[NewEvent::new(MissionEvent::RoleRunRequested {
+            namespace: lionclaw::model::TaskNamespace::Execution,
+            task_id: lionclaw::model::TaskId::new("fix").expect("task id"),
+            attempt_no: 1,
+            effect_id: id.clone(),
+            role: lionclaw::model::RoleName::new("implementer").expect("role"),
+            output: OutputSemantics::ProducesArtifact,
+            runtime: "codex".to_string(),
+            prompt: lionclaw::model::PayloadRef::inline("prompt"),
+            base_sha: BASE_SHA.to_string(),
+            assignment_epoch: 1,
+            recreate_workspace: true,
+            requested_at_ms: 0,
+            not_before_ms: 0,
+            deadline_ms: 100_000,
+            budget_deadline_ms: 100_000,
+        })],
+        1,
+    )
+    .await;
 
     let view = h.engine.advance(&mission_id).await.expect("advance");
     assert_eq!(view.disposition, MissionDisposition::Parked);
@@ -147,12 +136,7 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().expect("utf8"),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA)
         .await
         .expect("create");
     h.engine
@@ -166,63 +150,61 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
     let oracle_effect = effect_id("crashed-oracle");
     let oracle = OracleName::new("cargo-test").expect("oracle");
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    h.engine
-        .store()
-        .append(
-            &mission_id,
-            state.head,
-            &[
-                NewEvent::new(MissionEvent::RoleRunRequested {
-                    namespace: lionclaw::model::TaskNamespace::Execution,
-                    task_id: task_id.clone(),
-                    attempt_no: 1,
-                    effect_id: role_effect.clone(),
-                    role: lionclaw::model::RoleName::new("implementer").expect("role"),
-                    output: OutputSemantics::ProducesArtifact,
-                    runtime: "codex".to_string(),
-                    prompt: PayloadRef::inline("prompt"),
-                    base_sha: BASE_SHA.to_string(),
-                    assignment_epoch: 1,
-                    recreate_workspace: true,
-                    requested_at_ms: 0,
-                    not_before_ms: 0,
-                    deadline_ms: 100_000,
-                    budget_deadline_ms: 100_000,
-                }),
-                NewEvent::new(MissionEvent::RoleRunCompleted {
-                    namespace: lionclaw::model::TaskNamespace::Execution,
-                    task_id,
-                    attempt_no: 1,
-                    effect_id: role_effect,
-                    outcome: Ok(RoleRunSuccess {
-                        handoff: Handoff::Work {
-                            done: true,
-                            report: PayloadRef::inline("done"),
-                            request_attention: false,
-                        },
-                        artifact: Some(ArtifactOutcome {
-                            base_sha: BASE_SHA.to_string(),
-                            head_sha: HEAD_SHA.to_string(),
-                        }),
-                        final_response: PayloadRef::inline("done"),
-                        runtime_configuration: RuntimeConfigurationEvidence::default(),
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        state.head,
+        &[
+            NewEvent::new(MissionEvent::RoleRunRequested {
+                namespace: lionclaw::model::TaskNamespace::Execution,
+                task_id: task_id.clone(),
+                attempt_no: 1,
+                effect_id: role_effect.clone(),
+                role: lionclaw::model::RoleName::new("implementer").expect("role"),
+                output: OutputSemantics::ProducesArtifact,
+                runtime: "codex".to_string(),
+                prompt: PayloadRef::inline("prompt"),
+                base_sha: BASE_SHA.to_string(),
+                assignment_epoch: 1,
+                recreate_workspace: true,
+                requested_at_ms: 0,
+                not_before_ms: 0,
+                deadline_ms: 100_000,
+                budget_deadline_ms: 100_000,
+            }),
+            NewEvent::new(MissionEvent::RoleRunCompleted {
+                namespace: lionclaw::model::TaskNamespace::Execution,
+                task_id,
+                attempt_no: 1,
+                effect_id: role_effect,
+                outcome: Ok(RoleRunSuccess {
+                    handoff: Handoff::Work {
+                        done: true,
+                        report: PayloadRef::inline("done"),
+                        request_attention: false,
+                    },
+                    artifact: Some(ArtifactOutcome {
+                        base_sha: BASE_SHA.to_string(),
+                        head_sha: HEAD_SHA.to_string(),
                     }),
+                    final_response: PayloadRef::inline("done"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
                 }),
-                NewEvent::new(MissionEvent::OracleRunRequested {
-                    assertion_ids: vec![lionclaw::model::AssertionId::new("TESTS-PASS").unwrap()],
-                    oracle: oracle.clone(),
-                    judged_sha: HEAD_SHA.to_string(),
-                    attempt_no: 1,
-                    effect_id: oracle_effect.clone(),
-                    requested_at_ms: 0,
-                    not_before_ms: 0,
-                    deadline_ms: 100_000,
-                }),
-            ],
-            1,
-        )
-        .await
-        .expect("append requests");
+            }),
+            NewEvent::new(MissionEvent::OracleRunRequested {
+                assertion_ids: vec![lionclaw::model::AssertionId::new("TESTS-PASS").unwrap()],
+                oracle: oracle.clone(),
+                judged_sha: HEAD_SHA.to_string(),
+                attempt_no: 1,
+                effect_id: oracle_effect.clone(),
+                requested_at_ms: 0,
+                not_before_ms: 0,
+                deadline_ms: 100_000,
+            }),
+        ],
+        1,
+    )
+    .await;
 
     let view = h.engine.advance(&mission_id).await.expect("advance");
     assert_eq!(view.disposition, MissionDisposition::Parked);
@@ -257,12 +239,7 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA)
         .await
         .expect("create");
     h.engine
@@ -272,32 +249,30 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
     approve_plan(&h.engine, &mission_id).await;
     let id = effect_id("rebuild-crash");
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    h.engine
-        .store()
-        .append(
-            &mission_id,
-            state.head,
-            &[NewEvent::new(MissionEvent::RoleRunRequested {
-                namespace: lionclaw::model::TaskNamespace::Execution,
-                task_id: lionclaw::model::TaskId::new("fix").unwrap(),
-                attempt_no: 1,
-                effect_id: id.clone(),
-                role: lionclaw::model::RoleName::new("implementer").unwrap(),
-                output: OutputSemantics::ProducesArtifact,
-                runtime: "codex".to_string(),
-                prompt: lionclaw::model::PayloadRef::inline("p"),
-                base_sha: BASE_SHA.to_string(),
-                assignment_epoch: 1,
-                recreate_workspace: true,
-                requested_at_ms: 0,
-                not_before_ms: 0,
-                deadline_ms: 100_000,
-                budget_deadline_ms: 100_000,
-            })],
-            1,
-        )
-        .await
-        .expect("append");
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        state.head,
+        &[NewEvent::new(MissionEvent::RoleRunRequested {
+            namespace: lionclaw::model::TaskNamespace::Execution,
+            task_id: lionclaw::model::TaskId::new("fix").unwrap(),
+            attempt_no: 1,
+            effect_id: id.clone(),
+            role: lionclaw::model::RoleName::new("implementer").unwrap(),
+            output: OutputSemantics::ProducesArtifact,
+            runtime: "codex".to_string(),
+            prompt: lionclaw::model::PayloadRef::inline("p"),
+            base_sha: BASE_SHA.to_string(),
+            assignment_epoch: 1,
+            recreate_workspace: true,
+            requested_at_ms: 0,
+            not_before_ms: 0,
+            deadline_ms: 100_000,
+            budget_deadline_ms: 100_000,
+        })],
+        1,
+    )
+    .await;
     let rebuilt = h
         .engine
         .store()
@@ -314,53 +289,5 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
             .unwrap()
             .get(id.as_str()),
         None
-    );
-}
-
-#[tokio::test]
-async fn one_outcome_per_effect_id_is_a_store_invariant() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let h = harness(
-        dir.path(),
-        MockRoleRunner::happy(HEAD_SHA),
-        MockOracleRunner::exiting(0),
-    )
-    .await;
-    let mission_id = h
-        .engine
-        .create_mission(
-            dir.path().to_str().expect("utf8"),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
-        .await
-        .expect("create");
-    h.engine
-        .propose_plan(&mission_id, proposal(0, simple_plan()))
-        .await
-        .expect("propose");
-    approve_plan(&h.engine, &mission_id).await;
-    h.engine.advance(&mission_id).await.expect("advance");
-
-    let events = h.engine.store().load(&mission_id).await.expect("load");
-    let (key, template) = events
-        .iter()
-        .find_map(|event| match &event.event {
-            MissionEvent::OracleRunCompleted { effect_id, .. } => {
-                Some((effect_id.clone(), event.event.clone()))
-            }
-            _ => None,
-        })
-        .expect("oracle outcome exists");
-    let head = h.engine.load_state(&mission_id).await.expect("state").head;
-    let result = h
-        .engine
-        .store()
-        .append(&mission_id, head, &[NewEvent::new(template)], 99)
-        .await;
-    assert!(
-        matches!(result, Err(AppendError::Duplicate { effect_id: duplicate }) if duplicate == key.as_str()),
-        "duplicate outcome must be rejected"
     );
 }

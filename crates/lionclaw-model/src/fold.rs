@@ -26,7 +26,7 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 17;
+pub const REDUCER_VERSION: u32 = 18;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -130,13 +130,24 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             namespace,
             task_id,
             attempt_no,
-            effect_id,
             role,
             output,
+            base_sha,
             ..
         } => {
-            let request_matches =
-                role_request_matches_task(state, *namespace, task_id, role, *output);
+            let request_matches = role_request_matches_dispatch(
+                state,
+                *namespace,
+                task_id,
+                *attempt_no,
+                role,
+                *output,
+                base_sha,
+            );
+            if !request_matches {
+                finish_apply(state, seq);
+                return;
+            }
             state.parked_effects.retain(|_, parked| {
                 !matches!(parked, ParkedEffect::RoleRun { namespace: parked_namespace, task_id: parked_task } if parked_namespace == namespace && parked_task == task_id)
             });
@@ -144,24 +155,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 .tasks_in_mut(*namespace)
                 .entry(task_id.clone())
                 .or_insert_with(pending_task);
-            if request_matches {
-                task.status = TaskStatus::Running;
-                task.attempts = *attempt_no;
-                track_inflight(state, &envelope.event, seq);
-            } else {
-                apply_role_failure(
-                    state,
-                    TaskAddress::new(*namespace, task_id.clone()),
-                    *attempt_no,
-                    effect_id,
-                    TypedFailure::permanent(
-                        "kernel.role_contract",
-                        "role effect does not match its task contract",
-                    ),
-                    None,
-                    None,
-                );
-            }
+            task.status = TaskStatus::Running;
+            task.attempts = *attempt_no;
+            track_inflight(state, &envelope.event, seq);
         }
         MissionEvent::TaskWorkspacePrepared {
             task_id,
@@ -321,8 +317,22 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }
         }
         MissionEvent::OracleRunRequested {
-            oracle, attempt_no, ..
+            assertion_ids,
+            oracle,
+            judged_sha,
+            attempt_no,
+            ..
         } => {
+            if !oracle_request_matches_obligation(
+                state,
+                assertion_ids,
+                oracle,
+                judged_sha,
+                *attempt_no,
+            ) {
+                finish_apply(state, seq);
+                return;
+            }
             state.parked_effects.retain(|_, parked| {
                 !matches!(parked, ParkedEffect::OracleRun { oracle: parked_oracle } if parked_oracle == oracle)
             });
@@ -374,12 +384,18 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 }
             }
         }
-        // `attempts` is the highest attempt number the log has seen — from
-        // ANY review event, not just requests: the materialize fallback
-        // records a `Failed` without a `Requested`, and a retry must still
-        // dispatch under a fresh attempt (and a fresh effect ID), never
-        // spin the drive loop re-appending a duplicate.
-        MissionEvent::TerminalReviewRequested { attempt_no, .. } => {
+        // A legal request owns the next attempt number. Orphan outcomes are
+        // filtered at ingress and cannot advance recovery identity.
+        MissionEvent::TerminalReviewRequested {
+            attempt_no,
+            role,
+            judged_sha,
+            ..
+        } => {
+            if !terminal_review_request_matches_obligation(state, *attempt_no, role, judged_sha) {
+                finish_apply(state, seq);
+                return;
+            }
             state
                 .parked_effects
                 .retain(|_, parked| !matches!(parked, ParkedEffect::TerminalReview));
@@ -632,14 +648,16 @@ fn merge_failure_configuration(
     failure
 }
 
-fn role_request_matches_task(
+fn role_request_matches_dispatch(
     state: &MissionState,
     namespace: super::TaskNamespace,
     task_id: &TaskId,
+    attempt_no: u32,
     role: &RoleName,
     output: OutputSemantics,
+    base_sha: &str,
 ) -> bool {
-    match namespace {
+    let output_matches = match namespace {
         super::TaskNamespace::Planning => state
             .config
             .planning
@@ -654,7 +672,64 @@ fn role_request_matches_task(
             .is_some_and(|task| {
                 task.role.as_ref() == Some(role) && output.execution_task_kind() == Some(task.kind)
             }),
-    }
+    };
+    let super::step::StepDecision::DispatchRole(intent) = super::step::step(state) else {
+        return false;
+    };
+    output_matches
+        && intent.namespace == namespace
+        && &intent.task_id == task_id
+        && intent.attempt_no == attempt_no
+        && &intent.role == role
+        && intent.base_sha == base_sha
+}
+
+fn oracle_request_matches_obligation(
+    state: &MissionState,
+    assertion_ids: &[AssertionId],
+    oracle: &super::OracleName,
+    judged_sha: &str,
+    attempt_no: u32,
+) -> bool {
+    let owed_assertions = state.owed_assertions_for_oracle(oracle);
+    let only_oracles_inflight = state
+        .inflight
+        .values()
+        .all(|effect| matches!(effect, InflightEffect::OracleRun { .. }));
+    let same_oracle_inflight = state.inflight.values().any(
+        |effect| matches!(effect, InflightEffect::OracleRun { oracle: active, .. } if active == oracle),
+    );
+    only_oracles_inflight
+        && !same_oracle_inflight
+        && state.oracle_dispatchable(oracle)
+        && judged_sha == state.deliverable_head()
+        && attempt_no
+            == state
+                .oracle_attempts
+                .get(oracle)
+                .copied()
+                .unwrap_or_default()
+                + 1
+        && !owed_assertions.is_empty()
+        && assertion_ids == owed_assertions
+}
+
+fn terminal_review_request_matches_obligation(
+    state: &MissionState,
+    attempt_no: u32,
+    role: &RoleName,
+    judged_sha: &str,
+) -> bool {
+    state.inflight.is_empty()
+        && !work_outstanding(state)
+        && terminal_review_outstanding(state)
+        && state
+            .config
+            .terminal_review
+            .as_ref()
+            .is_some_and(|config| &config.role == role)
+        && judged_sha == state.deliverable_head()
+        && attempt_no == state.terminal_review.attempts + 1
 }
 
 fn apply_role_failure(
@@ -1919,9 +1994,10 @@ mod tests {
         handoff: Handoff,
         artifact: Option<ArtifactOutcome>,
     ) -> MissionEvent {
-        role_completed_in(
+        role_completed_at(
             crate::TaskNamespace::Execution,
             task,
+            1,
             key,
             handoff,
             artifact,
@@ -1934,12 +2010,20 @@ mod tests {
         handoff: Handoff,
         artifact: Option<ArtifactOutcome>,
     ) -> MissionEvent {
-        role_completed_in(crate::TaskNamespace::Planning, task, key, handoff, artifact)
+        role_completed_at(
+            crate::TaskNamespace::Planning,
+            task,
+            1,
+            key,
+            handoff,
+            artifact,
+        )
     }
 
-    fn role_completed_in(
+    fn role_completed_at(
         namespace: crate::TaskNamespace,
         task: &str,
+        attempt_no: u32,
         key: &str,
         handoff: Handoff,
         artifact: Option<ArtifactOutcome>,
@@ -1947,7 +2031,7 @@ mod tests {
         MissionEvent::RoleRunCompleted {
             namespace,
             task_id: tid(task),
-            attempt_no: 1,
+            attempt_no,
             effect_id: EffectId::for_parts(&["test", key]),
             outcome: Ok(RoleRunSuccess {
                 handoff,
@@ -1977,11 +2061,21 @@ mod tests {
         key: &str,
         exit_code: i32,
     ) -> MissionEvent {
+        oracle_completed_at(assertion_id, judged, 1, key, exit_code)
+    }
+
+    fn oracle_completed_at(
+        assertion_id: &str,
+        judged: &str,
+        attempt_no: u32,
+        key: &str,
+        exit_code: i32,
+    ) -> MissionEvent {
         MissionEvent::OracleRunCompleted {
             assertion_ids: vec![aid(assertion_id)],
             oracle: oracle("cargo-test"),
             judged_sha: judged.into(),
-            attempt_no: 1,
+            attempt_no,
             effect_id: EffectId::for_parts(&["test", key]),
             outcome: Ok(OracleRunSuccess {
                 exit_code,
@@ -2550,12 +2644,6 @@ mod tests {
                 expect_last: &[("v1", true), ("v2", false)],
             },
             Case {
-                name: "same validator flips pass to fail: sticky pass, latest verdict recorded",
-                verdicts: &[("v1", true), ("v1", false)],
-                expect_advisory: AdvisoryStatus::Passed,
-                expect_last: &[("v1", false)],
-            },
-            Case {
                 name: "fail then pass lands passed",
                 verdicts: &[("v1", false), ("v2", true)],
                 expect_advisory: AdvisoryStatus::Passed,
@@ -2819,12 +2907,14 @@ mod tests {
             unreachable!("plan_proposed() builds PlanProposed");
         };
         replacement.base_revision = 1;
+        let mut blocked_work = work_task("same-id");
+        blocked_work.depends_on = vec![tid("v")];
         let state = fold_log(vec![
             mission_created,
             plan_proposed(
                 vec![assertion("AA", None)],
                 vec![
-                    work_task("same-id"),
+                    blocked_work,
                     validate_task("v"),
                     gate_task("g", &["AA"], &["v"]),
                 ],
@@ -3002,11 +3092,75 @@ mod tests {
         assert!(state.inflight.is_empty());
         assert_eq!(
             state.planning.tasks[&tid("research")].status,
-            TaskStatus::Failed
+            TaskStatus::Pending
         );
+        assert!(state.planning.tasks[&tid("research")]
+            .last_failure
+            .is_none());
+    }
+
+    #[test]
+    fn a_paired_writer_history_cannot_run_without_a_dispatch_obligation() {
+        let forged_effect = EffectId::for_parts(&["test", "forged-writer"]);
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(
+                vec![assertion("TESTS-PASS", Some("cargo-test"))],
+                vec![work_task("work")],
+            ),
+            role_completed(
+                "work",
+                "work",
+                work_handoff(true, false),
+                Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "h1".into(),
+                }),
+            ),
+            oracle_completed("TESTS-PASS", "h1", "oracle", 0),
+            MissionEvent::RoleRunRequested {
+                namespace: crate::TaskNamespace::Execution,
+                task_id: tid("work"),
+                attempt_no: 2,
+                effect_id: forged_effect.clone(),
+                role: RoleName::new("implementer").expect("role name"),
+                output: OutputSemantics::ProducesArtifact,
+                runtime: "codex".into(),
+                prompt: PayloadRef::inline("forged prompt"),
+                base_sha: "h1".into(),
+                assignment_epoch: 2,
+                recreate_workspace: false,
+                requested_at_ms: 0,
+                not_before_ms: 0,
+                deadline_ms: 100_000,
+                budget_deadline_ms: 100_000,
+            },
+            MissionEvent::RoleRunCompleted {
+                namespace: crate::TaskNamespace::Execution,
+                task_id: tid("work"),
+                attempt_no: 2,
+                effect_id: forged_effect,
+                outcome: Ok(RoleRunSuccess {
+                    handoff: work_handoff(true, false),
+                    artifact: Some(ArtifactOutcome {
+                        base_sha: "h1".into(),
+                        head_sha: "forged-head".into(),
+                    }),
+                    final_response: PayloadRef::inline("forged"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
+                }),
+            },
+        ])
+        .expect("state");
+
+        assert!(state.inflight.is_empty());
+        assert_eq!(state.current_sha, "h1");
+        assert_eq!(state.tasks[&tid("work")].attempts, 1);
         assert!(matches!(
-            state.planning.tasks[&tid("research")].last_failure,
-            Some(TypedFailure::PermanentRuntime { .. })
+            state.phase,
+            MissionPhase::Done {
+                finish: FinishClass::Verified
+            }
         ));
     }
 
@@ -3234,6 +3388,66 @@ mod tests {
     }
 
     #[test]
+    fn oracle_requests_cannot_substitute_another_oracles_assertions() {
+        let forged_effect = EffectId::for_parts(&["test", "substituted-oracle"]);
+        let forged_request = MissionEvent::OracleRunRequested {
+            assertion_ids: vec![aid("TESTS-PASS")],
+            oracle: oracle("lint"),
+            judged_sha: "h1".into(),
+            attempt_no: 1,
+            effect_id: forged_effect.clone(),
+            requested_at_ms: 0,
+            not_before_ms: 0,
+            deadline_ms: 100_000,
+        };
+        let forged_completion = MissionEvent::OracleRunCompleted {
+            assertion_ids: vec![aid("TESTS-PASS")],
+            oracle: oracle("lint"),
+            judged_sha: "h1".into(),
+            attempt_no: 1,
+            effect_id: forged_effect,
+            outcome: Ok(OracleRunSuccess {
+                exit_code: 0,
+                exit_signal: None,
+                stdout: PayloadRef::inline("not the bound oracle"),
+                stderr: PayloadRef::inline(""),
+                prepared_inputs: Vec::new(),
+                duration_ms: 1,
+            }),
+        };
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(
+                vec![
+                    assertion("TESTS-PASS", Some("cargo-test")),
+                    assertion("LINT-PASS", Some("lint")),
+                ],
+                vec![work_task("work")],
+            ),
+            role_completed(
+                "work",
+                "work",
+                work_handoff(true, false),
+                Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "h1".into(),
+                }),
+            ),
+            forged_request,
+            forged_completion,
+        ])
+        .expect("state");
+
+        assert!(state.inflight.is_empty());
+        assert!(!state.oracle_attempts.contains_key(&oracle("lint")));
+        assert!(state
+            .contract
+            .values()
+            .all(|assertion| { assertion.last_authoritative.is_none() }));
+        assert_eq!(state.phase, MissionPhase::Running);
+    }
+
+    #[test]
     fn planning_attention_cannot_leak_to_an_execution_task_with_the_same_id() {
         let mut mission_created = created();
         let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
@@ -3283,16 +3497,16 @@ mod tests {
             applied_model: Some("observed-model".into()),
             ..Default::default()
         };
-        let state = fold_log(vec![
-            created_with_review(),
-            review_requested(1, "review-identity", "base"),
+        let mut events = events_to_the_brink();
+        events.extend([
+            review_requested(1, "review-identity", "h1"),
             MissionEvent::EffectRuntimeConfigured {
                 effect_id: effect_id.clone(),
                 configuration: observed.clone(),
             },
             review_completed_at(2, "review-identity", "different-head", true, vec![]),
-        ])
-        .expect("state");
+        ]);
+        let state = fold_log(events).expect("state");
 
         assert!(state.inflight.is_empty());
         let Some(ReviewOutcome::Failed { failure }) = state.terminal_review.outcome else {
@@ -3496,8 +3710,9 @@ mod tests {
                 reason: "operator stop".into()
             }
         );
-        // Later facts still fold; only the phase is pinned.
-        assert_eq!(state.tasks[&tid("t1")].status, TaskStatus::Cleared);
+        // Later facts remain in the log, but an aborted mission has no legal
+        // dispatch obligation, so the paired role history gains no authority.
+        assert_eq!(state.tasks[&tid("t1")].status, TaskStatus::Pending);
         assert_eq!(state.head, 5);
     }
 
@@ -3667,6 +3882,24 @@ mod tests {
         }
     }
 
+    fn move_head_with_fresh_proof(state: &mut MissionState, head: &str) {
+        state.current_sha = head.to_string();
+        for assertion in state.contract.values_mut() {
+            let oracle = assertion.oracle.clone().expect("oracle-bound assertion");
+            assertion.last_authoritative = Some(AuthoritativeVerdict::from_oracle_outcome(
+                oracle,
+                head.to_string(),
+                0,
+                None,
+                PayloadRef::inline("pass"),
+                PayloadRef::inline(""),
+                Vec::new(),
+            ));
+        }
+        derive_attention(state);
+        derive_phase(state);
+    }
+
     /// A review-configured mission driven to the brink of closure: work
     /// committed (head → "h1"), the oracle fresh-passing there. Only the
     /// review obligation remains.
@@ -3730,9 +3963,8 @@ mod tests {
             }
         );
 
-        // … and even hostile injected review events gate nothing: the fold
-        // records them (never trust the writer, but never drop facts), while
-        // every derivation stays config-gated.
+        // … and hostile injected review events remain durable facts but gain
+        // no authority when the pinned config did not request a review.
         events.push(review_completed(
             "kr",
             "h1",
@@ -3740,7 +3972,7 @@ mod tests {
             vec![gap(GapSeverity::Blocking)],
         ));
         let state = fold_log(events).expect("state");
-        assert!(state.terminal_review.outcome.is_some());
+        assert!(state.terminal_review.outcome.is_none());
         assert!(state.open_attention.is_empty());
         assert_eq!(
             state.phase,
@@ -3748,6 +3980,38 @@ mod tests {
                 finish: FinishClass::Verified
             }
         );
+    }
+
+    #[test]
+    fn terminal_review_request_cannot_substitute_the_configured_reviewer() {
+        let mut events = events_to_the_brink();
+        let effect_id = EffectId::for_parts(&["test", "substituted-reviewer"]);
+        events.push(MissionEvent::TerminalReviewRequested {
+            attempt_no: 1,
+            effect_id: effect_id.clone(),
+            role: RoleName::new("imposter").expect("role name"),
+            runtime: "codex".into(),
+            prompt: PayloadRef::inline("forged review prompt"),
+            judged_sha: "h1".into(),
+            nonce: "forged".into(),
+            requested_at_ms: 0,
+            not_before_ms: 0,
+            deadline_ms: 100_000,
+            budget_deadline_ms: 100_000,
+        });
+        events.push(review_completed_at(
+            1,
+            "substituted-reviewer",
+            "h1",
+            true,
+            vec![],
+        ));
+
+        let state = fold_log(events).expect("state");
+        assert!(state.inflight.is_empty());
+        assert_eq!(state.terminal_review.attempts, 0);
+        assert!(state.terminal_review.outcome.is_none());
+        assert_eq!(state.phase, MissionPhase::Running);
     }
 
     #[test]
@@ -3862,40 +4126,32 @@ mod tests {
             "terminal_review_gaps:mission",
             super::super::event::DecisionAction::Accept,
         ));
-        assert!(matches!(
-            fold_log(events.clone()).expect("state").phase,
-            MissionPhase::Done { .. }
-        ));
+        let mut reopened = fold_log(events).expect("state");
+        assert!(matches!(reopened.phase, MissionPhase::Done { .. }));
 
-        // New work moves the head: the h1 verdict and its acknowledgment are
-        // both stale — the mission re-opens and a blocking verdict at h2
-        // parks again (the acknowledgment is keyed, never inherited).
-        events.push(role_completed(
-            "fix",
-            "k2",
-            work_handoff(true, false),
-            Some(ArtifactOutcome {
-                base_sha: "h1".into(),
-                head_sha: "h2".into(),
-            }),
-        ));
-        events.push(oracle_completed("TESTS-PASS", "h2", "ko2", 0));
-        let reopened = fold_log(events.clone()).expect("reopened state");
+        // Model a later deliverable with fresh proof. The review and its
+        // acknowledgment are both keyed to h1, so the closing review reopens.
+        move_head_with_fresh_proof(&mut reopened, "h2");
         assert!(terminal_review_outstanding(&reopened));
         assert_eq!(reopened.phase, MissionPhase::Running);
 
-        events.push(review_completed(
-            "kr2",
-            "h2",
-            false,
-            vec![gap(GapSeverity::Blocking)],
-        ));
-        let state = fold_log(events).expect("state");
+        let request_seq = reopened.head + 1;
+        apply(
+            &mut reopened,
+            &envelope(request_seq, review_requested(2, "kr2", "h2")),
+        );
+        apply(
+            &mut reopened,
+            &envelope(
+                request_seq + 1,
+                review_completed_at(2, "kr2", "h2", false, vec![gap(GapSeverity::Blocking)]),
+            ),
+        );
         assert_eq!(
-            state.terminal_review.accepted,
+            reopened.terminal_review.accepted,
             Some(accepted(ReviewAcceptanceKind::AcknowledgedGaps, "h1"))
         );
-        assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+        assert_eq!(reopened.phase, MissionPhase::AttentionNeeded);
     }
 
     #[test]
@@ -3959,34 +4215,29 @@ mod tests {
             unreachable!("events_to_the_brink starts with MissionCreated");
         };
         config.recovery.max_attempts = 3;
-        events.push(review_requested(4, "kr4", "h1"));
-        events.push(review_completed_at(4, "kr4", "h1", true, vec![]));
-        events.push(role_completed(
-            "fix",
-            "k2",
-            work_handoff(true, false),
-            Some(ArtifactOutcome {
-                base_sha: "h1".into(),
-                head_sha: "h2".into(),
-            }),
-        ));
-        events.push(oracle_completed("TESTS-PASS", "h2", "ko2", 0));
-        events.push(review_requested(5, "kr5", "h2"));
-        events.push(review_transient_failed_at(
-            5,
-            "kr5",
-            "h2",
-            "temporary overload",
-        ));
-
-        let state = fold_log(events).expect("state");
-        assert_eq!(state.terminal_review.attempts, 5);
+        events.push(review_requested(1, "kr1", "h1"));
+        events.push(review_completed_at(1, "kr1", "h1", true, vec![]));
+        let mut state = fold_log(events).expect("state");
+        move_head_with_fresh_proof(&mut state, "h2");
+        let request_seq = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(request_seq, review_requested(2, "kr2", "h2")),
+        );
+        apply(
+            &mut state,
+            &envelope(
+                request_seq + 1,
+                review_transient_failed_at(2, "kr2", "h2", "temporary overload"),
+            ),
+        );
+        assert_eq!(state.terminal_review.attempts, 2);
         assert_eq!(state.terminal_review.consecutive_failures, 1);
         assert!(state.open_attention.is_empty());
         assert_eq!(state.phase, MissionPhase::Running);
         assert!(matches!(
             step(&state),
-            StepDecision::ReviewTerminal(intent) if intent.attempt_no == 6
+            StepDecision::ReviewTerminal(intent) if intent.attempt_no == 3
         ));
     }
 
@@ -4027,22 +4278,9 @@ mod tests {
             "terminal_review_failed:mission",
             super::super::event::DecisionAction::Accept,
         ));
-        assert!(matches!(
-            fold_log(events.clone()).expect("state").phase,
-            MissionPhase::Done { .. }
-        ));
-
-        events.push(role_completed(
-            "fix",
-            "k2",
-            work_handoff(true, false),
-            Some(ArtifactOutcome {
-                base_sha: "h1".into(),
-                head_sha: "h2".into(),
-            }),
-        ));
-        events.push(oracle_completed("TESTS-PASS", "h2", "ko2", 0));
-        let state = fold_log(events).expect("state");
+        let mut state = fold_log(events).expect("state");
+        assert!(matches!(state.phase, MissionPhase::Done { .. }));
+        move_head_with_fresh_proof(&mut state, "h2");
         assert!(terminal_review_outstanding(&state));
         assert_eq!(state.phase, MissionPhase::Running);
     }

@@ -155,8 +155,8 @@ mod tests {
         }
     }
 
-    /// Build a state by folding: create → accept a plan → validators report
-    /// the given verdicts.
+    /// Build a state by folding the same dispatch order as the scheduler:
+    /// create, accept, clear writers, then collect validator verdicts.
     fn state_with_verdicts(plan: Plan, verdicts: &[(&str, &[(&str, bool)])]) -> MissionState {
         let mission_id = MissionId::from_digest_prefix("abcdef0123456789");
         let mut events = vec![
@@ -200,6 +200,52 @@ mod tests {
             ),
         ];
         let mut seq = 4;
+        for task in plan.tasks.iter().filter(|task| task.kind == TaskKind::Work) {
+            let effect_id = EffectId::for_parts(&["test", task.id.as_str()]);
+            events.push(env(
+                &mission_id,
+                seq,
+                MissionEvent::RoleRunRequested {
+                    namespace: crate::TaskNamespace::Execution,
+                    task_id: task.id.clone(),
+                    attempt_no: 1,
+                    effect_id: effect_id.clone(),
+                    role: RoleName::new("implementer").unwrap(),
+                    output: crate::OutputSemantics::ProducesArtifact,
+                    runtime: "codex".into(),
+                    prompt: PayloadRef::inline("p"),
+                    base_sha: "s0".into(),
+                    assignment_epoch: 1,
+                    recreate_workspace: true,
+                    requested_at_ms: 0,
+                    not_before_ms: 0,
+                    deadline_ms: 100_000,
+                    budget_deadline_ms: 100_000,
+                },
+            ));
+            seq += 1;
+            events.push(env(
+                &mission_id,
+                seq,
+                MissionEvent::RoleRunCompleted {
+                    namespace: crate::TaskNamespace::Execution,
+                    task_id: task.id.clone(),
+                    attempt_no: 1,
+                    effect_id,
+                    outcome: Ok(crate::RoleRunSuccess {
+                        handoff: Handoff::Work {
+                            done: true,
+                            report: PayloadRef::inline("done"),
+                            request_attention: false,
+                        },
+                        artifact: None,
+                        final_response: PayloadRef::inline("done"),
+                        runtime_configuration: crate::RuntimeConfigurationEvidence::default(),
+                    }),
+                },
+            ));
+            seq += 1;
+        }
         for (validator, items) in verdicts {
             events.push(env(
                 &mission_id,

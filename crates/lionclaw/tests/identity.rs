@@ -7,7 +7,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{default_config, test_mission_type, BASE_SHA, HEAD_SHA};
+use common::{test_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::authority::AuthorityCeiling;
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::load_mission_type;
@@ -130,12 +130,7 @@ async fn opening_a_mission_whose_type_digest_changed_is_refused() {
         ),
     );
     let id = engine_a
-        .create_mission(
-            &dir.path().to_string_lossy(),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(&dir.path().to_string_lossy(), "obj", BASE_SHA)
         .await
         .unwrap();
     // Same engine (matching digest) loads fine.

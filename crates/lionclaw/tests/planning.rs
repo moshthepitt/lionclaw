@@ -14,10 +14,9 @@ use common::{covered_requirement, BASE_SHA};
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
-    ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionConfig,
-    MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal,
-    PlanningDag, PlanningRefinement, PlanningTask, RecoveryConfig, RoleName, StopBar, Task,
-    TaskKind, TaskStatus,
+    ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionEvent,
+    MissionPhase, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, PlanningDag,
+    PlanningRefinement, PlanningTask, RoleName, StopBar, Task, TaskKind, TaskStatus,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -275,31 +274,20 @@ async fn advance_through_checkpoints(
 }
 
 #[tokio::test]
-async fn mission_creation_rejects_a_substituted_planning_contract() {
+async fn mission_creation_persists_the_pinned_planning_contract() {
     let dir = tempfile::tempdir().unwrap();
     let engine = planning_engine(dir.path()).await;
-    let mut planning = planning_dag();
-    planning.tasks[0].output = OutputSemantics::ProposesPlan;
-
-    let error = engine
+    let id = engine
         .create_mission(
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning,
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
-        .expect_err("the pinned mission type owns the planning contract");
+        .expect("create mission");
+    let state = engine.load_state(&id).await.expect("state");
 
-    assert!(error
-        .to_string()
-        .contains("planning DAG must exactly match pinned mission type"));
+    assert_eq!(state.config, engine.mission_type().mission_config());
 }
 
 #[tokio::test]
@@ -311,13 +299,6 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -375,13 +356,6 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -460,13 +434,6 @@ async fn replanning_prompt_combines_the_accepted_plan_rejected_candidate_and_gui
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -527,13 +494,6 @@ async fn ratification_can_revise_a_to_b_to_c_and_then_approve() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -632,13 +592,6 @@ async fn ratification_revisions_are_unbounded_and_keep_only_the_newest_input() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -706,13 +659,6 @@ async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
             &dir.path().to_string_lossy(),
             "refine without spending recovery",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: RecoveryConfig { max_attempts: 3 },
-                execution: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -750,13 +696,6 @@ async fn revise_guidance_preserves_whitespace_verbatim() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -791,13 +730,6 @@ async fn aborting_a_plan_proposal_records_the_generic_decision_atomically() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -878,18 +810,7 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
         ),
     );
     let id = engine
-        .create_mission(
-            &dir.path().to_string_lossy(),
-            "obj",
-            BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
-        )
+        .create_mission(&dir.path().to_string_lossy(), "obj", BASE_SHA)
         .await
         .unwrap();
 
@@ -954,18 +875,7 @@ async fn park_after_author(
         ),
     );
     let id = engine
-        .create_mission(
-            &dir.to_string_lossy(),
-            "obj",
-            BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
-        )
+        .create_mission(&dir.to_string_lossy(), "obj", BASE_SHA)
         .await
         .unwrap();
     advance_through_checkpoints(&engine, &id).await;

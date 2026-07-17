@@ -1,8 +1,7 @@
 mod common;
 
 use common::{
-    approve_plan, default_config, harness_with_type, proposal, simple_plan, test_mission_type,
-    BASE_SHA, HEAD_SHA,
+    approve_plan, harness_with_type, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::mission_type::SkillPackage;
 use lionclaw::model::{ArtifactOutcome, Handoff, PayloadRef, RoleName};
@@ -69,7 +68,6 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
             dir.path().to_str().unwrap(),
             "use the configured skill",
             BASE_SHA,
-            default_config(),
         )
         .await
         .unwrap();
@@ -130,7 +128,6 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
             dir.path().to_str().unwrap(),
             "run without mission skills",
             BASE_SHA,
-            default_config(),
         )
         .await
         .unwrap();

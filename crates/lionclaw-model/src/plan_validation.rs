@@ -21,6 +21,11 @@ use super::plan::{
 use super::state::MissionState;
 use crate::prelude::*;
 
+/// Maximum direct fan-in for one task. Role reports are independently bounded
+/// at ingress, so this limit also gives prompt construction a fixed aggregate
+/// upstream-context ceiling.
+pub const MAX_TASK_DEPENDENCIES: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{code}: {detail}")]
 pub struct PlanValidationError {
@@ -143,19 +148,12 @@ pub fn validate_planning_dag(
     let mut errors = Vec::new();
     let mut proposers = 0;
     for t in &dag.tasks {
-        for dep in &t.depends_on {
-            if dep == &t.id {
-                errors.push(err(
-                    "self_loop",
-                    format!("planning task '{}' depends on itself", t.id),
-                ));
-            } else if !ids.contains(dep) {
-                errors.push(err(
-                    "dep_unknown_task",
-                    format!("planning task '{}' depends on unknown '{dep}'", t.id),
-                ));
-            }
-        }
+        errors.extend(check_dependency_list(
+            "planning task",
+            &t.id,
+            &t.depends_on,
+            &ids,
+        ));
         let declared_output = match inventory.roles.get(&t.role) {
             None => {
                 errors.push(err(
@@ -636,18 +634,49 @@ fn check_deps_resolve(plan: &Plan) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
     let ids: BTreeSet<_> = plan.tasks.iter().map(|t| &t.id).collect();
     for task in &plan.tasks {
-        for dep in &task.depends_on {
-            if dep == &task.id {
-                errors.push(err(
-                    "self_loop",
-                    format!("task '{}' depends on itself", task.id),
-                ));
-            } else if !ids.contains(dep) {
-                errors.push(err(
-                    "dep_unknown_task",
-                    format!("task '{}' depends on unknown task '{dep}'", task.id),
-                ));
-            }
+        errors.extend(check_dependency_list(
+            "task",
+            &task.id,
+            &task.depends_on,
+            &ids,
+        ));
+    }
+    errors
+}
+
+fn check_dependency_list(
+    scope: &str,
+    task_id: &TaskId,
+    dependencies: &[TaskId],
+    known_tasks: &BTreeSet<&TaskId>,
+) -> Vec<PlanValidationError> {
+    let mut errors = Vec::new();
+    if dependencies.len() > MAX_TASK_DEPENDENCIES {
+        errors.push(err(
+            "dependency_fan_in",
+            format!(
+                "{scope} '{task_id}' has {} dependencies; the limit is {MAX_TASK_DEPENDENCIES}",
+                dependencies.len()
+            ),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for dependency in dependencies {
+        if !seen.insert(dependency) {
+            errors.push(err(
+                "duplicate_dependency",
+                format!("{scope} '{task_id}' repeats dependency '{dependency}'"),
+            ));
+        } else if dependency == task_id {
+            errors.push(err(
+                "self_loop",
+                format!("{scope} '{task_id}' depends on itself"),
+            ));
+        } else if !known_tasks.contains(dependency) {
+            errors.push(err(
+                "dep_unknown_task",
+                format!("{scope} '{task_id}' depends on unknown task '{dependency}'"),
+            ));
         }
     }
     errors
@@ -901,6 +930,17 @@ mod tests {
         );
         // Empty is valid (no in-engine planning).
         assert_eq!(planning_codes(vec![]), CLEAN);
+
+        let dependencies = (0..=MAX_TASK_DEPENDENCIES)
+            .map(|index| format!("dependency-{index}"))
+            .collect::<Vec<_>>();
+        let dependency_refs = dependencies.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut excessive_fan_in = dependencies
+            .iter()
+            .map(|id| ptask(id, "reporter", &[]))
+            .collect::<Vec<_>>();
+        excessive_fan_in.push(ptask("author", "author", &dependency_refs));
+        assert_eq!(planning_codes(excessive_fan_in), vec!["dependency_fan_in"]);
         // Two proposers → planning_author.
         assert_eq!(
             planning_codes(vec![
@@ -951,6 +991,20 @@ mod tests {
             ]),
             vec!["dep_unknown_task"]
         );
+    }
+
+    #[test]
+    fn execution_task_dependency_fan_in_is_bounded() {
+        let dependencies = (0..=MAX_TASK_DEPENDENCIES)
+            .map(|index| format!("dependency-{index}"))
+            .collect::<Vec<_>>();
+        let dependency_refs = dependencies.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut tasks = dependencies
+            .iter()
+            .map(|id| work(id, &[], &[]))
+            .collect::<Vec<_>>();
+        tasks.push(work("consumer", &["ASSERT-A"], &dependency_refs));
+        assert!(codes(&plan(vec![assertion("ASSERT-A")], tasks)).contains(&"dependency_fan_in"));
     }
 
     // The check_shape chokepoint: a read-only planning role (produces-report /

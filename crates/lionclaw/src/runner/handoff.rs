@@ -5,13 +5,100 @@
 
 use std::path::Path;
 
-use crate::model::{Handoff, OutputSemantics};
+use crate::model::{Gap, Handoff, OutputSemantics, PayloadRef, PlanProposal, ValidationItem};
 use lionclaw_runtime_api::TypedFailure;
+use serde::Deserialize;
 
-pub const WORK_HANDOFF_SCHEMA: &str = "lionclaw.mission.work-handoff.v1";
-pub const VALIDATE_HANDOFF_SCHEMA: &str = "lionclaw.mission.validate-handoff.v1";
-pub const REVIEW_HANDOFF_SCHEMA: &str = "lionclaw.mission.review-handoff.v1";
-pub const PLAN_HANDOFF_SCHEMA: &str = "lionclaw.mission.plan-handoff.v1";
+pub const WORK_HANDOFF_SCHEMA: &str = "lionclaw.mission.work-handoff.v2";
+pub const VALIDATE_HANDOFF_SCHEMA: &str = "lionclaw.mission.validate-handoff.v2";
+pub const REVIEW_HANDOFF_SCHEMA: &str = "lionclaw.mission.review-handoff.v2";
+pub const PLAN_HANDOFF_SCHEMA: &str = "lionclaw.mission.plan-handoff.v2";
+
+/// Agent-controlled wire data. Reports are strings at this boundary; only the
+/// engine can mint durable content-addressed payload references.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum AgentHandoff {
+    Work {
+        done: bool,
+        report: String,
+        request_attention: bool,
+    },
+    Validate {
+        done: bool,
+        report: String,
+        items: Vec<ValidationItem>,
+        passed: bool,
+        request_attention: bool,
+    },
+    Review {
+        done: bool,
+        report: String,
+        passed: bool,
+        gaps: Vec<Gap>,
+        nonce: String,
+    },
+    Plan {
+        done: bool,
+        report: String,
+        #[serde(default)]
+        proposal: Option<PlanProposal>,
+        request_attention: bool,
+    },
+}
+
+impl From<AgentHandoff> for Handoff {
+    fn from(handoff: AgentHandoff) -> Self {
+        match handoff {
+            AgentHandoff::Work {
+                done,
+                report,
+                request_attention,
+            } => Self::Work {
+                done,
+                report: PayloadRef::inline(report),
+                request_attention,
+            },
+            AgentHandoff::Validate {
+                done,
+                report,
+                items,
+                passed,
+                request_attention,
+            } => Self::Validate {
+                done,
+                report: PayloadRef::inline(report),
+                items,
+                passed,
+                request_attention,
+            },
+            AgentHandoff::Review {
+                done,
+                report,
+                passed,
+                gaps,
+                nonce,
+            } => Self::Review {
+                done,
+                report: PayloadRef::inline(report),
+                passed,
+                gaps,
+                nonce,
+            },
+            AgentHandoff::Plan {
+                done,
+                report,
+                proposal,
+                request_attention,
+            } => Self::Plan {
+                done,
+                report: PayloadRef::inline(report),
+                proposal,
+                request_attention,
+            },
+        }
+    }
+}
 
 pub fn expected_schema(output: OutputSemantics) -> &'static str {
     match output {
@@ -26,6 +113,10 @@ pub fn expected_schema(output: OutputSemantics) -> &'static str {
 /// The handoff file is a small control document; cap the read so an agent
 /// can't OOM the host by writing a huge file into the rw handoff mount.
 const MAX_HANDOFF_BYTES: u64 = 4 * 1024 * 1024;
+
+/// With the model's fan-in bound, accepted reports compose to at most 4 MiB
+/// of upstream narrative in any one prompt.
+pub const MAX_HANDOFF_REPORT_BYTES: usize = 256 * 1024;
 
 /// Typed gaps land inline in the event log (only `PayloadRef`s externalize
 /// to blobs), so cap them well under the file cap.
@@ -95,8 +186,21 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, TypedFai
             "handoff schema '{schema}' does not match this role's contract '{expected}'"
         )));
     }
-    let handoff: Handoff = serde_json::from_value(value)
+    let handoff: Handoff = serde_json::from_value::<AgentHandoff>(value)
+        .map(Handoff::from)
         .map_err(|err| invalid(format!("handoff does not match '{expected}': {err}")))?;
+    let PayloadRef::Inline { text: report } = handoff.report() else {
+        unreachable!("the agent handoff wire type accepts only inline reports")
+    };
+    if report.len() > MAX_HANDOFF_REPORT_BYTES {
+        return Err(TypedFailure::invalid(
+            "handoff.report_too_large",
+            format!(
+                "handoff report is {} bytes; the limit is {MAX_HANDOFF_REPORT_BYTES}",
+                report.len()
+            ),
+        ));
+    }
     if let Handoff::Review { gaps, .. } = &handoff {
         let gaps_bytes = serde_json::to_vec(gaps)
             .map_err(|err| invalid(format!("gaps are not serializable: {err}")))?
@@ -144,12 +248,27 @@ mod tests {
     fn oversized_handoff_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let big = format!(
-            "{{\"schema\":\"lionclaw.mission.work-handoff.v1\",\"type\":\"work\",\"done\":true,\"report\":{{\"kind\":\"inline\",\"text\":\"{}\"}},\"request_attention\":false}}",
+            "{{\"schema\":\"lionclaw.mission.work-handoff.v2\",\"type\":\"work\",\"done\":true,\"report\":\"{}\",\"request_attention\":false}}",
             "x".repeat((MAX_HANDOFF_BYTES + 1024) as usize)
         );
         std::fs::write(dir.path().join("handoff.json"), big).expect("write");
         let err = read_handoff(dir.path(), OutputSemantics::ProducesArtifact).expect_err("reject");
         assert!(err.is_invalid_output());
+    }
+
+    #[test]
+    fn oversized_report_is_rejected_as_invalid_output() {
+        let raw = format!(
+            r#"{{"schema":"{WORK_HANDOFF_SCHEMA}","type":"work","done":true,"report":"{}","request_attention":false}}"#,
+            "x".repeat(MAX_HANDOFF_REPORT_BYTES + 1)
+        );
+        let error = parse_handoff(&raw, OutputSemantics::ProducesArtifact)
+            .expect_err("a report cannot exceed the aggregate prompt budget");
+        assert!(error.is_invalid_output());
+        assert_eq!(
+            error.evidence().code.as_deref(),
+            Some("handoff.report_too_large")
+        );
     }
 
     // A malicious agent could leave a symlink (traverse to a host file) or a
@@ -184,8 +303,8 @@ mod tests {
 
     #[test]
     fn parses_work_handoff() {
-        let raw = r#"{"schema":"lionclaw.mission.work-handoff.v1","type":"work",
-                      "done":true,"report":{"kind":"inline","text":"done"},
+        let raw = r#"{"schema":"lionclaw.mission.work-handoff.v2","type":"work",
+                      "done":true,"report":"done",
                       "request_attention":false}"#;
         let handoff = parse_handoff(raw, OutputSemantics::ProducesArtifact).expect("parse");
         assert_eq!(
@@ -200,8 +319,8 @@ mod tests {
 
     #[test]
     fn parses_validate_handoff_with_items() {
-        let raw = r#"{"schema":"lionclaw.mission.validate-handoff.v1","type":"validate",
-                      "done":true,"report":{"kind":"inline","text":"findings"},
+        let raw = r#"{"schema":"lionclaw.mission.validate-handoff.v2","type":"validate",
+                      "done":true,"report":"findings",
                       "items":[{"item_id":"TESTS-PASS","passed":false}],
                       "passed":false,"request_attention":false}"#;
         let handoff = parse_handoff(raw, OutputSemantics::EmitsVerdict).expect("parse");
@@ -215,8 +334,8 @@ mod tests {
 
     #[test]
     fn ordinary_validate_handoff_rejects_terminal_review_fields() {
-        let raw = r#"{"schema":"lionclaw.mission.validate-handoff.v1","type":"validate",
-                      "done":true,"report":{"kind":"inline","text":"checked"},
+        let raw = r#"{"schema":"lionclaw.mission.validate-handoff.v2","type":"validate",
+                      "done":true,"report":"checked",
                       "items":[],"passed":true,"request_attention":false,
                       "nonce":"terminal-only","gaps":[]}"#;
         let err = parse_handoff(raw, OutputSemantics::EmitsVerdict)
@@ -227,8 +346,8 @@ mod tests {
     #[test]
     fn parses_review_handoff_with_gaps_and_nonce() {
         use crate::model::GapSeverity;
-        let raw = r#"{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
-                      "done":true,"report":{"kind":"inline","text":"map"},
+        let raw = r#"{"schema":"lionclaw.mission.review-handoff.v2","type":"review",
+                      "done":true,"report":"map",
                       "passed":false,"nonce":"n-1",
                       "gaps":[{"severity":"blocking",
                                "requirement":"starts up",
@@ -247,14 +366,14 @@ mod tests {
     #[test]
     fn review_handoff_rejects_validator_fields_and_requires_a_nonce() {
         for raw in [
-            r#"{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
-                "done":true,"report":{"kind":"inline","text":"map"},
+            r#"{"schema":"lionclaw.mission.review-handoff.v2","type":"review",
+                "done":true,"report":"map",
                 "items":[],"passed":true,"nonce":"n-1","gaps":[]}"#,
-            r#"{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
-                "done":true,"report":{"kind":"inline","text":"map"},
+            r#"{"schema":"lionclaw.mission.review-handoff.v2","type":"review",
+                "done":true,"report":"map",
                 "passed":true,"request_attention":false,"nonce":"n-1","gaps":[]}"#,
-            r#"{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
-                "done":true,"report":{"kind":"inline","text":"map"},
+            r#"{"schema":"lionclaw.mission.review-handoff.v2","type":"review",
+                "done":true,"report":"map",
                 "passed":true,"gaps":[]}"#,
         ] {
             let err = parse_handoff(raw, OutputSemantics::EmitsGapVerdict)
@@ -269,8 +388,8 @@ mod tests {
         // parser caps them before they can reach an event.
         let evidence = "x".repeat(300 * 1024);
         let raw = format!(
-            r#"{{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
-                "done":true,"report":{{"kind":"inline","text":""}},
+            r#"{{"schema":"lionclaw.mission.review-handoff.v2","type":"review",
+                "done":true,"report":"",
                 "passed":false,"nonce":"n-1",
                 "gaps":[{{"severity":"blocking","requirement":"r",
                          "expected":"e","observed":"o","evidence":"{evidence}"}}]
@@ -296,8 +415,8 @@ mod tests {
             r#"{"severity":"blocking","requirement":"","expected":"e","observed":"o","evidence":"v"}"#,
         ] {
             let raw = format!(
-                r#"{{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
-                    "done":true,"report":{{"kind":"inline","text":""}},
+                r#"{{"schema":"lionclaw.mission.review-handoff.v2","type":"review",
+                    "done":true,"report":"",
                     "passed":false,"nonce":"n-1","gaps":[{gap_json}]}}"#
             );
             let err =
@@ -309,8 +428,8 @@ mod tests {
     #[test]
     fn rejects_wrong_schema_for_role() {
         // A judge trying to hand back a work handoff is refused.
-        let raw = r#"{"schema":"lionclaw.mission.work-handoff.v1","type":"work",
-                      "done":true,"report":{"kind":"inline","text":"looks great"},
+        let raw = r#"{"schema":"lionclaw.mission.work-handoff.v2","type":"work",
+                      "done":true,"report":"looks great",
                       "request_attention":false}"#;
         let err = parse_handoff(raw, OutputSemantics::EmitsVerdict).expect_err("must refuse");
         assert!(err.is_invalid_output());
@@ -327,11 +446,24 @@ mod tests {
     #[test]
     fn rejects_invalid_item_ids() {
         // Item ids run through the AssertionId charset validation.
-        let raw = r#"{"schema":"lionclaw.mission.validate-handoff.v1","type":"validate",
-                      "done":true,"report":{"kind":"inline","text":""},
+        let raw = r#"{"schema":"lionclaw.mission.validate-handoff.v2","type":"validate",
+                      "done":true,"report":"",
                       "items":[{"item_id":"lowercase-bad","passed":true}],
                       "passed":true,"request_attention":false}"#;
         let err = parse_handoff(raw, OutputSemantics::EmitsVerdict).expect_err("must refuse");
+        assert!(err.is_invalid_output());
+    }
+
+    #[test]
+    fn agent_handoffs_cannot_supply_durable_blob_references() {
+        let raw = r#"{"schema":"lionclaw.mission.work-handoff.v2","type":"work",
+                      "done":true,
+                      "report":{"kind":"blob","blob":{"algo":"sha256",
+                                "hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                "len":1}},
+                      "request_attention":false}"#;
+        let err = parse_handoff(raw, OutputSemantics::ProducesArtifact)
+            .expect_err("only the engine may mint payload refs");
         assert!(err.is_invalid_output());
     }
 }

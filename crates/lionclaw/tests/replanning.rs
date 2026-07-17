@@ -3,9 +3,7 @@
 
 mod common;
 
-use common::{
-    approve_plan, default_config, harness, proposal, simple_plan, ParseTask, BASE_SHA, HEAD_SHA,
-};
+use common::{approve_plan, harness, proposal, simple_plan, ParseTask, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::ProposeError;
 use lionclaw::model::{
     Assertion, AssertionId, DecisionAction, OracleName, PlanProposal, ProposalError, Requirement,
@@ -43,7 +41,7 @@ async fn started() -> (
     let (dir, h) = test_harness().await;
     let id = h
         .engine
-        .create_mission("/repo", "revise", BASE_SHA, default_config())
+        .create_mission("/repo", "revise", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -138,7 +136,7 @@ async fn a_limitation_may_become_covered_but_not_the_reverse() {
     let (_dir, h) = test_harness().await;
     let id = h
         .engine
-        .create_mission("/repo", "limitations", BASE_SHA, default_config())
+        .create_mission("/repo", "limitations", BASE_SHA)
         .await
         .unwrap();
     let mut initial = simple_plan();
@@ -216,10 +214,9 @@ async fn retained_task_ids_are_immutable_and_retired_ids_never_revive() {
 #[tokio::test]
 async fn approval_policy_applies_to_every_revision() {
     let (_dir, h) = test_harness().await;
-    let config = default_config();
     let id = h
         .engine
-        .create_mission("/repo", "approval", BASE_SHA, config)
+        .create_mission("/repo", "approval", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -253,7 +250,7 @@ async fn initial_proposal_must_target_revision_zero() {
     let (_dir, h) = test_harness().await;
     let id = h
         .engine
-        .create_mission("/repo", "initial", BASE_SHA, default_config())
+        .create_mission("/repo", "initial", BASE_SHA)
         .await
         .unwrap();
     let error = h

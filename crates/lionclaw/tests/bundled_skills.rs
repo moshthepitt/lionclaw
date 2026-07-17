@@ -93,7 +93,7 @@ fn every_bundled_skill_has_no_end_node_and_carries_the_handoff_directive() {
 
         // No embedded lionclaw.mission.*-handoff schema literal.
         assert!(
-            !text.contains("lionclaw.mission.") && !text.contains("-handoff.v1"),
+            !text.contains("lionclaw.mission.") && !text.contains("-handoff.v"),
             "{}: no handoff schema literal may be embedded in a skill file",
             path.display()
         );

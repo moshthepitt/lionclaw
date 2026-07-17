@@ -12,8 +12,8 @@ use lionclaw::authority::AuthorityCeiling;
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::load_mission_type;
 use lionclaw::model::{
-    AssertionId, FinishClass, Handoff, MissionConfig, MissionPhase, OutputSemantics, PayloadRef,
-    Plan, RoleName, StopBar, Task, TaskId, TaskKind, ValidationItem,
+    AssertionId, FinishClass, Handoff, MissionPhase, OutputSemantics, PayloadRef, Plan, RoleName,
+    StopBar, Task, TaskId, TaskKind, ValidationItem,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -93,9 +93,6 @@ async fn advisory_only_mission_type_never_verifies() {
             final_response: String::new(),
         })
     }));
-    // The reviewed bar requires the closing review (create_mission refuses
-    // it otherwise), so thread the fixture's declaration like cmd_start does.
-    let terminal_review = mission_type.terminal_review.clone();
     let engine = Engine::new(
         store,
         mission_type,
@@ -109,22 +106,7 @@ async fn advisory_only_mission_type_never_verifies() {
         ),
     );
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "make it readable",
-            "base-0",
-            MissionConfig {
-                stop: StopBar::Reviewed,
-                planning: Default::default(),
-                recovery: Default::default(),
-                execution: lionclaw::model::ExecutionPolicy {
-                    auto_continue_candidate: true,
-                    auto_continue_proof: true,
-                    ..Default::default()
-                },
-                terminal_review,
-            },
-        )
+        .create_mission(dir.path().to_str().unwrap(), "make it readable", "base-0")
         .await
         .expect("create");
     // One oracle-less assertion, covered by a worker and judged by a reviewer.

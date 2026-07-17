@@ -72,7 +72,7 @@ struct PayloadDoc {
 
 impl MissionStore {
     /// Register a mission and append its `MissionCreated` event atomically.
-    pub async fn create_mission(
+    pub(crate) async fn create_mission(
         &self,
         mission_id: &MissionId,
         workspace_dir: &str,
@@ -103,7 +103,7 @@ impl MissionStore {
     }
 
     /// Append events after `expected_head`. Returns the new head.
-    pub async fn append(
+    pub(crate) async fn append(
         &self,
         mission_id: &MissionId,
         expected_head: u64,
@@ -284,7 +284,8 @@ mod sink_tests {
     use std::sync::{Arc, Mutex};
 
     use crate::model::{
-        DecisionAction, EventEnvelope, MissionConfig, MissionEvent, MissionTypeRef, StopBar,
+        DecisionAction, EffectId, EventEnvelope, MissionConfig, MissionEvent, MissionTypeRef,
+        OracleName, StopBar,
     };
     use crate::ports::EventSink;
 
@@ -362,5 +363,39 @@ mod sink_tests {
             vec![1, 2, 3],
             "a rolled-back append must not publish"
         );
+    }
+
+    #[tokio::test]
+    async fn one_outcome_per_effect_id_is_a_store_invariant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MissionStore::open(dir.path()).await.unwrap();
+        let id = MissionId::parse("mabc123def456").unwrap();
+        store
+            .create_mission(&id, "/w", "o", created(), 1)
+            .await
+            .unwrap();
+        let effect_id = EffectId::for_parts(&["test", "duplicate-outcome"]);
+        let outcome = NewEvent::new(MissionEvent::OracleRunCompleted {
+            assertion_ids: Vec::new(),
+            oracle: OracleName::new("test").unwrap(),
+            judged_sha: "base".into(),
+            attempt_no: 1,
+            effect_id: effect_id.clone(),
+            outcome: Err(lionclaw_runtime_api::TypedFailure::Interrupted {
+                evidence: Box::new(lionclaw_runtime_api::TypedFailureEvidence::new(
+                    None,
+                    "interrupted",
+                )),
+            }),
+        });
+        store
+            .append(&id, 1, std::slice::from_ref(&outcome), 2)
+            .await
+            .unwrap();
+        let duplicate = store.append(&id, 2, &[outcome], 3).await;
+        assert!(matches!(
+            duplicate,
+            Err(AppendError::Duplicate { effect_id: duplicate }) if duplicate == effect_id.as_str()
+        ));
     }
 }

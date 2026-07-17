@@ -10,8 +10,9 @@ use lionclaw_runtime_api::TypedFailure;
 use std::sync::Mutex;
 
 use common::{
-    approve_plan, blocking_gap, default_config, effect_id, harness_with_type, proposal,
-    review_config, review_mission_type, review_runner, simple_plan, ParseTask, BASE_SHA, HEAD_SHA,
+    approve_plan, blocking_gap, effect_id, fault_append_events, harness_with_type, proposal,
+    review_mission_type, review_runner, simple_plan, test_mission_type, ParseTask, BASE_SHA,
+    HEAD_SHA,
 };
 use lionclaw::engine::{MissionDisposition, MissionView, TERMINAL_REVIEW_TASK_TAG as REVIEW_TAG};
 use lionclaw::model::{
@@ -50,21 +51,50 @@ fn work_outcome(request: &RoleRunRequest, head_sha: &str) -> RoleRunOutcome {
     }
 }
 
+fn failing_review_runner() -> MockRoleRunner {
+    MockRoleRunner::new(Box::new(|request| {
+        if request.task_id.as_str() == REVIEW_TAG {
+            Err(TypedFailure::permanent(
+                "test.review_failed",
+                "establish a retryable review obligation",
+            ))
+        } else {
+            Ok(work_outcome(request, HEAD_SHA))
+        }
+    }))
+}
+
+async fn reopen_failed_review(h: &common::TestHarness, mission_id: &lionclaw::model::MissionId) {
+    let parked = h.engine.advance(mission_id).await.expect("initial advance");
+    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    h.engine
+        .decide(
+            mission_id,
+            "terminal_review_failed:mission",
+            DecisionAction::Retry,
+            "retry after the failed review",
+        )
+        .await
+        .expect("retry review");
+}
+
 async fn started(
     dir: &tempfile::TempDir,
     runner: MockRoleRunner,
 ) -> (common::TestHarness, lionclaw::model::MissionId) {
-    started_with_config(dir, runner, review_config()).await
+    started_with_recovery(dir, runner, 3).await
 }
 
-async fn started_with_config(
+async fn started_with_recovery(
     dir: &tempfile::TempDir,
     runner: MockRoleRunner,
-    config: lionclaw::model::MissionConfig,
+    max_attempts: u32,
 ) -> (common::TestHarness, lionclaw::model::MissionId) {
+    let mut mission_type = review_mission_type();
+    mission_type.recovery.max_attempts = max_attempts;
     let h = harness_with_type(
         dir.path(),
-        review_mission_type(),
+        mission_type,
         runner,
         MockOracleRunner::exiting(0),
     )
@@ -75,7 +105,6 @@ async fn started_with_config(
             dir.path().to_str().expect("utf8"),
             "make the failing test pass",
             BASE_SHA,
-            config,
         )
         .await
         .expect("create");
@@ -248,7 +277,6 @@ async fn terminal_review_receives_its_declared_skill_packages() {
             dir.path().to_str().expect("utf8"),
             "make the failing test pass",
             BASE_SHA,
-            review_config(),
         )
         .await
         .expect("create");
@@ -407,9 +435,7 @@ async fn a_failed_review_parks_then_retry_re_rolls() {
             Ok(work_outcome(request, HEAD_SHA))
         }
     }));
-    let mut config = review_config();
-    config.recovery.max_attempts = 1;
-    let (h, mission_id) = started_with_config(&dir, runner, config).await;
+    let (h, mission_id) = started_with_recovery(&dir, runner, 1).await;
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
@@ -454,9 +480,7 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
             Ok(work_outcome(request, HEAD_SHA))
         }
     }));
-    let mut config = review_config();
-    config.recovery.max_attempts = 1;
-    let (h, mission_id) = started_with_config(&dir, runner, config).await;
+    let (h, mission_id) = started_with_recovery(&dir, runner, 1).await;
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
@@ -481,29 +505,26 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
 #[tokio::test]
 async fn a_crashed_review_is_interrupted_without_rerunning_the_llm() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (h, mission_id) = started(&dir, review_runner(vec![(true, vec![])])).await;
+    let (h, mission_id) = started(&dir, failing_review_runner()).await;
+    reopen_failed_review(&h, &mission_id).await;
 
-    // Record a request with no outcome, as left by a dead driver.
+    // Record the owed second request with no outcome, as left by a dead driver.
     let state = h.engine.load_state(&mission_id).await.expect("state");
     let id = effect_id("crashed-review");
     let event = lionclaw::store::NewEvent::new(MissionEvent::TerminalReviewRequested {
-        attempt_no: 1,
+        attempt_no: 2,
         effect_id: id.clone(),
         role: lionclaw::model::RoleName::new("gap-reviewer").expect("role"),
         runtime: "codex".to_string(),
         prompt: PayloadRef::inline("prompt"),
-        judged_sha: BASE_SHA.to_string(),
+        judged_sha: HEAD_SHA.to_string(),
         nonce: "n0".to_string(),
         requested_at_ms: 0,
         not_before_ms: 0,
         deadline_ms: 100_000,
         budget_deadline_ms: 100_000,
     });
-    h.engine
-        .store()
-        .append(&mission_id, state.head, &[event], 1)
-        .await
-        .expect("append request");
+    fault_append_events(dir.path(), &mission_id, state.head, &[event], 1).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     assert_eq!(outcome.disposition, MissionDisposition::Parked);
     let state = h.engine.load_state(&mission_id).await.expect("state");
@@ -524,25 +545,19 @@ async fn a_crashed_review_is_interrupted_without_rerunning_the_llm() {
 }
 
 #[tokio::test]
-async fn a_mission_without_the_config_never_dispatches_a_review() {
+async fn a_mission_type_without_a_review_never_dispatches_one() {
     let dir = tempfile::tempdir().expect("tempdir");
-    // The mission type provides the reviewer role, but this mission was
-    // created without the config (a pre-feature log's shape).
+    // The pinned type has no terminal-review policy; creation cannot add one.
     let h = harness_with_type(
         dir.path(),
-        review_mission_type(),
+        test_mission_type(),
         review_runner(vec![(true, vec![])]),
         MockOracleRunner::exiting(0),
     )
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().expect("utf8"),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA)
         .await
         .expect("create");
     h.engine
@@ -552,7 +567,10 @@ async fn a_mission_without_the_config_never_dispatches_a_review() {
     approve_plan(&h.engine, &mission_id).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     assert_terminal(&outcome);
-    assert!(review_calls(&h).is_empty(), "no config, no reviewer");
+    assert!(
+        review_calls(&h).is_empty(),
+        "no declared review, no reviewer"
+    );
 }
 
 #[tokio::test]
@@ -560,28 +578,25 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_review() {
     // Rebuilding the snapshot must preserve the unfinished request so the
     // next driver interrupts it rather than invoking the reviewer.
     let dir = tempfile::tempdir().expect("tempdir");
-    let (h, mission_id) = started(&dir, review_runner(vec![(true, vec![])])).await;
+    let (h, mission_id) = started(&dir, failing_review_runner()).await;
+    reopen_failed_review(&h, &mission_id).await;
 
     let state = h.engine.load_state(&mission_id).await.expect("state");
     let id = effect_id("crash-review");
     let event = lionclaw::store::NewEvent::new(MissionEvent::TerminalReviewRequested {
-        attempt_no: 1,
+        attempt_no: 2,
         effect_id: id.clone(),
         role: lionclaw::model::RoleName::new("gap-reviewer").expect("role"),
         runtime: "codex".to_string(),
         prompt: PayloadRef::inline("p"),
-        judged_sha: BASE_SHA.to_string(),
+        judged_sha: HEAD_SHA.to_string(),
         nonce: "n0".to_string(),
         requested_at_ms: 0,
         not_before_ms: 0,
         deadline_ms: 100_000,
         budget_deadline_ms: 100_000,
     });
-    h.engine
-        .store()
-        .append(&mission_id, state.head, &[event], 1_000)
-        .await
-        .expect("append");
+    fault_append_events(dir.path(), &mission_id, state.head, &[event], 1_000).await;
     h.engine
         .store()
         .rebuild_cursors(&mission_id, 5_000)
@@ -606,30 +621,23 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_review() {
 }
 
 #[tokio::test]
-async fn a_reviewed_bar_mission_without_the_config_is_refused_at_creation() {
-    // Regression (QA round 1): the loader's reviewed-bar rule must also hold
-    // at the config choke point — no direct caller can mint a reviewed-bar
-    // mission whose closing gate never runs.
+async fn a_reviewed_bar_mission_type_without_a_review_is_refused_at_creation() {
+    // Directly constructed mission types obey the same creation invariant as
+    // loaded bundles; there is no caller-owned config that can weaken it.
     let dir = tempfile::tempdir().expect("tempdir");
+    let mut mission_type = review_mission_type();
+    mission_type.stop = lionclaw::model::StopBar::Reviewed;
+    mission_type.terminal_review = None;
     let h = harness_with_type(
         dir.path(),
-        review_mission_type(),
+        mission_type,
         review_runner(vec![(true, vec![])]),
         MockOracleRunner::exiting(0),
     )
     .await;
     let err = h
         .engine
-        .create_mission(
-            dir.path().to_str().expect("utf8"),
-            "obj",
-            BASE_SHA,
-            lionclaw::model::MissionConfig {
-                stop: lionclaw::model::StopBar::Reviewed,
-                terminal_review: None,
-                ..Default::default()
-            },
-        )
+        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA)
         .await
         .expect_err("a reviewed-bar mission without a review must be refused");
     assert!(err.to_string().contains("terminal review"), "got {err}");
@@ -668,9 +676,7 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
             Ok(work_outcome(request, &head))
         }
     }));
-    let mut config = review_config();
-    config.recovery.max_attempts = 1;
-    let (h, mission_id) = started_with_config(&dir, runner, config).await;
+    let (h, mission_id) = started_with_recovery(&dir, runner, 1).await;
 
     // Park on the review failure; propose follow-up work while parked.
     h.engine.advance(&mission_id).await.expect("advance");
@@ -712,36 +718,26 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
 }
 
 #[tokio::test]
-async fn a_config_naming_an_unknown_or_non_verdict_reviewer_is_refused_at_creation() {
-    // Regression (QA round 2): a config whose reviewer the pinned type cannot
-    // resolve would wedge at the closing gate (every advance erroring before
-    // any event lands, so no attention item and no abort path). Refuse it at
-    // the config choke point instead.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let h = harness_with_type(
-        dir.path(),
-        review_mission_type(),
-        review_runner(vec![(true, vec![])]),
-        MockOracleRunner::exiting(0),
-    )
-    .await;
+async fn a_mission_type_naming_an_unknown_or_non_verdict_reviewer_is_refused_at_creation() {
     for (role, expected) in [
         ("ghost", "is not provided"),
         ("implementer", "must be emits-gap-verdict"),
     ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut mission_type = review_mission_type();
+        mission_type.terminal_review = Some(lionclaw::model::TerminalReviewConfig {
+            role: lionclaw::model::RoleName::new(role).expect("role name"),
+        });
+        let h = harness_with_type(
+            dir.path(),
+            mission_type,
+            review_runner(vec![(true, vec![])]),
+            MockOracleRunner::exiting(0),
+        )
+        .await;
         let err = h
             .engine
-            .create_mission(
-                dir.path().to_str().expect("utf8"),
-                "obj",
-                BASE_SHA,
-                lionclaw::model::MissionConfig {
-                    terminal_review: Some(lionclaw::model::TerminalReviewConfig {
-                        role: lionclaw::model::RoleName::new(role).expect("role name"),
-                    }),
-                    ..Default::default()
-                },
-            )
+            .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA)
             .await
             .expect_err("an unresolvable reviewer must be refused");
         assert!(err.to_string().contains(expected), "{role}: got {err}");

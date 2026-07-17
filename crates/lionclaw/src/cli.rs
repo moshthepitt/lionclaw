@@ -19,8 +19,7 @@ use crate::mission_type::{
     BundledMissionTypes, Home, MissionType, MissionTypeLocator, SkillSource,
 };
 use crate::model::{
-    fold, short_hex, ControlAction, DecisionAction, EffectId, FinishClass, MissionConfig,
-    MissionId, MissionPhase,
+    fold, short_hex, ControlAction, DecisionAction, EffectId, FinishClass, MissionId, MissionPhase,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, SystemClock};
@@ -724,17 +723,6 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
                 &repo.to_string_lossy(),
                 &args.objective,
                 &base_sha,
-                MissionConfig {
-                    // The honesty bar is the mission type's, not a hardcoded default.
-                    stop: engine.mission_type().stop,
-                    // The planning DAG the mission type ships (empty ⇒ awaits a
-                    // manually proposed plan).
-                    planning: engine.mission_type().planning.clone(),
-                    recovery: engine.mission_type().recovery.clone(),
-                    execution: engine.mission_type().execution.clone(),
-                    // The closing review the mission type ships (None ⇒ off).
-                    terminal_review: engine.mission_type().terminal_review.clone(),
-                },
             )
             .await?;
         Ok::<_, anyhow::Error>((mission_id.clone(), engine))
@@ -2403,7 +2391,12 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
             )
         }).collect::<Result<Vec<_>>>()?,
         "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
-            task_runtime_json(store, id, task, None)
+            task_runtime_json(
+                store,
+                id,
+                task,
+                Some(&crate::activity::WorkspaceObservation::NotApplicable),
+            )
         }).collect::<Result<Vec<_>>>()?,
         "planning_input": planning_input_json(state, blobs)?,
         "contract": state.contract.iter().map(|(id, assertion)| {
@@ -3450,7 +3443,7 @@ mod tests {
         assert_eq!(json["planning_tasks"][0]["id"], "planner");
         assert_eq!(
             json["planning_tasks"][0]["workspace_observation"],
-            serde_json::Value::Null
+            serde_json::json!({"status": "not_applicable"})
         );
         let retained = json["tasks"]
             .as_array()

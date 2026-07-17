@@ -13,15 +13,66 @@ use std::sync::Arc;
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::{MissionType, RoleDefinition};
 use lionclaw::model::{
-    Assertion, AssertionId, MissionConfig, OracleName, OutputSemantics, Plan, PlanProposal,
-    Requirement, RequirementDisposition, RequirementId, RequirementKind, RoleName, StopBar, Task,
-    TaskKind,
+    Assertion, AssertionId, OracleName, OutputSemantics, Plan, PlanProposal, Requirement,
+    RequirementDisposition, RequirementId, RequirementKind, RoleName, StopBar, Task, TaskKind,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
 pub const BASE_SHA: &str = "0000000000000000000000000000000000000001";
 pub const HEAD_SHA: &str = "0000000000000000000000000000000000000002";
+
+/// Test-only fault injection that writes directly to the on-disk log. Raw
+/// production append is kernel-private; crash/replay tests deliberately bypass
+/// that boundary through SQLite rather than reopening it in the public API.
+pub async fn fault_append_events(
+    workspace: &Path,
+    mission_id: &lionclaw::model::MissionId,
+    expected_head: u64,
+    events: &[lionclaw::store::NewEvent],
+    now_ms: i64,
+) -> u64 {
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        workspace.join(".lionclaw/mission.db").display()
+    ))
+    .await
+    .expect("open mission database for fault injection");
+    let mut transaction = database.begin().await.expect("begin fault append");
+    let actual: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sequence_no), 0) FROM mission_events WHERE mission_id = ?1",
+    )
+    .bind(mission_id.as_str())
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("read fault append head");
+    assert_eq!(actual as u64, expected_head, "fault append head changed");
+
+    let mut sequence = expected_head;
+    for event in events {
+        sequence += 1;
+        let payload = serde_json::to_string(&serde_json::json!({
+            "stamps": event.stamps,
+            "event": event.event,
+        }))
+        .expect("encode fault event");
+        sqlx::query(
+            "INSERT INTO mission_events
+                 (mission_id, sequence_no, recorded_at_ms, schema_version, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(mission_id.as_str())
+        .bind(sequence as i64)
+        .bind(now_ms)
+        .bind(event.stamps.schema_version)
+        .bind(payload)
+        .execute(&mut *transaction)
+        .await
+        .expect("inject fault event");
+    }
+    transaction.commit().await.expect("commit fault events");
+    sequence
+}
 
 pub fn effect_id(label: &str) -> lionclaw::model::EffectId {
     lionclaw::model::EffectId::for_parts(&["test", label])
@@ -45,20 +96,16 @@ pub fn test_mission_type() -> MissionType {
     MissionType {
         name: "software-dev-test".to_string(),
         digest: "test-digest".to_string(),
-        // `Reviewed` so the shared harness accepts both oracle-bound and
-        // advisory plans; the `Verified` proposal-reachability check is exercised
-        // in the plan_validation unit tests. A reviewed-bar type must declare
-        // a terminal review (the loader/engine invariant) — the shipped
-        // `reviewer` judge serves; missions only run it when their CONFIG
-        // carries it (`review_config`), so `default_config` tests are untouched.
-        stop: StopBar::Reviewed,
+        stop: StopBar::Verified,
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
         planning: Default::default(),
         recovery: Default::default(),
-        execution: Default::default(),
-        terminal_review: Some(lionclaw::model::TerminalReviewConfig {
-            role: RoleName::new("reviewer").expect("role name"),
-        }),
+        execution: lionclaw::model::ExecutionPolicy {
+            auto_continue_candidate: true,
+            auto_continue_proof: true,
+            ..Default::default()
+        },
+        terminal_review: None,
         playbook: None,
         roles: BTreeMap::from([
             (
@@ -240,27 +287,6 @@ pub async fn harness_with_type(
         engine,
         role_runner,
         oracle_runner,
-    }
-}
-
-pub fn default_config() -> MissionConfig {
-    MissionConfig {
-        execution: lionclaw::model::ExecutionPolicy {
-            auto_continue_candidate: true,
-            auto_continue_proof: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-
-/// `default_config` plus the closing review (matches `review_mission_type`).
-pub fn review_config() -> MissionConfig {
-    MissionConfig {
-        terminal_review: Some(lionclaw::model::TerminalReviewConfig {
-            role: RoleName::new("gap-reviewer").expect("role name"),
-        }),
-        ..default_config()
     }
 }
 

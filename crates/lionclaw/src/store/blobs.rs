@@ -65,8 +65,26 @@ impl BlobStore {
             .join(&blob.hex[..2])
             .join(&blob.hex[2..4])
             .join(&blob.hex);
+        let stored_len = fs::metadata(&path)
+            .with_context(|| format!("failed to stat blob '{}'", path.display()))?
+            .len();
+        if stored_len != blob.len {
+            bail!(
+                "blob '{}' length mismatch (declared {}, stored {stored_len})",
+                blob.hex,
+                blob.len
+            );
+        }
         let bytes =
             fs::read(&path).with_context(|| format!("failed to read blob '{}'", path.display()))?;
+        if bytes.len() as u64 != blob.len {
+            bail!(
+                "blob '{}' changed length while reading (declared {}, read {})",
+                blob.hex,
+                blob.len,
+                bytes.len()
+            );
+        }
         let actual = hex::encode(Sha256::digest(&bytes));
         if actual != blob.hex {
             bail!(
@@ -103,6 +121,19 @@ impl BlobStore {
             PayloadRef::Inline { text } => Ok(text.clone()),
             PayloadRef::Blob(blob) => Ok(String::from_utf8_lossy(&self.get(blob)?).into_owned()),
         }
+    }
+
+    /// Resolve text only when its declared size fits the caller's remaining
+    /// aggregate budget. Blob metadata is checked before any content read.
+    pub fn resolve_bounded(&self, payload: &PayloadRef, max_bytes: usize) -> Result<String> {
+        let declared = match payload {
+            PayloadRef::Inline { text } => text.len() as u64,
+            PayloadRef::Blob(blob) => blob.len,
+        };
+        if declared > max_bytes as u64 {
+            bail!("payload declares {declared} bytes, which exceeds the {max_bytes}-byte limit");
+        }
+        self.resolve(payload)
     }
 }
 
@@ -153,6 +184,32 @@ mod tests {
         std::fs::set_permissions(&path, perms).expect("chmod");
         std::fs::write(&path, b"tampered").expect("tamper");
         assert!(store.get(&blob).is_err());
+    }
+
+    #[test]
+    fn get_rejects_a_forged_declared_length_before_reading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path().to_path_buf());
+        let mut blob = store.put(b"content").expect("put");
+        blob.len += 1;
+        let error = store.get(&blob).expect_err("length mismatch");
+        assert!(error.to_string().contains("length mismatch"));
+    }
+
+    #[test]
+    fn bounded_resolution_rejects_declared_overflow_before_reading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path().to_path_buf());
+        let blob = BlobRef {
+            algo: "sha256".into(),
+            hex: "a".repeat(64),
+            len: 1025,
+        };
+        let error = store
+            .resolve_bounded(&PayloadRef::Blob(blob), 1024)
+            .expect_err("declared overflow must be rejected before blob I/O");
+        assert!(error.to_string().contains("exceeds the 1024-byte limit"));
+        assert!(!error.to_string().contains("failed to stat"));
     }
 
     // A BlobRef can come from an agent-authored handoff, so a malformed hex must

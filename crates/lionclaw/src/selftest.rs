@@ -25,11 +25,10 @@ use crate::config::RuntimeProfiles;
 use crate::engine::{Engine, EngineServices, MissionDisposition, ProposeError};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
-    ArtifactOutcome, Assertion, AssertionId, DecisionAction, EffectId, ExecutionPolicy,
-    FinishClass, Gap, GapSeverity, Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase,
-    OracleName, PayloadRef, Plan, PlanProposal, ProposalError, Requirement, RequirementDisposition,
-    RequirementId, RequirementKind, ReviewAcceptanceKind, RoleName, Task, TaskId, TaskKind,
-    TaskStatus,
+    ArtifactOutcome, Assertion, AssertionId, DecisionAction, EffectId, FinishClass, Gap,
+    GapSeverity, Handoff, MissionEvent, MissionId, MissionPhase, OracleName, PayloadRef, Plan,
+    PlanProposal, ProposalError, Requirement, RequirementDisposition, RequirementId,
+    RequirementKind, ReviewAcceptanceKind, RoleName, Task, TaskId, TaskKind, TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
@@ -45,17 +44,6 @@ use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
 use lionclaw_runtime_api::{ExecutionOutput, RuntimeAuthRegistry, RuntimeProgramExecutor};
 
 const RUNTIME_IMAGE: &str = "localhost/lionclaw-runtime-dev:v1";
-
-fn self_test_config() -> MissionConfig {
-    MissionConfig {
-        execution: ExecutionPolicy {
-            auto_continue_candidate: true,
-            auto_continue_proof: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
 
 /// A no-op producer: clears its work task without changing the tree, so the
 /// real oracle judges the base fixture as-is. Used by the oracle-honesty
@@ -332,7 +320,11 @@ const BROKEN_LIB: &str = include_str!("../tests/fixtures/eval/interval-bug/src/l
 /// A `mission.toml` for a self-test mission type: `stop = verified`, running
 /// in the runtime image the readiness probe already gated on.
 fn manifest_toml(name: &str) -> String {
-    format!("[mission-type]\nname = \"{name}\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n")
+    format!(
+        "[mission-type]\nname = \"{name}\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n\
+         \n[execution]\ndefault-timeout-secs = 1800\nmax-task-time-secs = 1800\n\
+         extension-step-secs = 300\nauto-continue-candidate = true\nauto-continue-proof = true\n"
+    )
 }
 const IMPLEMENTER_ROLE: &str = "\
 ---
@@ -658,7 +650,6 @@ async fn check_happy_writer_and_resume() -> Result<()> {
                 &repo.path().to_string_lossy(),
                 "self-test writable worker",
                 &base,
-                self_test_config(),
             )
             .await?;
         engine
@@ -714,7 +705,6 @@ async fn check_prepared_input() -> Result<()> {
             &repo.path().to_string_lossy(),
             "self-test prepared input",
             &base,
-            self_test_config(),
         )
         .await?;
     engine
@@ -798,7 +788,6 @@ async fn check_oracle_honesty() -> Result<()> {
             &repo.path().to_string_lossy(),
             "self-test oracle honesty",
             &base,
-            self_test_config(),
         )
         .await?;
     engine
@@ -860,7 +849,6 @@ async fn check_replanning() -> Result<()> {
             repo.path().to_str().context("utf8 repo path")?,
             "re-planning self-test",
             &base,
-            self_test_config(),
         )
         .await?;
     engine
@@ -940,6 +928,8 @@ async fn check_terminal_review() -> Result<()> {
         type_dir.path().join("mission.toml"),
         format!(
             "[mission-type]\nname = \"selftest\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n\
+             \n[execution]\ndefault-timeout-secs = 1800\nmax-task-time-secs = 1800\n\
+             extension-step-secs = 300\nauto-continue-candidate = true\nauto-continue-proof = true\n\
              \n[terminal-review]\nrole = \"gap-reviewer\"\n"
         ),
     )?;
@@ -952,10 +942,6 @@ async fn check_terminal_review() -> Result<()> {
 
     let repo = tempfile::tempdir().context("tempdir")?;
     let base = materialize_repo(repo.path(), ADD_CARGO, FIXED_ADD_LIB).await?;
-    let config = MissionConfig {
-        terminal_review: mission_type.terminal_review.clone(),
-        ..self_test_config()
-    };
     let engine = Engine::new(
         MissionStore::open(repo.path()).await?,
         mission_type,
@@ -975,7 +961,6 @@ async fn check_terminal_review() -> Result<()> {
             repo.path().to_str().context("utf8 repo path")?,
             "terminal-review self-test",
             &base,
-            config,
         )
         .await?;
     engine

@@ -120,44 +120,75 @@ fn launch(detail: String) -> TypedFailure {
     TypedFailure::permanent("kernel.launch", detail)
 }
 
+#[derive(Clone, Copy)]
+enum CancellationKind {
+    Deadline,
+    Stop,
+    Abort,
+}
+
+impl CancellationKind {
+    fn setup_detail(self) -> &'static str {
+        match self {
+            Self::Deadline => "effect deadline reached before or after the runtime turn",
+            Self::Stop => "effect stopped before or after the runtime turn",
+            Self::Abort => "mission aborted before or after the runtime turn",
+        }
+    }
+
+    fn setup_code(self) -> &'static str {
+        match self {
+            Self::Deadline => "kernel.deadline",
+            Self::Stop => "kernel.stopped",
+            Self::Abort => "kernel.aborted",
+        }
+    }
+
+    fn active_detail(self) -> &'static str {
+        match self {
+            Self::Deadline => "agent turn exceeded its recorded effect deadline",
+            Self::Stop => "agent turn stopped by operator",
+            Self::Abort => "mission aborted by operator",
+        }
+    }
+
+    fn failure(self, evidence: lionclaw_runtime_api::TypedFailureEvidence) -> TypedFailure {
+        match self {
+            Self::Deadline => TypedFailure::DeadlineExhausted {
+                evidence: Box::new(evidence),
+            },
+            Self::Stop => TypedFailure::OperatorStopped {
+                evidence: Box::new(evidence),
+            },
+            Self::Abort => TypedFailure::OperatorAborted {
+                evidence: Box::new(evidence),
+            },
+        }
+    }
+}
+
 fn setup_control_failure(
     profile: &MissionRuntimeProfile,
     control: &ExecutionControl,
 ) -> Option<TypedFailure> {
-    let (deadline, reason) = match control {
+    let (kind, reason) = match control {
         ExecutionControl::RunUntil(_) => return None,
-        ExecutionControl::DeadlineExhausted => (true, "effect deadline exhausted".to_string()),
-        ExecutionControl::Stop(reason) => (false, reason.clone()),
+        ExecutionControl::DeadlineExhausted => (
+            CancellationKind::Deadline,
+            "effect deadline exhausted".to_string(),
+        ),
+        ExecutionControl::Stop(reason) => (CancellationKind::Stop, reason.clone()),
+        ExecutionControl::Abort(reason) => (CancellationKind::Abort, reason.clone()),
     };
     let mut evidence = turn_failure_evidence(
         profile,
-        if deadline {
-            "effect deadline reached before or after the runtime turn"
-        } else {
-            "effect stopped before or after the runtime turn"
-        }
-        .into(),
+        kind.setup_detail().into(),
         String::new(),
         String::new(),
     );
-    evidence.code = Some(
-        if deadline {
-            "kernel.deadline"
-        } else {
-            "kernel.stopped"
-        }
-        .into(),
-    );
+    evidence.code = Some(kind.setup_code().into());
     evidence.stop_reason = Some(reason);
-    Some(if deadline {
-        TypedFailure::DeadlineExhausted {
-            evidence: Box::new(evidence),
-        }
-    } else {
-        TypedFailure::OperatorStopped {
-            evidence: Box::new(evidence),
-        }
-    })
+    Some(kind.failure(evidence))
 }
 
 async fn cancellation_acknowledged<A, T, O>(
@@ -529,7 +560,10 @@ impl OciRoleRunner {
         let mut control = request.control.clone();
         enum TurnEnd {
             Completed(anyhow::Result<lionclaw_runtime_api::RuntimeTurnResult>),
-            Cancel { reason: String, deadline: bool },
+            Cancel {
+                reason: String,
+                kind: CancellationKind,
+            },
         }
         let end = loop {
             let current_control = control.borrow().clone();
@@ -538,13 +572,19 @@ impl OciRoleRunner {
                 ExecutionControl::DeadlineExhausted => {
                     break TurnEnd::Cancel {
                         reason: "effect deadline exhausted".into(),
-                        deadline: true,
+                        kind: CancellationKind::Deadline,
                     };
                 }
                 ExecutionControl::Stop(reason) => {
                     break TurnEnd::Cancel {
                         reason,
-                        deadline: false,
+                        kind: CancellationKind::Stop,
+                    };
+                }
+                ExecutionControl::Abort(reason) => {
+                    break TurnEnd::Cancel {
+                        reason,
+                        kind: CancellationKind::Abort,
                     };
                 }
             }
@@ -564,7 +604,7 @@ impl OciRoleRunner {
                     .cloned()
                     .unwrap_or_else(|| TypedFailure::permanent("runtime.unknown", err.to_string()))
             }),
-            TurnEnd::Cancel { reason, deadline } => {
+            TurnEnd::Cancel { reason, kind } => {
                 let (acknowledged, completed) = cancellation_acknowledged(
                     adapter.cancel(&handle, Some(reason.clone())),
                     turn.as_mut(),
@@ -573,12 +613,7 @@ impl OciRoleRunner {
                 .await;
                 let mut evidence = turn_failure_evidence(
                     profile,
-                    if deadline {
-                        "agent turn exceeded its recorded effect deadline"
-                    } else {
-                        "agent turn stopped by operator"
-                    }
-                    .into(),
+                    kind.active_detail().into(),
                     String::new(),
                     String::new(),
                 );
@@ -595,15 +630,7 @@ impl OciRoleRunner {
                     .into(),
                 );
                 evidence.stop_reason = Some(reason);
-                if deadline {
-                    Err(TypedFailure::DeadlineExhausted {
-                        evidence: Box::new(evidence),
-                    })
-                } else {
-                    Err(TypedFailure::OperatorStopped {
-                        evidence: Box::new(evidence),
-                    })
-                }
+                Err(kind.failure(evidence))
             }
         };
         drop(turn);

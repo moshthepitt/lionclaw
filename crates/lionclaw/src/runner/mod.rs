@@ -8,6 +8,7 @@ mod prepared_input;
 mod role_runner;
 
 pub use executor::MissionProgramExecutor;
+pub use handoff::MAX_HANDOFF_REPORT_BYTES;
 pub(crate) use prepared_input::{prepare_inputs, PreparedInputs};
 pub use role_runner::OciRoleRunner;
 
@@ -195,6 +196,16 @@ mod control_tests {
                 );
                 evidence.stop_reason = Some(reason.clone());
                 Some(lionclaw_runtime_api::TypedFailure::OperatorStopped {
+                    evidence: Box::new(evidence),
+                })
+            }
+            ExecutionControl::Abort(reason) => {
+                let mut evidence = lionclaw_runtime_api::TypedFailureEvidence::new(
+                    Some("test.aborted".into()),
+                    reason,
+                );
+                evidence.stop_reason = Some(reason.clone());
+                Some(lionclaw_runtime_api::TypedFailure::OperatorAborted {
                     evidence: Box::new(evidence),
                 })
             }
