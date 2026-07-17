@@ -2622,6 +2622,55 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_an_incomplete_planning_handoff_with_a_valid_proposal() {
+        let mut mission_created = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.planning.tasks.push(PlanningTask {
+            id: tid("author"),
+            role: RoleName::new("planner").expect("role name"),
+            output: OutputSemantics::ProposesPlan,
+            body: "author a complete plan".into(),
+            depends_on: Vec::new(),
+        });
+        let MissionEvent::PlanProposed { proposal, .. } =
+            plan_proposed(Vec::new(), vec![work_task("work")])
+        else {
+            unreachable!("plan_proposed() builds PlanProposed");
+        };
+
+        let state = fold_log(vec![
+            mission_created,
+            planning_role_requested("author", "incomplete-author", OutputSemantics::ProposesPlan),
+            planning_role_completed(
+                "author",
+                "incomplete-author",
+                Handoff::Plan {
+                    done: false,
+                    report: PayloadRef::inline("proposal is not ready"),
+                    proposal: Some(proposal),
+                    request_attention: false,
+                },
+                None,
+            ),
+        ])
+        .expect("mission remains replayable");
+
+        assert!(state.proposal.is_none());
+        assert!(state.plan.is_none());
+        assert_eq!(
+            state.planning.tasks[&tid("author")].status,
+            TaskStatus::Failed
+        );
+        assert!(matches!(
+            state.planning.tasks[&tid("author")].last_failure,
+            Some(TypedFailure::InvalidOutput { .. })
+        ));
+        assert!(state.open_attention.contains_key("node_failed:author"));
+    }
+
+    #[test]
     fn plan_proposed_initializes_contract_and_tasks() {
         let state = fold_log(vec![
             created(),
