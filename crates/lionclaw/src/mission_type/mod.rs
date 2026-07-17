@@ -39,6 +39,10 @@ use crate::model::{
     TerminalReviewConfig,
 };
 
+/// Aggregate program and declared-key content admitted to one prepared-input
+/// cache identity.
+pub(crate) const MAX_PREPARED_INPUT_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// A role is property-composed data: open fields (name, prompt, runtime) plus
 /// the closed engine-understood axes (`output`, and the plain `network`/
 /// `secrets` flags). There is no role "kind".
@@ -125,6 +129,9 @@ impl MissionType {
                 );
             }
             if let Some(timeout_secs) = role.timeout_secs {
+                if timeout_secs == 0 {
+                    anyhow::bail!("role '{}' timeout must be at least 1 second", role.name);
+                }
                 crate::model::resolve_execution_deadline_ms(now_ms, timeout_secs).map_err(
                     |error| anyhow::anyhow!("role '{}' deadline is invalid: {error}", role.name),
                 )?;

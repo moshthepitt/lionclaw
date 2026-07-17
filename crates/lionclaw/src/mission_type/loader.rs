@@ -17,7 +17,9 @@ use super::manifest::{
     is_path_safe_name, ManifestFile, ManifestInput, ManifestPlanningDag, MISSION_LOCK_FILE,
 };
 use super::skills::{load_skills, package_files};
-use super::{MissionType, PreparedInput, RoleDefinition, SkillPackage};
+use super::{
+    MissionType, PreparedInput, RoleDefinition, SkillPackage, MAX_PREPARED_INPUT_CONTENT_BYTES,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MissionTypeError {
@@ -219,6 +221,14 @@ fn load_inputs(
                 detail: "program must be a regular file (no symlinks)".to_string(),
             });
         }
+        if metadata.len() > MAX_PREPARED_INPUT_CONTENT_BYTES {
+            return Err(MissionTypeError::Input {
+                input: input.name,
+                detail: format!(
+                    "program exceeds the {MAX_PREPARED_INPUT_CONTENT_BYTES} byte limit"
+                ),
+            });
+        }
         if !is_executable(&program) || !has_shebang(&program) {
             return Err(MissionTypeError::Input {
                 input: name.to_string(),
@@ -413,11 +423,18 @@ fn read(path: &Path) -> Result<String, MissionTypeError> {
     })
 }
 
-fn read_bytes(path: &Path) -> Result<Vec<u8>, MissionTypeError> {
-    std::fs::read(path).map_err(|source| MissionTypeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+fn feed_digest_file(
+    digest: &mut ContentDigest,
+    logical: &str,
+    path: &Path,
+    executable: bool,
+) -> Result<(), MissionTypeError> {
+    digest
+        .feed_file(logical, path, executable)
+        .map_err(|source| MissionTypeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 /// A content digest over everything the loader consumes: manifest, optional
@@ -429,16 +446,17 @@ fn compute_digest(
     skills: &BTreeMap<String, SkillPackage>,
 ) -> Result<String, MissionTypeError> {
     let mut digest = ContentDigest::new();
-    digest.feed(
+    feed_digest_file(
+        &mut digest,
         "mission.toml",
-        &read_bytes(&root.join("mission.toml"))?,
+        &root.join("mission.toml"),
         false,
-    );
-    if let Ok(lock) = std::fs::read(root.join(MISSION_LOCK_FILE)) {
-        digest.feed(MISSION_LOCK_FILE, &lock, false);
-    }
-    if let Ok(playbook) = std::fs::read(root.join("playbook.md")) {
-        digest.feed("playbook.md", &playbook, false);
+    )?;
+    for optional in [MISSION_LOCK_FILE, "playbook.md"] {
+        let path = root.join(optional);
+        if path.exists() {
+            feed_digest_file(&mut digest, optional, &path, false)?;
+        }
     }
     for (subdir, hash_exec) in [("roles", false), ("inputs", true), ("oracles", true)] {
         let dir = root.join(subdir);
@@ -448,7 +466,7 @@ fn compute_digest(
         for entry in read_dir(&dir)? {
             let path = entry.path();
             let rel = format!("{subdir}/{}", entry.file_name().to_string_lossy());
-            digest.feed(&rel, &read_bytes(&path)?, hash_exec && is_executable(&path));
+            feed_digest_file(&mut digest, &rel, &path, hash_exec && is_executable(&path))?;
         }
     }
     for (name, package) in skills {
@@ -460,7 +478,7 @@ fn compute_digest(
                         detail: format!("package entry '{}' escaped its root", path.display()),
                     })?;
             let logical = format!("skills/{name}/{}", relative.to_string_lossy());
-            digest.feed(&logical, &read_bytes(&path)?, is_executable(&path));
+            feed_digest_file(&mut digest, &logical, &path, is_executable(&path))?;
         }
     }
     Ok(digest.finish())

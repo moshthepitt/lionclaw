@@ -395,6 +395,30 @@ fn prepared_input_declarations_load_as_plain_mission_type_data() {
 }
 
 #[test]
+fn oversized_prepared_input_programs_fail_from_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    add_input_program(dir.path(), "cargo-home");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("inputs/cargo-home"))
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[[inputs]]\nname = \"cargo-home\"\nnetwork = true\nkey-files = [\"Cargo.lock\"]\n",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        &load_err(dir.path()),
+        MissionTypeError::Input { detail, .. } if detail.contains("byte limit")
+    ));
+}
+
+#[test]
 fn prepared_inputs_require_explicit_authority_and_safe_keys() {
     let dir = tempfile::tempdir().unwrap();
     write_valid_type(dir.path());

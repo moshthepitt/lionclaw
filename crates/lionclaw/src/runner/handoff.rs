@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::model::{Gap, Handoff, OutputSemantics, PayloadRef, PlanProposal, ValidationItem};
 use lionclaw_runtime_api::TypedFailure;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const WORK_HANDOFF_SCHEMA: &str = "lionclaw.mission.work-handoff.v2";
 pub const VALIDATE_HANDOFF_SCHEMA: &str = "lionclaw.mission.validate-handoff.v2";
@@ -203,10 +203,10 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, TypedFai
 /// it came from the production wire parser or another `RoleRunner`.
 pub(crate) fn validate_handoff(handoff: &Handoff) -> Result<(), TypedFailure> {
     let invalid = |detail: String| TypedFailure::invalid("handoff.schema", detail);
-    let encoded_bytes = serde_json::to_vec(handoff)
+    if bounded_serialized_len(handoff, MAX_HANDOFF_BYTES as usize)
         .map_err(|err| invalid(format!("handoff is not serializable: {err}")))?
-        .len() as u64;
-    if encoded_bytes > MAX_HANDOFF_BYTES {
+        .is_none()
+    {
         return Err(TypedFailure::invalid(
             "handoff.too_large",
             format!("handoff exceeds {MAX_HANDOFF_BYTES} bytes"),
@@ -224,12 +224,12 @@ pub(crate) fn validate_handoff(handoff: &Handoff) -> Result<(), TypedFailure> {
         }
     }
     if let Handoff::Review { gaps, .. } = &handoff {
-        let gaps_bytes = serde_json::to_vec(gaps)
+        if bounded_serialized_len(gaps, MAX_GAPS_BYTES)
             .map_err(|err| invalid(format!("gaps are not serializable: {err}")))?
-            .len();
-        if gaps_bytes > MAX_GAPS_BYTES {
+            .is_none()
+        {
             return Err(invalid(format!(
-                "typed gaps are {gaps_bytes} bytes (cap {MAX_GAPS_BYTES}): \
+                "typed gaps exceed {MAX_GAPS_BYTES} bytes: \
                  cite short excerpts as evidence, not full logs"
             )));
         }
@@ -255,8 +255,56 @@ pub(crate) fn validate_handoff(handoff: &Handoff) -> Result<(), TypedFailure> {
     Ok(())
 }
 
+struct LimitedWriter {
+    bytes: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for LimitedWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let Some(next) = self.bytes.checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("serialized size overflow"));
+        };
+        if next > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other("serialized value exceeds byte limit"));
+        }
+        self.bytes = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Return the exact JSON size when it fits, or `None` immediately after the
+/// cap is crossed. This validates alternate-runner values without allocating a
+/// second copy of provider-controlled data.
+fn bounded_serialized_len<T: Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+) -> Result<Option<usize>, serde_json::Error> {
+    let mut writer = LimitedWriter {
+        bytes: 0,
+        limit,
+        exceeded: false,
+    };
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => Ok(Some(writer.bytes)),
+        Err(_) if writer.exceeded => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use serde::ser::SerializeSeq;
+
     use super::*;
     use crate::model::PayloadRef;
 
@@ -284,6 +332,38 @@ mod tests {
         assert_eq!(
             error.evidence().code.as_deref(),
             Some("handoff.report_too_large")
+        );
+    }
+
+    #[test]
+    fn bounded_serialization_stops_without_traversing_a_virtual_huge_value() {
+        struct CountedSequence<'a> {
+            visited: &'a Cell<usize>,
+        }
+
+        impl Serialize for CountedSequence<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                let mut sequence = serializer.serialize_seq(Some(1_000_000))?;
+                for _ in 0..1_000_000 {
+                    self.visited.set(self.visited.get() + 1);
+                    sequence.serialize_element("bounded-record")?;
+                }
+                sequence.end()
+            }
+        }
+
+        let visited = Cell::new(0);
+        assert_eq!(
+            bounded_serialized_len(&CountedSequence { visited: &visited }, 1024).unwrap(),
+            None
+        );
+        assert!(
+            visited.get() < 100,
+            "serializer traversed {} items",
+            visited.get()
         );
     }
 

@@ -1065,3 +1065,36 @@ async fn mission_creation_rejects_unrepresentable_role_deadlines() {
         "unexpected error: {error:#}"
     );
 }
+
+#[tokio::test]
+async fn mission_creation_rejects_zero_second_role_deadlines() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mission_type = test_mission_type();
+    mission_type.roles.values_mut().next().unwrap().timeout_secs = Some(0);
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let engine = Engine::new(
+        store,
+        mission_type,
+        "codex".into(),
+        "test-image".into(),
+        EngineServices::new(
+            Arc::new(lionclaw::testing::MockRoleRunner::happy(HEAD_SHA)),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    );
+
+    let error = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "reject a zero-second role deadline",
+            BASE_SHA,
+        )
+        .await
+        .expect_err("role deadlines are positive durations");
+    assert!(
+        error.to_string().contains("at least 1"),
+        "unexpected error: {error:#}"
+    );
+}
