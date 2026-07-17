@@ -438,16 +438,6 @@ mod tests {
         )
     }
 
-    fn role_requested_as(
-        task: &str,
-        attempt_no: u32,
-        key: &str,
-        role: &str,
-        output: crate::OutputSemantics,
-    ) -> MissionEvent {
-        role_requested_at_base(task, attempt_no, key, role, output, "sha-0")
-    }
-
     fn role_requested_at_base(
         task: &str,
         attempt_no: u32,
@@ -756,15 +746,26 @@ mod tests {
         };
         let state = fold_log(vec![
             created("sha-0"),
-            plan(vec![assertion("A1")], vec![validate("v1", &["A1"]), g]),
-            role_requested_as(
+            plan(
+                vec![assertion("A1")],
+                vec![work("w1", &["A1"], &[]), validate("v1", &["A1"]), g],
+            ),
+            role_requested("w1", 1, "k-w1-1"),
+            work_done("w1", "k-w1-1", Some(("sha-0", "sha-1"))),
+            role_requested_at_base(
                 "v1",
                 1,
                 "k-v1-1",
                 "checker",
                 crate::OutputSemantics::EmitsVerdict,
+                "sha-1",
             ),
         ]);
+        let effect_id = EffectId::for_parts(&["test", "k-v1-1"]);
+        assert!(matches!(
+            state.inflight.get(&effect_id),
+            Some(crate::InflightEffect::RoleRun { task_id, .. }) if task_id == &tid("v1")
+        ));
         // v1 is running (inflight), so the step idles rather than dispatching.
         assert_eq!(step(&state), StepDecision::Idle);
     }
