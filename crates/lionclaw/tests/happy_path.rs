@@ -110,6 +110,30 @@ async fn direct_engine_creation_rejects_invalid_mission_type_policy() {
         error.to_string().contains("missing-planner"),
         "got {error:#}"
     );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mission_type = test_mission_type();
+    mission_type
+        .roles
+        .get_mut(&RoleName::new("reviewer").expect("role name"))
+        .expect("reviewer role")
+        .secrets = true;
+    let h = common::harness_with_type(
+        dir.path(),
+        mission_type,
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let error = h
+        .engine
+        .create_mission("/repo", "invalid authority", BASE_SHA)
+        .await
+        .expect_err("direct creation must enforce the non-writer authority moat");
+    assert!(
+        error.to_string().contains("may not mount runtime secrets"),
+        "got {error:#}"
+    );
 }
 
 #[tokio::test]

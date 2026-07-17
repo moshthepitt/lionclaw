@@ -108,6 +108,7 @@ pub fn compile_authority(
     role: &RoleDefinition,
     ceiling: &AuthorityCeiling,
 ) -> Result<CompiledAuthority, MoatViolation> {
+    validate_role_authority_request(role)?;
     let workspace_access = match role.output {
         // Only a writer gets the workspace read-write. Judges and every planning
         // role (report / proposal) are read-only.
@@ -117,14 +118,6 @@ pub fn compile_authority(
         | OutputSemantics::EmitsGapVerdict
         | OutputSemantics::ProposesPlan => WorkspaceAccess::ReadOnly,
     };
-    if role.secrets && role.output != OutputSemantics::ProducesArtifact {
-        // Fail closed rather than silently clamp: only a writer may hold
-        // secrets; a read-only judge or planner asking for them is a
-        // mission-type bug the author must see.
-        return Err(MoatViolation::SecretsForJudge {
-            role: role.name.to_string(),
-        });
-    }
     let preset = ExecutionPreset {
         workspace_access,
         // Enforced from the role's `network` flag (default on — agent roles
@@ -149,6 +142,18 @@ pub fn compile_authority(
         output: role.output,
         preset,
     })
+}
+
+/// Validate role-authored authority before any operator ceiling is applied.
+/// A ceiling may remove grants; it can never legalize a request that breaks
+/// the semantic moat.
+pub(crate) fn validate_role_authority_request(role: &RoleDefinition) -> Result<(), MoatViolation> {
+    if role.secrets && role.output != OutputSemantics::ProducesArtifact {
+        return Err(MoatViolation::SecretsForJudge {
+            role: role.name.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// The authority an engine-run oracle executes under: a verdict node with

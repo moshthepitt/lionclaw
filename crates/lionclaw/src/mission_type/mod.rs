@@ -117,6 +117,7 @@ impl MissionType {
             .validate_at(now_ms)
             .map_err(|error| anyhow::anyhow!("[execution] invalid execution policy: {error}"))?;
         for (name, role) in &self.roles {
+            crate::authority::validate_role_authority_request(role)?;
             if name != &role.name {
                 anyhow::bail!(
                     "role map key '{name}' does not match role definition '{}'",
