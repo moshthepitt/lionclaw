@@ -103,6 +103,71 @@ pub struct MissionType {
 }
 
 impl MissionType {
+    /// Validate the complete semantic mission-type contract at the clock epoch
+    /// where immutable effect deadlines will be derived. Bundle loading and
+    /// direct engine creation use this same boundary.
+    pub fn validate_at(&self, now_ms: i64) -> anyhow::Result<()> {
+        if self.roles.is_empty() {
+            anyhow::bail!("mission type has no roles");
+        }
+        if self.recovery.max_attempts == 0 {
+            anyhow::bail!("[recovery] max-attempts must be at least 1");
+        }
+        self.execution
+            .validate_at(now_ms)
+            .map_err(|error| anyhow::anyhow!("[execution] invalid execution policy: {error}"))?;
+        for (name, role) in &self.roles {
+            if name != &role.name {
+                anyhow::bail!(
+                    "role map key '{name}' does not match role definition '{}'",
+                    role.name
+                );
+            }
+            if let Some(timeout_secs) = role.timeout_secs {
+                crate::model::resolve_execution_deadline_ms(now_ms, timeout_secs).map_err(
+                    |error| anyhow::anyhow!("role '{}' deadline is invalid: {error}", role.name),
+                )?;
+            }
+            for skill in &role.skills {
+                if !self.skills.contains_key(skill) {
+                    anyhow::bail!("role '{}' names missing skill '{skill}'", role.name);
+                }
+            }
+        }
+        let planning_errors =
+            crate::model::validate_planning_dag(&self.planning, &self.inventory());
+        if !planning_errors.is_empty() {
+            anyhow::bail!(
+                "[planning] is invalid:\n{}",
+                planning_errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        if self.stop == StopBar::Reviewed && self.terminal_review.is_none() {
+            anyhow::bail!(
+                "stop = \"reviewed\" requires [terminal-review]: the reviewed bar is defined by an independent terminal review"
+            );
+        }
+        if let Some(review) = &self.terminal_review {
+            match self.roles.get(&review.role) {
+                Some(role) if role.output == OutputSemantics::EmitsGapVerdict => {}
+                Some(role) => anyhow::bail!(
+                    "[terminal-review] role '{}' must be emits-gap-verdict, got {}",
+                    review.role,
+                    role.output.slug()
+                ),
+                None => anyhow::bail!(
+                    "[terminal-review] role '{}' is not provided by this mission type",
+                    review.role
+                ),
+            }
+        }
+        Ok(())
+    }
+
     /// The complete revision-zero policy persisted at mission creation.
     /// Mission types are the sole source; replay reads the resolved copy from
     /// `MissionCreated` and never reopens bundle files.

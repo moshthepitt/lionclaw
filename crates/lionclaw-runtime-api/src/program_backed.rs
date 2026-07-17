@@ -140,7 +140,7 @@ where
     A: RuntimeAdapter + Send + Sync + ?Sized,
 {
     let program = adapter.build_turn_program(input, context)?;
-    let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel();
+    let (stdout_tx, mut stdout_rx) = mpsc::channel(crate::event::RUNTIME_TURN_JOURNAL_CAPACITY);
     let execution = executor.execute_streaming(program, stdout_tx);
     tokio::pin!(execution);
 

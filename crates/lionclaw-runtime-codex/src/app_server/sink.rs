@@ -15,13 +15,12 @@ impl<'a> CodexAppServerEventSink<'a> {
         Self::Journal(journal)
     }
 
-    pub(crate) async fn send(self, event: RuntimeEvent, raw_payload: &str) {
+    pub(crate) async fn send(self, event: RuntimeEvent) {
         match self {
             Self::Runtime(events) => {
                 drop(events.send(event));
             }
             Self::Journal(journal) => {
-                let _ = raw_payload;
                 drop(journal.send(TurnEvent::canonical(event)).await);
             }
         }
@@ -52,13 +51,10 @@ mod tests {
         });
         let sink = CodexAppServerEventSink::journal(&journal);
         for sequence in 0..expected {
-            sink.send(
-                RuntimeEvent::MessageDelta {
-                    lane: RuntimeMessageLane::Answer,
-                    text: sequence.to_string(),
-                },
-                "discarded raw provider payload",
-            )
+            sink.send(RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: sequence.to_string(),
+            })
             .await;
         }
         drop(journal);

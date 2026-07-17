@@ -389,7 +389,7 @@ fn apply_runtime_event(
     else {
         return;
     };
-    match &event.event {
+    match event.event() {
         RuntimeEvent::Configuration { configuration } => {
             effect.applied_model = configuration.applied_model.clone();
             effect.model_confirmation = configuration.model_confirmation;
@@ -885,7 +885,7 @@ mod tests {
         let latest = observed.borrow().clone().unwrap();
         assert_eq!(latest.0, effect_id);
         assert!(matches!(
-            latest.1.event,
+            latest.1.event(),
             RuntimeEvent::Status { ref text, .. } if text == "event 9999"
         ));
     }

@@ -18,10 +18,10 @@ use sha2::{Digest, Sha256};
 use crate::driver_lock::DriverGuard;
 use crate::mission_type::MissionType;
 use crate::model::{
-    step, validate_plan_proposal, EffectId, Handoff, InflightEffect, MissionEvent, MissionId,
-    MissionPhase, MissionState, OracleDispatchIntent, OracleRunSuccess, PayloadRef, PlanProposal,
-    ProposalError, RoleDispatchIntent, RoleRunSuccess, StepDecision, TaskId, TaskNamespace,
-    TerminalReviewDispatchIntent, TerminalReviewSuccess,
+    step, validate_plan_proposal, EffectEventClass, EffectId, Handoff, InflightEffect,
+    MissionEvent, MissionId, MissionPhase, MissionState, OracleDispatchIntent, OracleRunSuccess,
+    PayloadRef, PlanProposal, ProposalError, RoleDispatchIntent, RoleRunSuccess, StepDecision,
+    TaskId, TaskNamespace, TerminalReviewDispatchIntent, TerminalReviewSuccess,
 };
 use crate::ports::{
     Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl, OracleRunRequest, OracleRunner,
@@ -308,42 +308,8 @@ impl Engine {
         objective: &str,
         base_sha: &str,
     ) -> Result<MissionId> {
+        self.mission_type.validate_at(now_ms)?;
         let config = self.mission_type.mission_config();
-        config
-            .execution
-            .validate_at(now_ms)
-            .map_err(|error| anyhow::anyhow!("invalid execution policy: {error}"))?;
-        for role in self.mission_type.roles.values() {
-            if let Some(timeout_secs) = role.timeout_secs {
-                resolved_deadline(now_ms, timeout_secs).with_context(|| {
-                    format!("role '{}' deadline is not representable", role.name)
-                })?;
-            }
-        }
-        // The loader enforces both rules for bundles; enforce them here too
-        // for directly constructed MissionType values before the fold records
-        // their resolved revision-zero policy.
-        if config.stop == crate::model::StopBar::Reviewed && config.terminal_review.is_none() {
-            bail!(
-                "a reviewed-bar mission requires a terminal review: \
-                 the reviewed bar is defined by an independent closing review"
-            );
-        }
-        if let Some(review) = &config.terminal_review {
-            match self.mission_type.roles.get(&review.role) {
-                Some(role) if role.output == crate::model::OutputSemantics::EmitsGapVerdict => {}
-                Some(role) => bail!(
-                    "terminal-review role '{}' must be emits-gap-verdict, got {}",
-                    review.role,
-                    role.output.slug()
-                ),
-                None => bail!(
-                    "terminal-review role '{}' is not provided by mission type '{}'",
-                    review.role,
-                    self.mission_type.name
-                ),
-            }
-        }
         let created = NewEvent::new(MissionEvent::MissionCreated {
             objective: objective.to_string(),
             mission_type: self.mission_type_ref(),
@@ -811,7 +777,20 @@ impl Engine {
                 )
                 .await
             {
-                Ok(_) | Err(AppendError::Duplicate { .. }) => return Ok(Some(outcome)),
+                Ok(_) => return Ok(Some(outcome)),
+                Err(AppendError::Duplicate {
+                    effect_id: duplicate,
+                }) => {
+                    if self
+                        .duplicate_effects_applied(mission_id, std::slice::from_ref(&outcome))
+                        .await?
+                    {
+                        return Ok(Some(outcome));
+                    }
+                    bail!(
+                        "effect identity collision for '{duplicate}': the durable outcome was not applied by the event fold"
+                    );
+                }
                 Err(AppendError::Conflict { .. }) => continue,
                 Err(err) => return Err(err.into()),
             }
@@ -937,11 +916,61 @@ impl Engine {
             .append(mission_id, head, events, self.clock.now_ms())
             .await
         {
-            Ok(_) | Err(AppendError::Duplicate { .. }) | Err(AppendError::Conflict { .. }) => {
-                Ok(())
+            Ok(_) | Err(AppendError::Conflict { .. }) => Ok(()),
+            Err(AppendError::Duplicate { effect_id }) => {
+                if self.duplicate_effects_applied(mission_id, events).await? {
+                    Ok(())
+                } else {
+                    bail!(
+                        "effect identity collision for '{effect_id}': the durable request was not applied by the event fold"
+                    )
+                }
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// A duplicate effect identity is idempotent only when the event log holds
+    /// the exact same fact and the pure fold actually applied it. This keeps a
+    /// malformed inert row from reserving a deterministic generation forever.
+    async fn duplicate_effects_applied(
+        &self,
+        mission_id: &MissionId,
+        expected: &[NewEvent],
+    ) -> Result<bool> {
+        let log = self.store.load(mission_id).await?;
+        for expected in expected {
+            let Some((class, effect_id)) = expected.event.effect_identity() else {
+                return Ok(false);
+            };
+            if !log.iter().any(|stored| {
+                stored.event.effect_identity() == Some((class, effect_id))
+                    && stored.event == expected.event
+                    && stored.stamps == expected.stamps
+            }) {
+                return Ok(false);
+            }
+        }
+        let Some(state) = crate::model::fold(log) else {
+            return Ok(false);
+        };
+        for expected in expected {
+            let Some((class, effect_id)) = expected.event.effect_identity() else {
+                return Ok(false);
+            };
+            let remains_inflight = state
+                .inflight
+                .keys()
+                .any(|candidate| candidate.as_str() == effect_id);
+            let applied = match class {
+                EffectEventClass::Request => remains_inflight,
+                EffectEventClass::Outcome => !remains_inflight,
+            };
+            if !applied {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn execute_role_run(
@@ -1026,19 +1055,10 @@ impl Engine {
             .await?
         {
             Ok(outcome) => {
-                let outcome = outcome.projected();
-                if let Some(detail) = crate::model::role_success_contract_error(
-                    *output,
-                    &outcome.handoff,
-                    outcome.artifact.as_ref(),
-                    base_sha,
-                ) {
-                    return Ok(completed(Err(invalid_role_outcome(
-                        "role.success_contract",
-                        detail,
-                        &outcome,
-                    ))));
-                }
+                let outcome = match validated_role_success(outcome, *output, base_sha) {
+                    Ok(outcome) => outcome,
+                    Err(failure) => return Ok(completed(Err(failure))),
+                };
                 let incomplete = match &outcome.handoff {
                     Handoff::Work { done: false, .. } => Some("role reported done=false"),
                     Handoff::Plan { done: false, .. } => {
@@ -1278,7 +1298,14 @@ impl Engine {
             .run_role_observed(state, effect_id, request, update_rx, false)
             .await?
         {
-            Ok(outcome) => outcome.projected(),
+            Ok(outcome) => match validated_role_success(
+                outcome,
+                crate::model::OutputSemantics::EmitsGapVerdict,
+                judged_sha,
+            ) {
+                Ok(outcome) => outcome,
+                Err(failure) => return Ok(completed(Err(failure))),
+            },
             Err(mut failure) => {
                 if failure.is_transient() {
                     let delay_ms = transient_backoff_ms(
@@ -1326,14 +1353,29 @@ impl Engine {
             configuration: runtime_configuration_evidence(&outcome.runtime_configuration),
             ..Default::default()
         };
+        let report = match self.externalize_handoff_report(report.clone()) {
+            Ok(report) => report,
+            Err(failure) => {
+                return Ok(completed(Err(with_role_outcome_evidence(
+                    failure, &outcome,
+                ))))
+            }
+        };
+        let final_response = match self
+            .externalize_role_payload(PayloadRef::inline(outcome.final_response.clone()))
+        {
+            Ok(response) => response,
+            Err(failure) => {
+                return Ok(completed(Err(with_role_outcome_evidence(
+                    failure, &outcome,
+                ))))
+            }
+        };
         Ok(completed(Ok(TerminalReviewSuccess {
             passed: *passed,
             gaps: gaps.clone(),
-            report: self.store.blobs().externalize(report.clone())?,
-            final_response: self
-                .store
-                .blobs()
-                .externalize(PayloadRef::inline(outcome.final_response))?,
+            report,
+            final_response,
             runtime_configuration: outcome.runtime_configuration,
         }))
         .with_settlement_evidence(settlement_evidence))
@@ -2239,6 +2281,30 @@ fn runtime_configuration_evidence(
         applied_mode: evidence.applied_mode.clone(),
         mode_confirmation: evidence.mode_confirmation,
     }
+}
+
+fn validated_role_success(
+    outcome: crate::ports::RoleRunOutcome,
+    output: crate::model::OutputSemantics,
+    base_sha: &str,
+) -> std::result::Result<crate::ports::RoleRunOutcome, TypedFailure> {
+    let outcome = outcome.projected();
+    if let Err(failure) = crate::runner::validate_handoff(&outcome.handoff) {
+        return Err(with_role_outcome_evidence(failure, &outcome));
+    }
+    if let Some(detail) = crate::model::role_success_contract_error(
+        output,
+        &outcome.handoff,
+        outcome.artifact.as_ref(),
+        base_sha,
+    ) {
+        return Err(invalid_role_outcome(
+            "role.success_contract",
+            detail,
+            &outcome,
+        ));
+    }
+    Ok(outcome)
 }
 
 fn invalid_role_outcome(

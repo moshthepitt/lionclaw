@@ -76,7 +76,7 @@ impl fmt::Debug for ExecutionRequest {
 
 pub type ExecutionOutput = super::process::ProcessOutput;
 
-pub type ExecutionStdoutSender = mpsc::UnboundedSender<String>;
+pub type ExecutionStdoutSender = mpsc::Sender<String>;
 
 pub enum ExecutionSession {
     Oci(super::oci::OciExecutionSession),

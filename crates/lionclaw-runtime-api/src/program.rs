@@ -77,7 +77,7 @@ pub trait RuntimeProgramSession: Send {
     async fn shutdown(self: Box<Self>) -> Result<ExecutionOutput>;
 }
 
-pub type RuntimeProgramStdoutSender = mpsc::UnboundedSender<String>;
+pub type RuntimeProgramStdoutSender = mpsc::Sender<String>;
 
 #[async_trait]
 pub trait RuntimeProgramExecutor: Send {

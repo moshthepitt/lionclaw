@@ -144,13 +144,11 @@ fn acp_capability_object_enabled(value: &Value) -> bool {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AcpMessage {
-    pub(crate) raw: String,
     pub(crate) value: Value,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct AcpResponse {
-    pub(crate) raw: String,
     pub(crate) result: Value,
 }
 
@@ -173,7 +171,6 @@ pub(crate) fn parse_acp_response(message: AcpMessage, method: &str) -> Result<Ac
         return Err(acp_typed_failure(method, error).into());
     }
     Ok(AcpResponse {
-        raw: message.raw,
         result: message.value.get("result").cloned().unwrap_or(Value::Null),
     })
 }

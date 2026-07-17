@@ -189,17 +189,39 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, TypedFai
     let handoff: Handoff = serde_json::from_value::<AgentHandoff>(value)
         .map(Handoff::from)
         .map_err(|err| invalid(format!("handoff does not match '{expected}': {err}")))?;
-    let PayloadRef::Inline { text: report } = handoff.report() else {
-        unreachable!("the agent handoff wire type accepts only inline reports")
-    };
-    if report.len() > MAX_HANDOFF_REPORT_BYTES {
+    validate_handoff(&handoff)?;
+    // The schema string and the payload tag must agree with the role's output.
+    if !handoff.matches_output(output) {
+        return Err(invalid(format!(
+            "handoff type does not match this role's output semantics ({output:?})"
+        )));
+    }
+    Ok(handoff)
+}
+
+/// Validate the complete bounded role-output document regardless of whether
+/// it came from the production wire parser or another `RoleRunner`.
+pub(crate) fn validate_handoff(handoff: &Handoff) -> Result<(), TypedFailure> {
+    let invalid = |detail: String| TypedFailure::invalid("handoff.schema", detail);
+    let encoded_bytes = serde_json::to_vec(handoff)
+        .map_err(|err| invalid(format!("handoff is not serializable: {err}")))?
+        .len() as u64;
+    if encoded_bytes > MAX_HANDOFF_BYTES {
         return Err(TypedFailure::invalid(
-            "handoff.report_too_large",
-            format!(
-                "handoff report is {} bytes; the limit is {MAX_HANDOFF_REPORT_BYTES}",
-                report.len()
-            ),
+            "handoff.too_large",
+            format!("handoff exceeds {MAX_HANDOFF_BYTES} bytes"),
         ));
+    }
+    if let PayloadRef::Inline { text: report } = handoff.report() {
+        if report.len() > MAX_HANDOFF_REPORT_BYTES {
+            return Err(TypedFailure::invalid(
+                "handoff.report_too_large",
+                format!(
+                    "handoff report is {} bytes; the limit is {MAX_HANDOFF_REPORT_BYTES}",
+                    report.len()
+                ),
+            ));
+        }
     }
     if let Handoff::Review { gaps, .. } = &handoff {
         let gaps_bytes = serde_json::to_vec(gaps)
@@ -230,13 +252,7 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, TypedFai
             }
         }
     }
-    // The schema string and the payload tag must agree with the role's output.
-    if !handoff.matches_output(output) {
-        return Err(invalid(format!(
-            "handoff type does not match this role's output semantics ({output:?})"
-        )));
-    }
-    Ok(handoff)
+    Ok(())
 }
 
 #[cfg(test)]

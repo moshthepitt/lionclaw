@@ -682,7 +682,7 @@ async fn terminal_review_prompt_for_unassigned_role_has_no_skill_section() {
 // ---- Missing reference fails closed ----
 
 #[tokio::test]
-async fn a_role_referencing_a_missing_skill_fails_closed_at_prompt_materialization() {
+async fn a_role_referencing_a_missing_skill_fails_closed_at_mission_creation() {
     let dir = tempfile::tempdir().unwrap();
 
     // Build a mission type where a role references a skill that is NOT in
@@ -708,22 +708,12 @@ async fn a_role_referencing_a_missing_skill_fails_closed_at_prompt_materializati
             Arc::new(MockClock::default()),
         ),
     );
-    let mission_id = engine
+    let error = engine
         .create_mission(dir.path().to_str().unwrap(), "fix the bug", BASE_SHA)
         .await
-        .unwrap();
-    engine
-        .propose_plan(&mission_id, proposal(0, simple_plan()))
-        .await
-        .unwrap();
-    approve_plan(&engine, &mission_id).await;
-
-    // Advance must error — the missing skill reference cannot be resolved
-    // at prompt materialization, so the mission fails closed.
-    let err = engine.advance(&mission_id).await;
-    assert!(err.is_err(), "missing skill reference must fail closed");
+        .expect_err("missing skill reference must fail before a mission is recorded");
     assert!(
-        err.unwrap_err().to_string().contains("ghost-skill"),
+        error.to_string().contains("ghost-skill"),
         "error must name the missing skill"
     );
 }

@@ -12,7 +12,6 @@ pub(crate) trait AppServerTransport {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppServerMessage {
-    pub(crate) raw: String,
     pub(crate) value: Value,
 }
 
@@ -28,8 +27,7 @@ impl AppServerMessage {
 
 impl From<Value> for AppServerMessage {
     fn from(value: Value) -> Self {
-        let raw = serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
-        Self { raw, value }
+        Self { value }
     }
 }
 
@@ -70,10 +68,7 @@ impl AppServerTransport for ExecutionSessionTransport {
             }
             let value = serde_json::from_str(trimmed)
                 .with_context(|| format!("invalid codex app-server JSON-RPC line: {trimmed}"))?;
-            return Ok(Some(AppServerMessage {
-                raw: trimmed.to_string(),
-                value,
-            }));
+            return Ok(Some(AppServerMessage { value }));
         }
     }
 

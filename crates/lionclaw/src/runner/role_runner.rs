@@ -658,8 +658,8 @@ async fn drain_runtime_journal(
 ) -> String {
     let mut final_response = String::new();
     while let Some(event) = journal.recv().await {
-        lionclaw_runtime_api::observe_final_response(&mut final_response, &event.event);
-        if let lionclaw_runtime_api::RuntimeEvent::Configuration { configuration } = &event.event {
+        lionclaw_runtime_api::observe_final_response(&mut final_response, event.event());
+        if let lionclaw_runtime_api::RuntimeEvent::Configuration { configuration } = event.event() {
             let _ = updates
                 .send(crate::ports::RoleRunUpdate::RuntimeConfigured(
                     configuration.clone(),

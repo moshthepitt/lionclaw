@@ -8,7 +8,10 @@ use common::{
     HEAD_SHA,
 };
 use lionclaw::engine::MissionDisposition;
-use lionclaw::model::{Assertion, AssertionId, FinishClass, MissionPhase, OracleName, TaskStatus};
+use lionclaw::model::{
+    Assertion, AssertionId, FinishClass, MissionPhase, OracleName, OutputSemantics, PlanningDag,
+    PlanningTask, RoleName, TaskId, TaskStatus,
+};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 #[tokio::test]
@@ -58,6 +61,54 @@ async fn passing_oracle_yields_verified_finish() {
     assert_eq!(
         h.oracle_runner.calls.lock().expect("lock").as_slice(),
         &[("cargo-test".to_string(), HEAD_SHA.to_string())]
+    );
+}
+
+#[tokio::test]
+async fn direct_engine_creation_rejects_invalid_mission_type_policy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mission_type = test_mission_type();
+    mission_type.recovery.max_attempts = 0;
+    let h = common::harness_with_type(
+        dir.path(),
+        mission_type,
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let error = h
+        .engine
+        .create_mission("/repo", "invalid recovery", BASE_SHA)
+        .await
+        .expect_err("direct creation must enforce mission-type recovery policy");
+    assert!(error.to_string().contains("max-attempts"), "got {error:#}");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mission_type = test_mission_type();
+    mission_type.planning = PlanningDag {
+        tasks: vec![PlanningTask {
+            id: TaskId::new("author").expect("task id"),
+            role: RoleName::new("missing-planner").expect("role name"),
+            output: OutputSemantics::ProposesPlan,
+            body: "Propose the plan.".into(),
+            depends_on: Vec::new(),
+        }],
+    };
+    let h = common::harness_with_type(
+        dir.path(),
+        mission_type,
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let error = h
+        .engine
+        .create_mission("/repo", "invalid planning", BASE_SHA)
+        .await
+        .expect_err("direct creation must validate the planning DAG");
+    assert!(
+        error.to_string().contains("missing-planner"),
+        "got {error:#}"
     );
 }
 

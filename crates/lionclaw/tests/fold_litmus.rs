@@ -381,9 +381,9 @@ async fn iterative_ratification_and_abort_survive_every_prefix_and_snapshot_gene
     assert_eq!(from_old_snapshot, expected);
     h.engine
         .store()
-        .save_snapshot(&from_old_snapshot, 11)
+        .rebuild_cursors(&mission_id, 11)
         .await
-        .expect("replace stale snapshot");
+        .expect("replace stale snapshot from the authoritative log");
     assert_eq!(
         h.engine
             .store()

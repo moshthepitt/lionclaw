@@ -16,7 +16,7 @@ use lionclaw_runtime_api::{
     RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
     RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput,
     RuntimeTerminalConfig, RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnMode,
-    RUNTIME_SESSION_READY_MARKER, RUNTIME_TURN_JOURNAL_CAPACITY,
+    TurnEvent, RUNTIME_SESSION_READY_MARKER, RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 
 use super::{
@@ -353,13 +353,10 @@ fn project_opencode_acp_fixture_events() -> Vec<RuntimeEvent> {
         .iter()
         .flat_map(|raw| {
             let value = serde_json::from_str(raw).expect("fixture raw JSON-RPC line");
-            let message = AcpMessage {
-                raw: raw.clone(),
-                value,
-            };
+            let message = AcpMessage { value };
             acp_turn_events(&message)
         })
-        .map(|record| record.event)
+        .map(TurnEvent::into_event)
         .collect()
 }
 
@@ -695,10 +692,6 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
             },
             RuntimeEvent::Done,
         ]
-    );
-    assert!(
-        journal.iter().all(|record| record.raw.is_none()),
-        "runtime evidence retains canonical events, never raw provider payloads"
     );
     assert_eq!(
         std::fs::read_to_string(runtime_state_root.join(ACP_SESSION_ID_STATE_FILE))

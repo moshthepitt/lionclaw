@@ -265,22 +265,20 @@ impl AcpClient {
         cancel_rx: &mut mpsc::UnboundedReceiver<AcpCancelRequest>,
     ) -> Result<String> {
         self.final_response.clear();
-        let response = self
-            .request_with_cancel(
-                "session/prompt",
-                json!({
-                    "sessionId": session_id,
-                    "prompt": [{
-                        "type": "text",
-                        "text": prompt,
-                    }],
-                }),
-                Some(journal),
-                session_id,
-                cancel_rx,
-            )
-            .await?;
-        let _ = response.raw;
+        self.request_with_cancel(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{
+                    "type": "text",
+                    "text": prompt,
+                }],
+            }),
+            Some(journal),
+            session_id,
+            cancel_rx,
+        )
+        .await?;
         drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)).await);
         Ok(self.take_final_response())
     }
@@ -406,9 +404,9 @@ impl AcpClient {
             for record in acp_turn_events(&message) {
                 lionclaw_runtime_api::observe_final_response(
                     &mut self.final_response,
-                    &record.event,
+                    record.event(),
                 );
-                drop(journal.send(TurnEvent::canonical(record.event)).await);
+                drop(journal.send(record).await);
             }
         }
         Ok(())
@@ -480,10 +478,7 @@ impl AcpClient {
             }
             let value = serde_json::from_str(trimmed)
                 .with_context(|| format!("invalid ACP JSON-RPC line: {trimmed}"))?;
-            return Ok(Some(AcpMessage {
-                raw: trimmed.to_string(),
-                value,
-            }));
+            return Ok(Some(AcpMessage { value }));
         }
     }
 

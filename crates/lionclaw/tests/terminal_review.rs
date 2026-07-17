@@ -16,8 +16,8 @@ use common::{
 };
 use lionclaw::engine::{MissionDisposition, MissionView, TERMINAL_REVIEW_TASK_TAG as REVIEW_TAG};
 use lionclaw::model::{
-    ArtifactOutcome, DecisionAction, FinishClass, Handoff, MissionEvent, MissionPhase, PayloadRef,
-    ReviewAcceptanceKind, ReviewOutcome, Task, TaskKind,
+    ArtifactOutcome, BlobRef, DecisionAction, FinishClass, Gap, Handoff, MissionEvent,
+    MissionPhase, PayloadRef, ReviewAcceptanceKind, ReviewOutcome, Task, TaskKind,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::testing::{review_verdict, MockOracleRunner, MockRoleRunner};
@@ -197,6 +197,106 @@ async fn terminal_review_outcomes_bound_alternate_runner_evidence() {
             .len()
             <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT
     );
+}
+
+#[tokio::test]
+async fn terminal_review_uses_the_shared_role_output_boundary() {
+    #[derive(Clone, Copy)]
+    enum Fault {
+        BlobReport,
+        BlobReportWithInvalidGap,
+        OversizedReport,
+        OversizedGaps,
+        Artifact,
+    }
+
+    for (fault, expected_code) in [
+        (Fault::BlobReport, "handoff.payload_ref"),
+        (Fault::BlobReportWithInvalidGap, "handoff.schema"),
+        (Fault::OversizedReport, "handoff.report_too_large"),
+        (Fault::OversizedGaps, "handoff.schema"),
+        (Fault::Artifact, "role.success_contract"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runner = MockRoleRunner::new(Box::new(move |request| {
+            if request.task_id.as_str() != REVIEW_TAG {
+                return Ok(work_outcome(request, HEAD_SHA));
+            }
+            let mut outcome = review_verdict(request, true, vec![]);
+            match fault {
+                Fault::BlobReport => {
+                    let Handoff::Review { report, .. } = &mut outcome.handoff else {
+                        unreachable!("review_verdict returns a review handoff")
+                    };
+                    *report = PayloadRef::Blob(BlobRef {
+                        algo: "sha256".into(),
+                        hex: "0".repeat(64),
+                        len: 1,
+                    });
+                }
+                Fault::BlobReportWithInvalidGap => {
+                    let Handoff::Review { report, gaps, .. } = &mut outcome.handoff else {
+                        unreachable!("review_verdict returns a review handoff")
+                    };
+                    *report = PayloadRef::Blob(BlobRef {
+                        algo: "sha256".into(),
+                        hex: "0".repeat(64),
+                        len: 1,
+                    });
+                    gaps.push(Gap {
+                        id: Some("INVALID".into()),
+                        severity: lionclaw::model::GapSeverity::Blocking,
+                        requirement: String::new(),
+                        expected: "expected".into(),
+                        observed: "observed".into(),
+                        evidence: "evidence".into(),
+                    });
+                }
+                Fault::OversizedReport => {
+                    let Handoff::Review { report, .. } = &mut outcome.handoff else {
+                        unreachable!("review_verdict returns a review handoff")
+                    };
+                    *report = PayloadRef::inline(
+                        "x".repeat(lionclaw::runner::MAX_HANDOFF_REPORT_BYTES + 1),
+                    );
+                }
+                Fault::OversizedGaps => {
+                    let Handoff::Review { gaps, .. } = &mut outcome.handoff else {
+                        unreachable!("review_verdict returns a review handoff")
+                    };
+                    gaps.push(Gap {
+                        id: Some("OVERSIZED".into()),
+                        severity: lionclaw::model::GapSeverity::Blocking,
+                        requirement: "requirement".into(),
+                        expected: "expected".into(),
+                        observed: "observed".into(),
+                        evidence: "x".repeat(256 * 1024),
+                    });
+                }
+                Fault::Artifact => {
+                    outcome.artifact = Some(ArtifactOutcome {
+                        base_sha: request.base_sha.clone(),
+                        head_sha: HEAD_SHA.into(),
+                    });
+                }
+            }
+            Ok(outcome)
+        }));
+        let (h, mission_id) = started_with_recovery(&dir, runner, 1).await;
+
+        let view = h.engine.advance(&mission_id).await.expect("advance");
+        assert_eq!(view.disposition, MissionDisposition::Parked);
+        let ReviewOutcome::Failed { failure } = view
+            .state
+            .terminal_review
+            .outcome
+            .as_ref()
+            .expect("failed terminal review")
+        else {
+            panic!("invalid alternate-runner output must not mint a verdict")
+        };
+        assert_eq!(failure.evidence().code.as_deref(), Some(expected_code));
+    }
 }
 
 #[tokio::test]
@@ -804,5 +904,17 @@ async fn an_ordinary_validator_handoff_cannot_seal_the_terminal_review() {
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
     assert_eq!(attention[0].id, "terminal_review_failed:mission");
-    assert!(attention[0].report.contains("non-review handoff"));
+    let ReviewOutcome::Failed { failure } = outcome
+        .state
+        .terminal_review
+        .outcome
+        .as_ref()
+        .expect("failed terminal review")
+    else {
+        panic!("ordinary validator output must not mint a terminal verdict")
+    };
+    assert_eq!(
+        failure.evidence().code.as_deref(),
+        Some("role.success_contract")
+    );
 }

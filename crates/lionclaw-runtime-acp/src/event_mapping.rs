@@ -1,9 +1,7 @@
 use serde_json::Value;
 
-use lionclaw_runtime_api::{RawTurnPayload, RuntimeEvent, RuntimeMessageLane, TurnEvent};
-
-use crate::driver::ACP_PROTOCOL_NAME;
 use crate::protocol::AcpMessage;
+use lionclaw_runtime_api::{RuntimeEvent, RuntimeMessageLane, TurnEvent};
 
 pub(crate) fn acp_turn_events(message: &AcpMessage) -> Vec<TurnEvent> {
     if message.value.get("method").and_then(Value::as_str) != Some("session/update") {
@@ -39,17 +37,7 @@ pub(crate) fn acp_turn_events(message: &AcpMessage) -> Vec<TurnEvent> {
         _ => None,
     };
 
-    event
-        .map(|event| {
-            vec![TurnEvent::with_raw(
-                event,
-                RawTurnPayload {
-                    driver: ACP_PROTOCOL_NAME.to_string(),
-                    payload: message.raw.clone(),
-                },
-            )]
-        })
-        .unwrap_or_default()
+    event.map(TurnEvent::canonical).into_iter().collect()
 }
 
 fn acp_content_text(value: Option<&Value>) -> Option<String> {

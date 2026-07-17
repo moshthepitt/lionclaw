@@ -4,13 +4,13 @@ use lionclaw_runtime_api::TypedFailure;
 use std::sync::{Arc, Mutex};
 
 use common::{
-    approve_plan, covered_requirement, harness, harness_with_type, proposal, simple_plan,
-    test_mission_type, BASE_SHA, HEAD_SHA,
+    approve_plan, covered_requirement, fault_append_events, harness, harness_with_type, proposal,
+    simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{record_control, MissionDisposition};
 use lionclaw::model::{
-    ArtifactOutcome, Assertion, AssertionId, ControlAction, DecisionAction, Handoff, MissionPhase,
-    OracleName, PayloadRef,
+    ArtifactOutcome, Assertion, AssertionId, ControlAction, DecisionAction, Handoff, MissionEvent,
+    MissionPhase, OracleName, OutputSemantics, PayloadRef, RoleName, TaskNamespace,
 };
 use lionclaw::ports::{OracleOutcome, RoleRunOutcome};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -29,6 +29,98 @@ fn completed_work(base_sha: &str) -> RoleRunOutcome {
         runtime_configuration: Default::default(),
         final_response: String::new(),
     }
+}
+
+#[tokio::test]
+async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission("/repo", "collided recovery", BASE_SHA)
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+
+    let effect_id = common::effect_id("collided-recovery");
+    let interrupted = TypedFailure::Interrupted {
+        evidence: Box::new(lionclaw_runtime_api::TypedFailureEvidence {
+            code: Some("driver.interrupted".into()),
+            detail: "the previous mission driver exited before recording an outcome; its resources were cleaned and the effect was not replayed".into(),
+            stop_reason: Some("mission driver exited".into()),
+            ..Default::default()
+        }),
+    };
+    let orphan = lionclaw::store::NewEvent::new(MissionEvent::RoleRunCompleted {
+        namespace: TaskNamespace::Execution,
+        task_id: lionclaw::model::TaskId::new("fix").expect("task id"),
+        attempt_no: 1,
+        effect_id: effect_id.clone(),
+        outcome: Err(interrupted),
+    });
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    let head = fault_append_events(dir.path(), &mission_id, state.head, &[orphan], 1).await;
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.path().join(".lionclaw/mission.db").display()
+    ))
+    .await
+    .expect("open mission database");
+    sqlx::query(
+        "UPDATE mission_events SET effect_id = ?1, effect_class = 'outcome' \
+         WHERE mission_id = ?2 AND sequence_no = ?3",
+    )
+    .bind(effect_id.as_str())
+    .bind(mission_id.as_str())
+    .bind(head as i64)
+    .execute(&database)
+    .await
+    .expect("reserve the orphan outcome identity");
+    let request = lionclaw::store::NewEvent::new(MissionEvent::RoleRunRequested {
+        namespace: TaskNamespace::Execution,
+        task_id: lionclaw::model::TaskId::new("fix").expect("task id"),
+        attempt_no: 1,
+        effect_id: effect_id.clone(),
+        role: RoleName::new("implementer").expect("role name"),
+        output: OutputSemantics::ProducesArtifact,
+        runtime: "codex".into(),
+        prompt: PayloadRef::inline("prompt"),
+        base_sha: BASE_SHA.into(),
+        assignment_epoch: 1,
+        recreate_workspace: true,
+        requested_at_ms: 0,
+        not_before_ms: 0,
+        deadline_ms: 100_000,
+        budget_deadline_ms: 100_000,
+    });
+    fault_append_events(dir.path(), &mission_id, head, &[request], 1).await;
+    assert!(h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("state")
+        .inflight
+        .contains_key(&effect_id));
+
+    let error = h
+        .engine
+        .advance(&mission_id)
+        .await
+        .expect_err("an inert duplicate must not be mistaken for settlement");
+    assert!(
+        error.to_string().contains("effect identity collision"),
+        "got {error:#}"
+    );
+    assert!(h.role_runner.calls.lock().expect("calls").is_empty());
 }
 
 #[tokio::test]

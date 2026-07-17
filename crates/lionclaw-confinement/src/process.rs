@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    sync::mpsc,
 };
 
 pub use lionclaw_runtime_api::ExecutionOutput as ProcessOutput;
@@ -70,13 +71,10 @@ impl fmt::Debug for ProcessInvocation {
     }
 }
 
-pub async fn run_process_streaming<F>(
+pub async fn run_process_streaming(
     invocation: &ProcessInvocation,
-    mut on_stdout_line: F,
-) -> Result<ProcessOutput>
-where
-    F: FnMut(&str) -> Result<()>,
-{
+    stream: Option<&mpsc::Sender<String>>,
+) -> Result<ProcessOutput> {
     let mut command = Command::new(&invocation.executable);
     command.args(&invocation.args);
 
@@ -125,7 +123,12 @@ where
         else {
             break;
         };
-        on_stdout_line(&line)?;
+        if let Some(stream) = stream {
+            stream
+                .send(line)
+                .await
+                .map_err(|_| anyhow::anyhow!("streaming stdout receiver closed"))?;
+        }
     }
 
     let status = child
@@ -706,7 +709,7 @@ mod tests {
                 environment: Vec::new(),
                 input: "ignored\n".repeat(1024 * 1024),
             },
-            |_| Ok(()),
+            None,
         )
         .await
         .expect("run process");

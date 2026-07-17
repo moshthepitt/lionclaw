@@ -61,9 +61,9 @@ pub use context::{
 pub use driver::{RuntimeDriverConfig, RuntimeDriverProvider, RuntimeTerminalConfig};
 pub use event::{
     append_streamed_text_boundary, append_streamed_text_delta, canonical_events,
-    observe_final_response, RawTurnPayload, RuntimeArtifact, RuntimeEvent, RuntimeEventSender,
-    RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeTurnJournalSender,
-    TurnEvent, RUNTIME_TURN_JOURNAL_CAPACITY,
+    observe_final_response, RuntimeArtifact, RuntimeEvent, RuntimeEventSender, RuntimeFileChange,
+    RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeTurnJournalSender, TurnEvent,
+    RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 pub use lionclaw_model::{
     bounded_failure_text as bounded_text, AppliedRuntimeConfiguration,

@@ -8,6 +8,7 @@ mod prepared_input;
 mod role_runner;
 
 pub use executor::MissionProgramExecutor;
+pub(crate) use handoff::validate_handoff;
 pub use handoff::MAX_HANDOFF_REPORT_BYTES;
 pub(crate) use prepared_input::{prepare_inputs, PreparedInputs};
 pub use role_runner::OciRoleRunner;

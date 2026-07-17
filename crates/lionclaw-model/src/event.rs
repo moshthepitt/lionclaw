@@ -20,8 +20,8 @@ use super::plan::{OutputSemantics, PlanProposal, PlanningDag};
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure};
 
-/// Bumped for exact resolved planning-task output contracts.
-pub const SCHEMA_VERSION: u32 = 14;
+/// Bumped for engine-only payload-reference provenance.
+pub const SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

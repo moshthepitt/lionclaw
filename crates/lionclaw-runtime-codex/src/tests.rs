@@ -11,7 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw_runtime_api::{
     append_streamed_text_boundary, append_streamed_text_delta, canonical_events, ExecutionOutput,
-    NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
+    NetworkMode, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
     RuntimeControlOrigin, RuntimeControlOutcome, RuntimeDriverConfig, RuntimeDriverProvider,
     RuntimeEvent, RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMcpServerSpec,
     RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession,
@@ -1778,19 +1778,11 @@ async fn codex_fixture_canonical_journal(
         if response_id(&message).is_some() {
             continue;
         }
-        let raw = RawTurnPayload {
-            driver: "codex-app-server".to_string(),
-            payload: message.to_string(),
-        };
         let events = client
             .handle_message(message, &thread_state)
             .await
             .expect("handle message");
-        journal.extend(
-            events
-                .into_iter()
-                .map(|event| TurnEvent::with_raw(event, raw.clone())),
-        );
+        journal.extend(events.into_iter().map(TurnEvent::canonical));
     }
     (journal, client)
 }
@@ -1820,11 +1812,6 @@ async fn codex_app_server_turn_journals_project_to_canonical_events() {
             RuntimeEvent::Done,
         ],
     );
-    assert!(successful.iter().all(|record| record
-        .raw
-        .as_ref()
-        .is_some_and(|raw| raw.driver == "codex-app-server")));
-
     let (compaction, _) = codex_fixture_canonical_journal("compact_context_compaction_v2").await;
     assert_eq!(
         canonical_events(&compaction).cloned().collect::<Vec<_>>(),

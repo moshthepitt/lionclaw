@@ -73,50 +73,33 @@ pub enum RuntimeEvent {
     },
 }
 
-/// Raw, driver-specific payload retained alongside a canonical event for
-/// debugging. Retention is debug-only: it is never parsed back into canonical
-/// text or replayed into a prompt. Only the paired [`RuntimeEvent`] is canonical.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RawTurnPayload {
-    /// Driver/protocol that produced the payload, e.g. `"driver-protocol"`.
-    pub driver: String,
-    /// The payload exactly as the driver emitted it (e.g. one JSON-RPC line).
-    pub payload: String,
-}
-
 /// One record in a runtime turn's canonical journal.
 ///
-/// A protocol driver translates each harness message into journal records.
-/// `event` is the canonical, public output LionClaw persists, replays, and
-/// shows operators. `raw`, when present, retains the originating driver payload
-/// for debugging only and is excluded from every canonical projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A protocol driver translates each harness message into this bounded public
+/// form. The field is private so adapter implementations cannot bypass the
+/// canonical ingress constructor with an unbounded provider payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnEvent {
-    pub event: RuntimeEvent,
-    pub raw: Option<RawTurnPayload>,
+    event: RuntimeEvent,
 }
 
 impl TurnEvent {
-    /// A record for a kernel-synthesized event with no retained raw payload.
     pub fn canonical(event: RuntimeEvent) -> Self {
         Self {
             event: bounded_runtime_event(event),
-            raw: None,
         }
     }
 
-    /// A record retaining the raw driver payload the event was derived from.
-    pub fn with_raw(event: RuntimeEvent, raw: RawTurnPayload) -> Self {
-        Self {
-            event,
-            raw: Some(raw),
-        }
+    pub fn event(&self) -> &RuntimeEvent {
+        &self.event
+    }
+
+    pub fn into_event(self) -> RuntimeEvent {
+        self.event
     }
 }
 
-/// Project a canonical journal to its public [`RuntimeEvent`] stream, dropping
-/// every retained raw payload. This is the only sanctioned way to derive
-/// operator-visible output from a journal: raw retention never contributes.
+/// Project a canonical journal to its public [`RuntimeEvent`] stream.
 pub fn canonical_events(journal: &[TurnEvent]) -> impl Iterator<Item = &RuntimeEvent> {
     journal.iter().map(|record| &record.event)
 }

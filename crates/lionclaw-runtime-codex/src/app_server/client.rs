@@ -621,10 +621,9 @@ where
     {
         let sink = sink.into();
         let message = message.into();
-        let raw_payload = message.raw;
         for event in self.handle_message(message.value, thread_state).await? {
             lionclaw_runtime_api::observe_final_response(&mut self.final_response, &event);
-            sink.send(event, &raw_payload).await;
+            sink.send(event).await;
         }
         Ok(())
     }

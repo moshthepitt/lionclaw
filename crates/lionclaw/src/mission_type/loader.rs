@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
 use crate::model::{
-    InputName, OracleName, OutputSemantics, PlanningDag, PlanningTask, RoleName, StopBar,
-    TerminalReviewConfig,
+    InputName, OracleName, PlanningDag, PlanningTask, RoleName, StopBar, TerminalReviewConfig,
 };
 
 use super::digest::ContentDigest;
@@ -81,16 +80,6 @@ pub fn load_mission_type(
             )))
         }
     };
-    if manifest.recovery.max_attempts == 0 {
-        return Err(MissionTypeError::Manifest(
-            "[recovery] max-attempts must be at least 1".to_string(),
-        ));
-    }
-    manifest
-        .execution
-        .validate()
-        .map_err(|error| MissionTypeError::Manifest(format!("[execution] {error}")))?;
-
     let skills = load_skills(root)?;
     let inputs = load_inputs(root, manifest.inputs)?;
     let oracles = load_oracles(&root.join("oracles"))?;
@@ -100,35 +89,11 @@ pub fn load_mission_type(
     }
     let planning = resolve_planning_dag(manifest.planning, &roles)?;
 
-    // The closing review, fail-closed like the planning DAG: the named role
-    // must exist and be a judge. An agent-graded bar without an independent
-    // closing review would be the workers' own validators agreeing with the
-    // workers — so `reviewed` requires the declaration.
     let terminal_review = match &manifest.terminal_review {
-        None if stop == StopBar::Reviewed => {
-            return Err(MissionTypeError::Manifest(
-                "stop = \"reviewed\" requires [terminal-review]: the reviewed bar is \
-                 defined by an independent terminal review"
-                    .to_string(),
-            ));
-        }
         None => None,
         Some(declared) => {
             let role_name = RoleName::new(&declared.role)
                 .map_err(|e| MissionTypeError::Manifest(format!("[terminal-review] role: {e}")))?;
-            let Some(role) = roles.get(&role_name) else {
-                return Err(MissionTypeError::Manifest(format!(
-                    "[terminal-review] role '{}' is not provided by this mission type",
-                    declared.role
-                )));
-            };
-            if role.output != OutputSemantics::EmitsGapVerdict {
-                return Err(MissionTypeError::Manifest(format!(
-                    "[terminal-review] role '{}' must be emits-gap-verdict, got {}",
-                    declared.role,
-                    role.output.slug()
-                )));
-            }
             Some(TerminalReviewConfig { role: role_name })
         }
     };
@@ -156,20 +121,9 @@ pub fn load_mission_type(
         inputs,
         oracles,
     };
-    // Validate the planning DAG fail-closed at load against this type's own
-    // inventory (roles must be planning roles; the author is the unique sink).
-    let errors =
-        crate::model::validate_planning_dag(&mission_type.planning, &mission_type.inventory());
-    if !errors.is_empty() {
-        return Err(MissionTypeError::Manifest(format!(
-            "[planning] is invalid:\n{}",
-            errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-        )));
-    }
+    mission_type
+        .validate_at(0)
+        .map_err(|error| MissionTypeError::Manifest(error.to_string()))?;
     Ok(mission_type)
 }
 
