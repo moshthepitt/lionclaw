@@ -13,7 +13,6 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -26,20 +25,20 @@ use crate::config::RuntimeProfiles;
 use crate::engine::{Engine, EngineServices, MissionDisposition, ProposeError};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
-    ArtifactOutcome, Assertion, AssertionId, DecisionAction, EffectId, FinishClass, Gap,
-    GapSeverity, Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase, OracleName,
-    PayloadRef, Plan, PlanProposal, ProposalError, Requirement, RequirementDisposition,
-    RequirementId, RequirementKind, ReviewAcceptanceKind, RoleName, RunErrorKind, Task, TaskId,
-    TaskKind, TaskStatus,
+    Assertion, AssertionId, DecisionAction, EffectId, FinishClass, Gap, GapSeverity, Handoff,
+    MissionEvent, MissionId, MissionPhase, OracleName, PayloadRef, Plan, PlanProposal,
+    ProposalError, Requirement, RequirementDisposition, RequirementId, RequirementKind,
+    ReviewAcceptanceKind, RoleName, Task, TaskId, TaskKind, TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
-    OracleFailure, OracleOutcome, OracleRunRequest, OracleRunner, RoleRunFailure, RoleRunOutcome,
-    RoleRunRequest, RoleRunner, SystemClock,
+    OracleOutcome, OracleRunRequest, OracleRunner, RoleRunOutcome, RoleRunRequest, RoleRunner,
+    SystemClock,
 };
 use crate::runner::MissionProgramExecutor;
 use crate::store::MissionStore;
 use crate::workspace;
+use lionclaw_runtime_api::TypedFailure;
 
 use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
 use lionclaw_runtime_api::{ExecutionOutput, RuntimeAuthRegistry, RuntimeProgramExecutor};
@@ -53,7 +52,7 @@ struct NoopRoleRunner;
 
 #[async_trait]
 impl RoleRunner for NoopRoleRunner {
-    async fn run(&self, _request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+    async fn run(&self, _request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
                 done: true,
@@ -61,19 +60,20 @@ impl RoleRunner for NoopRoleRunner {
                 request_attention: false,
             },
             artifact: None,
-            model_id: None,
+            runtime_configuration: Default::default(),
+            final_response: "self-test noop worker".to_string(),
         })
     }
 }
 
-/// A worker that "commits" a fixed head, plus a terminal reviewer that
-/// returns one blocking gap (echoing the prompt's nonce, as a real agent
-/// must). Drives check (6) without a model or a container.
+/// An already-satisfied worker plus a terminal reviewer that returns one
+/// blocking gap (echoing the prompt's nonce, as a real agent must). Drives
+/// check (6) without a model or a container.
 struct ReviewParkRoleRunner;
 
 #[async_trait]
 impl RoleRunner for ReviewParkRoleRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         if request.task_id.as_str() == crate::engine::TERMINAL_REVIEW_TASK_TAG {
             Ok(RoleRunOutcome {
                 handoff: Handoff::Review {
@@ -93,7 +93,8 @@ impl RoleRunner for ReviewParkRoleRunner {
                         .to_string(),
                 },
                 artifact: None,
-                model_id: None,
+                runtime_configuration: Default::default(),
+                final_response: "self-test scripted review".to_string(),
             })
         } else {
             Ok(RoleRunOutcome {
@@ -102,11 +103,9 @@ impl RoleRunner for ReviewParkRoleRunner {
                     report: PayloadRef::inline("self-test worker"),
                     request_attention: false,
                 },
-                artifact: Some(ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha: request.base_sha,
-                }),
-                model_id: None,
+                artifact: None,
+                runtime_configuration: Default::default(),
+                final_response: "self-test worker".to_string(),
             })
         }
     }
@@ -118,7 +117,7 @@ struct FixedOracleRunner(i32);
 
 #[async_trait]
 impl OracleRunner for FixedOracleRunner {
-    async fn run(&self, _request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure> {
+    async fn run(&self, _request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
         Ok(OracleOutcome {
             exit_code: self.0,
             exit_signal: None,
@@ -139,7 +138,7 @@ struct CountingOracleRunner {
 
 #[async_trait]
 impl OracleRunner for CountingOracleRunner {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure> {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
         self.count.fetch_add(1, Ordering::SeqCst);
         self.inner.run(request).await
     }
@@ -318,7 +317,11 @@ const BROKEN_LIB: &str = include_str!("../tests/fixtures/eval/interval-bug/src/l
 /// A `mission.toml` for a self-test mission type: `stop = verified`, running
 /// in the runtime image the readiness probe already gated on.
 fn manifest_toml(name: &str) -> String {
-    format!("[mission-type]\nname = \"{name}\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n")
+    format!(
+        "[mission-type]\nname = \"{name}\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n\
+         \n[execution]\ndefault-timeout-secs = 1800\nmax-task-time-secs = 1800\n\
+         extension-step-secs = 300\nauto-continue-candidate = true\nauto-continue-proof = true\n"
+    )
 }
 const IMPLEMENTER_ROLE: &str = "\
 ---
@@ -484,27 +487,37 @@ async fn approve_plan(engine: &Engine, mission_id: &MissionId) -> Result<()> {
 /// A real writable worker without a model: it checks out the repo, writes a
 /// known-good fix and commits it **inside a real read-write container**, and
 /// returns the captured commit — proving the allow-side of confinement (writes
-/// land) and that the engine records the commit. Reuses the same checkout/capture
-/// helpers as the production `OciRoleRunner`.
+/// land) and that the engine records the commit. Reuses the exact engine-issued
+/// capture authority as the production `OciRoleRunner`.
 struct ScriptedRoleRunner {
     fixed_lib: &'static str,
 }
 
 #[async_trait]
 impl RoleRunner for ScriptedRoleRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
-        self.run_inner(request).await.map_err(|e| RoleRunFailure {
-            kind: RunErrorKind::Launch,
-            detail: format!("{e:#}"),
-        })
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        self.run_inner(request)
+            .await
+            .map_err(|e| TypedFailure::permanent("selftest.runner", format!("{e:#}")))
     }
 }
 
 impl ScriptedRoleRunner {
     async fn run_inner(&self, request: RoleRunRequest) -> Result<RoleRunOutcome> {
-        let attempt_tag = request.effect_id.as_str();
-        let dest = request.state_dir.join("selftest-work").join(attempt_tag);
+        let capture = request
+            .artifact_capture
+            .as_ref()
+            .context("scripted writer received no artifact capture authority")?;
+        let dest = capture.checkout_dir().to_path_buf();
         workspace::create_checkout(&request.workspace_dir, &dest, &request.base_sha).await?;
+        request
+            .updates
+            .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
+                base_sha: request.base_sha.clone(),
+                assignment_epoch: request.assignment_epoch,
+            })
+            .await
+            .context("engine role update receiver closed")?;
         // The produces-artifact role compiles to a writable workspace.
         let authority = compile_authority(&request.role, &AuthorityCeiling::default())
             .map_err(|e| anyhow::anyhow!("authority refused to compile: {e}"))?;
@@ -522,25 +535,16 @@ impl ScriptedRoleRunner {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let head = workspace::capture_worker_result(
-            &request.workspace_dir,
-            &dest,
-            request.mission_id.as_str(),
-            &request.effect_id,
-        )
-        .await?;
-        workspace::remove_dir(&dest).await?;
+        let artifact = capture.capture().await?;
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("self-test scripted fix"),
                 request_attention: false,
             },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha.clone(),
-                head_sha: head,
-            }),
-            model_id: None,
+            artifact: Some(artifact),
+            runtime_configuration: Default::default(),
+            final_response: "self-test scripted fix".to_string(),
         })
     }
 }
@@ -566,7 +570,6 @@ async fn run_confined_sh(
         },
         judged_roots,
         environment: vec![("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string())],
-        hard_timeout: Duration::from_secs(120),
     })
     .map_err(|e| anyhow::anyhow!("plan refused to compile: {e}"))?;
     let mut executor = MissionProgramExecutor::new(
@@ -644,9 +647,6 @@ async fn check_happy_writer_and_resume() -> Result<()> {
                 &repo.path().to_string_lossy(),
                 "self-test writable worker",
                 &base,
-                MissionConfig {
-                    ..Default::default()
-                },
             )
             .await?;
         engine
@@ -702,9 +702,6 @@ async fn check_prepared_input() -> Result<()> {
             &repo.path().to_string_lossy(),
             "self-test prepared input",
             &base,
-            MissionConfig {
-                ..Default::default()
-            },
         )
         .await?;
     engine
@@ -744,7 +741,7 @@ async fn check_prepared_input() -> Result<()> {
 }
 
 async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
-    let outcome = engine.advance(id).await?;
+    let outcome = advance_through_ready_checkpoints(engine, id).await?;
     let state = engine.load_state(id).await?;
     match state.phase {
         MissionPhase::Done {
@@ -752,6 +749,19 @@ async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
         } => Ok(()),
         other => anyhow::bail!("expected verified finish, got {other:?} (outcome {outcome:?})"),
     }
+}
+
+async fn advance_through_ready_checkpoints(
+    engine: &Engine,
+    id: &MissionId,
+) -> Result<crate::engine::MissionView> {
+    for _ in 0..16 {
+        let outcome = engine.advance(id).await?;
+        if outcome.disposition != MissionDisposition::Ready {
+            return Ok(outcome);
+        }
+    }
+    anyhow::bail!("self-test exceeded 16 explicit ready checkpoints")
 }
 
 /// (2) The real cargo-test oracle on a genuinely-broken tree records a valid
@@ -775,9 +785,6 @@ async fn check_oracle_honesty() -> Result<()> {
             &repo.path().to_string_lossy(),
             "self-test oracle honesty",
             &base,
-            MissionConfig {
-                ..Default::default()
-            },
         )
         .await?;
     engine
@@ -785,7 +792,7 @@ async fn check_oracle_honesty() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
     approve_plan(&engine, &id).await?;
-    let outcome = engine.advance(&id).await?;
+    let outcome = advance_through_ready_checkpoints(&engine, &id).await?;
     let state = engine.load_state(&id).await?;
     let verdict = state
         .contract
@@ -839,9 +846,6 @@ async fn check_replanning() -> Result<()> {
             repo.path().to_str().context("utf8 repo path")?,
             "re-planning self-test",
             &base,
-            MissionConfig {
-                ..Default::default()
-            },
         )
         .await?;
     engine
@@ -921,6 +925,8 @@ async fn check_terminal_review() -> Result<()> {
         type_dir.path().join("mission.toml"),
         format!(
             "[mission-type]\nname = \"selftest\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n\
+             \n[execution]\ndefault-timeout-secs = 1800\nmax-task-time-secs = 1800\n\
+             extension-step-secs = 300\nauto-continue-candidate = true\nauto-continue-proof = true\n\
              \n[terminal-review]\nrole = \"gap-reviewer\"\n"
         ),
     )?;
@@ -933,10 +939,6 @@ async fn check_terminal_review() -> Result<()> {
 
     let repo = tempfile::tempdir().context("tempdir")?;
     let base = materialize_repo(repo.path(), ADD_CARGO, FIXED_ADD_LIB).await?;
-    let config = MissionConfig {
-        terminal_review: mission_type.terminal_review.clone(),
-        ..Default::default()
-    };
     let engine = Engine::new(
         MissionStore::open(repo.path()).await?,
         mission_type,
@@ -956,7 +958,6 @@ async fn check_terminal_review() -> Result<()> {
             repo.path().to_str().context("utf8 repo path")?,
             "terminal-review self-test",
             &base,
-            config,
         )
         .await?;
     engine
@@ -1099,7 +1100,6 @@ async fn check_runtime_skill_mount() -> Result<()> {
             "HOME".to_string(),
             lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET.to_string(),
         )],
-        hard_timeout: Duration::from_secs(120),
     })
     .map_err(|err| anyhow::anyhow!("plan refused to compile: {err}"))?;
     let mut executor = MissionProgramExecutor::new(

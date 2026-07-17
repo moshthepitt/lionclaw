@@ -13,7 +13,7 @@ use lionclaw_runtime_api::{
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
     RuntimeMcpServerSpec, RuntimeProgramExecutor, RuntimeProgramSpec, RuntimeProgramTurnExecution,
     RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTurnInput,
-    RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult,
+    RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult, TypedFailure,
 };
 
 use crate::client::{finish_acp_session, AcpClient, AcpEnsureSession};
@@ -127,7 +127,11 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
         Ok(())
     }
 
-    async fn cancel(&self, handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+    async fn cancel(
+        &self,
+        handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<lionclaw_runtime_api::RuntimeCancellation> {
         let active_turn = self
             .sessions
             .read()
@@ -135,7 +139,7 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
             .get(&handle.runtime_session_id)
             .and_then(|state| state.active_turn.clone());
         let Some(active_turn) = active_turn else {
-            return Ok(());
+            return Ok(lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn);
         };
 
         let completion = Arc::clone(&active_turn.completion);
@@ -160,18 +164,24 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
                     session_id = active_turn.session_id,
                     "timed out waiting for ACP session/cancel send acknowledgement"
                 );
-                return Ok(());
+                return Err(anyhow!(
+                    "timed out waiting for ACP session/cancel send acknowledgement for '{}'",
+                    active_turn.session_id
+                ));
             }
         }?;
 
         match timeout(ACP_CANCEL_ACK_TIMEOUT, completion.wait()).await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(lionclaw_runtime_api::RuntimeCancellation::Acknowledged),
             Err(_) => {
                 warn!(
                     session_id = active_turn.session_id,
                     "timed out waiting for ACP cancelled turn to finish"
                 );
-                Ok(())
+                Err(anyhow!(
+                    "timed out waiting for ACP cancelled turn to finish for '{}'",
+                    active_turn.session_id
+                ))
             }
         }
     }
@@ -205,6 +215,7 @@ impl AcpTurnRunner {
         let session = self.executor.spawn(program).await?;
         let mut client = AcpClient::new(session);
         let mut active_turn = None;
+        let mut applied_configuration = None;
 
         let result = async {
             let session_capabilities = client.initialize().await?;
@@ -219,9 +230,26 @@ impl AcpTurnRunner {
                     mcp_servers: &self.mcp_servers,
                 })
                 .await?;
-            client
-                .configure_session(&self.config, &opened_session.session_id)
-                .await?;
+            let configuration = client
+                .configure_session(
+                    &self.config,
+                    &opened_session.session_id,
+                    &opened_session.selections,
+                )
+                .await?
+                .projected();
+            applied_configuration = Some(configuration.clone());
+            if configuration.requested_model.is_some() || configuration.requested_mode.is_some() {
+                drop(
+                    journal
+                        .send(lionclaw_runtime_api::TurnEvent::canonical(
+                            lionclaw_runtime_api::RuntimeEvent::Configuration {
+                                configuration: configuration.clone(),
+                            },
+                        ))
+                        .await,
+                );
+            }
             let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
             active_turn = Some(register_active_acp_turn(
                 &self.sessions,
@@ -237,13 +265,45 @@ impl AcpTurnRunner {
             let prompt_result = client
                 .prompt(&opened_session.session_id, prompt, &journal, &mut cancel_rx)
                 .await;
-            prompt_result?;
-            Ok(RuntimeTurnResult::default())
+            let final_response = prompt_result?;
+            Ok(RuntimeTurnResult {
+                configuration,
+                final_response,
+                ..Default::default()
+            }
+            .projected())
         }
         .await;
 
-        let result = finish_acp_session(client, result).await;
+        let failed_final_response = if let Ok(completed) = &result {
+            completed.final_response.clone()
+        } else {
+            client.take_final_response()
+        };
+        let result = finish_acp_session(client, result).await.map_err(|error| {
+            let mut error =
+                configured_failure(error, applied_configuration.as_ref(), "acp.runtime");
+            if let Some(failure) = error.downcast_mut::<TypedFailure>() {
+                failure.evidence_mut().final_response = failed_final_response;
+            }
+            error
+        });
         drop(active_turn);
         result
     }
+}
+
+fn configured_failure(
+    error: anyhow::Error,
+    configuration: Option<&lionclaw_runtime_api::AppliedRuntimeConfiguration>,
+    code: &str,
+) -> anyhow::Error {
+    let mut failure = error
+        .downcast_ref::<TypedFailure>()
+        .cloned()
+        .unwrap_or_else(|| TypedFailure::permanent(code, error.to_string()));
+    if let Some(configuration) = configuration {
+        failure.evidence_mut().configuration = configuration.clone();
+    }
+    anyhow::Error::new(failure.projected())
 }

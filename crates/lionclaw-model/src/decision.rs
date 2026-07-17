@@ -6,6 +6,8 @@
 //! are rejected before any event is recorded, so the fold only ever applies
 //! legal transitions.
 
+use crate::prelude::*;
+
 use super::event::DecisionAction;
 use super::state::{AttentionKind, MissionState};
 

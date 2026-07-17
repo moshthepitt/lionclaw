@@ -13,7 +13,7 @@ use super::MissionStore;
 impl MissionStore {
     /// Persist a fold snapshot at `state.head`. Monotonic: an older
     /// `upto_sequence_no` is rejected without effect.
-    pub async fn save_snapshot(&self, state: &MissionState, now_ms: i64) -> Result<()> {
+    pub(crate) async fn save_snapshot(&self, state: &MissionState, now_ms: i64) -> Result<()> {
         let state_json = serde_json::to_string(state)?;
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let current: Option<(i64, i64)> = sqlx::query_as(

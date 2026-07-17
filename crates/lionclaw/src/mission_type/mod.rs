@@ -12,6 +12,7 @@
 //! └─ oracles/<name>          # executable; exit 0 = pass
 //! ```
 
+mod bounded_tree;
 mod bundled;
 mod digest;
 mod frontmatter;
@@ -20,6 +21,7 @@ mod install;
 mod loader;
 mod locator;
 mod manifest;
+mod prepared_input;
 mod skill_install;
 mod skills;
 
@@ -27,17 +29,37 @@ pub use bundled::BundledMissionTypes;
 pub(crate) use digest::ContentDigest;
 pub use home::Home;
 pub use install::{install_mission_type, materialize_mission_type, InstallOutcome};
+pub(crate) use loader::load_materialized_mission_type;
 pub use loader::{load_mission_type, MissionTypeError};
 pub use locator::MissionTypeLocator;
 pub use skill_install::{add_skill, remove_skill, SkillChange, SkillSource};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::model::{
-    InputName, MissionTypeInventory, OracleName, OutputSemantics, PlanningDag, RoleName, StopBar,
+    InputName, OracleName, OutputSemantics, PlanInventory, PlanningDag, RoleName, StopBar,
     TerminalReviewConfig,
 };
+
+/// Aggregate program and declared-key content admitted to one prepared-input
+/// cache identity.
+pub(crate) const MAX_PREPARED_INPUT_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
+
+pub(crate) fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+pub(crate) fn has_shebang(path: &Path) -> bool {
+    use std::io::Read;
+    let mut bytes = [0_u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok_and(|_| &bytes == b"#!")
+}
 
 /// A role is property-composed data: open fields (name, prompt, runtime) plus
 /// the closed engine-understood axes (`output`, and the plain `network`/
@@ -48,6 +70,7 @@ pub struct RoleDefinition {
     pub output: OutputSemantics,
     /// Runtime profile name; `None` uses the mission default.
     pub runtime: Option<String>,
+    pub timeout_secs: Option<u64>,
     pub network: bool,
     pub secrets: bool,
     /// Mission-owned skills projected for this role. Empty is valid.
@@ -76,12 +99,12 @@ pub struct PreparedInput {
     pub environment: BTreeMap<String, String>,
 }
 
+/// Untrusted mission-type data. Production callers obtain a sealed
+/// [`MissionType`] from [`load_mission_type`]; keeping the definition separate
+/// makes a stale or caller-selected content pin unrepresentable.
 #[derive(Debug, Clone)]
-pub struct MissionType {
+pub struct MissionTypeDefinition {
     pub name: String,
-    /// Content digest over the loaded files (`loader::compute_digest`),
-    /// recorded at start and verified on every engine open.
-    pub digest: String,
     pub stop: StopBar,
     /// The confinement image every role and oracle runs in (from `mission.toml`).
     pub image: String,
@@ -90,6 +113,7 @@ pub struct MissionType {
     pub planning: PlanningDag,
     /// Mission-level role recovery budget.
     pub recovery: crate::model::RecoveryConfig,
+    pub execution: crate::model::ExecutionPolicy,
     /// The closing review (the pure-core config type, threaded verbatim into
     /// `MissionConfig` at mission start). Required when `stop = "reviewed"`.
     pub terminal_review: Option<TerminalReviewConfig>,
@@ -100,17 +124,159 @@ pub struct MissionType {
     pub oracles: BTreeMap<OracleName, PathBuf>,
 }
 
+/// One validated mission-type closure sealed to its content identity.
+#[derive(Debug, Clone)]
+pub struct MissionType {
+    definition: MissionTypeDefinition,
+    digest: String,
+    source_owner: Option<std::sync::Arc<tempfile::TempDir>>,
+}
+
+impl std::ops::Deref for MissionType {
+    type Target = MissionTypeDefinition;
+
+    fn deref(&self) -> &Self::Target {
+        &self.definition
+    }
+}
+
 impl MissionType {
+    pub(crate) fn from_loaded(definition: MissionTypeDefinition, digest: String) -> Self {
+        Self {
+            definition,
+            digest,
+            source_owner: None,
+        }
+    }
+
+    pub(crate) fn with_source_owner(mut self, owner: std::sync::Arc<tempfile::TempDir>) -> Self {
+        self.source_owner = Some(owner);
+        self
+    }
+
+    /// Content digest over the complete loaded bundle, recorded at mission
+    /// creation and verified on every engine open.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_testing(definition: MissionTypeDefinition) -> Self {
+        let digest = test_definition_digest(&definition);
+        Self {
+            definition,
+            digest,
+            source_owner: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn edit_for_testing(&mut self, edit: impl FnOnce(&mut MissionTypeDefinition)) {
+        edit(&mut self.definition);
+        self.digest = test_definition_digest(&self.definition);
+    }
+
+    /// Validate the complete semantic mission-type contract at the clock epoch
+    /// where immutable effect deadlines will be derived. Bundle loading and
+    /// direct engine creation use this same boundary.
+    pub fn validate_at(&self, now_ms: i64) -> anyhow::Result<()> {
+        if self.roles.is_empty() {
+            anyhow::bail!("mission type has no roles");
+        }
+        if self.recovery.max_attempts == 0 {
+            anyhow::bail!("[recovery] max-attempts must be at least 1");
+        }
+        self.execution
+            .validate_at(now_ms)
+            .map_err(|error| anyhow::anyhow!("[execution] invalid execution policy: {error}"))?;
+        for (name, role) in &self.roles {
+            crate::authority::validate_role_authority_request(role)?;
+            if name != &role.name {
+                anyhow::bail!(
+                    "role map key '{name}' does not match role definition '{}'",
+                    role.name
+                );
+            }
+            if let Some(timeout_secs) = role.timeout_secs {
+                if timeout_secs == 0 {
+                    anyhow::bail!("role '{}' timeout must be at least 1 second", role.name);
+                }
+                crate::model::resolve_execution_deadline_ms(now_ms, timeout_secs).map_err(
+                    |error| anyhow::anyhow!("role '{}' deadline is invalid: {error}", role.name),
+                )?;
+            }
+            for skill in &role.skills {
+                if !self.skills.contains_key(skill) {
+                    anyhow::bail!("role '{}' names missing skill '{skill}'", role.name);
+                }
+            }
+        }
+        prepared_input::validate_prepared_inputs(&self.inputs)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let planning_errors =
+            crate::model::validate_planning_dag(&self.planning, &self.inventory());
+        if !planning_errors.is_empty() {
+            anyhow::bail!(
+                "[planning] is invalid:\n{}",
+                planning_errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        if self.stop == StopBar::Reviewed && self.terminal_review.is_none() {
+            anyhow::bail!(
+                "stop = \"reviewed\" requires [terminal-review]: the reviewed bar is defined by an independent terminal review"
+            );
+        }
+        if let Some(review) = &self.terminal_review {
+            match self.roles.get(&review.role) {
+                Some(role) if role.output == OutputSemantics::EmitsGapVerdict => {}
+                Some(role) => anyhow::bail!(
+                    "[terminal-review] role '{}' must be emits-gap-verdict, got {}",
+                    review.role,
+                    role.output.slug()
+                ),
+                None => anyhow::bail!(
+                    "[terminal-review] role '{}' is not provided by this mission type",
+                    review.role
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// The complete revision-zero policy persisted at mission creation.
+    /// Mission types are the sole source; replay reads the resolved copy from
+    /// `MissionCreated` and never reopens bundle files.
+    pub fn mission_config(&self) -> crate::model::MissionConfig {
+        crate::model::MissionConfig {
+            stop: self.stop,
+            plan_inventory: self.inventory(),
+            planning: self.planning.clone(),
+            recovery: self.recovery.clone(),
+            execution: self.execution.clone(),
+            terminal_review: self.terminal_review.clone(),
+        }
+    }
+
     /// The pure inventory plan validation runs against.
-    pub fn inventory(&self) -> MissionTypeInventory {
-        MissionTypeInventory {
+    fn inventory(&self) -> PlanInventory {
+        PlanInventory {
             roles: self
                 .roles
                 .iter()
                 .map(|(name, role)| (name.clone(), role.output))
                 .collect(),
             oracles: self.oracles.keys().cloned().collect::<BTreeSet<_>>(),
-            stop: self.stop,
         }
     }
+}
+
+#[cfg(any(test, feature = "testing"))]
+fn test_definition_digest(definition: &MissionTypeDefinition) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(format!("{definition:#?}").as_bytes()))
 }

@@ -7,15 +7,15 @@ mod common;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use common::{approve_plan, covered_requirement, proposal};
+use common::{approve_plan, covered_requirement, proposal, BASE_SHA};
 use lionclaw::authority::AuthorityCeiling;
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::load_mission_type;
 use lionclaw::model::{
-    AssertionId, FinishClass, Handoff, MissionConfig, MissionPhase, OutputSemantics, PayloadRef,
-    Plan, RoleName, StopBar, Task, TaskId, TaskKind, ValidationItem,
+    AssertionId, FinishClass, Handoff, MissionPhase, OutputSemantics, PayloadRef, Plan, RoleName,
+    StopBar, Task, TaskId, TaskKind, ValidationItem,
 };
-use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
+use lionclaw::ports::{CapturedArtifact, RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
@@ -55,6 +55,7 @@ async fn advisory_only_mission_type_never_verifies() {
     assert!(mission_type.oracles.is_empty(), "fixture has no oracles");
 
     let dir = tempfile::tempdir().expect("tempdir");
+    common::initialize_repository(dir.path());
     let store = MissionStore::open(dir.path()).await.expect("store");
     // A reviewer that passes everything (the plan validator per assertion,
     // the terminal reviewer with a clean verdict); a worker that commits.
@@ -80,21 +81,15 @@ async fn advisory_only_mission_type_never_verifies() {
                 request_attention: false,
             }
         };
-        let artifact = (req.role.output == OutputSemantics::ProducesArtifact).then(|| {
-            lionclaw::model::ArtifactOutcome {
-                base_sha: req.base_sha.clone(),
-                head_sha: "head-1".to_string(),
-            }
-        });
+        let artifact = (req.role.output == OutputSemantics::ProducesArtifact)
+            .then(|| CapturedArtifact::for_testing(req.base_sha.clone(), "head-1"));
         Ok(RoleRunOutcome {
             handoff,
             artifact,
-            model_id: None,
+            runtime_configuration: Default::default(),
+            final_response: String::new(),
         })
     }));
-    // The reviewed bar requires the closing review (create_mission refuses
-    // it otherwise), so thread the fixture's declaration like cmd_start does.
-    let terminal_review = mission_type.terminal_review.clone();
     let engine = Engine::new(
         store,
         mission_type,
@@ -108,17 +103,7 @@ async fn advisory_only_mission_type_never_verifies() {
         ),
     );
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "make it readable",
-            "base-0",
-            MissionConfig {
-                stop: StopBar::Reviewed,
-                planning: Default::default(),
-                recovery: Default::default(),
-                terminal_review,
-            },
-        )
+        .create_mission(dir.path().to_str().unwrap(), "make it readable", BASE_SHA)
         .await
         .expect("create");
     // One oracle-less assertion, covered by a worker and judged by a reviewer.

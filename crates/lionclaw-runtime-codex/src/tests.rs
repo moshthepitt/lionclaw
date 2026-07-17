@@ -11,12 +11,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw_runtime_api::{
     append_streamed_text_boundary, append_streamed_text_delta, canonical_events, ExecutionOutput,
-    NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
+    NetworkMode, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
     RuntimeControlOrigin, RuntimeControlOutcome, RuntimeDriverConfig, RuntimeDriverProvider,
     RuntimeEvent, RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMcpServerSpec,
     RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession,
-    RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionReady,
-    RuntimeSessionStartInput, RuntimeTerminalProgramInput, TurnEvent, RUNTIME_SESSION_READY_MARKER,
+    RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeProgramTurnExecution,
+    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+    RuntimeTerminalProgramInput, RuntimeTurnInput, TurnEvent, TypedFailure,
+    RUNTIME_SESSION_READY_MARKER,
 };
 
 use crate::codex_runtime_auth_kind;
@@ -105,6 +107,56 @@ impl RuntimeProgramExecutor for UnusedRuntimeProgramExecutor {
         _program: RuntimeProgramSpec,
     ) -> Result<Box<dyn RuntimeProgramSession>> {
         anyhow::bail!("test did not expect interactive runtime execution")
+    }
+}
+
+struct ScriptedRuntimeProgramSession {
+    incoming: VecDeque<String>,
+}
+
+#[async_trait]
+impl RuntimeProgramSession for ScriptedRuntimeProgramSession {
+    async fn write_line(&mut self, _line: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn read_line(&mut self) -> Result<Option<String>> {
+        Ok(self.incoming.pop_front())
+    }
+
+    async fn shutdown(self: Box<Self>) -> Result<ExecutionOutput> {
+        Ok(ExecutionOutput {
+            exit_code: Some(0),
+            ..ExecutionOutput::default()
+        })
+    }
+}
+
+struct ScriptedRuntimeProgramExecutor {
+    incoming: Option<VecDeque<String>>,
+}
+
+#[async_trait]
+impl RuntimeProgramExecutor for ScriptedRuntimeProgramExecutor {
+    async fn execute_streaming(
+        &mut self,
+        _program: RuntimeProgramSpec,
+        _stdout: RuntimeProgramStdoutSender,
+    ) -> Result<ExecutionOutput> {
+        anyhow::bail!("test expected interactive runtime execution")
+    }
+
+    async fn execute_captured(&mut self, _program: RuntimeProgramSpec) -> Result<ExecutionOutput> {
+        anyhow::bail!("test expected interactive runtime execution")
+    }
+
+    async fn spawn(
+        &mut self,
+        _program: RuntimeProgramSpec,
+    ) -> Result<Box<dyn RuntimeProgramSession>> {
+        Ok(Box::new(ScriptedRuntimeProgramSession {
+            incoming: self.incoming.take().expect("runtime spawned once"),
+        }))
     }
 }
 
@@ -568,6 +620,169 @@ async fn app_server_agent_message_phases_choose_transcript_lane() {
     assert!(!events
         .iter()
         .any(|event| matches!(event, RuntimeEvent::MessageBoundary { .. })));
+    assert_eq!(client.take_final_response(), "Final answer.");
+}
+
+#[tokio::test]
+async fn app_server_protocol_state_is_bounded_against_unmatched_provider_ids() {
+    let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+    let mut limit_error = None;
+
+    for index in 0..1_024 {
+        let result = client
+            .handle_message(
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": format!("unmatched-thread-{index}"),
+                        "turn": {"id": format!("unmatched-turn-{index}")},
+                    }
+                }),
+                &thread_state,
+            )
+            .await;
+        if let Err(error) = result {
+            limit_error = Some(error);
+            break;
+        }
+    }
+
+    let error = limit_error.expect("provider-selected protocol IDs must have a finite state bound");
+    assert!(error.to_string().contains("protocol state limit"));
+}
+
+#[tokio::test]
+async fn app_server_rejects_oversized_thread_id_from_start_response() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let (adapter, handle, thread_state) =
+        start_codex_test_session(Some(runtime_state_root.clone())).await;
+    let transport = FakeAppServerTransport::new(vec![json!({
+        "id": 1,
+        "result": {"thread": {"id": "x".repeat(2_048)}}
+    })]);
+    let mut client = CodexAppServerClient::new(transport);
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = adapter
+        .ensure_app_server_thread(
+            &mut client,
+            &handle.runtime_session_id,
+            &event_tx,
+            &thread_state,
+        )
+        .await
+        .expect_err("oversized response thread id must fail closed");
+
+    assert!(error.to_string().contains("identifier"));
+    assert!(!runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE).exists());
+}
+
+#[tokio::test]
+async fn app_server_rejects_oversized_turn_id_from_start_response() {
+    let (adapter, handle, _thread_state) = start_codex_test_session(None).await;
+    let messages = [
+        json!({"id": 1, "result": {"serverInfo": {"name": "codex", "version": "test"}}}),
+        json!({"id": 2, "result": {"thread": {"id": "thr_1"}}}),
+        json!({"id": 3, "result": {"turn": {"id": "x".repeat(2_048)}}}),
+    ]
+    .into_iter()
+    .map(|message| serde_json::to_string(&message).unwrap())
+    .collect();
+    let executor = ScriptedRuntimeProgramExecutor {
+        incoming: Some(messages),
+    };
+    let (journal, _journal_rx) = tokio::sync::mpsc::channel(4);
+
+    let error = adapter
+        .program_backed_turn(
+            RuntimeProgramTurnExecution {
+                input: RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id.clone(),
+                    prompt: "test".into(),
+                    fresh_prompt: None,
+                },
+                context: RuntimeExecutionContext {
+                    network_mode: NetworkMode::None,
+                    working_dir: None,
+                    environment: Vec::new(),
+                    runtime_state_root: None,
+                    runtime_path_projections: Vec::new(),
+                    mcp_servers: Vec::new(),
+                },
+                executor: Box::new(executor),
+            },
+            journal,
+        )
+        .await
+        .expect_err("oversized response turn id must fail closed");
+
+    assert!(error.to_string().contains("identifier"));
+}
+
+#[tokio::test]
+async fn codex_session_rejects_oversized_restored_thread_id() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    std::fs::write(
+        runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
+        format!("{}\n", "x".repeat(2_048)),
+    )
+    .expect("write oversized thread state");
+    let ready = mark_runtime_ready(&runtime_state_root);
+    let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+
+    let error = adapter
+        .session_start(RuntimeSessionStartInput {
+            session_id: Uuid::new_v4(),
+            working_dir: None,
+            environment: Vec::new(),
+            runtime_state_root: Some(runtime_state_root),
+            runtime_session_ready: ready,
+        })
+        .await
+        .expect_err("oversized restored thread id must fail closed");
+
+    assert!(error.to_string().contains("identifier"));
+}
+
+#[tokio::test]
+async fn codex_active_turn_rejects_oversized_protocol_id() {
+    let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+    let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = thread_state
+        .set_active_turn("thr_1", &"x".repeat(2_048), interrupt_tx)
+        .expect_err("oversized active turn id must fail closed");
+
+    assert!(error.to_string().contains("identifier"));
+}
+
+#[tokio::test]
+async fn codex_active_turn_rejects_empty_protocol_id() {
+    let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+    let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = thread_state
+        .set_active_turn("thr_1", "", interrupt_tx)
+        .expect_err("empty active turn id must fail closed");
+
+    assert!(error.to_string().contains("must not be empty"));
+}
+
+#[tokio::test]
+async fn codex_active_turn_rejects_oversized_thread_id() {
+    let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+    let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = thread_state
+        .set_active_turn(&"x".repeat(2_048), "turn_1", interrupt_tx)
+        .expect_err("oversized active thread id must fail closed");
+
+    assert!(error.to_string().contains("identifier"));
 }
 
 #[tokio::test]
@@ -607,6 +822,8 @@ async fn app_server_agent_message_items_emit_answer_boundaries() {
             .await
             .expect("handle message");
     }
+
+    assert_eq!(client.take_final_response(), "Intro.\n\n**Project**");
 
     let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
     let message_events = events
@@ -736,6 +953,20 @@ fn model_list_description_uses_codex_app_server_display_fields() {
     assert_eq!(
         super::describe_model_list_response(&response),
         "Available Codex models: GPT-5 Codex, fallback-model."
+    );
+}
+
+#[test]
+fn applied_model_is_read_from_structured_turn_response() {
+    assert_eq!(
+        crate::app_server::extract_app_server_model(&json!({
+            "turn": {"id": "turn_1", "model": "gpt-5.5"}
+        })),
+        Some("gpt-5.5".to_string())
+    );
+    assert_eq!(
+        crate::app_server::extract_app_server_model(&json!({"turn": {"id": "turn_1"}})),
+        None
     );
 }
 
@@ -1547,19 +1778,11 @@ async fn codex_fixture_canonical_journal(
         if response_id(&message).is_some() {
             continue;
         }
-        let raw = RawTurnPayload {
-            driver: "codex-app-server".to_string(),
-            payload: message.to_string(),
-        };
         let events = client
             .handle_message(message, &thread_state)
             .await
             .expect("handle message");
-        journal.extend(
-            events
-                .into_iter()
-                .map(|event| TurnEvent::with_raw(event, raw.clone())),
-        );
+        journal.extend(events.into_iter().map(TurnEvent::canonical));
     }
     (journal, client)
 }
@@ -1589,11 +1812,6 @@ async fn codex_app_server_turn_journals_project_to_canonical_events() {
             RuntimeEvent::Done,
         ],
     );
-    assert!(successful.iter().all(|record| record
-        .raw
-        .as_ref()
-        .is_some_and(|raw| raw.driver == "codex-app-server")));
-
     let (compaction, _) = codex_fixture_canonical_journal("compact_context_compaction_v2").await;
     assert_eq!(
         canonical_events(&compaction).cloned().collect::<Vec<_>>(),
@@ -1625,7 +1843,9 @@ async fn codex_app_server_turn_journals_project_to_canonical_events() {
     let (interrupted, client) = codex_fixture_canonical_journal("turn_interrupt_v2").await;
     assert!(interrupted.is_empty());
     assert_eq!(
-        client.turn_failure(Some("turn_1")),
+        client
+            .turn_failure(Some("turn_1"))
+            .map(TypedFailure::detail),
         Some("codex turn interrupted")
     );
 }
@@ -1712,6 +1932,13 @@ async fn codex_app_server_turn_interrupt_uses_contract_fixture() {
 #[tokio::test]
 async fn codex_cancel_interrupts_active_app_server_turn() {
     let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+    assert_eq!(
+        adapter
+            .cancel(&handle, Some("pre-start".into()))
+            .await
+            .unwrap(),
+        lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn
+    );
     let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
     thread_state
         .set_active_turn("thr_1", "turn_1", interrupt_tx)
@@ -1722,10 +1949,14 @@ async fn codex_cancel_interrupts_active_app_server_turn() {
         request.ack_tx.send(Ok(())).expect("ack interrupt");
     });
 
-    adapter
+    let cancellation = adapter
         .cancel(&handle, Some("test timeout".to_string()))
         .await
         .expect("cancel sends native Codex interrupt");
+    assert_eq!(
+        cancellation,
+        lionclaw_runtime_api::RuntimeCancellation::Acknowledged
+    );
     wait_task.await.expect("wait task joins");
 
     adapter.close(&handle).await.expect("close");
@@ -1858,12 +2089,71 @@ async fn codex_app_server_unmatched_terminal_error_returns_error() {
         .expect_err("unmatched terminal errors should fail a specific turn");
 
     assert!(err.to_string().contains("global app-server failure"));
+    assert!(matches!(
+        err.downcast_ref::<TypedFailure>(),
+        Some(TypedFailure::PermanentRuntime { .. })
+    ));
     let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
     assert!(!events
         .iter()
         .any(|event| matches!(event, RuntimeEvent::Done)));
 
     adapter.close(&handle).await.expect("close");
+}
+
+#[test]
+fn codex_turn_failure_classification_uses_only_will_retry() {
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+    client.remember_turn_failure(
+        &json!({"turnId": "transient", "willRetry": true, "code": "capacity", "message": "overloaded"}),
+        "overloaded".into(),
+    );
+    client.remember_turn_failure(
+        &json!({"turnId": "unknown", "message": "please retry later"}),
+        "please retry later".into(),
+    );
+
+    assert!(matches!(
+        client.turn_failure(Some("transient")),
+        Some(TypedFailure::TransientRuntime { .. })
+    ));
+    assert_eq!(
+        client
+            .turn_failure(Some("transient"))
+            .unwrap()
+            .evidence()
+            .code
+            .as_deref(),
+        Some("capacity")
+    );
+    assert!(matches!(
+        client.turn_failure(Some("unknown")),
+        Some(TypedFailure::PermanentRuntime { .. })
+    ));
+}
+
+#[test]
+fn codex_turn_failure_state_bounds_provider_codes_before_retention() {
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+    let oversized_code = "x".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT + 1);
+
+    for index in 0..256 {
+        client.remember_turn_failure(
+            &json!({
+                "turnId": format!("turn_{index}"),
+                "willRetry": false,
+                "code": oversized_code,
+            }),
+            "failed".into(),
+        );
+    }
+
+    assert!((0..256).all(|index| {
+        client
+            .turn_failure(Some(&format!("turn_{index}")))
+            .and_then(|failure| failure.evidence().code.as_ref())
+            .is_some_and(|code| code.len() <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT)
+    }));
 }
 
 #[tokio::test]

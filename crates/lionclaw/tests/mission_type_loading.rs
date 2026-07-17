@@ -18,6 +18,21 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn write_minimal_bundle(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("roles")).unwrap();
+    std::fs::write(
+        root.join("mission.toml"),
+        "[mission-type]\nname = \"bounded\"\nstop = \"verified\"\nimage = \"img\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("roles/worker.md"),
+        "---\noutput: produces-artifact\n---\nDo it.\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("playbook.md"), "# Bounded\n").unwrap();
+}
+
 #[test]
 fn software_dev_mission_type_loads() {
     let mission_type = load_mission_type(
@@ -37,6 +52,174 @@ fn software_dev_mission_type_loads() {
     assert!(mission_type
         .oracles
         .contains_key(&lionclaw::model::OracleName::new("cargo-test").expect("name")));
+    assert_eq!(mission_type.planning.tasks.len(), 1);
+    let planner = &mission_type.planning.tasks[0];
+    assert_eq!(planner.id.as_str(), "strategist");
+    assert_eq!(
+        planner.output,
+        lionclaw::model::OutputSemantics::ProposesPlan
+    );
+    assert_eq!(mission_type.roles[&planner.role].output, planner.output);
+}
+
+#[test]
+fn mission_bundle_depth_is_bounded_before_semantic_loading() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    let mut nested = dir.path().join("resources");
+    for _ in 0..64 {
+        nested.push("nested");
+    }
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("leaf"), "leaf").unwrap();
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("deep bundle must be rejected");
+    assert!(error.to_string().contains("depth limit"), "got {error:?}");
+}
+
+#[test]
+fn mission_bundle_entry_count_is_bounded_before_semantic_loading() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    let resources = dir.path().join("resources");
+    std::fs::create_dir(&resources).unwrap();
+    for index in 0..4_100 {
+        std::fs::write(resources.join(format!("entry-{index:04}")), []).unwrap();
+    }
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("oversized bundle inventory must be rejected");
+    assert!(error.to_string().contains("entry limit"), "got {error:?}");
+}
+
+#[test]
+fn mission_bundle_bytes_are_bounded_before_snapshot_copy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    std::fs::File::create(dir.path().join("oversized-resource"))
+        .unwrap()
+        .set_len(256 * 1024 * 1024 + 1)
+        .unwrap();
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("oversized bundle must be rejected before copying");
+    assert!(error.to_string().contains("byte limit"), "got {error:?}");
+}
+
+#[test]
+fn reserved_mission_lock_path_must_be_a_regular_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    std::fs::create_dir(dir.path().join("mission.lock.toml")).unwrap();
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("a directory cannot stand in for the optional lock file");
+    assert!(
+        error.to_string().contains("must be a regular file"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn skill_control_text_is_bounded_before_whole_file_loading() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    let skill = dir.path().join("skills/large");
+    std::fs::create_dir_all(&skill).unwrap();
+    let skill_md = skill.join("SKILL.md");
+    std::fs::write(
+        &skill_md,
+        "---\nname: large\ndescription: Bounded instructions.\n---\n\nInstructions.\n",
+    )
+    .unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&skill_md)
+        .unwrap()
+        .set_len(2 * 1024 * 1024)
+        .unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\nskills: [large]\n---\nDo it.\n",
+    )
+    .unwrap();
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("oversized SKILL.md must be rejected");
+    assert!(error.to_string().contains("text limit"), "got {error:?}");
+}
+
+#[test]
+fn mission_control_text_has_one_aggregate_budget() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    let mut assigned = Vec::new();
+    for index in 0..5 {
+        let name = format!("large-{index}");
+        assigned.push(name.clone());
+        let skill = dir.path().join("skills").join(&name);
+        std::fs::create_dir_all(&skill).unwrap();
+        let skill_md = skill.join("SKILL.md");
+        std::fs::write(
+            &skill_md,
+            format!(
+                "---\nname: {name}\ndescription: Aggregate bounded instructions.\n---\n\nInstructions.\n"
+            ),
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&skill_md)
+            .unwrap()
+            .set_len(900 * 1024)
+            .unwrap();
+    }
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        format!(
+            "---\noutput: produces-artifact\nskills: [{}]\n---\nDo it.\n",
+            assigned.join(", ")
+        ),
+    )
+    .unwrap();
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("aggregate control text must be rejected");
+    assert!(
+        error.to_string().contains("aggregate limit"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn mission_digest_seals_runtime_visible_empty_skill_directories() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    let skill = dir.path().join("skills/visible");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: visible\ndescription: Visible tree.\n---\n\nInstructions.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\nskills: [visible]\n---\nDo it.\n",
+    )
+    .unwrap();
+
+    let before = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect("initial bundle")
+        .digest()
+        .to_string();
+    std::fs::create_dir(skill.join("runtime-control")).unwrap();
+    let after = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect("mutated bundle")
+        .digest()
+        .to_string();
+
+    assert_ne!(before, after, "every mounted tree entry must be sealed");
 }
 
 #[test]
@@ -83,9 +266,14 @@ fn role_declaring_a_bundled_skill_loads_the_resolved_package() {
         load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("mission type loads");
     let role = mission_type.roles.values().next().expect("worker role");
     assert_eq!(role.skills, ["rust"]);
-    assert_eq!(
-        mission_type.skills.get("rust").expect("rust package").root,
-        dir.path().join("skills/rust")
+    assert!(
+        !mission_type
+            .skills
+            .get("rust")
+            .expect("rust package")
+            .root
+            .starts_with(dir.path()),
+        "runtime skill paths must belong to LionClaw's owned snapshot"
     );
 }
 
@@ -340,6 +528,23 @@ fn the_minimal_type_loads() {
     load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("valid type loads");
 }
 
+#[test]
+fn an_invalid_execution_policy_refuses_to_load() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[execution]\ndefault-timeout-secs = 0\nmax-task-time-secs = 1\nextension-step-secs = 1\n",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        &load_err(dir.path()),
+        MissionTypeError::Manifest(detail) if detail.contains("[execution]")
+    ));
+}
+
 fn add_input_program(root: &std::path::Path, name: &str) {
     std::fs::create_dir_all(root.join("inputs")).unwrap();
     write_oracle(
@@ -367,6 +572,67 @@ fn prepared_input_declarations_load_as_plain_mission_type_data() {
     assert!(input.network);
     assert_eq!(input.key_files, [PathBuf::from("Cargo.lock")]);
     assert_eq!(input.environment["CARGO_HOME"], "/inputs/cargo-home");
+}
+
+#[test]
+fn loaded_runtime_files_survive_removal_of_the_source_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    add_input_program(dir.path(), "cargo-home");
+    std::fs::create_dir_all(dir.path().join("skills/rust")).unwrap();
+    std::fs::write(
+        dir.path().join("skills/rust/SKILL.md"),
+        "---\nname: rust\ndescription: Owned source.\n---\n\n# Rust\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[[inputs]]\nname = \"cargo-home\"\nnetwork = false\nkey-files = [\"Cargo.lock\"]\n",
+    )
+    .unwrap();
+
+    let mission_type =
+        load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("valid bundle");
+    let input = &mission_type.inputs[&lionclaw::model::InputName::new("cargo-home").unwrap()];
+    let oracle = &mission_type.oracles[&lionclaw::model::OracleName::new("cargo-test").unwrap()];
+    let skill = &mission_type.skills["rust"].root;
+    for path in [&input.program, oracle, skill] {
+        assert!(!path.starts_with(dir.path()));
+    }
+
+    std::fs::remove_dir_all(dir.path()).unwrap();
+    assert!(std::fs::read_to_string(&input.program)
+        .unwrap()
+        .starts_with("#!"));
+    assert!(std::fs::read_to_string(oracle).unwrap().starts_with("#!"));
+    assert!(std::fs::read_to_string(skill.join("SKILL.md"))
+        .unwrap()
+        .contains("Owned source"));
+}
+
+#[test]
+fn oversized_prepared_input_programs_fail_from_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    add_input_program(dir.path(), "cargo-home");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("inputs/cargo-home"))
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[[inputs]]\nname = \"cargo-home\"\nnetwork = true\nkey-files = [\"Cargo.lock\"]\n",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        &load_err(dir.path()),
+        MissionTypeError::Input { detail, .. } if detail.contains("byte limit")
+    ));
 }
 
 #[test]
@@ -471,7 +737,10 @@ fn a_terminal_review_declaration_loads_and_pins_the_role() {
     .unwrap();
     let mission_type = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("loads");
     assert_eq!(
-        mission_type.terminal_review.map(|tr| tr.role.to_string()),
+        mission_type
+            .terminal_review
+            .as_ref()
+            .map(|tr| tr.role.to_string()),
         Some("gap-reviewer".to_string())
     );
 }
@@ -530,7 +799,8 @@ fn editing_the_terminal_review_declaration_changes_the_digest() {
     write_reviewer_role(dir.path());
     let before = load_mission_type(dir.path(), &AuthorityCeiling::default())
         .expect("loads")
-        .digest;
+        .digest()
+        .to_string();
     std::fs::write(
         dir.path().join("mission.toml"),
         "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
@@ -539,7 +809,8 @@ fn editing_the_terminal_review_declaration_changes_the_digest() {
     .unwrap();
     let after = load_mission_type(dir.path(), &AuthorityCeiling::default())
         .expect("loads")
-        .digest;
+        .digest()
+        .to_string();
     // The declaration is part of the pinned instrument: adding it mid-mission
     // trips the digest check on the next engine open.
     assert_ne!(before, after);
@@ -572,6 +843,26 @@ fn skill_description_is_loaded_and_trimmed_into_the_package() {
     let pkg = mission_type.skills.get("rust").expect("rust package");
     // Leading and trailing whitespace trimmed, inner spacing preserved.
     assert_eq!(pkg.description, "Work effectively in Rust.");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_skill_package_name_is_rejected_without_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    std::fs::create_dir(dir.path().join("skills")).unwrap();
+    std::fs::create_dir(
+        dir.path()
+            .join("skills")
+            .join(std::ffi::OsString::from_vec(vec![0x80])),
+    )
+    .unwrap();
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("skill package names must be UTF-8");
+    assert!(error.to_string().contains("non-UTF-8"), "got {error:#}");
 }
 
 fn load_skill_with_description(

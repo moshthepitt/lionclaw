@@ -99,7 +99,6 @@ mod tests {
                 working_dir: None,
                 environment: Vec::new(),
                 mcp_servers: Vec::new(),
-                hard_timeout: std::time::Duration::from_secs(90),
                 mounts: vec![
                     MountSpec {
                         source: "/tmp/lionclaw-runtime-auth-test".into(),

@@ -6,13 +6,14 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA};
+use common::{initialize_repository, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
-use lionclaw::model::{DecisionAction, FinishClass, MissionConfig, MissionEvent, MissionPhase};
+use lionclaw::model::{DecisionAction, FinishClass, MissionEvent, MissionPhase};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
 async fn gated_engine(dir: &std::path::Path) -> Engine {
+    initialize_repository(dir);
     let store = MissionStore::open(dir).await.expect("store");
     Engine::new(
         store,
@@ -33,12 +34,7 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = gated_engine(dir.path()).await;
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "gated mission",
-            BASE_SHA,
-            MissionConfig::default(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "gated mission", BASE_SHA)
         .await
         .expect("create");
     engine
@@ -106,12 +102,7 @@ async fn abort_decision_terminates_the_mission() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = gated_engine(dir.path()).await;
     let mission_id = engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "gated",
-            BASE_SHA,
-            MissionConfig::default(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "gated", BASE_SHA)
         .await
         .expect("create");
     engine

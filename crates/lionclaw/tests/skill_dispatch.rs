@@ -1,12 +1,11 @@
 mod common;
 
 use common::{
-    approve_plan, default_config, harness_with_type, proposal, simple_plan, test_mission_type,
-    BASE_SHA, HEAD_SHA,
+    approve_plan, harness_with_type, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::mission_type::SkillPackage;
-use lionclaw::model::{ArtifactOutcome, Handoff, PayloadRef, RoleName};
-use lionclaw::ports::RoleRunOutcome;
+use lionclaw::model::{Handoff, PayloadRef, RoleName};
+use lionclaw::ports::{CapturedArtifact, RoleRunOutcome};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 #[tokio::test]
@@ -17,20 +16,22 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
     std::fs::write(package_root.join("SKILL.md"), "fixture").unwrap();
 
     let mut mission_type = test_mission_type();
-    mission_type.skills.insert(
-        "engineering".to_string(),
-        SkillPackage {
-            name: "engineering".to_string(),
-            root: package_root.clone(),
-            description: "engineering skill".to_string(),
-        },
-    );
-    let implementer = mission_type
-        .roles
-        .get_mut(&RoleName::new("implementer").unwrap())
-        .unwrap();
-    implementer.runtime = Some("opencode".to_string());
-    implementer.skills = vec!["engineering".to_string()];
+    mission_type.edit_for_testing(|definition| {
+        definition.skills.insert(
+            "engineering".to_string(),
+            SkillPackage {
+                name: "engineering".to_string(),
+                root: package_root.clone(),
+                description: "engineering skill".to_string(),
+            },
+        );
+        let implementer = definition
+            .roles
+            .get_mut(&RoleName::new("implementer").unwrap())
+            .unwrap();
+        implementer.runtime = Some("opencode".to_string());
+        implementer.skills = vec!["engineering".to_string()];
+    });
 
     let expected_root = package_root.clone();
     let runner = MockRoleRunner::new(Box::new(move |request| {
@@ -44,11 +45,16 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
                 report: PayloadRef::inline("done"),
                 request_attention: false,
             },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha.clone(),
-                head_sha: HEAD_SHA.to_string(),
-            }),
-            model_id: Some("mock".to_string()),
+            artifact: Some(CapturedArtifact::for_testing(
+                request.base_sha.clone(),
+                HEAD_SHA,
+            )),
+            runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
+                requested_model: Some("mock".to_string()),
+                applied_model: Some("mock".to_string()),
+                ..Default::default()
+            },
+            final_response: String::new(),
         })
     }));
     let harness = harness_with_type(
@@ -64,7 +70,6 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
             dir.path().to_str().unwrap(),
             "use the configured skill",
             BASE_SHA,
-            default_config(),
         )
         .await
         .unwrap();
@@ -100,11 +105,16 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
                 report: PayloadRef::inline("done"),
                 request_attention: false,
             },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha.clone(),
-                head_sha: HEAD_SHA.to_string(),
-            }),
-            model_id: Some("mock".to_string()),
+            artifact: Some(CapturedArtifact::for_testing(
+                request.base_sha.clone(),
+                HEAD_SHA,
+            )),
+            runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
+                requested_model: Some("mock".to_string()),
+                applied_model: Some("mock".to_string()),
+                ..Default::default()
+            },
+            final_response: String::new(),
         })
     }));
     let harness = harness_with_type(
@@ -120,7 +130,6 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
             dir.path().to_str().unwrap(),
             "run without mission skills",
             BASE_SHA,
-            default_config(),
         )
         .await
         .unwrap();

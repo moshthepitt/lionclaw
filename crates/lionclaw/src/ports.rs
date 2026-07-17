@@ -9,19 +9,22 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use lionclaw_runtime_api::TypedFailure;
+use tokio::sync::{mpsc, watch};
 
 use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
 use crate::model::{
-    ArtifactOutcome, EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
-    RunErrorKind, TaskId,
+    EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
+    RuntimeConfigurationEvidence, TaskId,
 };
+pub use crate::workspace::{ArtifactCapture, CapturedArtifact};
 
 /// One full autonomous agent run — the engine never micromanages how a role
 /// works. The engine guarantees an effect ID with a recorded outcome
 /// is never re-invoked.
 #[async_trait]
 pub trait RoleRunner: Send + Sync {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure>;
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure>;
 }
 
 #[derive(Debug, Clone)]
@@ -39,34 +42,57 @@ pub struct RoleRunRequest {
     pub prompt: String,
     /// Commit the role's workspace is created at.
     pub base_sha: String,
+    pub assignment_epoch: u32,
+    pub recreate_workspace: bool,
+    pub deadline_ms: i64,
+    pub control: watch::Receiver<ExecutionControl>,
+    /// Lossless, low-volume facts that may affect durable mission evidence.
+    pub updates: mpsc::Sender<RoleRunUpdate>,
+    /// Coalesced, non-authoritative runtime telemetry. Slow observers retain
+    /// only the latest event and can never backpressure runtime execution.
+    pub activity: watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
     /// The target repository the mission operates on.
     pub workspace_dir: PathBuf,
     /// Mission state root (attempt dirs, worktrees) — `<workspace>/.lionclaw`.
     pub state_dir: PathBuf,
+    /// Present only for artifact-producing roles and bound to this request's
+    /// exact task checkout and durable capture ref.
+    pub artifact_capture: Option<ArtifactCapture>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RoleRunUpdate {
+    WorkspacePrepared {
+        base_sha: String,
+        assignment_epoch: u32,
+    },
+    RuntimeConfigured(lionclaw_runtime_api::AppliedRuntimeConfiguration),
 }
 
 #[derive(Debug, Clone)]
 pub struct RoleRunOutcome {
     pub handoff: Handoff,
-    /// Engine-observed commits (never agent-claimed); `Some` for every
-    /// artifact-producing role, even one that committed nothing — then
-    /// `head_sha == base_sha`. Readers/judges/planners are never captured, so
-    /// this is `None` for them.
-    pub artifact: Option<ArtifactOutcome>,
-    pub model_id: Option<String>,
+    /// Engine-observed commits (never agent-claimed). Writers return `Some`
+    /// only when a clean committed head was captured; work that was already
+    /// satisfied may legitimately return `None`. Read-only roles never return
+    /// an artifact.
+    pub artifact: Option<CapturedArtifact>,
+    pub runtime_configuration: RuntimeConfigurationEvidence,
+    pub final_response: String,
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("role run failed ({kind:?}): {detail}")]
-pub struct RoleRunFailure {
-    pub kind: RunErrorKind,
-    pub detail: String,
+impl RoleRunOutcome {
+    pub(crate) fn projected(mut self) -> Self {
+        self.runtime_configuration = self.runtime_configuration.projected();
+        self.final_response = lionclaw_runtime_api::bounded_text(&self.final_response);
+        self
+    }
 }
 
 /// An engine-run, worker-independent, reproducible check. Exit 0 = pass.
 #[async_trait]
 pub trait OracleRunner: Send + Sync {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure>;
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure>;
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +107,16 @@ pub struct OracleRunRequest {
     pub workspace_dir: PathBuf,
     pub state_dir: PathBuf,
     pub prepared_inputs: Vec<PreparedInput>,
+    pub deadline_ms: i64,
+    pub control: watch::Receiver<ExecutionControl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionControl {
+    RunUntil(i64),
+    DeadlineExhausted,
+    Stop(String),
+    Abort(String),
 }
 
 #[derive(Debug, Clone)]
@@ -112,14 +148,6 @@ pub struct OracleOutcome {
     pub stderr: Vec<u8>,
     pub prepared_inputs: Vec<PreparedInputRef>,
     pub duration_ms: u64,
-}
-
-/// Infrastructure failure — distinct from a nonzero exit (which is a valid,
-/// recorded verdict).
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("oracle failed to run: {detail}")]
-pub struct OracleFailure {
-    pub detail: String,
 }
 
 pub trait Clock: Send + Sync {

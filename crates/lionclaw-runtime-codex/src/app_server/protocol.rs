@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lionclaw_runtime_api::NetworkMode;
+use lionclaw_runtime_api::{NetworkMode, TypedFailure};
 use serde_json::{json, Value};
 
 use super::event_mapping::app_server_error_text;
@@ -35,41 +35,25 @@ pub(crate) fn response_id(message: &Value) -> Option<u64> {
 
 pub(crate) fn parse_app_server_response(message: Value, method: &str) -> Result<Value> {
     if let Some(error) = message.get("error") {
-        return Err(CodexAppServerResponseError {
-            method: method.to_string(),
-            code: error.get("code").and_then(Value::as_i64),
-            message: app_server_error_text(error),
-        }
+        let code = error
+            .get("code")
+            .and_then(|code| {
+                code.as_str()
+                    .map(str::to_string)
+                    .or_else(|| code.as_i64().map(|code| code.to_string()))
+            })
+            .unwrap_or_else(|| "codex.app_server".to_string());
+        return Err(TypedFailure::permanent(
+            code,
+            format!(
+                "codex app-server {method} failed: {}",
+                app_server_error_text(error)
+            ),
+        )
         .into());
     }
     Ok(message.get("result").cloned().unwrap_or(Value::Null))
 }
-
-#[derive(Debug)]
-pub(crate) struct CodexAppServerResponseError {
-    method: String,
-    code: Option<i64>,
-    message: String,
-}
-
-impl std::fmt::Display for CodexAppServerResponseError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.code {
-            Some(code) => write!(
-                formatter,
-                "codex app-server {} failed with code {}: {}",
-                self.method, code, self.message
-            ),
-            None => write!(
-                formatter,
-                "codex app-server {} failed: {}",
-                self.method, self.message
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CodexAppServerResponseError {}
 
 pub(crate) fn thread_start_params(model: Option<&str>) -> Value {
     let mut params = json!({
@@ -149,6 +133,17 @@ pub(crate) fn extract_app_server_turn_id(value: &Value) -> Option<String> {
         .map(|turn_id| turn_id.trim().to_string())
 }
 
+pub(crate) fn extract_app_server_model(value: &Value) -> Option<String> {
+    value
+        .pointer("/turn/model")
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/thread/model").and_then(Value::as_str))
+        .or_else(|| value.get("model").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
 pub(crate) fn extract_app_server_item_id(value: &Value) -> Option<String> {
     value
         .pointer("/item/id")
@@ -158,4 +153,20 @@ pub(crate) fn extract_app_server_item_id(value: &Value) -> Option<String> {
         .or_else(|| value.get("id").and_then(Value::as_str))
         .filter(|item_id| !item_id.trim().is_empty())
         .map(|item_id| item_id.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_error_preserves_scalar_code_without_json_quoting() {
+        let error = parse_app_server_response(
+            json!({"error": {"code": "capacity", "message": "busy"}}),
+            "turn/start",
+        )
+        .unwrap_err();
+        let failure = error.downcast_ref::<TypedFailure>().unwrap();
+        assert_eq!(failure.evidence().code.as_deref(), Some("capacity"));
+    }
 }

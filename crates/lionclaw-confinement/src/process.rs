@@ -7,6 +7,42 @@ use tokio::{
 };
 
 pub use lionclaw_runtime_api::ExecutionOutput as ProcessOutput;
+use lionclaw_runtime_api::{RuntimeProgramStdoutLine, RuntimeProgramStdoutSender};
+
+pub const PROCESS_CAPTURE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+pub const PROCESS_LINE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const PROCESS_TRUNCATION_MARKER: &[u8] = b"\n...[truncated]";
+
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl BoundedCapture {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn extend(&mut self, chunk: &[u8]) {
+        let remaining = PROCESS_CAPTURE_LIMIT_BYTES.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        self.truncated |= chunk.len() > remaining;
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.truncated {
+            self.bytes.truncate(
+                PROCESS_CAPTURE_LIMIT_BYTES.saturating_sub(PROCESS_TRUNCATION_MARKER.len()),
+            );
+            self.bytes.extend_from_slice(PROCESS_TRUNCATION_MARKER);
+        }
+        self.bytes
+    }
+}
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -35,13 +71,10 @@ impl fmt::Debug for ProcessInvocation {
     }
 }
 
-pub async fn run_process_streaming<F>(
+pub async fn run_process_streaming(
     invocation: &ProcessInvocation,
-    mut on_stdout_line: F,
-) -> Result<ProcessOutput>
-where
-    F: FnMut(&str) -> Result<()>,
-{
+    stream: Option<&RuntimeProgramStdoutSender>,
+) -> Result<ProcessOutput> {
     let mut command = Command::new(&invocation.executable);
     command.args(&invocation.args);
 
@@ -77,18 +110,10 @@ where
         .take()
         .context("subprocess stderr was not captured")?;
 
-    let stderr_task = tokio::spawn(async move {
-        let mut stderr = stderr;
-        let mut captured = Vec::new();
-        stderr
-            .read_to_end(&mut captured)
-            .await
-            .context("failed to read subprocess stderr")?;
-        Ok::<Vec<u8>, anyhow::Error>(captured)
-    });
+    let stderr_task = spawn_bounded_reader(stderr, "subprocess stderr");
 
     let mut stdout_reader = BufReader::new(stdout);
-    let mut captured_stdout = Vec::new();
+    let mut captured_stdout = BoundedCapture::new();
     let mut line_buffer = Vec::new();
 
     loop {
@@ -98,7 +123,12 @@ where
         else {
             break;
         };
-        on_stdout_line(&line)?;
+        if let Some(stream) = stream {
+            stream
+                .send(RuntimeProgramStdoutLine::new(line)?)
+                .await
+                .map_err(|_| anyhow::anyhow!("streaming stdout receiver closed"))?;
+        }
     }
 
     let status = child
@@ -108,7 +138,7 @@ where
     let captured_stderr = stderr_task.await.context("stderr reader task failed")??;
 
     Ok(ProcessOutput {
-        stdout: captured_stdout,
+        stdout: captured_stdout.finish(),
         stderr: captured_stderr,
         exit_code: status.code(),
         exit_signal: exit_signal(&status),
@@ -153,7 +183,7 @@ pub struct ProcessSession {
     stdout_reader: BufReader<ChildStdout>,
     stdout_line_buffer: Vec<u8>,
     stderr_task: tokio::task::JoinHandle<Result<Vec<u8>>>,
-    captured_stdout: Vec<u8>,
+    captured_stdout: BoundedCapture,
 }
 
 impl ProcessSession {
@@ -195,10 +225,14 @@ impl ProcessSession {
 
     pub async fn wait(mut self) -> Result<ProcessOutput> {
         self.close_stdin().await?;
-        self.stdout_reader
-            .read_to_end(&mut self.captured_stdout)
-            .await
-            .context("failed to read remaining subprocess stdout")?;
+        self.captured_stdout.extend(&self.stdout_line_buffer);
+        self.stdout_line_buffer.clear();
+        drain_bounded(
+            &mut self.stdout_reader,
+            &mut self.captured_stdout,
+            "subprocess stdout",
+        )
+        .await?;
         let status = self
             .child
             .wait()
@@ -210,7 +244,7 @@ impl ProcessSession {
             .context("stderr reader task failed")??;
 
         Ok(ProcessOutput {
-            stdout: self.captured_stdout,
+            stdout: self.captured_stdout.finish(),
             stderr: captured_stderr,
             exit_code: status.code(),
             exit_signal: exit_signal(&status),
@@ -336,40 +370,116 @@ pub async fn spawn_process_session(invocation: &ProcessInvocation) -> Result<Pro
         stdout_reader: BufReader::new(stdout),
         stdout_line_buffer: Vec::new(),
         stderr_task: spawn_stderr_reader(stderr),
-        captured_stdout: Vec::new(),
+        captured_stdout: BoundedCapture::new(),
     })
 }
 
 async fn read_next_process_line<R>(
     reader: &mut R,
     line_buffer: &mut Vec<u8>,
-    captured_stdout: &mut Vec<u8>,
+    captured_stdout: &mut BoundedCapture,
 ) -> Result<Option<String>>
 where
     R: AsyncBufRead + Unpin,
 {
-    let bytes_read = reader
-        .read_until(b'\n', line_buffer)
-        .await
-        .context("failed to read subprocess stdout")?;
+    let mut bytes_read = 0;
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .context("failed to read subprocess stdout")?;
+        if available.is_empty() {
+            break;
+        }
+        let consume = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line_buffer.len().saturating_add(consume) > PROCESS_LINE_LIMIT_BYTES {
+            anyhow::bail!("subprocess stdout line exceeded {PROCESS_LINE_LIMIT_BYTES} byte limit");
+        }
+        line_buffer.extend_from_slice(&available[..consume]);
+        reader.consume(consume);
+        bytes_read += consume;
+        if line_buffer.last() == Some(&b'\n') {
+            break;
+        }
+    }
     if bytes_read == 0 && line_buffer.is_empty() {
         return Ok(None);
     }
 
-    captured_stdout.extend_from_slice(line_buffer);
+    captured_stdout.extend(line_buffer);
     let line = String::from_utf8_lossy(line_buffer).to_string();
     line_buffer.clear();
     Ok(Some(line))
 }
 
-fn spawn_stderr_reader(mut stderr: ChildStderr) -> tokio::task::JoinHandle<Result<Vec<u8>>> {
+fn spawn_stderr_reader(stderr: ChildStderr) -> tokio::task::JoinHandle<Result<Vec<u8>>> {
+    spawn_bounded_reader(stderr, "subprocess stderr")
+}
+
+fn spawn_bounded_reader<R>(
+    mut reader: R,
+    label: &'static str,
+) -> tokio::task::JoinHandle<Result<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
-        let mut captured = Vec::new();
-        stderr
-            .read_to_end(&mut captured)
+        let mut captured = BoundedCapture::new();
+        drain_bounded(&mut reader, &mut captured, label).await?;
+        Ok(captured.finish())
+    })
+}
+
+async fn drain_bounded<R>(reader: &mut R, captured: &mut BoundedCapture, label: &str) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
             .await
-            .context("failed to read subprocess stderr")?;
-        Ok::<Vec<u8>, anyhow::Error>(captured)
+            .with_context(|| format!("failed to read {label}"))?;
+        if read == 0 {
+            return Ok(());
+        }
+        captured.extend(&buffer[..read]);
+    }
+}
+
+pub async fn run_command_bounded(command: &mut Command) -> Result<ProcessOutput> {
+    command
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .context("failed to spawn bounded subprocess")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("bounded subprocess stdout was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("bounded subprocess stderr was not captured")?;
+    let stdout_task = spawn_bounded_reader(stdout, "bounded subprocess stdout");
+    let stderr_task = spawn_bounded_reader(stderr, "bounded subprocess stderr");
+    let status = child
+        .wait()
+        .await
+        .context("failed to wait for bounded subprocess")?;
+    let stdout = stdout_task.await.context("stdout reader task failed")??;
+    let stderr = stderr_task.await.context("stderr reader task failed")??;
+    Ok(ProcessOutput {
+        stdout,
+        stderr,
+        exit_code: status.code(),
+        exit_signal: exit_signal(&status),
     })
 }
 
@@ -429,9 +539,11 @@ async fn spawn_with_retry(
 mod tests {
     use super::{
         read_next_process_line, run_process_attached, run_process_streaming, spawn_process_session,
-        ProcessInvocation,
+        BoundedCapture, ProcessInvocation,
     };
+    use lionclaw_runtime_api::RUNTIME_PROGRAM_STDOUT_LINE_LIMIT;
     use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc;
 
     #[test]
     fn process_invocation_debug_redacts_environment_and_input_values() {
@@ -456,7 +568,7 @@ mod tests {
         let (reader, mut writer) = tokio::io::duplex(64);
         let mut reader = tokio::io::BufReader::new(reader);
         let mut line_buffer = Vec::new();
-        let mut captured_stdout = Vec::new();
+        let mut captured_stdout = BoundedCapture::new();
 
         writer
             .write_all(b"{\"jsonrpc\"")
@@ -473,7 +585,7 @@ mod tests {
         }
 
         assert_eq!(line_buffer, b"{\"jsonrpc\"");
-        assert!(captured_stdout.is_empty());
+        assert!(captured_stdout.bytes.is_empty());
 
         writer
             .write_all(b":\"2.0\"}\n")
@@ -485,7 +597,7 @@ mod tests {
             .expect("read line")
             .expect("line");
         assert_eq!(line, "{\"jsonrpc\":\"2.0\"}\n");
-        assert_eq!(captured_stdout, line.as_bytes());
+        assert_eq!(captured_stdout.bytes, line.as_bytes());
     }
 
     #[tokio::test]
@@ -542,6 +654,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_session_rejects_an_oversized_unterminated_protocol_line() {
+        let mut session = spawn_process_session(&ProcessInvocation {
+            executable: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "head -c 9437184 /dev/zero | tr '\\000' x".to_string(),
+            ],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        })
+        .await
+        .expect("spawn session");
+
+        let error = session
+            .read_line()
+            .await
+            .expect_err("a provider line must have a finite transport bound");
+        assert!(error.to_string().contains("stdout line exceeded"));
+    }
+
+    #[tokio::test]
+    async fn process_session_retains_only_bounded_stdout_and_stderr() {
+        const EXPECTED_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
+        let session = spawn_process_session(&ProcessInvocation {
+            executable: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "head -c 9437184 /dev/zero; head -c 9437184 /dev/zero >&2".to_string(),
+            ],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        })
+        .await
+        .expect("spawn session");
+
+        let output = session.wait().await.expect("wait");
+        assert!(output.success());
+        assert!(output.stdout.len() <= EXPECTED_CAPTURE_LIMIT);
+        assert!(output.stderr.len() <= EXPECTED_CAPTURE_LIMIT);
+    }
+
+    #[tokio::test]
     async fn streaming_process_collects_status_after_child_closes_stdin() {
         let output = run_process_streaming(
             &ProcessInvocation {
@@ -555,7 +711,7 @@ mod tests {
                 environment: Vec::new(),
                 input: "ignored\n".repeat(1024 * 1024),
             },
-            |_| Ok(()),
+            None,
         )
         .await
         .expect("run process");
@@ -569,6 +725,30 @@ mod tests {
             String::from_utf8(output.stderr).expect("stderr"),
             "details\n"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_process_rejects_an_oversized_record_before_enqueue() {
+        let (stdout, mut receiver) = mpsc::channel(1);
+        let output_bytes = RUNTIME_PROGRAM_STDOUT_LINE_LIMIT + 1;
+        let error = run_process_streaming(
+            &ProcessInvocation {
+                executable: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!("printf '%*s\\n' {output_bytes} '' | tr ' ' x"),
+                ],
+                working_dir: None,
+                environment: Vec::new(),
+                input: String::new(),
+            },
+            Some(&stdout),
+        )
+        .await
+        .expect_err("oversized raw record must fail before enqueue");
+
+        assert!(error.to_string().contains("stdout record"));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[cfg(unix)]

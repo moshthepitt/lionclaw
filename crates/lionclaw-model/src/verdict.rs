@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::event::{PayloadRef, PreparedInputRef, StopBar};
 use super::ids::OracleName;
 use super::state::{AdvisoryStatus, MissionState};
+use crate::prelude::*;
 
 /// A worker-independent, reproducible verdict from an engine-run oracle,
 /// with its evidence. The evidence floor is the constructor signature: no
@@ -143,7 +144,7 @@ pub fn classify_finish(state: &MissionState) -> FinishClass {
         let fresh = assertion
             .last_authoritative
             .as_ref()
-            .filter(|v| v.is_fresh_at(&state.current_sha));
+            .filter(|v| v.is_fresh_at(state.deliverable_head()));
         match fresh {
             Some(v) if v.passed() => {}
             Some(_) => {

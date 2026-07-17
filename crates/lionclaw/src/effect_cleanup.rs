@@ -18,11 +18,11 @@ impl LocalEffectCleaner {
 impl EffectCleaner for LocalEffectCleaner {
     async fn cleanup(&self, request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
         let resource_name = request.effect_id.resource_name();
-        let attempt_dir = request
+        let effect_dir = request
             .state_dir
             .join("missions")
             .join(request.mission_id.as_str())
-            .join("attempts")
+            .join("effects")
             .join(request.effect_id.as_str());
         let mut failures = Vec::new();
 
@@ -36,8 +36,8 @@ impl EffectCleaner for LocalEffectCleaner {
         {
             failures.push((EffectResource::RuntimeSecret, error.to_string()));
         }
-        if let Err(error) = workspace::remove_dir(&attempt_dir).await {
-            failures.push((EffectResource::AttemptDirectory, error.to_string()));
+        if let Err(error) = workspace::remove_dir(&effect_dir).await {
+            failures.push((EffectResource::EffectDirectory, error.to_string()));
         }
         if request.discard_artifact {
             if let Err(error) = workspace::discard_worker_result(
@@ -120,12 +120,18 @@ mod tests {
         }
 
         let state_dir = repo.join(".lionclaw");
-        let attempt_dir = state_dir
+        let effect_dir = state_dir
             .join("missions")
             .join(mission_id.as_str())
-            .join("attempts")
+            .join("effects")
             .join(effect_id.as_str());
-        std::fs::create_dir_all(&attempt_dir).unwrap();
+        std::fs::create_dir_all(&effect_dir).unwrap();
+        let task_work = state_dir
+            .join("missions")
+            .join(mission_id.as_str())
+            .join("tasks/task-1/work");
+        std::fs::create_dir_all(&task_work).unwrap();
+        std::fs::write(task_work.join("uncommitted"), "keep").unwrap();
         let cache = state_dir.join("inputs/sha256/published/sentinel");
         std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
         std::fs::write(&cache, "keep").unwrap();
@@ -150,7 +156,11 @@ mod tests {
 
         cleaner.cleanup(request.clone()).await.unwrap();
         cleaner.cleanup(request).await.unwrap();
-        assert!(!attempt_dir.exists());
+        assert!(!effect_dir.exists());
+        assert_eq!(
+            std::fs::read_to_string(task_work.join("uncommitted")).unwrap(),
+            "keep"
+        );
         assert!(cache.is_file());
         assert!(
             !git(&repo, &["show-ref", "--verify", "--quiet", &effect_ref])
@@ -169,7 +179,7 @@ mod tests {
             .await
             .status
             .success());
-        std::fs::create_dir_all(&attempt_dir).unwrap();
+        std::fs::create_dir_all(&effect_dir).unwrap();
         cleaner
             .cleanup(EffectCleanupRequest {
                 mission_id,

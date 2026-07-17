@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::{RoleName, TaskId};
+
 pub const MISSION_LOCK_FILE: &str = "mission.lock.toml";
 
 pub(crate) fn is_path_safe_name(name: &str) -> bool {
@@ -21,15 +23,38 @@ pub(crate) struct ManifestFile {
     #[serde(rename = "mission-type")]
     pub mission_type: ManifestMissionType,
     #[serde(default)]
-    pub planning: crate::model::PlanningDag,
+    pub planning: ManifestPlanningDag,
     #[serde(default)]
     pub recovery: crate::model::RecoveryConfig,
+    #[serde(default)]
+    pub execution: crate::model::ExecutionPolicy,
     /// The optional engine-owned closing review. Required for the reviewed
     /// stop bar and resolved against the loaded role inventory.
     #[serde(default, rename = "terminal-review")]
     pub terminal_review: Option<ManifestTerminalReview>,
     #[serde(default)]
     pub inputs: Vec<ManifestInput>,
+}
+
+/// Source manifest shape. Role output is intentionally absent here: the role
+/// file is the mission author's single source of truth. The loader resolves
+/// and persists it into the model's `PlanningTask` contract.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestPlanningDag {
+    #[serde(default)]
+    pub tasks: Vec<ManifestPlanningTask>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestPlanningTask {
+    pub id: TaskId,
+    pub role: RoleName,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub depends_on: Vec<TaskId>,
 }
 
 #[derive(Debug, Deserialize)]

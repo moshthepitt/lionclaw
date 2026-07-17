@@ -14,7 +14,7 @@
 //! <prompt body>
 //! ```
 
-use crate::model::OutputSemantics;
+use crate::model::{OutputSemantics, MAX_EXECUTION_DURATION_SECS};
 
 #[derive(Debug)]
 pub struct RoleFrontmatter {
@@ -22,6 +22,7 @@ pub struct RoleFrontmatter {
     pub network: bool,
     pub secrets: bool,
     pub runtime: Option<String>,
+    pub timeout_secs: Option<u64>,
     pub skills: Vec<String>,
     pub prompt_body: String,
 }
@@ -34,6 +35,7 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
     let mut network = true;
     let mut secrets = false;
     let mut runtime: Option<String> = None;
+    let mut timeout_secs: Option<u64> = None;
     let mut skills: Vec<String> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
@@ -55,6 +57,17 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
             "network" => network = parse_bool(key, value)?,
             "secrets" => secrets = parse_bool(key, value)?,
             "runtime" => runtime = Some(parse_scalar(key, value)?),
+            "timeout-secs" => {
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|_| "timeout-secs must be a positive integer".to_string())?;
+                if parsed == 0 || parsed > MAX_EXECUTION_DURATION_SECS {
+                    return Err(format!(
+                        "timeout-secs must be between 1 and {MAX_EXECUTION_DURATION_SECS}"
+                    ));
+                }
+                timeout_secs = Some(parsed);
+            }
             "skills" => skills = parse_string_list(value)?,
             other => return Err(format!("unknown key '{other}'")),
         }
@@ -70,6 +83,7 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
         network,
         secrets,
         runtime,
+        timeout_secs,
         skills,
         prompt_body: prompt_body.to_string(),
     })
@@ -218,5 +232,20 @@ mod tests {
     fn rejects_bad_bool() {
         let text = "---\noutput: produces-report\nnetwork: yes\n---\nx";
         assert!(parse_role_file(text).unwrap_err().contains("true or false"));
+    }
+
+    #[test]
+    fn timeout_must_fit_the_effect_deadline_representation() {
+        let first_overflow = MAX_EXECUTION_DURATION_SECS + 1;
+        let rejected =
+            format!("---\noutput: produces-report\ntimeout-secs: {first_overflow}\n---\nx");
+        assert!(parse_role_file(&rejected).is_err());
+
+        let maximum = MAX_EXECUTION_DURATION_SECS;
+        let accepted = format!("---\noutput: produces-report\ntimeout-secs: {maximum}\n---\nx");
+        assert_eq!(
+            parse_role_file(&accepted).unwrap().timeout_secs,
+            Some(maximum)
+        );
     }
 }

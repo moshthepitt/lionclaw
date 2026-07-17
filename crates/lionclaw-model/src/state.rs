@@ -2,16 +2,76 @@
 //! only (`BTreeMap`), derives `PartialEq` so the fold-litmus test can assert
 //! rebuilt state equality. Wall-clock time never enters this type.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 use super::event::{
-    EffectResource, Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef, RunErrorKind,
+    EffectResource, Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef,
+    RuntimeConfigurationEvidence,
 };
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{Plan, PlanProposal};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
+use crate::prelude::*;
+use crate::{TypedFailure, TypedFailureEvidence};
+
+/// A durable cancellation fact that dominates any later effect outcome.
+/// Event order chooses one cause; both the live engine and pure replay use
+/// this value so the shell cannot grant success that the reducer rejects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableCancellation {
+    Aborted { reason: String },
+    Stopped { reason: String },
+    DeadlineReached { deadline_ms: i64 },
+}
+
+impl DurableCancellation {
+    pub fn matches_failure(&self, failure: &TypedFailure) -> bool {
+        matches!(
+            (self, failure),
+            (Self::Aborted { .. }, TypedFailure::OperatorAborted { .. })
+                | (Self::Stopped { .. }, TypedFailure::OperatorStopped { .. })
+                | (
+                    Self::DeadlineReached { .. },
+                    TypedFailure::DeadlineExhausted { .. }
+                )
+        )
+    }
+
+    pub fn into_failure(self, mut evidence: TypedFailureEvidence) -> TypedFailure {
+        let (code, detail, reason) = match &self {
+            Self::Aborted { reason } => (
+                "control.aborted_before_settlement",
+                "mission abort became durable before the effect outcome",
+                reason.clone(),
+            ),
+            Self::Stopped { reason } => (
+                "control.stopped_before_settlement",
+                "operator stop became durable before the effect outcome",
+                reason.clone(),
+            ),
+            Self::DeadlineReached { deadline_ms } => (
+                "control.deadline_before_settlement",
+                "the recorded effect deadline became durable before the effect outcome",
+                format!("deadline reached at {deadline_ms}"),
+            ),
+        };
+        evidence.code = Some(code.into());
+        evidence.detail = detail.into();
+        evidence.stop_reason = Some(reason);
+        match self {
+            Self::Aborted { .. } => TypedFailure::OperatorAborted {
+                evidence: Box::new(evidence),
+            },
+            Self::Stopped { .. } => TypedFailure::OperatorStopped {
+                evidence: Box::new(evidence),
+            },
+            Self::DeadlineReached { .. } => TypedFailure::DeadlineExhausted {
+                evidence: Box::new(evidence),
+            },
+        }
+        .projected()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
@@ -72,6 +132,22 @@ pub enum TaskStatus {
     Superseded,
 }
 
+/// Stable identity of one task runtime across the planning and execution
+/// namespaces. A bare `TaskId` is intentionally insufficient: both maps may
+/// contain the same id at once.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskAddress {
+    pub namespace: super::TaskNamespace,
+    pub task_id: TaskId,
+}
+
+impl TaskAddress {
+    pub fn new(namespace: super::TaskNamespace, task_id: TaskId) -> Self {
+        Self { namespace, task_id }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRuntimeState {
     pub status: TaskStatus,
@@ -84,10 +160,47 @@ pub struct TaskRuntimeState {
     #[serde(default)]
     pub last_report: Option<PayloadRef>,
     #[serde(default)]
-    pub last_failure: Option<RunFailure>,
+    pub last_failure: Option<TypedFailure>,
     /// Engine-routed repair feedback for this task's next attempt.
     #[serde(default)]
     pub feedback: Vec<FailureFeedback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_runtime_configuration: Option<RuntimeConfigurationEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_base_sha: Option<String>,
+    #[serde(default)]
+    pub assignment_epoch: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_response: Option<PayloadRef>,
+}
+
+/// Resolve one fresh or retry assignment from durable task state. Both the
+/// engine and replay fold use this function; request intent never becomes
+/// authority merely because it was recorded.
+pub fn resolve_task_assignment(
+    previous: Option<&TaskRuntimeState>,
+    required_base: &str,
+    max_attempts: u32,
+) -> (String, u32, bool) {
+    let retrying_failure =
+        previous.is_some_and(|task| task.automatic_retry_remaining(max_attempts));
+    let base_sha = if retrying_failure {
+        previous
+            .and_then(|task| task.workspace_base_sha.clone())
+            .unwrap_or_else(|| required_base.to_string())
+    } else {
+        required_base.to_string()
+    };
+    let previous_epoch = previous.map_or(0, |task| task.assignment_epoch);
+    let recreate = previous.and_then(|task| task.workspace_base_sha.as_deref())
+        != Some(base_sha.as_str())
+        && !retrying_failure;
+    let epoch = match (previous_epoch, recreate) {
+        (0, _) => 1,
+        (epoch, true) => epoch.saturating_add(1),
+        (epoch, false) => epoch,
+    };
+    (base_sha, epoch, recreate)
 }
 
 impl TaskRuntimeState {
@@ -97,30 +210,7 @@ impl TaskRuntimeState {
             && self
                 .last_failure
                 .as_ref()
-                .is_some_and(RunFailure::automatically_retryable)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunFailure {
-    pub kind: RunErrorKind,
-    pub detail: String,
-}
-
-impl RunFailure {
-    pub fn automatically_retryable(&self) -> bool {
-        matches!(
-            self.kind,
-            RunErrorKind::TurnFailed
-                | RunErrorKind::Timeout
-                | RunErrorKind::HandoffMissing
-                | RunErrorKind::HandoffInvalid
-                | RunErrorKind::DirtyWorktree
-        )
-    }
-
-    pub fn transient(&self) -> bool {
-        matches!(self.kind, RunErrorKind::TurnFailed | RunErrorKind::Timeout)
+                .is_some_and(|failure| failure.is_transient() || failure.is_invalid_output())
     }
 }
 
@@ -162,7 +252,7 @@ pub struct PlanningInput {
 pub struct EffectCleanupFailure {
     pub effect_id: super::EffectId,
     pub resource: EffectResource,
-    pub failure: RunFailure,
+    pub failure: TypedFailure,
 }
 
 /// Runtime status of the contract-free planning DAG. A separate map from the
@@ -260,8 +350,22 @@ pub enum ReviewOutcome {
     /// until a decision clears it. Prevents a broken reviewer from
     /// re-requesting forever (mirrors `oracle_failures`).
     Failed {
-        failure: RunFailure,
+        failure: TypedFailure,
     },
+}
+
+/// Exact failed effect generation that may be reopened by `continue`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ParkedEffect {
+    RoleRun {
+        namespace: super::TaskNamespace,
+        task_id: TaskId,
+    },
+    OracleRun {
+        oracle: OracleName,
+    },
+    TerminalReview,
 }
 
 /// How a human accepted closure despite the review: `accept` on a gap park
@@ -407,12 +511,21 @@ pub struct AttentionItem {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InflightEffect {
     RoleRun {
+        namespace: super::TaskNamespace,
         task_id: TaskId,
         attempt_no: u32,
         role: RoleName,
+        output: super::OutputSemantics,
         runtime: String,
         prompt: PayloadRef,
         base_sha: String,
+        assignment_epoch: u32,
+        recreate_workspace: bool,
+        runtime_configuration: Option<super::RuntimeConfigurationEvidence>,
+        requested_at_ms: i64,
+        not_before_ms: i64,
+        deadline_ms: i64,
+        budget_deadline_ms: i64,
         requested_seq: u64,
     },
     OracleRun {
@@ -420,6 +533,9 @@ pub enum InflightEffect {
         oracle: OracleName,
         judged_sha: String,
         attempt_no: u32,
+        requested_at_ms: i64,
+        not_before_ms: i64,
+        deadline_ms: i64,
         requested_seq: u64,
     },
     TerminalReview {
@@ -431,11 +547,66 @@ pub enum InflightEffect {
         /// Carried from the event so the runner's handoff-forgery check
         /// still has its expected token after a crash/resume.
         nonce: String,
+        runtime_configuration: Option<super::RuntimeConfigurationEvidence>,
+        requested_at_ms: i64,
+        not_before_ms: i64,
+        deadline_ms: i64,
+        budget_deadline_ms: i64,
         requested_seq: u64,
     },
 }
 
 impl InflightEffect {
+    pub fn set_deadline_ms(&mut self, new_deadline_ms: i64) {
+        match self {
+            Self::RoleRun { deadline_ms, .. }
+            | Self::OracleRun { deadline_ms, .. }
+            | Self::TerminalReview { deadline_ms, .. } => *deadline_ms = new_deadline_ms,
+        }
+    }
+
+    pub fn deadline_ms(&self) -> i64 {
+        match self {
+            Self::RoleRun { deadline_ms, .. }
+            | Self::OracleRun { deadline_ms, .. }
+            | Self::TerminalReview { deadline_ms, .. } => *deadline_ms,
+        }
+    }
+
+    pub fn not_before_ms(&self) -> i64 {
+        match self {
+            Self::RoleRun { not_before_ms, .. }
+            | Self::OracleRun { not_before_ms, .. }
+            | Self::TerminalReview { not_before_ms, .. } => *not_before_ms,
+        }
+    }
+
+    pub fn budget_deadline_ms(&self) -> Option<i64> {
+        match self {
+            Self::RoleRun {
+                budget_deadline_ms, ..
+            }
+            | Self::TerminalReview {
+                budget_deadline_ms, ..
+            } => Some(*budget_deadline_ms),
+            Self::OracleRun { .. } => None,
+        }
+    }
+
+    pub fn runtime_configuration(&self) -> Option<&super::RuntimeConfigurationEvidence> {
+        match self {
+            Self::RoleRun {
+                runtime_configuration,
+                ..
+            }
+            | Self::TerminalReview {
+                runtime_configuration,
+                ..
+            } => runtime_configuration.as_ref(),
+            Self::OracleRun { .. } => None,
+        }
+    }
+
     /// Build the inflight entry for a `…Requested` event.
     pub fn from_request(
         event: &super::event::MissionEvent,
@@ -444,22 +615,39 @@ impl InflightEffect {
         use super::event::MissionEvent;
         match event {
             MissionEvent::RoleRunRequested {
+                namespace,
                 task_id,
                 attempt_no,
                 effect_id,
                 role,
+                output,
                 runtime,
                 prompt,
                 base_sha,
+                assignment_epoch,
+                recreate_workspace,
+                requested_at_ms,
+                not_before_ms,
+                deadline_ms,
+                budget_deadline_ms,
             } => Some((
                 effect_id.clone(),
                 Self::RoleRun {
+                    namespace: *namespace,
                     task_id: task_id.clone(),
                     attempt_no: *attempt_no,
                     role: role.clone(),
+                    output: *output,
                     runtime: runtime.clone(),
                     prompt: prompt.clone(),
                     base_sha: base_sha.clone(),
+                    assignment_epoch: *assignment_epoch,
+                    recreate_workspace: *recreate_workspace,
+                    runtime_configuration: None,
+                    requested_at_ms: *requested_at_ms,
+                    not_before_ms: *not_before_ms,
+                    deadline_ms: *deadline_ms,
+                    budget_deadline_ms: *budget_deadline_ms,
                     requested_seq,
                 },
             )),
@@ -469,6 +657,9 @@ impl InflightEffect {
                 judged_sha,
                 attempt_no,
                 effect_id,
+                requested_at_ms,
+                not_before_ms,
+                deadline_ms,
             } => Some((
                 effect_id.clone(),
                 Self::OracleRun {
@@ -476,6 +667,9 @@ impl InflightEffect {
                     oracle: oracle.clone(),
                     judged_sha: judged_sha.clone(),
                     attempt_no: *attempt_no,
+                    requested_at_ms: *requested_at_ms,
+                    not_before_ms: *not_before_ms,
+                    deadline_ms: *deadline_ms,
                     requested_seq,
                 },
             )),
@@ -487,6 +681,10 @@ impl InflightEffect {
                 prompt,
                 judged_sha,
                 nonce,
+                requested_at_ms,
+                not_before_ms,
+                deadline_ms,
+                budget_deadline_ms,
             } => Some((
                 effect_id.clone(),
                 Self::TerminalReview {
@@ -496,6 +694,11 @@ impl InflightEffect {
                     prompt: prompt.clone(),
                     judged_sha: judged_sha.clone(),
                     nonce: nonce.clone(),
+                    runtime_configuration: None,
+                    requested_at_ms: *requested_at_ms,
+                    not_before_ms: *not_before_ms,
+                    deadline_ms: *deadline_ms,
+                    budget_deadline_ms: *budget_deadline_ms,
                     requested_seq,
                 },
             )),
@@ -503,15 +706,77 @@ impl InflightEffect {
             // its inflight entry here.
             MissionEvent::MissionCreated { .. }
             | MissionEvent::PlanProposed { .. }
+            | MissionEvent::TaskWorkspacePrepared { .. }
+            | MissionEvent::EffectRuntimeConfigured { .. }
             | MissionEvent::RoleRunCompleted { .. }
-            | MissionEvent::RoleRunFailed { .. }
             | MissionEvent::OracleRunCompleted { .. }
-            | MissionEvent::OracleRunFailed { .. }
             | MissionEvent::TerminalReviewCompleted { .. }
-            | MissionEvent::TerminalReviewFailed { .. }
             | MissionEvent::MissionAborted { .. }
             | MissionEvent::DecisionRecorded { .. }
+            | MissionEvent::ControlRequested { .. }
+            | MissionEvent::EffectDeadlineReached { .. }
             | MissionEvent::EffectCleanupFailed { .. } => None,
+        }
+    }
+
+    /// Whether an outcome fact names the exact immutable request identity.
+    /// Effect IDs are store-unique, but the redundant identity fields remain
+    /// part of the auditable wire contract and must agree before settlement.
+    pub(crate) fn matches_outcome(&self, event: &super::event::MissionEvent) -> bool {
+        use super::event::MissionEvent;
+        match (self, event) {
+            (
+                Self::RoleRun {
+                    namespace,
+                    task_id,
+                    attempt_no,
+                    ..
+                },
+                MissionEvent::RoleRunCompleted {
+                    namespace: completed_namespace,
+                    task_id: completed_task,
+                    attempt_no: completed_attempt,
+                    ..
+                },
+            ) => {
+                namespace == completed_namespace
+                    && task_id == completed_task
+                    && attempt_no == completed_attempt
+            }
+            (
+                Self::OracleRun {
+                    assertion_ids,
+                    oracle,
+                    judged_sha,
+                    attempt_no,
+                    ..
+                },
+                MissionEvent::OracleRunCompleted {
+                    assertion_ids: completed_assertions,
+                    oracle: completed_oracle,
+                    judged_sha: completed_sha,
+                    attempt_no: completed_attempt,
+                    ..
+                },
+            ) => {
+                assertion_ids == completed_assertions
+                    && oracle == completed_oracle
+                    && judged_sha == completed_sha
+                    && attempt_no == completed_attempt
+            }
+            (
+                Self::TerminalReview {
+                    attempt_no,
+                    judged_sha,
+                    ..
+                },
+                MissionEvent::TerminalReviewCompleted {
+                    attempt_no: completed_attempt,
+                    judged_sha: completed_sha,
+                    ..
+                },
+            ) => attempt_no == completed_attempt && judged_sha == completed_sha,
+            _ => false,
         }
     }
 }
@@ -552,6 +817,12 @@ pub struct MissionState {
     /// Per-oracle dispatch counter (attempt numbering).
     pub oracle_attempts: BTreeMap<OracleName, u32>,
     pub inflight: BTreeMap<super::EffectId, InflightEffect>,
+    #[serde(default)]
+    pub stop_requests: BTreeMap<super::EffectId, String>,
+    #[serde(default)]
+    pub reached_deadlines: BTreeMap<super::EffectId, i64>,
+    #[serde(default)]
+    pub parked_effects: BTreeMap<super::EffectId, ParkedEffect>,
     /// Latest cleanup failure for an unfinished effect. Cleared only when that
     /// effect's outcome is durably recorded.
     #[serde(default)]
@@ -569,18 +840,19 @@ pub struct MissionState {
     pub revision: u32,
     /// Gate checkpoints the human approved — the mission
     /// proceeds past them without re-raising the checkpoint.
-    pub acknowledged_gates: std::collections::BTreeSet<TaskId>,
-    /// Nodes whose handoff asked for a human look (`request_attention`),
-    /// until a decision clears them.
-    pub flagged_nodes: std::collections::BTreeSet<TaskId>,
+    pub acknowledged_gates: BTreeSet<TaskId>,
+    /// Tasks whose handoff asked for a human look (`request_attention`), until
+    /// a decision clears them. Namespaced because planning and execution may
+    /// legitimately use the same task id.
+    pub flagged_tasks: BTreeSet<TaskAddress>,
     /// Oracles that failed to *run* (infrastructure failure, distinct from a
     /// nonzero exit) → mapped to the failure detail, until a decision clears
     /// them. Prevents a broken oracle from re-requesting forever.
-    pub oracle_failures: BTreeMap<OracleName, RunFailure>,
+    pub oracle_failures: BTreeMap<OracleName, TypedFailure>,
     /// Oracles whose obligation a human waived (`accept` on an oracle
     /// failure): the mission may finish, but never *verified* — there is no
     /// authoritative verdict.
-    pub waived_oracles: std::collections::BTreeSet<OracleName>,
+    pub waived_oracles: BTreeSet<OracleName>,
     /// Terminal-review runtime (config-gated; default-empty for every
     /// pre-feature mission and snapshot).
     #[serde(default)]
@@ -590,12 +862,86 @@ pub struct MissionState {
 }
 
 impl MissionState {
-    /// Runtime state for the task era currently allowed to dispatch roles.
-    pub(crate) fn active_tasks(&self) -> &BTreeMap<TaskId, TaskRuntimeState> {
+    /// The authoritative serial artifact head. Later slices may change how
+    /// this value is produced; proof and closure consumers use this boundary.
+    pub fn deliverable_head(&self) -> &str {
+        &self.current_sha
+    }
+
+    /// The cancellation fact, if any, that became durable before settlement
+    /// of this exact effect. Abort dominates stop, which dominates deadline.
+    pub fn durable_cancellation(&self, effect_id: &super::EffectId) -> Option<DurableCancellation> {
+        if let MissionPhase::Aborted { reason } = &self.phase {
+            return Some(DurableCancellation::Aborted {
+                reason: reason.clone(),
+            });
+        }
+        if let Some(reason) = self.stop_requests.get(effect_id) {
+            return Some(DurableCancellation::Stopped {
+                reason: reason.clone(),
+            });
+        }
+        self.reached_deadlines
+            .get(effect_id)
+            .copied()
+            .map(|deadline_ms| DurableCancellation::DeadlineReached { deadline_ms })
+    }
+
+    /// Whether the exact parked effect still belongs to live mission work.
+    /// Controls and replay share this query so a stale operator view cannot
+    /// reopen a task era retired by a later plan promotion.
+    pub fn parked_effect_is_continuable(&self, effect_id: &super::EffectId) -> bool {
+        self.parked_effects
+            .get(effect_id)
+            .is_some_and(|effect| self.parked_effect_remains_continuable(effect))
+    }
+
+    pub(crate) fn parked_effect_remains_continuable(&self, effect: &ParkedEffect) -> bool {
+        match effect {
+            ParkedEffect::RoleRun { namespace, task_id } => {
+                let task_failed = self
+                    .tasks_in(*namespace)
+                    .get(task_id)
+                    .is_some_and(|task| task.status == TaskStatus::Failed);
+                let task_is_live = match namespace {
+                    super::TaskNamespace::Planning => self
+                        .config
+                        .planning
+                        .tasks
+                        .iter()
+                        .any(|task| &task.id == task_id),
+                    super::TaskNamespace::Execution => self
+                        .plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.tasks.iter().any(|task| &task.id == task_id)),
+                };
+                task_failed && task_is_live
+            }
+            ParkedEffect::OracleRun { oracle } => self.oracle_failures.contains_key(oracle),
+            ParkedEffect::TerminalReview => matches!(
+                self.terminal_review.outcome,
+                Some(ReviewOutcome::Failed { .. })
+            ),
+        }
+    }
+
+    pub fn active_task_namespace(&self) -> super::TaskNamespace {
         if self.planning_base_revision.is_some() {
-            &self.planning.tasks
+            super::TaskNamespace::Planning
         } else {
-            &self.tasks
+            super::TaskNamespace::Execution
+        }
+    }
+
+    /// Runtime state for the task era currently allowed to dispatch roles.
+    pub fn active_tasks(&self) -> &BTreeMap<TaskId, TaskRuntimeState> {
+        self.tasks_in(self.active_task_namespace())
+    }
+
+    pub fn tasks_in(&self, namespace: super::TaskNamespace) -> &BTreeMap<TaskId, TaskRuntimeState> {
+        match namespace {
+            super::TaskNamespace::Planning => &self.planning.tasks,
+            super::TaskNamespace::Execution => &self.tasks,
         }
     }
 
@@ -606,12 +952,56 @@ impl MissionState {
             &mut self.tasks
         }
     }
+
+    pub(crate) fn tasks_in_mut(
+        &mut self,
+        namespace: super::TaskNamespace,
+    ) -> &mut BTreeMap<TaskId, TaskRuntimeState> {
+        match namespace {
+            super::TaskNamespace::Planning => &mut self.planning.tasks,
+            super::TaskNamespace::Execution => &mut self.tasks,
+        }
+    }
+
+    pub(crate) fn oracle_automatic_retry_remaining(&self, oracle: &OracleName) -> bool {
+        self.oracle_failures
+            .get(oracle)
+            .is_some_and(TypedFailure::is_transient)
+            && self
+                .oracle_attempts
+                .get(oracle)
+                .copied()
+                .unwrap_or_default()
+                < self.config.recovery.max_attempts
+    }
+
+    /// Assertions the named oracle still owes at the current deliverable.
+    /// This is the shared proof query used by scheduling and request ingress.
+    pub(crate) fn owed_assertions_for_oracle(&self, oracle: &OracleName) -> Vec<AssertionId> {
+        self.contract
+            .iter()
+            .filter(|(_, assertion)| {
+                assertion.oracle.as_ref() == Some(oracle)
+                    && assertion
+                        .last_authoritative
+                        .as_ref()
+                        .is_none_or(|verdict| !verdict.is_fresh_at(self.deliverable_head()))
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    pub(crate) fn oracle_dispatchable(&self, oracle: &OracleName) -> bool {
+        !self.waived_oracles.contains(oracle)
+            && (!self.oracle_failures.contains_key(oracle)
+                || self.oracle_automatic_retry_remaining(oracle))
+    }
 }
 
 #[cfg(test)]
 mod slug_tests {
     use super::*;
-    use crate::model::{FinishClass, OutputSemantics, StopBar};
+    use crate::{FinishClass, OutputSemantics, StopBar};
 
     /// Every `slug()` must equal the enum's serde repr — the single source that
     /// keeps the CLI, the fold's attention ids, and the wire format from
@@ -630,6 +1020,12 @@ mod slug_tests {
 
     #[test]
     fn slugs_match_the_serde_repr() {
+        for namespace in [
+            crate::TaskNamespace::Planning,
+            crate::TaskNamespace::Execution,
+        ] {
+            assert_slug(&namespace, namespace.slug());
+        }
         for k in [
             AttentionKind::NodeFailed,
             AttentionKind::NodeAttention,

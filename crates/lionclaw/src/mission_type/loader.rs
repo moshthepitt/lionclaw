@@ -7,15 +7,19 @@ use std::path::{Path, PathBuf};
 
 use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
 use crate::model::{
-    InputName, OracleName, OutputSemantics, RoleName, StopBar, TerminalReviewConfig,
+    InputName, OracleName, PlanningDag, PlanningTask, RoleName, StopBar, TerminalReviewConfig,
 };
 
+use super::bounded_tree::{BoundedTree, ControlTextBudget};
 use super::digest::ContentDigest;
 use super::frontmatter::{parse_role_file, RoleFrontmatter};
-use super::install::validate_closed_tree;
-use super::manifest::{is_path_safe_name, ManifestFile, ManifestInput, MISSION_LOCK_FILE};
-use super::skills::{load_skills, package_files};
-use super::{MissionType, PreparedInput, RoleDefinition, SkillPackage};
+use super::manifest::{is_path_safe_name, ManifestFile, ManifestInput, ManifestPlanningDag};
+use super::prepared_input::{validate_prepared_inputs, PreparedInputContractError};
+use super::skills::load_skills;
+use super::{
+    has_shebang, is_executable, MissionType, MissionTypeDefinition, PreparedInput, RoleDefinition,
+    SkillPackage,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MissionTypeError {
@@ -45,22 +49,39 @@ pub enum MissionTypeError {
 }
 
 pub fn load_mission_type(
+    source: &Path,
+    ceiling: &AuthorityCeiling,
+) -> Result<MissionType, MissionTypeError> {
+    let owned = tempfile::Builder::new()
+        .prefix("lionclaw-mission-type-")
+        .tempdir()
+        .map_err(|source_error| MissionTypeError::Io {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+    let root = owned.path().join("bundle");
+    let source_tree =
+        BoundedTree::open(source).map_err(|error| MissionTypeError::Manifest(error.to_string()))?;
+    source_tree
+        .copy_to(&root)
+        .map_err(|error| MissionTypeError::Manifest(error.to_string()))?;
+    load_materialized_mission_type(&root, ceiling)
+        .map(|mission_type| mission_type.with_source_owner(std::sync::Arc::new(owned)))
+}
+
+/// Load a LionClaw-owned closed tree. Arbitrary source directories must cross
+/// `load_mission_type` or `materialize_mission_type` first so semantic path
+/// reads and later runtime mounts cannot observe a different tree than the one
+/// admitted through `BoundedTree`.
+pub(crate) fn load_materialized_mission_type(
     root: &Path,
     ceiling: &AuthorityCeiling,
 ) -> Result<MissionType, MissionTypeError> {
-    let root_metadata = std::fs::symlink_metadata(root).map_err(|source| MissionTypeError::Io {
-        path: root.to_path_buf(),
-        source,
-    })?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err(MissionTypeError::Manifest(format!(
-            "mission type root '{}' must be a directory, not a symlink",
-            root.display()
-        )));
-    }
-    validate_closed_tree(root).map_err(|err| MissionTypeError::Manifest(err.to_string()))?;
+    let tree =
+        BoundedTree::open(root).map_err(|error| MissionTypeError::Manifest(error.to_string()))?;
+    let mut text_budget = ControlTextBudget::default();
     let manifest_path = root.join("mission.toml");
-    let manifest_text = read(&manifest_path)?;
+    let manifest_text = read(&tree, Path::new("mission.toml"), &mut text_budget)?;
     let manifest: ManifestFile = toml::from_str(&manifest_text)
         .map_err(|e| MissionTypeError::Manifest(format!("{manifest_path:?}: {e}")))?;
     if !is_path_safe_name(&manifest.mission_type.name) {
@@ -78,68 +99,46 @@ pub fn load_mission_type(
             )))
         }
     };
-    if manifest.recovery.max_attempts == 0 {
-        return Err(MissionTypeError::Manifest(
-            "[recovery] max-attempts must be at least 1".to_string(),
-        ));
-    }
-
-    let skills = load_skills(root)?;
+    let skills = load_skills(root, &tree, &mut text_budget)?;
     let inputs = load_inputs(root, manifest.inputs)?;
     let oracles = load_oracles(&root.join("oracles"))?;
-    let roles = load_roles(&root.join("roles"), ceiling, &skills)?;
+    let roles = load_roles(
+        root,
+        &tree,
+        &root.join("roles"),
+        ceiling,
+        &skills,
+        &mut text_budget,
+    )?;
     if roles.is_empty() {
         return Err(MissionTypeError::NoRoles(root.to_path_buf()));
     }
+    let planning = resolve_planning_dag(manifest.planning, &roles)?;
 
-    // The closing review, fail-closed like the planning DAG: the named role
-    // must exist and be a judge. An agent-graded bar without an independent
-    // closing review would be the workers' own validators agreeing with the
-    // workers — so `reviewed` requires the declaration.
     let terminal_review = match &manifest.terminal_review {
-        None if stop == StopBar::Reviewed => {
-            return Err(MissionTypeError::Manifest(
-                "stop = \"reviewed\" requires [terminal-review]: the reviewed bar is \
-                 defined by an independent terminal review"
-                    .to_string(),
-            ));
-        }
         None => None,
         Some(declared) => {
             let role_name = RoleName::new(&declared.role)
                 .map_err(|e| MissionTypeError::Manifest(format!("[terminal-review] role: {e}")))?;
-            let Some(role) = roles.get(&role_name) else {
-                return Err(MissionTypeError::Manifest(format!(
-                    "[terminal-review] role '{}' is not provided by this mission type",
-                    declared.role
-                )));
-            };
-            if role.output != OutputSemantics::EmitsGapVerdict {
-                return Err(MissionTypeError::Manifest(format!(
-                    "[terminal-review] role '{}' must be emits-gap-verdict, got {}",
-                    declared.role,
-                    role.output.slug()
-                )));
-            }
             Some(TerminalReviewConfig { role: role_name })
         }
     };
 
-    let playbook = read(&root.join("playbook.md"))?;
+    let playbook = read(&tree, Path::new("playbook.md"), &mut text_budget)?;
     if playbook.trim().is_empty() {
         return Err(MissionTypeError::Manifest(
             "playbook.md must not be empty".to_string(),
         ));
     }
-    let digest = compute_digest(root, &skills)?;
+    let digest = compute_digest(&tree)?;
 
-    let mission_type = MissionType {
+    let definition = MissionTypeDefinition {
         name: manifest.mission_type.name,
-        digest,
         stop,
         image: manifest.mission_type.image,
-        planning: manifest.planning,
+        planning,
         recovery: manifest.recovery,
+        execution: manifest.execution,
         terminal_review,
         playbook: Some(playbook),
         roles,
@@ -147,21 +146,40 @@ pub fn load_mission_type(
         inputs,
         oracles,
     };
-    // Validate the planning DAG fail-closed at load against this type's own
-    // inventory (roles must be planning roles; the author is the unique sink).
-    let errors =
-        crate::model::validate_planning_dag(&mission_type.planning, &mission_type.inventory());
-    if !errors.is_empty() {
-        return Err(MissionTypeError::Manifest(format!(
-            "[planning] is invalid:\n{}",
-            errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-        )));
-    }
+    let mission_type = MissionType::from_loaded(definition, digest);
+    mission_type
+        .validate_at(0)
+        .map_err(|error| MissionTypeError::Manifest(error.to_string()))?;
     Ok(mission_type)
+}
+
+fn resolve_planning_dag(
+    dag: ManifestPlanningDag,
+    roles: &BTreeMap<RoleName, RoleDefinition>,
+) -> Result<PlanningDag, MissionTypeError> {
+    let tasks = dag
+        .tasks
+        .into_iter()
+        .map(|task| {
+            let output = roles
+                .get(&task.role)
+                .map(|role| role.output)
+                .ok_or_else(|| {
+                    MissionTypeError::Manifest(format!(
+                    "[planning] task '{}' names role '{}' which the mission type does not provide",
+                    task.id, task.role
+                ))
+                })?;
+            Ok(PlanningTask {
+                id: task.id,
+                role: task.role,
+                output,
+                body: task.body,
+                depends_on: task.depends_on,
+            })
+        })
+        .collect::<Result<Vec<_>, MissionTypeError>>()?;
+    Ok(PlanningDag { tasks })
 }
 
 fn load_inputs(
@@ -169,70 +187,12 @@ fn load_inputs(
     declared: Vec<ManifestInput>,
 ) -> Result<BTreeMap<InputName, PreparedInput>, MissionTypeError> {
     let mut inputs = BTreeMap::new();
-    let mut environment_owners = BTreeMap::<String, InputName>::new();
     for input in declared {
         let name = InputName::new(&input.name).map_err(|error| MissionTypeError::Input {
             input: input.name.clone(),
             detail: error.to_string(),
         })?;
-        if input.key_files.is_empty() {
-            return Err(MissionTypeError::Input {
-                input: input.name,
-                detail: "key-files must contain at least one workspace path".to_string(),
-            });
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        for path in &input.key_files {
-            if !safe_relative_path(path) {
-                return Err(MissionTypeError::Input {
-                    input: input.name.clone(),
-                    detail: format!(
-                        "key-file '{}' must be a non-empty relative path without traversal",
-                        path.display()
-                    ),
-                });
-            }
-            if !seen.insert(path) {
-                return Err(MissionTypeError::Input {
-                    input: input.name.clone(),
-                    detail: format!("key-file '{}' is declared more than once", path.display()),
-                });
-            }
-        }
-        for variable in input.environment.keys() {
-            if !valid_environment_name(variable) {
-                return Err(MissionTypeError::Input {
-                    input: input.name.clone(),
-                    detail: format!("environment key '{variable}' is invalid"),
-                });
-            }
-            if let Some(owner) = environment_owners.insert(variable.clone(), name.clone()) {
-                return Err(MissionTypeError::Input {
-                    input: input.name.clone(),
-                    detail: format!(
-                        "environment key '{variable}' is already provided by input '{owner}'"
-                    ),
-                });
-            }
-        }
         let program = root.join("inputs").join(name.as_str());
-        let metadata =
-            std::fs::symlink_metadata(&program).map_err(|source| MissionTypeError::Io {
-                path: program.clone(),
-                source,
-            })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(MissionTypeError::Input {
-                input: input.name,
-                detail: "program must be a regular file (no symlinks)".to_string(),
-            });
-        }
-        if !is_executable(&program) || !has_shebang(&program) {
-            return Err(MissionTypeError::Input {
-                input: name.to_string(),
-                detail: "program must be executable and start with a #! shebang".to_string(),
-            });
-        }
         if inputs
             .insert(
                 name.clone(),
@@ -252,30 +212,26 @@ fn load_inputs(
             });
         }
     }
+    validate_prepared_inputs(&inputs).map_err(map_prepared_input_error)?;
     Ok(inputs)
 }
 
-fn safe_relative_path(path: &Path) -> bool {
-    use std::path::Component;
-    !path.as_os_str().is_empty()
-        && !path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-}
-
-fn valid_environment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
-        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+fn map_prepared_input_error(error: PreparedInputContractError) -> MissionTypeError {
+    match error {
+        PreparedInputContractError::Invalid { input, detail } => {
+            MissionTypeError::Input { input, detail }
+        }
+        PreparedInputContractError::Io { path, source } => MissionTypeError::Io { path, source },
+    }
 }
 
 fn load_roles(
+    root: &Path,
+    tree: &BoundedTree,
     dir: &Path,
     ceiling: &AuthorityCeiling,
     packages: &BTreeMap<String, SkillPackage>,
+    text_budget: &mut ControlTextBudget,
 ) -> Result<BTreeMap<RoleName, RoleDefinition>, MissionTypeError> {
     let mut roles = BTreeMap::new();
     if !dir.exists() {
@@ -297,12 +253,19 @@ fn load_roles(
             role: stem.to_string(),
             detail: e.to_string(),
         })?;
-        let text = read(&path)?;
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| MissionTypeError::Role {
+                role: stem.to_string(),
+                detail: "role path escaped the mission root".to_string(),
+            })?;
+        let text = read(tree, relative, text_budget)?;
         let RoleFrontmatter {
             output,
             network,
             secrets,
             runtime,
+            timeout_secs,
             skills,
             prompt_body,
         } = parse_role_file(&text).map_err(|e| MissionTypeError::Role {
@@ -334,6 +297,7 @@ fn load_roles(
             name: name.clone(),
             output,
             runtime,
+            timeout_secs,
             network,
             secrets,
             skills,
@@ -396,79 +360,24 @@ fn load_oracles(dir: &Path) -> Result<BTreeMap<OracleName, PathBuf>, MissionType
     Ok(oracles)
 }
 
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-fn has_shebang(path: &Path) -> bool {
-    use std::io::Read;
-    let mut buf = [0u8; 2];
-    std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .map(|_| &buf == b"#!")
-        .unwrap_or(false)
-}
-
-fn read(path: &Path) -> Result<String, MissionTypeError> {
-    std::fs::read_to_string(path).map_err(|source| MissionTypeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn read_bytes(path: &Path) -> Result<Vec<u8>, MissionTypeError> {
-    std::fs::read(path).map_err(|source| MissionTypeError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+fn read(
+    tree: &BoundedTree,
+    relative: &Path,
+    text_budget: &mut ControlTextBudget,
+) -> Result<String, MissionTypeError> {
+    text_budget
+        .read(tree, relative)
+        .map_err(|error| MissionTypeError::Manifest(error.to_string()))
 }
 
 /// A content digest over everything the loader consumes: manifest, optional
 /// lock/playbook, roles, oracles, and each resolved skill package recursively.
 /// Entries contribute logical path, bytes, and executable bit. Verified on
 /// every engine open, so mutated mission behavior is caught.
-fn compute_digest(
-    root: &Path,
-    skills: &BTreeMap<String, SkillPackage>,
-) -> Result<String, MissionTypeError> {
+fn compute_digest(tree: &BoundedTree) -> Result<String, MissionTypeError> {
     let mut digest = ContentDigest::new();
-    digest.feed(
-        "mission.toml",
-        &read_bytes(&root.join("mission.toml"))?,
-        false,
-    );
-    if let Ok(lock) = std::fs::read(root.join(MISSION_LOCK_FILE)) {
-        digest.feed(MISSION_LOCK_FILE, &lock, false);
-    }
-    if let Ok(playbook) = std::fs::read(root.join("playbook.md")) {
-        digest.feed("playbook.md", &playbook, false);
-    }
-    for (subdir, hash_exec) in [("roles", false), ("inputs", true), ("oracles", true)] {
-        let dir = root.join(subdir);
-        if !dir.exists() {
-            continue;
-        }
-        for entry in read_dir(&dir)? {
-            let path = entry.path();
-            let rel = format!("{subdir}/{}", entry.file_name().to_string_lossy());
-            digest.feed(&rel, &read_bytes(&path)?, hash_exec && is_executable(&path));
-        }
-    }
-    for (name, package) in skills {
-        for path in package_files(name, &package.root)? {
-            let relative =
-                path.strip_prefix(&package.root)
-                    .map_err(|_| MissionTypeError::Skill {
-                        skill: name.clone(),
-                        detail: format!("package entry '{}' escaped its root", path.display()),
-                    })?;
-            let logical = format!("skills/{name}/{}", relative.to_string_lossy());
-            digest.feed(&logical, &read_bytes(&path)?, is_executable(&path));
-        }
-    }
+    tree.feed_digest(&mut digest, "")
+        .map_err(|error| MissionTypeError::Manifest(error.to_string()))?;
     Ok(digest.finish())
 }
 

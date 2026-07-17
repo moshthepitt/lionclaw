@@ -2,6 +2,8 @@ use std::str::FromStr;
 
 use serde_json::Value;
 
+use lionclaw_model::AppliedRuntimeConfiguration;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
     Any,
@@ -64,4 +66,14 @@ pub struct RuntimeCapabilityResult {
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeTurnResult {
     pub capability_requests: Vec<RuntimeCapabilityRequest>,
+    pub configuration: AppliedRuntimeConfiguration,
+    pub final_response: String,
+}
+
+impl RuntimeTurnResult {
+    pub fn projected(mut self) -> Self {
+        self.configuration = self.configuration.projected();
+        self.final_response = crate::bounded_text(&self.final_response);
+        self
+    }
 }

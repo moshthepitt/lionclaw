@@ -13,14 +13,21 @@
 //! rules are enforced by the id newtypes at every deserialization boundary, so
 //! only duplicates are checked here.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use super::event::StopBar;
-use super::ids::{OracleName, RoleName, TaskId};
+use super::ids::TaskId;
+#[cfg(test)]
+use super::ids::{OracleName, RoleName};
 use super::plan::{
-    OutputSemantics, Plan, PlanProposal, PlanningDag, RequirementDisposition, TaskKind,
+    OutputSemantics, Plan, PlanInventory, PlanProposal, PlanningDag, RequirementDisposition,
+    TaskKind,
 };
 use super::state::MissionState;
+use crate::prelude::*;
+
+/// Maximum direct fan-in for one task. Role reports are independently bounded
+/// at ingress, so this limit also gives prompt construction a fixed aggregate
+/// upstream-context ceiling.
+pub const MAX_TASK_DEPENDENCIES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{code}: {detail}")]
@@ -36,16 +43,11 @@ fn err(code: &'static str, detail: impl Into<String>) -> PlanValidationError {
     }
 }
 
-/// The mission-type-supplied inventory the plan is validated against.
-pub struct MissionTypeInventory {
-    pub roles: BTreeMap<RoleName, OutputSemantics>,
-    pub oracles: BTreeSet<OracleName>,
-    /// The honesty bar the mission type declares — plans under `Verified` must
-    /// be provable (every assertion bound to an oracle).
-    pub stop: StopBar,
-}
-
-pub fn validate_plan(plan: &Plan, inventory: &MissionTypeInventory) -> Vec<PlanValidationError> {
+pub fn validate_plan(
+    plan: &Plan,
+    inventory: &PlanInventory,
+    stop: StopBar,
+) -> Vec<PlanValidationError> {
     // Group 0: emptiness (zenith empty_contract / empty_task_list).
     if plan.assertions.is_empty() {
         return vec![err(
@@ -106,7 +108,7 @@ pub fn validate_plan(plan: &Plan, inventory: &MissionTypeInventory) -> Vec<PlanV
     // proposal *could* bind one, so this is a
     // launch-time policy, not a permanence claim; a domain with genuinely
     // unprovable claims declares `stop = reviewed`.)
-    check_stop_bar_reachable(plan, inventory.stop)
+    check_stop_bar_reachable(plan, stop)
 }
 
 /// Validate a mission type's planning DAG (at load, fail-closed): unique ids,
@@ -115,7 +117,7 @@ pub fn validate_plan(plan: &Plan, inventory: &MissionTypeInventory) -> Vec<PlanV
 /// DAG fully drains into the proposer with no orphan island.
 pub fn validate_planning_dag(
     dag: &PlanningDag,
-    inventory: &MissionTypeInventory,
+    inventory: &PlanInventory,
 ) -> Vec<PlanValidationError> {
     // An empty DAG is valid: it means "no in-engine planning" (the mission
     // awaits a manually proposed plan).
@@ -144,29 +146,38 @@ pub fn validate_planning_dag(
     let mut errors = Vec::new();
     let mut proposers = 0;
     for t in &dag.tasks {
-        for dep in &t.depends_on {
-            if dep == &t.id {
+        errors.extend(check_dependency_list(
+            "planning task",
+            &t.id,
+            &t.depends_on,
+            &ids,
+        ));
+        let declared_output = match inventory.roles.get(&t.role) {
+            None => {
                 errors.push(err(
-                    "self_loop",
-                    format!("planning task '{}' depends on itself", t.id),
+                    "unknown_role",
+                    format!(
+                        "planning task '{}' names role '{}' which the mission type does not provide",
+                        t.id, t.role
+                    ),
                 ));
-            } else if !ids.contains(dep) {
-                errors.push(err(
-                    "dep_unknown_task",
-                    format!("planning task '{}' depends on unknown '{dep}'", t.id),
-                ));
+                None
             }
-        }
-        match inventory.roles.get(&t.role) {
-            None => errors.push(err(
-                "unknown_role",
-                format!(
-                    "planning task '{}' names role '{}' which the mission type does not provide",
-                    t.id, t.role
-                ),
-            )),
+            Some(declared) if *declared != t.output => {
+                errors.push(err(
+                    "role_output_mismatch",
+                    format!(
+                        "planning task '{}' records {:?}, but role '{}' declares {:?}",
+                        t.id, t.output, t.role, declared
+                    ),
+                ));
+                None
+            }
+            Some(declared) => Some(*declared),
+        };
+        match declared_output {
             Some(OutputSemantics::ProposesPlan) => proposers += 1,
-            Some(OutputSemantics::ProducesReport) => {}
+            Some(OutputSemantics::ProducesReport) | None => {}
             Some(other) => errors.push(err(
                 "role_output_mismatch",
                 format!(
@@ -283,10 +294,13 @@ pub enum ProposalError {
 pub fn validate_plan_proposal(
     state: &MissionState,
     proposal: &PlanProposal,
-    inventory: &MissionTypeInventory,
 ) -> Result<(), ProposalError> {
     validate_plan_transition(state, proposal)?;
-    let errors = validate_plan(&proposal.plan, inventory);
+    let errors = validate_plan(
+        &proposal.plan,
+        &state.config.plan_inventory,
+        state.config.stop,
+    );
     if errors.is_empty() {
         Ok(())
     } else {
@@ -294,10 +308,9 @@ pub fn validate_plan_proposal(
     }
 }
 
-/// Validate the revision relationship without mission-type inventory. Shared
-/// with the fold so a malformed persisted proposal cannot weaken the contract
-/// even if an event bypassed the engine boundary.
-pub(crate) fn validate_plan_transition(
+/// Validate revision monotonicity and immutable ids before the caller checks
+/// the resulting complete plan against the persisted inventory.
+fn validate_plan_transition(
     state: &MissionState,
     proposal: &PlanProposal,
 ) -> Result<(), ProposalError> {
@@ -517,7 +530,7 @@ fn check_unique_ids(plan: &Plan) -> Vec<PlanValidationError> {
     errors
 }
 
-fn check_shape(plan: &Plan, inventory: &MissionTypeInventory) -> Vec<PlanValidationError> {
+fn check_shape(plan: &Plan, inventory: &PlanInventory) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
     for assertion in &plan.assertions {
         if let Some(oracle) = &assertion.oracle {
@@ -621,18 +634,49 @@ fn check_deps_resolve(plan: &Plan) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
     let ids: BTreeSet<_> = plan.tasks.iter().map(|t| &t.id).collect();
     for task in &plan.tasks {
-        for dep in &task.depends_on {
-            if dep == &task.id {
-                errors.push(err(
-                    "self_loop",
-                    format!("task '{}' depends on itself", task.id),
-                ));
-            } else if !ids.contains(dep) {
-                errors.push(err(
-                    "dep_unknown_task",
-                    format!("task '{}' depends on unknown task '{dep}'", task.id),
-                ));
-            }
+        errors.extend(check_dependency_list(
+            "task",
+            &task.id,
+            &task.depends_on,
+            &ids,
+        ));
+    }
+    errors
+}
+
+fn check_dependency_list(
+    scope: &str,
+    task_id: &TaskId,
+    dependencies: &[TaskId],
+    known_tasks: &BTreeSet<&TaskId>,
+) -> Vec<PlanValidationError> {
+    let mut errors = Vec::new();
+    if dependencies.len() > MAX_TASK_DEPENDENCIES {
+        errors.push(err(
+            "dependency_fan_in",
+            format!(
+                "{scope} '{task_id}' has {} dependencies; the limit is {MAX_TASK_DEPENDENCIES}",
+                dependencies.len()
+            ),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for dependency in dependencies {
+        if !seen.insert(dependency) {
+            errors.push(err(
+                "duplicate_dependency",
+                format!("{scope} '{task_id}' repeats dependency '{dependency}'"),
+            ));
+        } else if dependency == task_id {
+            errors.push(err(
+                "self_loop",
+                format!("{scope} '{task_id}' depends on itself"),
+            ));
+        } else if !known_tasks.contains(dependency) {
+            errors.push(err(
+                "dep_unknown_task",
+                format!("{scope} '{task_id}' depends on unknown task '{dependency}'"),
+            ));
         }
     }
     errors
@@ -716,8 +760,8 @@ fn check_coverage(plan: &Plan) -> Vec<PlanValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ids::{AssertionId, RequirementId};
-    use crate::model::plan::{Assertion, PlanningTask, Requirement, RequirementKind, Task};
+    use crate::ids::{AssertionId, RequirementId};
+    use crate::plan::{Assertion, PlanningTask, Requirement, RequirementKind, Task};
 
     fn aid(raw: &str) -> AssertionId {
         AssertionId::new(raw).expect("valid assertion id")
@@ -787,7 +831,7 @@ mod tests {
         task(id, TaskKind::Gate, None, "", targets, deps)
     }
 
-    fn inventory() -> MissionTypeInventory {
+    fn inventory() -> PlanInventory {
         let mut roles = BTreeMap::new();
         roles.insert(
             RoleName::new("implementer").expect("valid role name"),
@@ -807,12 +851,9 @@ mod tests {
             RoleName::new("author").expect("valid role name"),
             OutputSemantics::ProposesPlan,
         );
-        MissionTypeInventory {
+        PlanInventory {
             roles,
             oracles: BTreeSet::from([OracleName::new("cargo-test").expect("valid oracle name")]),
-            // `Reviewed` so these structural tests aren't also subject to the
-            // stop-bar-reachability check (exercised separately below).
-            stop: StopBar::Reviewed,
         }
     }
 
@@ -837,7 +878,7 @@ mod tests {
     }
 
     fn codes(plan: &Plan) -> Vec<&'static str> {
-        validate_plan(plan, &inventory())
+        validate_plan(plan, &inventory(), StopBar::Reviewed)
             .into_iter()
             .map(|e| e.code)
             .collect()
@@ -846,9 +887,12 @@ mod tests {
     const CLEAN: Vec<&str> = Vec::new();
 
     fn ptask(id: &str, role: &str, deps: &[&str]) -> PlanningTask {
+        let role = RoleName::new(role).expect("valid role name");
+        let output = inventory().roles[&role];
         PlanningTask {
             id: tid(id),
-            role: RoleName::new(role).expect("valid role name"),
+            role,
+            output,
             body: format!("do {id}"),
             depends_on: deps.iter().map(|d| tid(d)).collect(),
         }
@@ -874,8 +918,26 @@ mod tests {
             ]),
             CLEAN
         );
+
+        let mut swapped = ptask("research", "reporter", &[]);
+        swapped.output = OutputSemantics::ProposesPlan;
+        assert!(
+            planning_codes(vec![swapped, ptask("author", "author", &["research"]),])
+                .contains(&"role_output_mismatch")
+        );
         // Empty is valid (no in-engine planning).
         assert_eq!(planning_codes(vec![]), CLEAN);
+
+        let dependencies = (0..=MAX_TASK_DEPENDENCIES)
+            .map(|index| format!("dependency-{index}"))
+            .collect::<Vec<_>>();
+        let dependency_refs = dependencies.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut excessive_fan_in = dependencies
+            .iter()
+            .map(|id| ptask(id, "reporter", &[]))
+            .collect::<Vec<_>>();
+        excessive_fan_in.push(ptask("author", "author", &dependency_refs));
+        assert_eq!(planning_codes(excessive_fan_in), vec!["dependency_fan_in"]);
         // Two proposers → planning_author.
         assert_eq!(
             planning_codes(vec![
@@ -926,6 +988,20 @@ mod tests {
             ]),
             vec!["dep_unknown_task"]
         );
+    }
+
+    #[test]
+    fn execution_task_dependency_fan_in_is_bounded() {
+        let dependencies = (0..=MAX_TASK_DEPENDENCIES)
+            .map(|index| format!("dependency-{index}"))
+            .collect::<Vec<_>>();
+        let dependency_refs = dependencies.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut tasks = dependencies
+            .iter()
+            .map(|id| work(id, &[], &[]))
+            .collect::<Vec<_>>();
+        tasks.push(work("consumer", &["ASSERT-A"], &dependency_refs));
+        assert!(codes(&plan(vec![assertion("ASSERT-A")], tasks)).contains(&"dependency_fan_in"));
     }
 
     // The check_shape chokepoint: a read-only planning role (produces-report /
@@ -1260,10 +1336,8 @@ mod tests {
 
     #[test]
     fn verified_bar_rejects_an_oracle_less_assertion() {
-        let mut verified = inventory();
-        verified.stop = StopBar::Verified;
         let against = |sub: &Plan| -> Vec<&'static str> {
-            validate_plan(sub, &verified)
+            validate_plan(sub, &inventory(), StopBar::Verified)
                 .into_iter()
                 .map(|e| e.code)
                 .collect()

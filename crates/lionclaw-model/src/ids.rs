@@ -4,9 +4,11 @@
 //! `models.py` — `ASSERTION_ID_REGEX`, `TASK_ID_REGEX`, `SKILL_NAME_REGEX` —
 //! hand-rolled as charset checks so the model stays regex-free.
 
-use std::fmt;
+use core::fmt;
 
 use serde::{Deserialize, Serialize};
+
+use crate::prelude::*;
 
 macro_rules! id_type {
     ($name:ident, $validate:ident, $doc:literal) => {
@@ -147,7 +149,55 @@ impl EffectId {
     pub fn for_parts(parts: &[&str]) -> Self {
         use sha2::{Digest, Sha256};
 
-        Self(hex::encode(Sha256::digest(parts.join("\u{1f}").as_bytes())))
+        Self(lowercase_hex(&Sha256::digest(
+            parts.join("\u{1f}").as_bytes(),
+        )))
+    }
+
+    pub fn for_role_request(
+        namespace: crate::event::TaskNamespace,
+        mission_id: &MissionId,
+        task_id: &TaskId,
+        attempt_no: u32,
+        assignment_epoch: u32,
+        prompt_hash: &str,
+    ) -> Self {
+        Self::for_parts(&[
+            namespace.slug(),
+            mission_id.as_str(),
+            task_id.as_str(),
+            &attempt_no.to_string(),
+            &assignment_epoch.to_string(),
+            prompt_hash,
+        ])
+    }
+
+    pub fn for_oracle_request(
+        mission_id: &MissionId,
+        oracle: &OracleName,
+        judged_sha: &str,
+        attempt_no: u32,
+    ) -> Self {
+        Self::for_parts(&[
+            "oracle",
+            mission_id.as_str(),
+            oracle.as_str(),
+            judged_sha,
+            &attempt_no.to_string(),
+        ])
+    }
+
+    pub fn for_terminal_review_request(
+        mission_id: &MissionId,
+        judged_sha: &str,
+        attempt_no: u32,
+    ) -> Self {
+        Self::for_parts(&[
+            "terminal-review",
+            mission_id.as_str(),
+            judged_sha,
+            &attempt_no.to_string(),
+        ])
     }
 
     pub fn as_str(&self) -> &str {
@@ -215,10 +265,10 @@ impl MissionId {
         Self(format!("m{}", &digest_hex[..12]))
     }
 
-    pub(crate) fn for_creation(workspace: &str, objective: &str, now_ms: i64) -> Self {
+    pub fn for_creation(workspace: &str, objective: &str, now_ms: i64) -> Self {
         use sha2::{Digest, Sha256};
 
-        Self::from_digest_prefix(&hex::encode(Sha256::digest(
+        Self::from_digest_prefix(&lowercase_hex(&Sha256::digest(
             format!("{workspace}\u{1f}{objective}\u{1f}{now_ms}").as_bytes(),
         )))
     }
@@ -232,6 +282,17 @@ impl fmt::Display for MissionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// Encode bytes as lowercase hexadecimal without another model dependency.
+pub(crate) fn lowercase_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 /// The first 12 chars of a sha/digest, for compact human display.
@@ -294,5 +355,79 @@ mod tests {
         assert!(EffectId::parse(id.as_str()).is_ok());
         assert!(EffectId::parse("ABC").is_err());
         assert!(EffectId::parse("../escape").is_err());
+    }
+
+    #[test]
+    fn canonical_effect_ids_bind_every_authority_dimension() {
+        let mission = MissionId::parse("mabc123def456").unwrap();
+        let other_mission = MissionId::parse("mdef456abc123").unwrap();
+        let task = TaskId::new("work").unwrap();
+        let oracle = OracleName::new("cargo-test").unwrap();
+        let role = EffectId::for_role_request(
+            crate::event::TaskNamespace::Execution,
+            &mission,
+            &task,
+            1,
+            1,
+            "prompt-a",
+        );
+
+        let variants = [
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Planning,
+                &mission,
+                &task,
+                1,
+                1,
+                "prompt-a",
+            ),
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Execution,
+                &other_mission,
+                &task,
+                1,
+                1,
+                "prompt-a",
+            ),
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Execution,
+                &mission,
+                &task,
+                2,
+                1,
+                "prompt-a",
+            ),
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Execution,
+                &mission,
+                &task,
+                1,
+                2,
+                "prompt-a",
+            ),
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Execution,
+                &mission,
+                &task,
+                1,
+                1,
+                "prompt-b",
+            ),
+            EffectId::for_oracle_request(&mission, &oracle, "head", 1),
+            EffectId::for_terminal_review_request(&mission, "head", 1),
+        ];
+
+        assert!(variants.iter().all(|variant| variant != &role));
+        assert_eq!(
+            role,
+            EffectId::for_role_request(
+                crate::event::TaskNamespace::Execution,
+                &mission,
+                &task,
+                1,
+                1,
+                "prompt-a",
+            )
+        );
     }
 }

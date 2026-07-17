@@ -101,19 +101,11 @@ impl ExecutionBackend for OciExecutionBackend {
         request: ExecutionRequest,
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput> {
-        execute_oci_process(
-            request,
-            move |line| {
-                drop(stdout.send(line.to_string()));
-                Ok(())
-            },
-            "streaming OCI runtime turn",
-        )
-        .await
+        execute_oci_process(request, Some(stdout), "streaming OCI runtime turn").await
     }
 
     async fn execute_captured(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
-        execute_oci_process(request, |_| Ok(()), "captured OCI runtime command").await
+        execute_oci_process(request, None, "captured OCI runtime command").await
     }
 
     async fn spawn_interactive(&self, request: ExecutionRequest) -> Result<ExecutionSession> {
@@ -157,14 +149,11 @@ impl ExecutionBackend for OciExecutionBackend {
     }
 }
 
-async fn execute_oci_process<F>(
+async fn execute_oci_process(
     request: ExecutionRequest,
-    on_stdout_line: F,
+    stdout: Option<ExecutionStdoutSender>,
     cleanup_context: &'static str,
-) -> Result<ExecutionOutput>
-where
-    F: FnMut(&str) -> Result<()> + Send,
-{
+) -> Result<ExecutionOutput> {
     let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
     let runtime_auth_environment = prepare_runtime_auth(&request).await?;
     let prepared = prepare_oci_process_launch(
@@ -174,7 +163,7 @@ where
             .map(|secrets| secrets.secret_name.as_str()),
     )?;
     let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
-    let result = run_process_streaming(&invocation, on_stdout_line).await;
+    let result = run_process_streaming(&invocation, stdout.as_ref()).await;
     let runtime_secrets_cleanup_result = match runtime_secrets {
         Some(cleanup) => cleanup.shutdown().await,
         None => Ok(()),
@@ -489,12 +478,7 @@ async fn run_oci_preflight_command(
     action: &str,
     timeout_duration: Duration,
 ) -> Result<super::process::ProcessOutput> {
-    match timeout(
-        timeout_duration,
-        run_process_streaming(invocation, |_| Ok(())),
-    )
-    .await
-    {
+    match timeout(timeout_duration, run_process_streaming(invocation, None)).await {
         Ok(result) => result.with_context(|| {
             format!(
                 "failed to {} using OCI engine '{}'",
@@ -616,7 +600,7 @@ async fn ensure_runtime_secrets_registered(
     validate_oci_resource_name(&secret_name)?;
     let output = run_process_streaming(
         &build_runtime_secret_create_invocation(&engine, mount, &secret_name)?,
-        |_| Ok(()),
+        None,
     )
     .await
     .with_context(|| {
@@ -984,7 +968,6 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
-    use std::time::Duration;
 
     use super::{
         build_oci_attached_process_invocation, build_oci_process_invocation,
@@ -1710,7 +1693,7 @@ esac
         )
         .expect("write runtime secrets");
 
-        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel();
+        let (stdout_tx, _stdout_rx) = mpsc::channel(8);
         OciExecutionBackend
             .execute_streaming(request.clone(), stdout_tx)
             .await
@@ -1805,7 +1788,7 @@ esac
         )
         .expect("write runtime secrets");
 
-        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel();
+        let (stdout_tx, _stdout_rx) = mpsc::channel(8);
         OciExecutionBackend
             .execute_streaming(request, stdout_tx)
             .await
@@ -1842,7 +1825,6 @@ esac
             working_dir: Some("/host/workspace/src".to_string()),
             environment: vec![("FOO".to_string(), "from-plan".to_string())],
             mcp_servers: Vec::new(),
-            hard_timeout: Duration::from_secs(90),
             mounts: vec![
                 MountSpec {
                     source: "/host/workspace".into(),

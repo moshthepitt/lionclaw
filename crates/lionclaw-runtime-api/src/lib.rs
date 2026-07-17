@@ -42,10 +42,10 @@ mod registry;
 mod state;
 
 pub use adapter::{
-    HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeControlExecution,
-    RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeProgramTurnExecution,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTurnInput,
-    RuntimeTurnMode,
+    HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCancellation,
+    RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
+    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
+    RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnMode,
 };
 pub use auth::{
     RuntimeAuthContext, RuntimeAuthKind, RuntimeAuthPreparation, RuntimeAuthProvider,
@@ -60,13 +60,19 @@ pub use context::{
 };
 pub use driver::{RuntimeDriverConfig, RuntimeDriverProvider, RuntimeTerminalConfig};
 pub use event::{
-    append_streamed_text_boundary, append_streamed_text_delta, canonical_events, RawTurnPayload,
-    RuntimeArtifact, RuntimeEvent, RuntimeEventSender, RuntimeFileChange, RuntimeFileChangeStatus,
-    RuntimeMessageLane, RuntimeTurnJournalSender, TurnEvent,
+    append_streamed_text_boundary, append_streamed_text_delta, canonical_events,
+    observe_final_response, RuntimeArtifact, RuntimeEvent, RuntimeEventSender, RuntimeFileChange,
+    RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeTurnJournalSender, TurnEvent,
+    RUNTIME_TURN_JOURNAL_CAPACITY,
+};
+pub use lionclaw_model::{
+    bounded_failure_text as bounded_text, AppliedRuntimeConfiguration,
+    RuntimeConfigurationConfirmation, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT,
 };
 pub use program::{
     ExecutionOutput, NetworkMode, RuntimeProgramExecutor, RuntimeProgramSession,
-    RuntimeProgramSpec, RuntimeProgramStdoutSender,
+    RuntimeProgramSpec, RuntimeProgramStdoutLine, RuntimeProgramStdoutLineError,
+    RuntimeProgramStdoutSender, RUNTIME_PROGRAM_STDOUT_LINE_LIMIT,
 };
 pub use program_backed::{execute_program_backed_turn, RuntimeProgramOutputParser};
 pub use registry::RuntimeRegistry;

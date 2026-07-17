@@ -7,17 +7,17 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use lionclaw_runtime_api::{
-    ExecutionOutput, RawTurnPayload, RuntimeEvent, RuntimeMcpServerSpec, RuntimeProgramSession,
-    RuntimeTurnJournalSender, TurnEvent,
+    AppliedRuntimeConfiguration, ExecutionOutput, RuntimeEvent, RuntimeMcpServerSpec,
+    RuntimeProgramSession, RuntimeTurnJournalSender, TurnEvent, TypedFailure,
 };
 
-use crate::driver::{AcpRuntimeConfig, ACP_PROTOCOL_NAME};
+use crate::driver::AcpRuntimeConfig;
 use crate::event_mapping::acp_turn_events;
 use crate::policy::{acp_error_response, acp_permission_denial};
 use crate::program::acp_mcp_servers;
 use crate::protocol::{
     acp_is_server_request, acp_response_id, parse_acp_response, AcpMessage, AcpOpenedSession,
-    AcpResponse, AcpSessionCapabilities,
+    AcpResponse, AcpSelectionSet, AcpSessionCapabilities, AcpSessionSelections,
 };
 use crate::state::{
     forget_acp_session_id, normalize_acp_session_id, remember_acp_session_id, AcpCancelRequest,
@@ -27,6 +27,7 @@ use crate::state::{
 pub(crate) struct AcpClient {
     session: Option<Box<dyn RuntimeProgramSession>>,
     next_id: u64,
+    final_response: String,
 }
 
 struct AcpCancelWait<'a> {
@@ -49,6 +50,7 @@ impl AcpClient {
         Self {
             session: Some(session),
             next_id: 1,
+            final_response: String::new(),
         }
     }
 
@@ -81,19 +83,21 @@ impl AcpClient {
         let mcp_servers = acp_mcp_servers(input.mcp_servers);
         if let Some(session_id) = input.session_state.session_id.as_deref() {
             if let Some(reopen_method) = input.session_capabilities.reopen_method() {
-                self.request(
-                    reopen_method,
-                    json!({
-                        "sessionId": session_id,
-                        "cwd": input.working_dir,
-                        "mcpServers": mcp_servers.clone(),
-                    }),
-                    None,
-                )
-                .await?;
+                let response = self
+                    .request(
+                        reopen_method,
+                        json!({
+                            "sessionId": session_id,
+                            "cwd": input.working_dir,
+                            "mcpServers": mcp_servers.clone(),
+                        }),
+                        None,
+                    )
+                    .await?;
                 return Ok(AcpOpenedSession {
                     session_id: session_id.to_string(),
                     resumed_existing: true,
+                    selections: AcpSessionSelections::from_session_result(&response.result),
                 });
             } else {
                 forget_acp_session_id(input.config, input.sessions, input.runtime_session_id)?;
@@ -130,6 +134,7 @@ impl AcpClient {
         Ok(AcpOpenedSession {
             session_id,
             resumed_existing: false,
+            selections: AcpSessionSelections::from_session_result(&response.result),
         })
     }
 
@@ -137,34 +142,119 @@ impl AcpClient {
         &mut self,
         config: &AcpRuntimeConfig,
         session_id: &str,
-    ) -> Result<()> {
+        selections: &AcpSessionSelections,
+    ) -> Result<AppliedRuntimeConfiguration> {
+        let mut applied = AppliedRuntimeConfiguration {
+            requested_model: config.model.clone(),
+            requested_mode: config.mode.clone(),
+            ..Default::default()
+        };
         if let Some(model) = config.model.as_deref() {
-            self.request(
-                "session/set_config_option",
-                json!({
-                    "sessionId": session_id,
-                    "configId": "model",
-                    "value": model,
-                }),
-                None,
-            )
-            .await?;
+            let (selected, confirmation) = self
+                .apply_selection(
+                    session_id,
+                    "model",
+                    model,
+                    selections.models.as_ref(),
+                    selections,
+                )
+                .await?;
+            applied.applied_model = Some(selected);
+            applied.model_confirmation = Some(confirmation);
         }
 
         if let Some(mode) = config.mode.as_deref() {
+            let (selected, confirmation) = self
+                .apply_selection(
+                    session_id,
+                    "mode",
+                    mode,
+                    selections.modes.as_ref(),
+                    selections,
+                )
+                .await?;
+            applied.applied_mode = Some(selected);
+            applied.mode_confirmation = Some(confirmation);
+        }
+
+        Ok(applied)
+    }
+
+    async fn apply_selection(
+        &mut self,
+        session_id: &str,
+        kind: &str,
+        requested: &str,
+        first_class: Option<&AcpSelectionSet>,
+        selections: &AcpSessionSelections,
+    ) -> Result<(
+        String,
+        lionclaw_runtime_api::RuntimeConfigurationConfirmation,
+    )> {
+        if let Some(first_class) = first_class {
+            let matches = first_class
+                .values
+                .iter()
+                .filter(|value| value.id == requested || value.name.as_deref() == Some(requested))
+                .collect::<Vec<_>>();
+            let selected = match matches.as_slice() {
+                [selected] => selected.id.clone(),
+                [] => {
+                    return Err(anyhow!(
+                        "ACP runtime does not advertise requested {kind} '{requested}'"
+                    ))
+                }
+                _ => return Err(anyhow!("ACP requested {kind} '{requested}' is ambiguous")),
+            };
+            let (method, id_key) = match kind {
+                "model" => ("session/set_model", "modelId"),
+                "mode" => ("session/set_mode", "modeId"),
+                _ => return Err(anyhow!("unsupported ACP selection kind '{kind}'")),
+            };
             self.request(
-                "session/set_config_option",
-                json!({
-                    "sessionId": session_id,
-                    "configId": "mode",
-                    "value": mode,
-                }),
+                method,
+                json!({"sessionId": session_id, (id_key): selected}),
                 None,
             )
             .await?;
+            return Ok((
+                selected,
+                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged,
+            ));
         }
 
-        Ok(())
+        let option = selections
+            .config_options
+            .iter()
+            .find(|option| option.id == kind)
+            .ok_or_else(|| anyhow!("ACP runtime cannot apply requested {kind} '{requested}'"))?;
+        if !option.values.is_empty() && !option.values.iter().any(|value| value == requested) {
+            return Err(anyhow!(
+                "ACP runtime does not advertise requested {kind} '{requested}'"
+            ));
+        }
+        let response = self
+            .request(
+                "session/set_config_option",
+                json!({"sessionId": session_id, "configId": kind, "value": requested}),
+                None,
+            )
+            .await?;
+        let observed = AcpSessionSelections::from_session_result(&response.result)
+            .config_options
+            .into_iter()
+            .find(|candidate| candidate.id == kind)
+            .and_then(|candidate| candidate.current)
+            .ok_or_else(|| anyhow!("ACP runtime did not confirm applied {kind} '{requested}'"))?;
+        if observed != requested {
+            return Err(anyhow!(
+                "ACP runtime applied {kind} '{observed}' instead of requested '{requested}'"
+            ));
+        }
+        Ok((
+            observed,
+            lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+        ))
     }
 
     pub(crate) async fn prompt(
@@ -173,30 +263,24 @@ impl AcpClient {
         prompt: &str,
         journal: &RuntimeTurnJournalSender,
         cancel_rx: &mut mpsc::UnboundedReceiver<AcpCancelRequest>,
-    ) -> Result<()> {
-        let response = self
-            .request_with_cancel(
-                "session/prompt",
-                json!({
-                    "sessionId": session_id,
-                    "prompt": [{
-                        "type": "text",
-                        "text": prompt,
-                    }],
-                }),
-                Some(journal),
-                session_id,
-                cancel_rx,
-            )
-            .await?;
-        drop(journal.send(TurnEvent::with_raw(
-            RuntimeEvent::Done,
-            RawTurnPayload {
-                driver: ACP_PROTOCOL_NAME.to_string(),
-                payload: response.raw,
-            },
-        )));
-        Ok(())
+    ) -> Result<String> {
+        self.final_response.clear();
+        self.request_with_cancel(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{
+                    "type": "text",
+                    "text": prompt,
+                }],
+            }),
+            Some(journal),
+            session_id,
+            cancel_rx,
+        )
+        .await?;
+        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)).await);
+        Ok(self.take_final_response())
     }
 
     async fn request_with_cancel(
@@ -318,10 +402,20 @@ impl AcpClient {
 
         if let Some(journal) = journal {
             for record in acp_turn_events(&message) {
-                drop(journal.send(record));
+                lionclaw_runtime_api::observe_final_response(
+                    &mut self.final_response,
+                    record.event(),
+                );
+                drop(journal.send(record).await);
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn take_final_response(&mut self) -> String {
+        std::mem::take(&mut self.final_response)
+            .trim_end()
+            .to_string()
     }
 
     async fn respond_to_server_request(&mut self, request: &Value) -> Result<()> {
@@ -384,10 +478,7 @@ impl AcpClient {
             }
             let value = serde_json::from_str(trimmed)
                 .with_context(|| format!("invalid ACP JSON-RPC line: {trimmed}"))?;
-            return Ok(Some(AcpMessage {
-                raw: trimmed.to_string(),
-                value,
-            }));
+            return Ok(Some(AcpMessage { value }));
         }
     }
 
@@ -427,14 +518,37 @@ fn ensure_acp_exit_success(output: ExecutionOutput) -> Result<()> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        return Err(anyhow!(
-            "ACP process exited with {}",
+    let detail = if stderr.is_empty() {
+        format!("ACP process exited with {}", output.status_description())
+    } else {
+        format!(
+            "ACP process exited with {}: {stderr}",
             output.status_description()
-        ));
+        )
+    };
+    let mut failure = TypedFailure::permanent("acp.process_exit", detail);
+    failure.evidence_mut().exit_code = output.exit_code;
+    failure.evidence_mut().stop_reason =
+        output.exit_signal.map(|signal| format!("signal {signal}"));
+    failure.evidence_mut().stderr = stderr;
+    Err(anyhow::Error::new(failure.projected()))
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+
+    #[test]
+    fn nonzero_exit_preserves_structured_process_evidence() {
+        let error = ensure_acp_exit_success(ExecutionOutput {
+            stderr: b"fatal protocol error".to_vec(),
+            exit_code: Some(17),
+            ..Default::default()
+        })
+        .expect_err("nonzero exit must fail");
+        let failure = error.downcast_ref::<TypedFailure>().expect("typed failure");
+        assert!(matches!(failure, TypedFailure::PermanentRuntime { .. }));
+        assert_eq!(failure.evidence().exit_code, Some(17));
+        assert_eq!(failure.evidence().stderr, "fatal protocol error");
     }
-    Err(anyhow!(
-        "ACP process exited with {}: {stderr}",
-        output.status_description()
-    ))
 }

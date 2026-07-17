@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, OracleName, RequirementId, RoleName, TaskId};
+use crate::prelude::*;
 
 /// What part of the objective a requirement captures. This is descriptive
 /// contract structure for people and planning roles; enforcement remains in
@@ -80,6 +81,16 @@ impl OutputSemantics {
             Self::ProducesReport | Self::EmitsGapVerdict | Self::ProposesPlan => None,
         }
     }
+}
+
+/// Resolved mission-type names that a plan may bind. Persisted with mission
+/// policy so live ingress and replay enforce the same closed world without
+/// reopening bundle files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanInventory {
+    pub roles: BTreeMap<RoleName, OutputSemantics>,
+    pub oracles: BTreeSet<OracleName>,
 }
 
 /// One falsifiable claim in the mission contract. `oracle` binds it to a
@@ -172,6 +183,10 @@ pub struct PlanProposal {
 pub struct PlanningTask {
     pub id: TaskId,
     pub role: RoleName,
+    /// Resolved from the pinned mission type when the mission is created.
+    /// Persisted so the pure fold can enforce the exact role contract without
+    /// loading mission-type files during replay.
+    pub output: OutputSemantics,
     #[serde(default)]
     pub body: String,
     #[serde(default)]

@@ -77,7 +77,40 @@ pub trait RuntimeProgramSession: Send {
     async fn shutdown(self: Box<Self>) -> Result<ExecutionOutput>;
 }
 
-pub type RuntimeProgramStdoutSender = mpsc::UnboundedSender<String>;
+/// Maximum bytes in one newline-delimited program-backed runtime record.
+/// Together with the fixed channel capacity this gives raw transport a hard
+/// memory ceiling before adapter parsing and canonical event projection.
+pub const RUNTIME_PROGRAM_STDOUT_LINE_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("runtime program stdout record is {actual_bytes} bytes; limit is {limit_bytes}")]
+pub struct RuntimeProgramStdoutLineError {
+    pub actual_bytes: usize,
+    pub limit_bytes: usize,
+}
+
+/// One checked newline-delimited record from a program-backed runtime.
+/// The text is private so every sender must pass the byte boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeProgramStdoutLine(String);
+
+impl RuntimeProgramStdoutLine {
+    pub fn new(line: String) -> Result<Self, RuntimeProgramStdoutLineError> {
+        if line.len() > RUNTIME_PROGRAM_STDOUT_LINE_LIMIT {
+            return Err(RuntimeProgramStdoutLineError {
+                actual_bytes: line.len(),
+                limit_bytes: RUNTIME_PROGRAM_STDOUT_LINE_LIMIT,
+            });
+        }
+        Ok(Self(line))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub type RuntimeProgramStdoutSender = mpsc::Sender<RuntimeProgramStdoutLine>;
 
 #[async_trait]
 pub trait RuntimeProgramExecutor: Send {

@@ -8,11 +8,12 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use lionclaw_runtime_api::TypedFailure;
 
-use crate::model::{ArtifactOutcome, Gap, Handoff, PayloadRef, TaskId};
+use crate::model::{Gap, Handoff, PayloadRef, TaskId};
 use crate::ports::{
-    Clock, EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, OracleFailure, OracleOutcome,
-    OracleRunRequest, OracleRunner, RoleRunFailure, RoleRunOutcome, RoleRunRequest, RoleRunner,
+    CapturedArtifact, Clock, EffectCleaner, EffectCleanupFailure, EffectCleanupRequest,
+    OracleOutcome, OracleRunRequest, OracleRunner, RoleRunOutcome, RoleRunRequest, RoleRunner,
 };
 
 #[derive(Default)]
@@ -39,8 +40,50 @@ pub fn review_verdict(request: &RoleRunRequest, passed: bool, gaps: Vec<Gap>) ->
                 .to_string(),
         },
         artifact: None,
-        model_id: Some("mock-model".to_string()),
+        runtime_configuration: crate::model::RuntimeConfigurationEvidence {
+            requested_model: Some("mock-model".to_string()),
+            applied_model: Some("mock-model".to_string()),
+            ..Default::default()
+        },
+        final_response: "requirement map + observations".to_string(),
     }
+}
+
+/// Materialize and capture a deterministic artifact through the exact
+/// authority issued with a test role request.
+pub async fn capture_test_artifact(
+    request: &RoleRunRequest,
+    head_sha: &str,
+) -> Result<CapturedArtifact, TypedFailure> {
+    let capture = request.artifact_capture.as_ref().ok_or_else(|| {
+        TypedFailure::permanent(
+            "testing.capture_authority",
+            "artifact-producing test request has no capture authority",
+        )
+    })?;
+    capture
+        .prepare_for_testing(request.recreate_workspace)
+        .await
+        .map_err(|error| TypedFailure::permanent("testing.workspace", error.to_string()))?;
+    request
+        .updates
+        .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
+            base_sha: request.base_sha.clone(),
+            assignment_epoch: request.assignment_epoch,
+        })
+        .await
+        .map_err(|_| {
+            TypedFailure::permanent(
+                "testing.workspace_update",
+                "engine role update receiver closed",
+            )
+        })?;
+    if head_sha == request.base_sha {
+        capture.capture().await
+    } else {
+        capture.capture_test_commit(head_sha).await
+    }
+    .map_err(|error| TypedFailure::permanent("testing.capture", error.to_string()))
 }
 
 /// Deterministic monotonic clock — proves nothing depends on real time.
@@ -56,7 +99,7 @@ impl Clock for MockClock {
 }
 
 type RoleScript =
-    Box<dyn Fn(&RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> + Send + Sync>;
+    Box<dyn Fn(&RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> + Send + Sync>;
 
 pub struct MockRoleRunner {
     script: RoleScript,
@@ -83,11 +126,16 @@ impl MockRoleRunner {
                     report: PayloadRef::inline("did the work"),
                     request_attention: false,
                 },
-                artifact: Some(ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha: head_sha.clone(),
-                }),
-                model_id: Some("mock-model".to_string()),
+                artifact: Some(CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    head_sha.clone(),
+                )),
+                runtime_configuration: crate::model::RuntimeConfigurationEvidence {
+                    requested_model: Some("mock-model".to_string()),
+                    applied_model: Some("mock-model".to_string()),
+                    ..Default::default()
+                },
+                final_response: "did the work".to_string(),
             })
         }))
     }
@@ -105,7 +153,7 @@ impl MockRoleRunner {
 
 #[async_trait]
 impl RoleRunner for MockRoleRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         self.calls.lock().expect("lock").push((
             request.task_id.clone(),
             request.attempt_no,
@@ -117,12 +165,30 @@ impl RoleRunner for MockRoleRunner {
             .expect("lock")
             .entry(request.effect_id.to_string())
             .or_insert(0) += 1;
-        (self.script)(&request)
+        let mut outcome = (self.script)(&request)?;
+        if let Some(test_request) = outcome
+            .artifact
+            .as_ref()
+            .and_then(CapturedArtifact::test_request)
+            .cloned()
+        {
+            if test_request.base_sha != request.base_sha {
+                return Err(TypedFailure::invalid(
+                    "testing.artifact_base",
+                    "test artifact request names a different assignment base",
+                ));
+            }
+            if request.artifact_capture.is_some() {
+                outcome.artifact =
+                    Some(capture_test_artifact(&request, &test_request.head_sha).await?);
+            }
+        }
+        Ok(outcome)
     }
 }
 
 type OracleScript =
-    Box<dyn Fn(&OracleRunRequest) -> Result<OracleOutcome, OracleFailure> + Send + Sync>;
+    Box<dyn Fn(&OracleRunRequest) -> Result<OracleOutcome, TypedFailure> + Send + Sync>;
 
 pub struct MockOracleRunner {
     script: OracleScript,
@@ -154,7 +220,7 @@ impl MockOracleRunner {
 
 #[async_trait]
 impl OracleRunner for MockOracleRunner {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure> {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
         self.calls
             .lock()
             .expect("lock")

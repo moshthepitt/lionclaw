@@ -3,8 +3,10 @@
 
 mod common;
 
-use common::{default_config, effect_id, harness, BASE_SHA, HEAD_SHA};
-use lionclaw::model::{MissionEvent, PayloadRef, RoleName, TaskId};
+use common::{
+    approve_plan, fault_append_events, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA,
+};
+use lionclaw::model::{MissionEvent, OutputSemantics, PayloadRef, RoleName, TaskId};
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
@@ -19,34 +21,50 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA)
         .await
         .expect("create");
-    let id = effect_id("unfinished");
-    let state = h.engine.load_state(&mission_id).await.expect("state");
     h.engine
-        .store()
-        .append(
-            &mission_id,
-            state.head,
-            &[NewEvent::new(MissionEvent::RoleRunRequested {
-                task_id: TaskId::new("fix").unwrap(),
-                attempt_no: 1,
-                effect_id: id.clone(),
-                role: RoleName::new("implementer").unwrap(),
-                runtime: "codex".to_string(),
-                prompt: PayloadRef::inline("prompt"),
-                base_sha: BASE_SHA.to_string(),
-            })],
-            1,
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
-        .expect("append request");
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+    let prompt_hash = "cf07194ee232eb531e15f690000d19846dea69cf05504782658afcfacb9228a2";
+    let task_id = TaskId::new("fix").unwrap();
+    let id = lionclaw::model::EffectId::for_role_request(
+        lionclaw::model::TaskNamespace::Execution,
+        &mission_id,
+        &task_id,
+        1,
+        1,
+        prompt_hash,
+    );
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        state.head,
+        &[NewEvent::new(MissionEvent::RoleRunRequested {
+            namespace: lionclaw::model::TaskNamespace::Execution,
+            task_id,
+            attempt_no: 1,
+            effect_id: id.clone(),
+            role: RoleName::new("implementer").unwrap(),
+            output: OutputSemantics::ProducesArtifact,
+            runtime: "codex".to_string(),
+            prompt: PayloadRef::inline("prompt"),
+            base_sha: BASE_SHA.to_string(),
+            assignment_epoch: 1,
+            recreate_workspace: true,
+            requested_at_ms: 0,
+            not_before_ms: 0,
+            deadline_ms: 100_000,
+            budget_deadline_ms: 100_000,
+        })
+        .with_prompt_hash(prompt_hash)],
+        1,
+    )
+    .await;
 
     let before = h.engine.load_state(&mission_id).await.expect("state");
     assert!(before.inflight.contains_key(&id));
@@ -84,12 +102,7 @@ async fn an_old_event_schema_is_refused_instead_of_accepted_by_accident() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().expect("utf8"),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA)
         .await
         .expect("create");
     let state = h.engine.load_state(&mission_id).await.expect("state");
@@ -97,11 +110,7 @@ async fn an_old_event_schema_is_refused_instead_of_accepted_by_accident() {
         reason: "old writer".to_string(),
     });
     old.stamps.schema_version = lionclaw::model::SCHEMA_VERSION - 1;
-    h.engine
-        .store()
-        .append(&mission_id, state.head, &[old], 2)
-        .await
-        .expect("store accepts opaque event bytes");
+    fault_append_events(dir.path(), &mission_id, state.head, &[old], 2).await;
 
     let error = h
         .engine

@@ -3,25 +3,287 @@
 //! Every role and oracle gets the same self-contained checkout at its exact
 //! base commit. The authority compiler decides whether that checkout is mounted
 //! read-write or read-only; workspace materialization has no role policy of its
-//! own. `--no-hardlinks --dissociate` keeps confined Git objects independent
-//! from the user repository and any object store it borrows from, including
-//! under OCI relabeling. Artifact-producing output is a recorded commit fetched
-//! back under `refs/mission/…`, never auto-applied.
+//! own. `--no-local` uses Git's normal transport instead of copying or linking
+//! the source object store, keeping confined objects independent and packed.
+//! Artifact-producing output is a recorded commit fetched back under
+//! `refs/mission/…`, never auto-applied.
 
-use std::path::Path;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use rustix::fs::{open, Mode, OFlags};
+use rustix::io::Errno;
 
 use crate::model::EffectId;
 use tokio::process::Command;
 
+/// Proof that LionClaw observed and fetched one clean worker HEAD for one exact
+/// effect. The durable event payload and binding are intentionally hidden.
+///
+/// ```compile_fail
+/// use lionclaw::model::ArtifactOutcome;
+/// use lionclaw::ports::CapturedArtifact;
+/// let _ = CapturedArtifact(ArtifactOutcome {
+///     base_sha: "base".into(),
+///     head_sha: "claimed".into(),
+/// });
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedArtifact(CapturedArtifactInner);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapturedArtifactInner {
+    Verified {
+        mission_id: crate::model::MissionId,
+        effect_id: EffectId,
+        outcome: crate::model::ArtifactOutcome,
+    },
+    #[cfg(any(test, feature = "testing"))]
+    TestRequest(crate::model::ArtifactOutcome),
+}
+
+impl CapturedArtifact {
+    fn verified(
+        mission_id: crate::model::MissionId,
+        effect_id: EffectId,
+        base_sha: String,
+        head_sha: String,
+    ) -> Self {
+        Self(CapturedArtifactInner::Verified {
+            mission_id,
+            effect_id,
+            outcome: crate::model::ArtifactOutcome { base_sha, head_sha },
+        })
+    }
+
+    pub fn base_sha(&self) -> &str {
+        &self.outcome().base_sha
+    }
+
+    pub fn head_sha(&self) -> &str {
+        &self.outcome().head_sha
+    }
+
+    fn outcome(&self) -> &crate::model::ArtifactOutcome {
+        match &self.0 {
+            CapturedArtifactInner::Verified { outcome, .. } => outcome,
+            #[cfg(any(test, feature = "testing"))]
+            CapturedArtifactInner::TestRequest(outcome) => outcome,
+        }
+    }
+
+    pub(crate) fn validate_binding(
+        &self,
+        mission_id: &crate::model::MissionId,
+        effect_id: &EffectId,
+        base_sha: &str,
+    ) -> Result<(), String> {
+        match &self.0 {
+            CapturedArtifactInner::Verified {
+                mission_id: captured_mission,
+                effect_id: captured_effect,
+                outcome,
+            } if captured_mission == mission_id
+                && captured_effect == effect_id
+                && outcome.base_sha == base_sha =>
+            {
+                Ok(())
+            }
+            CapturedArtifactInner::Verified { .. } => {
+                Err("captured artifact belongs to a different effect request".to_string())
+            }
+            #[cfg(any(test, feature = "testing"))]
+            CapturedArtifactInner::TestRequest(_) => {
+                Err("unverified testing artifact reached engine settlement".to_string())
+            }
+        }
+    }
+
+    pub(crate) fn as_outcome(&self) -> &crate::model::ArtifactOutcome {
+        self.outcome()
+    }
+
+    pub(crate) fn into_outcome(self) -> crate::model::ArtifactOutcome {
+        match self.0 {
+            CapturedArtifactInner::Verified { outcome, .. } => outcome,
+            #[cfg(any(test, feature = "testing"))]
+            CapturedArtifactInner::TestRequest(_) => {
+                unreachable!("testing requests are rejected before conversion")
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_testing(base_sha: impl Into<String>, head_sha: impl Into<String>) -> Self {
+        Self(CapturedArtifactInner::TestRequest(
+            crate::model::ArtifactOutcome {
+                base_sha: base_sha.into(),
+                head_sha: head_sha.into(),
+            },
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn test_request(&self) -> Option<&crate::model::ArtifactOutcome> {
+        match &self.0 {
+            CapturedArtifactInner::TestRequest(outcome) => Some(outcome),
+            CapturedArtifactInner::Verified { .. } => None,
+        }
+    }
+}
+
+/// Engine-issued authority to capture one exact task checkout into one exact
+/// mission effect. A runner may change the checkout, but cannot redirect the
+/// target repository, base, mission, or effect identity.
+#[derive(Debug, Clone)]
+pub struct ArtifactCapture {
+    repo: PathBuf,
+    checkout: PathBuf,
+    required_base: String,
+    mission_id: crate::model::MissionId,
+    effect_id: EffectId,
+}
+
+impl ArtifactCapture {
+    pub(crate) fn new(
+        repo: PathBuf,
+        checkout: PathBuf,
+        required_base: String,
+        mission_id: crate::model::MissionId,
+        effect_id: EffectId,
+    ) -> Self {
+        Self {
+            repo,
+            checkout,
+            required_base,
+            mission_id,
+            effect_id,
+        }
+    }
+
+    pub fn checkout_dir(&self) -> &Path {
+        &self.checkout
+    }
+
+    pub async fn capture(&self) -> Result<CapturedArtifact, CaptureError> {
+        capture_worker_result(
+            &self.repo,
+            &self.checkout,
+            &self.required_base,
+            &self.mission_id,
+            &self.effect_id,
+        )
+        .await
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub async fn prepare_for_testing(&self, recreate: bool) -> Result<()> {
+        if recreate || !self.checkout.is_dir() {
+            replace_checkout(&self.repo, &self.checkout, &self.required_base).await?;
+        } else {
+            let head = head_sha(&self.checkout).await?;
+            if !is_ancestor(&self.checkout, &self.required_base, &head).await? {
+                bail!(
+                    "retained test checkout HEAD {head} diverges from required base {}",
+                    self.required_base
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub async fn capture_test_commit(
+        &self,
+        _label: &str,
+    ) -> Result<CapturedArtifact, CaptureError> {
+        let current = head_sha(&self.checkout)
+            .await
+            .map_err(CaptureError::Infra)?;
+        if current != self.required_base {
+            return self.capture().await;
+        }
+        git(&self.checkout, &["add", "-A"])
+            .await
+            .map_err(CaptureError::Infra)?;
+        let mut commit = managed_git_command();
+        commit
+            .current_dir(&self.checkout)
+            .env("GIT_AUTHOR_DATE", "2000-01-02T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2000-01-02T00:00:00Z")
+            .args(["commit", "--quiet", "--allow-empty", "-m"])
+            .arg("LionClaw test artifact");
+        run(&mut commit, "creating test artifact commit")
+            .await
+            .map_err(CaptureError::Infra)?;
+        self.capture().await
+    }
+}
+
 pub async fn head_sha(repo: &Path) -> Result<String> {
-    let out = git(repo, &["rev-parse", "HEAD"]).await?;
+    let out = resolve_managed_commit(repo, "HEAD").await?;
     Ok(out.trim().to_string())
 }
 
 pub async fn commit_exists(repo: &Path, sha: &str) -> bool {
-    resolve_commit(repo, sha).await.is_ok()
+    resolve_managed_commit(repo, sha).await.is_ok()
+}
+
+pub async fn task_is_dirty(repo: &Path) -> Result<bool> {
+    Ok(!observed_task_git(repo, &["status", "--porcelain"])
+        .await?
+        .trim()
+        .is_empty())
+}
+
+pub async fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let status = managed_git_command()
+        .current_dir(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .status()
+        .await
+        .context("failed to spawn git merge-base --is-ancestor")?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git merge-base --is-ancestor failed in '{}'",
+            repo.display()
+        ),
+    }
+}
+
+pub async fn task_head_sha(repo: &Path) -> Result<String> {
+    let out = observed_task_git(repo, &["rev-parse", "HEAD"]).await?;
+    Ok(out.trim().to_string())
+}
+
+pub async fn task_commit_exists(repo: &Path, sha: &str) -> bool {
+    let peeled = format!("{sha}^{{commit}}");
+    observed_task_git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &peeled,
+        ],
+    )
+    .await
+    .is_ok()
+}
+
+pub async fn task_is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let observer = TaskGitObserver::open(repo).await?;
+    observer.is_ancestor(ancestor, descendant).await
 }
 
 /// Keep mission state out of the user's `git status` without touching tracked
@@ -67,16 +329,15 @@ pub async fn create_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()> 
             .context("failed to clear stale checkout")?;
     }
     tokio::fs::create_dir_all(dest.parent().context("checkout dest has no parent")?).await?;
-    let expected = resolve_commit(repo, sha)
+    let expected = resolve_managed_commit(repo, sha)
         .await
         .with_context(|| format!("resolving checkout commit '{sha}'"))?;
     let expected = expected.trim();
-    let mut clone = Command::new("git");
+    let mut clone = managed_git_command();
     clone.args([
         "clone",
         "--quiet",
-        "--no-hardlinks",
-        "--dissociate",
+        "--no-local",
         "--no-checkout",
         "-c",
         "core.untrackedCache=false",
@@ -92,8 +353,23 @@ pub async fn create_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()> 
     ]);
     clone.arg(repo).arg(dest);
     run(&mut clone, "git clone").await?;
+    // Normal clone refspecs do not retain LionClaw's private refs/mission/*
+    // namespace. Fetch the already-resolved object explicitly so a captured
+    // candidate remains materializable without copying the whole source object
+    // store.
+    git(
+        dest,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            "origin",
+            expected,
+        ],
+    )
+    .await?;
     git(dest, &["checkout", "--quiet", "--detach", expected]).await?;
-    let actual = head_sha(dest).await?;
+    let actual = task_head_sha(dest).await?;
     if actual != expected {
         bail!("checkout HEAD {actual} does not match requested commit {expected}");
     }
@@ -104,13 +380,132 @@ pub async fn create_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()> 
     Ok(())
 }
 
-/// Why post-run artifact capture failed. Distinguishes the one agent-behavior
-/// case (an uncommitted tree) from everything else (Git infrastructure),
-/// so the runner labels the persisted failure correctly.
+/// Materialize a checkout completely before replacing a task's durable clone.
+/// The two fixed siblings also make an interrupted swap recoverable on the
+/// next invocation without storing another authority-bearing state machine.
+pub async fn replace_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()> {
+    let parent = dest.parent().context("checkout dest has no parent")?;
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("checkout dest has no UTF-8 file name")?;
+    let staging = parent.join(format!(".{name}.prepare"));
+    let previous = parent.join(format!(".{name}.previous"));
+
+    if !dest.exists() && previous.exists() {
+        std::fs::rename(&previous, dest).context("restoring interrupted task checkout swap")?;
+    } else if dest.exists() {
+        remove_dir(&previous).await?;
+    }
+    remove_dir(&staging).await?;
+    create_checkout(repo, &staging, sha).await?;
+
+    if dest.exists() {
+        std::fs::rename(dest, &previous).context("preserving previous task checkout")?;
+    }
+    if let Err(error) = std::fs::rename(&staging, dest) {
+        if previous.exists() && !dest.exists() {
+            let _ = std::fs::rename(&previous, dest);
+        }
+        return Err(error).context("publishing replacement task checkout");
+    }
+    remove_dir(&previous).await?;
+    Ok(())
+}
+
+/// Materialize the immutable index used by live workspace observation. The
+/// index lives beside the task checkout, outside the runtime mount, and is
+/// built from the trusted target repository rather than worker Git metadata.
+pub async fn prepare_task_observer_index(
+    repo: &Path,
+    index: &Path,
+    base_sha: &str,
+    reset: bool,
+) -> Result<()> {
+    match std::fs::symlink_metadata(index) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            if !reset {
+                return Ok(());
+            }
+        }
+        Ok(_) => bail!(
+            "task observer index '{}' is not a regular file",
+            index.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading task observer index '{}'", index.display()))
+        }
+    }
+    std::fs::create_dir_all(index.parent().context("observer index has no parent")?)?;
+    let sequence = OBSERVER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = index.with_extension(format!("prepare-{}-{sequence}", std::process::id()));
+    let mut command = managed_git_command();
+    command
+        .current_dir(repo)
+        .env("GIT_INDEX_FILE", &temporary)
+        .args(["read-tree", "--reset", base_sha]);
+    let result = async {
+        run(&mut command, "git read-tree for task observer").await?;
+        let metadata = std::fs::symlink_metadata(&temporary)
+            .context("Git did not create the task observer index")?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            bail!("Git created an invalid task observer index");
+        }
+        std::fs::rename(&temporary, index).context("publishing task observer index")?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Observe a live task worktree relative to its assignment base without
+/// opening any worker-controlled `.git` path.
+pub async fn observe_task_workspace(
+    repo: &Path,
+    worktree: &Path,
+    index: &Path,
+    base_sha: &str,
+) -> Result<String> {
+    let observer = TaskGitObserver::from_engine_baseline(repo, worktree, index, base_sha).await?;
+    let diff = observer
+        .raw_output(&["diff", "--no-ext-diff", "--no-textconv", "--stat"])
+        .await?;
+    ensure_observer_success(&diff, "read task workspace diffstat")?;
+    let status = observer.raw_output(&["status", "--short"]).await?;
+    ensure_observer_success(&status, "read task workspace status")?;
+    let mut summary = String::from_utf8_lossy(&diff.stdout).into_owned();
+    summary.push_str(&String::from_utf8_lossy(&status.stdout));
+    Ok(summary)
+}
+
+fn ensure_observer_success(
+    output: &lionclaw_runtime_api::ExecutionOutput,
+    operation: &str,
+) -> Result<()> {
+    if !output.success() {
+        bail!(
+            "{operation} failed ({}): {}",
+            output.status_description(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Why post-run artifact capture failed. Correctable dirty output, permanent
+/// history divergence, and Git infrastructure failures have different retry
+/// semantics at the runner boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("worker left uncommitted changes ({0} paths)")]
     DirtyWorktree(usize),
+    #[error("worker HEAD {head} does not descend from required base {required_base}")]
+    HistoryDiverged { required_base: String, head: String },
     #[error(transparent)]
     Infra(#[from] anyhow::Error),
 }
@@ -118,22 +513,33 @@ pub enum CaptureError {
 /// Post-run artifact capture: the tree must be committed clean; the head
 /// commit is fetched back into the target repo under `refs/mission/…` so it
 /// survives checkout teardown.
-pub async fn capture_worker_result(
+async fn capture_worker_result(
     repo: &Path,
     checkout: &Path,
-    mission_id: &str,
+    required_base: &str,
+    mission_id: &crate::model::MissionId,
     effect_id: &EffectId,
-) -> Result<String, CaptureError> {
-    let status = git(checkout, &["status", "--porcelain"]).await?;
+) -> Result<crate::ports::CapturedArtifact, CaptureError> {
+    let observer = TaskGitObserver::open(checkout).await?;
+    let status = observer.output(&["status", "--porcelain"]).await?;
     if !status.trim().is_empty() {
         return Err(CaptureError::DirtyWorktree(status.lines().count()));
     }
-    let head = head_sha(checkout).await?;
+    let head = observer.output(&["rev-parse", "HEAD"]).await?;
+    let head = head.trim().to_string();
+    if !observer.is_ancestor(required_base, &head).await? {
+        return Err(CaptureError::HistoryDiverged {
+            required_base: required_base.to_string(),
+            head,
+        });
+    }
+    let fetch_source = observer.local_fetch_source()?;
+    let fetch_url = format!("file://{}", fetch_source.display());
     // Fetch the checkout's HEAD commit so the object we report is the object we
     // store, regardless of which refs the agent created or moved locally.
     let mission_ref = format!("refs/mission/{mission_id}/{effect_id}");
     let refspec = format!("+HEAD:{mission_ref}");
-    let mut fetch = Command::new("git");
+    let mut fetch = managed_git_command();
     fetch
         .current_dir(repo)
         .args([
@@ -142,12 +548,12 @@ pub async fn capture_worker_result(
             "--no-write-fetch-head",
             "--no-auto-maintenance",
         ])
-        .arg(checkout)
+        .arg(&fetch_url)
         .arg(&refspec);
     run(&mut fetch, "git fetch from worker checkout").await?;
     // The engine observes the commit from Git, never trusts the agent: verify
     // that the exact durable ref landed at the reported head.
-    let stored = resolve_commit(repo, &mission_ref)
+    let stored = resolve_managed_commit(repo, &mission_ref)
         .await
         .map_err(CaptureError::Infra)?;
     if stored.trim() != head {
@@ -156,7 +562,12 @@ pub async fn capture_worker_result(
             stored.trim()
         )));
     }
-    Ok(head)
+    Ok(CapturedArtifact::verified(
+        mission_id.clone(),
+        effect_id.clone(),
+        required_base.to_string(),
+        head,
+    ))
 }
 
 /// Delete the captured ref for an effect whose outcome was never committed.
@@ -191,7 +602,16 @@ pub fn make_executable(path: &Path) -> std::io::Result<()> {
 /// The unified diff between two commits (`from..to`). Empty when the tree did
 /// not change (a writer that committed nothing yields `to == from`).
 pub async fn diff(repo: &Path, from: &str, to: &str) -> Result<String> {
-    git(repo, &["diff", &format!("{from}..{to}")]).await
+    git(
+        repo,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            &format!("{from}..{to}"),
+        ],
+    )
+    .await
 }
 
 /// Create a branch `name` at `sha` without touching HEAD or the worktree. With
@@ -206,7 +626,10 @@ pub async fn create_branch(repo: &Path, name: &str, sha: &str, force: bool) -> R
     git(repo, &args).await.map(|_| ())
 }
 
-async fn resolve_commit(repo: &Path, revision: &str) -> Result<String> {
+/// Resolve a ref that LionClaw itself just created in the source repository.
+/// Worker-controlled repositories use `TaskGitObserver`, whose synthetic
+/// metadata prevents Git configuration from becoming executable authority.
+async fn resolve_managed_commit(repo: &Path, revision: &str) -> Result<String> {
     let peeled = format!("{revision}^{{commit}}");
     git(
         repo,
@@ -226,8 +649,34 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
+async fn observed_task_git(repo: &Path, args: &[&str]) -> Result<String> {
+    let observer = TaskGitObserver::open(repo).await?;
+    observer.output(args).await
+}
+
+pub async fn observed_git_output(
+    repo: &Path,
+    args: &[&str],
+) -> Result<lionclaw_runtime_api::ExecutionOutput> {
+    observed_git_output_with_timeout(repo, args, Path::new("git"), Duration::from_millis(500)).await
+}
+
+async fn observed_git_output_with_timeout(
+    repo: &Path,
+    args: &[&str],
+    executable: &Path,
+    timeout: Duration,
+) -> Result<lionclaw_runtime_api::ExecutionOutput> {
+    tokio::time::timeout(timeout, async {
+        let observer = TaskGitObserver::open(repo).await?;
+        observer.raw_output_with(executable, args).await
+    })
+    .await
+    .with_context(|| format!("isolated git {args:?} exceeded observation deadline"))?
+}
+
 async fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
+    let output = managed_git_command()
         .current_dir(repo)
         .args(args)
         .output()
@@ -245,6 +694,7 @@ async fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
 }
 
 async fn run(command: &mut Command, label: &str) -> Result<()> {
+    command.kill_on_drop(true);
     let output = command
         .output()
         .await
@@ -258,9 +708,490 @@ async fn run(command: &mut Command, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Git mutations against the operator repository or a newly-created clone.
+/// Worker-owned repositories are read only through `TaskGitObserver` below.
+fn managed_git_command() -> Command {
+    let mut command = Command::new("git");
+    clear_git_authority_environment(&mut command);
+    command
+        .kill_on_drop(true)
+        .arg("--no-optional-locks")
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "core.pager=cat"])
+        .args(["-c", "diff.external="])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command
+}
+
+fn clear_git_authority_environment(command: &mut Command) {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_SHALLOW_FILE",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_EXTERNAL_DIFF",
+    ] {
+        command.env_remove(key);
+    }
+}
+
+static OBSERVER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MAX_GIT_METADATA_BYTES: u64 = 4 * 1024;
+const MAX_PACKED_REFS_BYTES: u64 = 8 * 1024 * 1024;
+
+struct TaskGitObserver {
+    metadata: PathBuf,
+    worktree: PathBuf,
+    index: PathBuf,
+    objects: PathBuf,
+}
+
+impl TaskGitObserver {
+    async fn open(worktree: &Path) -> Result<Self> {
+        let worktree = worktree.to_path_buf();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelBlockingTraversal(cancelled.clone());
+        tokio::task::spawn_blocking(move || Self::open_blocking(&worktree, &cancelled))
+            .await
+            .context("joining task Git metadata observer")?
+    }
+
+    fn open_blocking(worktree: &Path, cancelled: &AtomicBool) -> Result<Self> {
+        directory(worktree, "task worktree")?;
+        let dot_git = worktree.join(".git");
+        let git_dir = directory(&dot_git, "standalone task Git directory").with_context(|| {
+            format!(
+                "task worktree '{}' must use LionClaw's standalone .git directory",
+                worktree.display()
+            )
+        })?;
+        reject_git_indirection(&git_dir.join("commondir"), "Git common-directory pointer")?;
+        reject_git_indirection(
+            &git_dir.join("objects/info/alternates"),
+            "Git object alternate",
+        )?;
+        reject_git_indirection(
+            &git_dir.join("objects/info/http-alternates"),
+            "Git HTTP object alternate",
+        )?;
+        let head = resolve_task_head(&git_dir)?;
+        let index = regular_file(&git_dir.join("index"), "Git index")?;
+        let objects = directory(&git_dir.join("objects"), "Git object database")?;
+        validate_worker_object_database(&objects, cancelled)?;
+        Self::create(worktree, index, objects, &head)
+    }
+
+    async fn from_engine_baseline(
+        repo: &Path,
+        worktree: &Path,
+        index: &Path,
+        head: &str,
+    ) -> Result<Self> {
+        if !valid_object_id(head) {
+            bail!("recorded task base is not a full Git object ID");
+        }
+        let objects = git(
+            repo,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ],
+        )
+        .await?;
+        let objects = std::fs::canonicalize(objects.trim())
+            .context("resolving trusted target Git object database")?;
+        let worktree = worktree.to_path_buf();
+        let index = index.to_path_buf();
+        let head = head.to_string();
+        tokio::task::spawn_blocking(move || Self::create(&worktree, index, objects, &head))
+            .await
+            .context("joining trusted task workspace observer")?
+    }
+
+    fn create(worktree: &Path, index: PathBuf, objects: PathBuf, head: &str) -> Result<Self> {
+        directory(worktree, "task worktree")?;
+        let index = regular_file(&index, "task observer index")?;
+        directory(&objects, "Git object database")?;
+        let metadata = loop {
+            let sequence = OBSERVER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = std::env::temp_dir().join(format!(
+                "lionclaw-git-observer-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error).context("creating isolated Git metadata"),
+            }
+        };
+        let observer = Self {
+            metadata,
+            worktree: worktree.to_path_buf(),
+            index,
+            objects,
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&observer.metadata, std::fs::Permissions::from_mode(0o700))?;
+        }
+        std::fs::create_dir(observer.metadata.join("objects"))?;
+        std::fs::create_dir(observer.metadata.join("refs"))?;
+        std::fs::write(observer.metadata.join("HEAD"), format!("{head}\n"))?;
+        std::fs::write(
+            observer.metadata.join("config"),
+            synthetic_repository_config(head),
+        )?;
+        Ok(observer)
+    }
+
+    fn tokio_command_with(&self, executable: &Path) -> Command {
+        let mut command = Command::new(executable);
+        self.configure_tokio(&mut command);
+        command
+    }
+
+    async fn output(&self, args: &[&str]) -> Result<String> {
+        let output = self.raw_output(args).await?;
+        if !output.success() {
+            bail!(
+                "isolated git {:?} failed in '{}': {}",
+                args,
+                self.worktree.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    async fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let output = self
+            .raw_output(&["merge-base", "--is-ancestor", ancestor, descendant])
+            .await?;
+        match output.exit_code {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => bail!(
+                "isolated git merge-base --is-ancestor failed in '{}'",
+                self.worktree.display()
+            ),
+        }
+    }
+
+    async fn raw_output(&self, args: &[&str]) -> Result<lionclaw_runtime_api::ExecutionOutput> {
+        self.raw_output_with(Path::new("git"), args).await
+    }
+
+    async fn raw_output_with(
+        &self,
+        executable: &Path,
+        args: &[&str],
+    ) -> Result<lionclaw_runtime_api::ExecutionOutput> {
+        let mut command = self.tokio_command_with(executable);
+        command.args(args);
+        lionclaw_confinement::process::run_command_bounded(&mut command)
+            .await
+            .with_context(|| format!("failed to run isolated git {args:?}"))
+    }
+
+    fn local_fetch_source(&self) -> Result<&Path> {
+        let objects = self.metadata.join("objects");
+        let info = objects.join("info");
+        std::fs::create_dir(&info)?;
+        let object_path = self.objects.to_string_lossy();
+        if object_path.contains(['\n', '\r']) {
+            bail!("Git object path cannot be represented safely for capture");
+        }
+        std::fs::write(info.join("alternates"), format!("{object_path}\n"))?;
+        Ok(&self.metadata)
+    }
+
+    fn configure_tokio(&self, command: &mut Command) {
+        clear_git_authority_environment(command);
+        command
+            .kill_on_drop(true)
+            .arg("--no-optional-locks")
+            .env("GIT_DIR", &self.metadata)
+            .env("GIT_WORK_TREE", &self.worktree)
+            .env("GIT_INDEX_FILE", &self.index)
+            .env("GIT_OBJECT_DIRECTORY", &self.objects)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG", "/dev/null");
+    }
+}
+
+/// Fresh task clones are transferred as packs (`--no-local`), so this budget
+/// covers the bounded loose objects a worker can legitimately create while
+/// preventing capture/observation from becoming an unbounded host traversal.
+const MAX_WORKER_OBJECT_ENTRIES: usize = 16 * 1024;
+const MAX_WORKER_OBJECT_DEPTH: usize = 16;
+
+struct CancelBlockingTraversal(Arc<AtomicBool>);
+
+impl Drop for CancelBlockingTraversal {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Capture runs only after the runtime is gone. Before passing the worker's
+/// object database to host Git, reject every indirection and special file so
+/// Git cannot escape into another host path.
+fn validate_worker_object_database(root: &Path, cancelled: &AtomicBool) -> Result<()> {
+    let mut pending = vec![(root.to_path_buf(), 0_usize)];
+    let mut entries = 0_usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("worker Git object validation was cancelled");
+        }
+        if depth > MAX_WORKER_OBJECT_DEPTH {
+            bail!("worker Git object database exceeds the depth limit");
+        }
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("reading Git object directory '{}'", directory.display()))?
+        {
+            if cancelled.load(Ordering::Acquire) {
+                bail!("worker Git object validation was cancelled");
+            }
+            let entry = entry?;
+            entries = entries.saturating_add(1);
+            if entries > MAX_WORKER_OBJECT_ENTRIES {
+                bail!("worker Git object database exceeds the entry limit");
+            }
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                bail!("Git object path '{}' is a symlink", path.display());
+            }
+            if kind.is_dir() {
+                pending.push((path, depth + 1));
+            } else if !kind.is_file() {
+                bail!("Git object path '{}' is not a regular file", path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Drop for TaskGitObserver {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.metadata);
+    }
+}
+
+fn reject_git_indirection(path: &Path, label: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => bail!(
+            "{label} '{}' is not allowed in a task clone",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("reading {label} '{}'", path.display())),
+    }
+}
+
+fn regular_file(path: &Path, label: &str) -> Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            Ok(path.to_path_buf())
+        }
+        Ok(_) => bail!("{label} '{}' is not a regular file", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("{label} '{}' does not exist", path.display())
+        }
+        Err(error) => Err(error).with_context(|| format!("reading {label} '{}'", path.display())),
+    }
+}
+
+fn try_read_bounded_regular_bytes(path: &Path, label: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+    let descriptor = match open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening {label} '{}'", path.display()))
+        }
+    };
+    let mut file = File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading {label} metadata '{}'", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{label} '{}' is not a regular file", path.display());
+    }
+    if metadata.len() > limit {
+        bail!(
+            "{label} '{}' exceeds the {} byte metadata limit",
+            path.display(),
+            limit
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {label} '{}'", path.display()))?;
+    if bytes.len() as u64 > limit {
+        bail!(
+            "{label} '{}' exceeds the {} byte metadata limit",
+            path.display(),
+            limit
+        );
+    }
+    Ok(Some(bytes))
+}
+
+fn read_bounded_regular_string(path: &Path, label: &str) -> Result<String> {
+    let bytes = try_read_bounded_regular_bytes(path, label, MAX_GIT_METADATA_BYTES)?
+        .with_context(|| format!("opening {label} '{}': file not found", path.display()))?;
+    String::from_utf8(bytes).with_context(|| format!("{label} '{}' is not UTF-8", path.display()))
+}
+
+fn directory(path: &Path, label: &str) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading {label} '{}'", path.display()))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!("{label} '{}' is not a directory", path.display());
+    }
+    Ok(path.to_path_buf())
+}
+
+fn resolve_task_head(git_dir: &Path) -> Result<String> {
+    let head = read_bounded_regular_string(&git_dir.join("HEAD"), "Git HEAD")?;
+    let head = head.trim();
+    if valid_object_id(head) {
+        return Ok(head.to_string());
+    }
+    let reference = head
+        .strip_prefix("ref:")
+        .map(str::trim)
+        .filter(|reference| {
+            reference.starts_with("refs/")
+                && !reference.contains("..")
+                && reference.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.')
+                })
+        })
+        .context("invalid symbolic Git HEAD")?;
+    let reference_path = safe_reference_path(git_dir, reference)?;
+    if let Some(bytes) =
+        try_read_bounded_regular_bytes(&reference_path, "Git reference", MAX_GIT_METADATA_BYTES)?
+    {
+        let value = String::from_utf8(bytes)
+            .with_context(|| format!("Git reference '{reference}' is not UTF-8"))?;
+        let value = value.trim();
+        if !valid_object_id(value) {
+            bail!("Git reference '{reference}' does not contain a full object ID");
+        }
+        return Ok(value.to_string());
+    }
+    read_packed_reference(git_dir, reference)?.with_context(|| {
+        format!("symbolic Git HEAD reference '{reference}' does not resolve in the task clone")
+    })
+}
+
+fn safe_reference_path(git_dir: &Path, reference: &str) -> Result<PathBuf> {
+    let relative = Path::new(reference);
+    let components = relative.components().collect::<Vec<_>>();
+    if components.len() < 2
+        || components.first() != Some(&Component::Normal("refs".as_ref()))
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("invalid symbolic Git HEAD reference '{reference}'");
+    }
+    let mut path = git_dir.to_path_buf();
+    let mut parent_missing = false;
+    for component in &components[..components.len() - 1] {
+        let Component::Normal(component) = component else {
+            unreachable!("reference components were validated")
+        };
+        path.push(component);
+        if !parent_missing {
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata)
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => bail!(
+                    "Git reference directory '{}' is not a directory",
+                    path.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    parent_missing = true;
+                }
+                Err(error) => return Err(error).context("reading Git reference directory"),
+            }
+        }
+    }
+    let Component::Normal(file_name) = components.last().expect("reference is nonempty") else {
+        unreachable!("reference components were validated")
+    };
+    path.push(file_name);
+    Ok(path)
+}
+
+fn read_packed_reference(git_dir: &Path, reference: &str) -> Result<Option<String>> {
+    let path = git_dir.join("packed-refs");
+    let Some(bytes) =
+        try_read_bounded_regular_bytes(&path, "packed Git references", MAX_PACKED_REFS_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let packed = std::str::from_utf8(&bytes)
+        .with_context(|| format!("packed Git references '{}' are not UTF-8", path.display()))?;
+    for line in packed.lines() {
+        if line.starts_with(['#', '^']) {
+            continue;
+        }
+        let Some((object, name)) = line.split_once(' ') else {
+            continue;
+        };
+        if name == reference {
+            if !valid_object_id(object) {
+                bail!("packed Git reference '{reference}' has an invalid object ID");
+            }
+            return Ok(Some(object.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn valid_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn synthetic_repository_config(head: &str) -> &'static [u8] {
+    if head.len() == 64 && valid_object_id(head) {
+        b"[core]\n\trepositoryFormatVersion = 1\n[extensions]\n\tobjectFormat = sha256\n"
+    } else {
+        b""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_mission_id() -> crate::model::MissionId {
+        crate::model::MissionId::parse("mabc123def456").unwrap()
+    }
 
     async fn init_repo(dir: &Path) -> String {
         std::fs::write(dir.join("f.txt"), "base\n").unwrap();
@@ -275,6 +1206,29 @@ mod tests {
         git(dir, &["add", "-A"]).await.unwrap();
         git(dir, &["commit", "-q", "-m", "base"]).await.unwrap();
         head_sha(dir).await.unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disposable_git_observation_has_a_hard_deadline() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let fake_git = repo.path().join("stalling-git");
+        std::fs::write(&fake_git, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        make_executable(&fake_git).unwrap();
+
+        let started = tokio::time::Instant::now();
+        let error = observed_git_output_with_timeout(
+            repo.path(),
+            &["status", "--short"],
+            &fake_git,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("disposable observation must time out");
+
+        assert!(error.to_string().contains("observation deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -299,13 +1253,19 @@ mod tests {
         assert_ne!(detached, base);
 
         let effect_id = EffectId::for_parts(&["test", "fix-a1"]);
-        let recorded = capture_worker_result(repo.path(), &checkout, "mabc123def456", &effect_id)
-            .await
-            .unwrap();
+        let recorded = capture_worker_result(
+            repo.path(),
+            &checkout,
+            &base,
+            &test_mission_id(),
+            &effect_id,
+        )
+        .await
+        .unwrap();
         // The recorded head is the worker's actual HEAD, and it really landed
         // in the target repo (so a later checkout succeeds).
-        assert_eq!(recorded, detached);
-        assert!(commit_exists(repo.path(), &recorded).await);
+        assert_eq!(recorded.head_sha(), detached);
+        assert!(commit_exists(repo.path(), recorded.head_sha()).await);
         assert_eq!(
             std::fs::read_to_string(fetch_head).unwrap(),
             "source sentinel\n",
@@ -319,10 +1279,120 @@ mod tests {
         );
 
         let replay = work.path().join("replay");
-        create_checkout(repo.path(), &replay, &recorded)
+        create_checkout(repo.path(), &replay, recorded.head_sha())
             .await
             .unwrap();
-        assert_eq!(head_sha(&replay).await.unwrap(), recorded);
+        assert_eq!(head_sha(&replay).await.unwrap(), recorded.head_sha());
+    }
+
+    #[tokio::test]
+    async fn captured_artifacts_are_bound_to_the_issuing_effect() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let work = tempfile::tempdir().unwrap();
+        let checkout = work.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        let mission_id = test_mission_id();
+        let effect_id = EffectId::for_parts(&["test", "bound-capture"]);
+        let capture = ArtifactCapture::new(
+            repo.path().to_path_buf(),
+            checkout,
+            base.clone(),
+            mission_id.clone(),
+            effect_id.clone(),
+        );
+        let captured = capture.capture().await.unwrap();
+
+        assert_eq!(
+            captured.validate_binding(&mission_id, &effect_id, &base),
+            Ok(())
+        );
+        assert!(captured
+            .validate_binding(
+                &crate::model::MissionId::parse("mdef456abc123").unwrap(),
+                &effect_id,
+                &base,
+            )
+            .is_err());
+        assert!(captured
+            .validate_binding(
+                &mission_id,
+                &EffectId::for_parts(&["test", "different-effect"]),
+                &base,
+            )
+            .is_err());
+        assert!(captured
+            .validate_binding(&mission_id, &effect_id, "different-base")
+            .is_err());
+
+        let unverified = CapturedArtifact::for_testing(base.clone(), base);
+        assert!(unverified
+            .validate_binding(&mission_id, &effect_id, unverified.base_sha())
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn capture_rejects_a_clean_head_that_rolls_back_its_assignment_base() {
+        let repo = tempfile::tempdir().unwrap();
+        let previous = init_repo(repo.path()).await;
+        let required_base = commit_change(repo.path(), "serial base\n").await;
+        let work = tempfile::tempdir().unwrap();
+        let checkout = work.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &required_base)
+            .await
+            .unwrap();
+        git(&checkout, &["reset", "--hard", &previous])
+            .await
+            .unwrap();
+
+        let effect_id = EffectId::for_parts(&["test", "history-rollback"]);
+        let error = capture_worker_result(
+            repo.path(),
+            &checkout,
+            &required_base,
+            &test_mission_id(),
+            &effect_id,
+        )
+        .await
+        .expect_err("capture must reject a clean HEAD that precedes the required base");
+        assert!(matches!(error, CaptureError::HistoryDiverged { .. }));
+        let mission_ref = format!("refs/mission/mabc123def456/{effect_id}");
+        assert!(resolve_managed_commit(repo.path(), &mission_ref)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn capture_supports_a_symbolic_head_stored_in_packed_refs() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let work = tempfile::tempdir().unwrap();
+        let checkout = work.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        git(&checkout, &["checkout", "-q", "-b", "worker"])
+            .await
+            .unwrap();
+        let head = commit_change(&checkout, "packed worker change\n").await;
+        git(&checkout, &["pack-refs", "--all", "--prune"])
+            .await
+            .unwrap();
+        assert!(!checkout.join(".git/refs/heads/worker").exists());
+
+        let effect_id = EffectId::for_parts(&["test", "packed-head"]);
+        let captured = capture_worker_result(
+            repo.path(),
+            &checkout,
+            &base,
+            &test_mission_id(),
+            &effect_id,
+        )
+        .await
+        .expect("a valid packed symbolic HEAD remains capturable");
+        assert_eq!(captured.head_sha(), head);
     }
 
     #[tokio::test]
@@ -339,9 +1409,238 @@ mod tests {
         // bucket, which would mislabel the persisted failure.
         let effect_id = EffectId::for_parts(&["test", "a1"]);
         assert!(matches!(
-            capture_worker_result(repo.path(), &checkout, "mabc123def456", &effect_id).await,
+            capture_worker_result(
+                repo.path(),
+                &checkout,
+                &base,
+                &test_mission_id(),
+                &effect_id
+            )
+            .await,
             Err(CaptureError::DirtyWorktree(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_rejects_symlinked_object_database_descendants() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let work = tempfile::tempdir().unwrap();
+        let checkout = work.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        let pack = checkout.join(".git/objects/pack");
+        std::fs::remove_dir_all(&pack).unwrap();
+        symlink(repo.path().join(".git/objects/pack"), &pack).unwrap();
+
+        let effect_id = EffectId::for_parts(&["test", "object-pack-symlink"]);
+        let error = capture_worker_result(
+            repo.path(),
+            &checkout,
+            &base,
+            &test_mission_id(),
+            &effect_id,
+        )
+        .await
+        .expect_err("capture must not pass descendant object symlinks to host Git");
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[tokio::test]
+    async fn capture_never_executes_worker_git_configuration() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let work = tempfile::tempdir().unwrap();
+        let checkout = work.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        let marker = work.path().join("worker-config-executed");
+        let hostile = work.path().join("hostile");
+        std::fs::write(
+            &hostile,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        make_executable(&hostile).unwrap();
+        git(
+            &checkout,
+            &["config", "core.fsmonitor", hostile.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        git(
+            &checkout,
+            &[
+                "config",
+                "uploadpack.packObjectsHook",
+                hostile.to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let effect_id = EffectId::for_parts(&["test", "hostile-config"]);
+        capture_worker_result(
+            repo.path(),
+            &checkout,
+            &base,
+            &test_mission_id(),
+            &effect_id,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !marker.exists(),
+            "capture must not execute worker status or upload-pack configuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_observation_rejects_a_git_directory_pointer() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let metadata = repo.path().join("moved-git");
+        std::fs::rename(repo.path().join(".git"), &metadata).unwrap();
+        std::fs::write(
+            repo.path().join(".git"),
+            format!("gitdir: {}\n", metadata.display()),
+        )
+        .unwrap();
+
+        let error = observed_git_output(repo.path(), &["status", "--short"])
+            .await
+            .expect_err("task clones must use LionClaw's standalone Git topology");
+        assert!(error.to_string().contains("standalone"));
+    }
+
+    #[tokio::test]
+    async fn task_observation_rejects_a_common_directory_pointer() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        std::fs::write(repo.path().join(".git/commondir"), "../external\n").unwrap();
+
+        let error = observed_git_output(repo.path(), &["status", "--short"])
+            .await
+            .expect_err("task clones cannot redirect their common Git directory");
+        assert!(error.to_string().contains("common-directory"));
+    }
+
+    #[tokio::test]
+    async fn task_observation_rejects_an_external_object_alternate() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let external = tempfile::tempdir().unwrap();
+        init_repo(external.path()).await;
+        let info = repo.path().join(".git/objects/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(
+            info.join("alternates"),
+            format!("{}\n", external.path().join(".git/objects").display()),
+        )
+        .unwrap();
+
+        let error = observed_git_output(repo.path(), &["status", "--short"])
+            .await
+            .expect_err("task observation must not follow an external object database");
+        assert!(error.to_string().contains("alternate"));
+    }
+
+    #[tokio::test]
+    async fn task_observer_construction_has_a_small_object_tree_budget() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let objects = repo.path().join(".git/objects/aa");
+        std::fs::create_dir_all(&objects).unwrap();
+        for index in 0..=MAX_WORKER_OBJECT_ENTRIES {
+            std::fs::write(objects.join(format!("{index:08x}")), b"x").unwrap();
+        }
+
+        let started = tokio::time::Instant::now();
+        let error = match TaskGitObserver::open(repo.path()).await {
+            Ok(_) => panic!("oversized worker object trees must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("entry limit"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn task_observation_rejects_oversized_head_metadata() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        std::fs::write(repo.path().join(".git/HEAD"), "a".repeat(8 * 1024)).unwrap();
+
+        let error = observed_git_output(repo.path(), &["status", "--short"])
+            .await
+            .expect_err("task metadata reads must be bounded");
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_observation_rejects_a_fifo_without_blocking() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let head = repo.path().join(".git/HEAD");
+        std::fs::remove_file(&head).unwrap();
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &head,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+
+        let started = tokio::time::Instant::now();
+        observed_git_output(repo.path(), &["status", "--short"])
+            .await
+            .expect_err("special Git metadata files are never opened as streams");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn task_observation_rejects_oversized_packed_refs() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        git(repo.path(), &["pack-refs", "--all", "--prune"])
+            .await
+            .unwrap();
+        let packed = repo.path().join(".git/packed-refs");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&packed)
+            .unwrap()
+            .set_len(MAX_PACKED_REFS_BYTES + 1)
+            .unwrap();
+
+        let error = observed_git_output(repo.path(), &["status", "--short"])
+            .await
+            .expect_err("packed reference parsing has a fixed total bound");
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_observation_rejects_symlinked_packed_refs() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        git(repo.path(), &["pack-refs", "--all", "--prune"])
+            .await
+            .unwrap();
+        let packed = repo.path().join(".git/packed-refs");
+        let external = repo.path().join("external-packed-refs");
+        std::fs::rename(&packed, &external).unwrap();
+        symlink(&external, &packed).unwrap();
+
+        observed_git_output(repo.path(), &["status", "--short"])
+            .await
+            .expect_err("packed references must be a no-follow regular file");
     }
 
     async fn commit_change(repo: &Path, contents: &str) -> String {
@@ -483,6 +1782,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_source_operations_support_a_linked_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let base = init_repo(&repo).await;
+        let linked = temp.path().join("linked");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                &base,
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(head_sha(&linked).await.unwrap(), base);
+        assert!(commit_exists(&linked, &base).await);
+        assert!(is_ancestor(&linked, &base, &base).await.unwrap());
+        assert!(diff(&linked, &base, &base).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn checkout_rejects_a_non_commit_revision() {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path()).await;
@@ -503,9 +1829,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn checkout_does_not_hardlink_git_objects_to_the_source() {
-        use std::os::unix::fs::MetadataExt;
-
+    async fn checkout_transfers_source_objects_into_an_independent_pack() {
         let repo = tempfile::tempdir().unwrap();
         let head = init_repo(repo.path()).await;
         let attempt = tempfile::tempdir().unwrap();
@@ -515,13 +1839,22 @@ mod tests {
             .await
             .unwrap();
 
-        let object = Path::new("objects").join(&head[..2]).join(&head[2..]);
-        let source = std::fs::metadata(repo.path().join(".git").join(&object)).unwrap();
-        let isolated = std::fs::metadata(checkout.join(".git").join(&object)).unwrap();
-        assert_ne!(
-            (source.dev(), source.ino()),
-            (isolated.dev(), isolated.ino()),
-            "confined checkout objects must not share source-repository inodes"
+        let source_loose_object = Path::new("objects").join(&head[..2]).join(&head[2..]);
+        assert!(repo
+            .path()
+            .join(".git")
+            .join(&source_loose_object)
+            .is_file());
+        assert!(
+            !checkout.join(".git").join(&source_loose_object).exists(),
+            "normal transport must not copy the source's loose-object topology"
+        );
+        assert!(
+            std::fs::read_dir(checkout.join(".git/objects/pack"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("pack")),
+            "normal transport must materialize the reachable source history as a pack"
         );
     }
 
@@ -549,5 +1882,75 @@ mod tests {
         assert!(git(&checkout, &["fsck", "--full", "--no-dangling"])
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn replacement_recovers_an_interrupted_swap_before_publishing_the_new_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let base = init_repo(&repo).await;
+        let checkout = temp.path().join("work");
+        replace_checkout(&repo, &checkout, &base).await.unwrap();
+
+        let next = commit_change(&repo, "next\n").await;
+        let previous = temp.path().join(".work.previous");
+        let staging = temp.path().join(".work.prepare");
+        std::fs::rename(&checkout, &previous).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("partial"), "interrupted clone").unwrap();
+
+        replace_checkout(&repo, &checkout, &next).await.unwrap();
+        assert_eq!(head_sha(&checkout).await.unwrap(), next);
+        assert!(!previous.exists());
+        assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn isolated_observation_and_capture_support_sha256_repositories() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let mut init = managed_git_command();
+        init.args(["init", "--quiet", "--object-format=sha256"])
+            .arg(&repo);
+        run(&mut init, "initialize SHA-256 repository")
+            .await
+            .unwrap();
+        git(&repo, &["config", "user.name", "test"]).await.unwrap();
+        git(&repo, &["config", "user.email", "test@local"])
+            .await
+            .unwrap();
+        git(&repo, &["config", "commit.gpgsign", "false"])
+            .await
+            .unwrap();
+        std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+        git(&repo, &["add", "f.txt"]).await.unwrap();
+        git(&repo, &["commit", "--quiet", "-m", "base"])
+            .await
+            .unwrap();
+        let base = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(base.trim().len(), 64);
+        assert_eq!(head_sha(&repo).await.unwrap(), base.trim());
+        assert!(!task_is_dirty(&repo).await.unwrap());
+        assert!(diff(&repo, base.trim(), base.trim())
+            .await
+            .unwrap()
+            .is_empty());
+
+        let checkout = temp.path().join("checkout");
+        create_checkout(&repo, &checkout, base.trim())
+            .await
+            .unwrap();
+        let effect_id = EffectId::for_parts(&["test", "sha256-capture"]);
+        let captured = capture_worker_result(
+            &repo,
+            &checkout,
+            base.trim(),
+            &test_mission_id(),
+            &effect_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(captured.head_sha(), base.trim());
     }
 }

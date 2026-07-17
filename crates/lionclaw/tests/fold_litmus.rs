@@ -6,12 +6,16 @@
 mod common;
 
 use common::{
-    approve_plan, blocking_gap, default_config, harness, harness_with_type, proposal,
-    review_config, review_mission_type, review_runner, simple_plan, TestHarness, BASE_SHA,
-    HEAD_SHA,
+    approve_plan, blocking_gap, fault_append_events, harness, harness_with_type, proposal,
+    review_mission_type, review_runner, simple_plan, TestHarness, BASE_SHA, HEAD_SHA,
 };
-use lionclaw::model::{apply, fold, DecisionAction, MissionId};
+use lionclaw::model::{
+    apply, fold, ControlAction, DecisionAction, EffectId, MissionEvent, MissionId, PayloadRef,
+    RoleName, TaskId,
+};
+use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
+use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
 
 /// The four laws, over whatever log the mission produced: determinism,
 /// incremental consistency, serde roundtrip, and cursor agreement/rebuild.
@@ -86,12 +90,7 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().expect("utf8"),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA)
         .await
         .expect("create");
     h.engine
@@ -119,12 +118,7 @@ async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().expect("utf8"),
-            "obj",
-            BASE_SHA,
-            review_config(),
-        )
+        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA)
         .await
         .expect("create");
     h.engine
@@ -164,12 +158,7 @@ async fn snapshot_resume_matches_full_refold() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(
-            dir.path().to_str().unwrap(),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
+        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA)
         .await
         .expect("create");
     h.engine
@@ -207,6 +196,104 @@ async fn snapshot_resume_matches_full_refold() {
 }
 
 #[tokio::test]
+async fn controlled_effect_log_satisfies_every_prefix_and_snapshot_law() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(dir.path().to_str().unwrap(), "controlled replay", BASE_SHA)
+        .await
+        .unwrap();
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &mission_id).await;
+
+    let task_id = TaskId::new("fix").unwrap();
+    let effect_id = EffectId::for_parts(&["litmus", "controlled"]);
+    let mut failure_evidence = TypedFailureEvidence::new(
+        Some("runtime.cancel_acknowledged".into()),
+        "effect reached its recorded deadline",
+    );
+    failure_evidence.stop_reason = Some("effect deadline exhausted".into());
+    let state = h.engine.load_state(&mission_id).await.unwrap();
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        state.head,
+        &[
+            NewEvent::new(MissionEvent::RoleRunRequested {
+                namespace: lionclaw::model::TaskNamespace::Execution,
+                task_id: task_id.clone(),
+                attempt_no: 1,
+                effect_id: effect_id.clone(),
+                role: RoleName::new("implementer").unwrap(),
+                output: lionclaw::model::OutputSemantics::ProducesArtifact,
+                runtime: "codex".into(),
+                prompt: PayloadRef::inline("prompt"),
+                base_sha: BASE_SHA.into(),
+                assignment_epoch: 1,
+                recreate_workspace: true,
+                requested_at_ms: 1_000,
+                not_before_ms: 1_000,
+                deadline_ms: 2_000,
+                budget_deadline_ms: 3_000,
+            }),
+            NewEvent::new(MissionEvent::TaskWorkspacePrepared {
+                task_id: task_id.clone(),
+                effect_id: effect_id.clone(),
+                base_sha: BASE_SHA.into(),
+                assignment_epoch: 1,
+            }),
+            NewEvent::new(MissionEvent::ControlRequested {
+                effect_id: effect_id.clone(),
+                action: ControlAction::ExtendDeadline {
+                    old_deadline_ms: 2_000,
+                    new_deadline_ms: 3_000,
+                    automatic: false,
+                },
+                reason: "observed progress".into(),
+            }),
+            NewEvent::new(MissionEvent::EffectDeadlineReached {
+                effect_id: effect_id.clone(),
+                deadline_ms: 3_000,
+            }),
+            NewEvent::new(MissionEvent::RoleRunCompleted {
+                namespace: lionclaw::model::TaskNamespace::Execution,
+                task_id,
+                attempt_no: 1,
+                effect_id,
+                outcome: Err(TypedFailure::DeadlineExhausted {
+                    evidence: Box::new(failure_evidence),
+                }),
+            }),
+        ],
+        3_001,
+    )
+    .await;
+
+    let events = h.engine.store().load(&mission_id).await.unwrap();
+    assert_every_prefix_is_deterministic(&events);
+    let expected = fold(events).unwrap();
+    assert!(expected.inflight.is_empty());
+    assert!(expected.reached_deadlines.is_empty());
+    assert_eq!(
+        h.engine
+            .store()
+            .rebuild_cursors(&mission_id, 4_000)
+            .await
+            .unwrap(),
+        expected
+    );
+}
+
+#[tokio::test]
 async fn iterative_ratification_and_abort_survive_every_prefix_and_snapshot_generation() {
     let dir = tempfile::tempdir().expect("tempdir");
     let h = harness(
@@ -221,7 +308,6 @@ async fn iterative_ratification_and_abort_survive_every_prefix_and_snapshot_gene
             dir.path().to_str().expect("utf8"),
             "ratify repeatedly",
             BASE_SHA,
-            default_config(),
         )
         .await
         .expect("create");
@@ -295,9 +381,9 @@ async fn iterative_ratification_and_abort_survive_every_prefix_and_snapshot_gene
     assert_eq!(from_old_snapshot, expected);
     h.engine
         .store()
-        .save_snapshot(&from_old_snapshot, 11)
+        .rebuild_cursors(&mission_id, 11)
         .await
-        .expect("replace stale snapshot");
+        .expect("replace stale snapshot from the authoritative log");
     assert_eq!(
         h.engine
             .store()
@@ -315,7 +401,6 @@ async fn iterative_ratification_and_abort_survive_every_prefix_and_snapshot_gene
             dir.path().to_str().expect("utf8"),
             "abort during ratification",
             BASE_SHA,
-            default_config(),
         )
         .await
         .expect("create aborted mission");
@@ -357,7 +442,6 @@ async fn failure_driven_replanning_survives_every_prefix_and_snapshot_rebuild() 
             dir.path().to_str().expect("utf8"),
             "repair the reviewed behavior",
             BASE_SHA,
-            review_config(),
         )
         .await
         .expect("create");

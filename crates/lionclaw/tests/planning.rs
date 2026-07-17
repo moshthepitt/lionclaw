@@ -5,20 +5,20 @@
 
 mod common;
 
+use lionclaw_runtime_api::TypedFailure;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use common::{covered_requirement, BASE_SHA};
 use lionclaw::engine::{Engine, EngineServices};
-use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
+use lionclaw::mission_type::{MissionType, MissionTypeDefinition, RoleDefinition, SkillPackage};
 use lionclaw::model::{
-    ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionConfig,
-    MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal,
-    PlanningDag, PlanningRefinement, PlanningTask, RecoveryConfig, RoleName, RunErrorKind, StopBar,
-    Task, TaskKind, TaskStatus,
+    Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionEvent, MissionPhase,
+    OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, PlanningDag, PlanningRefinement,
+    PlanningTask, RoleName, StopBar, Task, TaskKind, TaskStatus,
 };
-use lionclaw::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest};
+use lionclaw::ports::{CapturedArtifact, RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
@@ -48,6 +48,7 @@ fn role(name: &str, output: OutputSemantics) -> RoleDefinition {
         name: rn(name),
         output,
         runtime: None,
+        timeout_secs: None,
         network: false,
         secrets: false,
         skills: Vec::new(),
@@ -71,13 +72,13 @@ fn planning_mission_type() -> MissionType {
     let strategist = roles.get_mut(&rn("strategist")).unwrap();
     strategist.skills = vec!["planning-method".to_string()];
     strategist.runtime = Some("opencode".to_string());
-    MissionType {
+    MissionType::for_testing(MissionTypeDefinition {
         name: "planning-test".to_string(),
-        digest: "test-digest".to_string(),
         stop: StopBar::Verified,
         image: "img".to_string(),
         planning: planning_dag(),
         recovery: Default::default(),
+        execution: Default::default(),
         terminal_review: None,
         playbook: Some("plan carefully".to_string()),
         roles,
@@ -94,7 +95,7 @@ fn planning_mission_type() -> MissionType {
             OracleName::new("cargo-test").unwrap(),
             PathBuf::from("/nonexistent/oracles/cargo-test"),
         )]),
-    }
+    })
 }
 
 fn planning_dag() -> PlanningDag {
@@ -103,18 +104,21 @@ fn planning_dag() -> PlanningDag {
             PlanningTask {
                 id: tid("strategist"),
                 role: rn("strategist"),
+                output: OutputSemantics::ProducesReport,
                 body: "draft".to_string(),
                 depends_on: vec![],
             },
             PlanningTask {
                 id: tid("red-team"),
                 role: rn("red-team"),
+                output: OutputSemantics::ProducesReport,
                 body: "critique".to_string(),
                 depends_on: vec![tid("strategist")],
             },
             PlanningTask {
                 id: tid("author"),
                 role: rn("author"),
+                output: OutputSemantics::ProposesPlan,
                 body: "propose".to_string(),
                 depends_on: vec![tid("strategist"), tid("red-team")],
             },
@@ -215,15 +219,13 @@ fn successful_role_outcome(req: &RoleRunRequest) -> RoleRunOutcome {
             panic!("terminal-review roles are never plan tasks")
         }
     };
-    let artifact =
-        (req.role.output == OutputSemantics::ProducesArtifact).then(|| ArtifactOutcome {
-            base_sha: req.base_sha.clone(),
-            head_sha: "head-1".to_string(),
-        });
+    let artifact = (req.role.output == OutputSemantics::ProducesArtifact)
+        .then(|| CapturedArtifact::for_testing(req.base_sha.clone(), "head-1"));
     RoleRunOutcome {
         handoff,
         artifact,
-        model_id: None,
+        runtime_configuration: Default::default(),
+        final_response: String::new(),
     }
 }
 
@@ -235,6 +237,7 @@ async fn planning_engine_with_runner(
     workspace: &std::path::Path,
     runner: MockRoleRunner,
 ) -> Engine {
+    common::initialize_repository(workspace);
     let store = MissionStore::open(workspace).await.expect("store");
     Engine::new(
         store,
@@ -254,6 +257,36 @@ async fn planning_engine(workspace: &std::path::Path) -> Engine {
     planning_engine_with_runner(workspace, planning_runner()).await
 }
 
+async fn advance_through_checkpoints(
+    engine: &Engine,
+    id: &lionclaw::model::MissionId,
+) -> lionclaw::engine::MissionView {
+    for _ in 0..32 {
+        let view = engine.advance(id).await.unwrap();
+        if view.disposition != lionclaw::engine::MissionDisposition::Ready {
+            return view;
+        }
+    }
+    panic!("planning test exceeded checkpoint bound")
+}
+
+#[tokio::test]
+async fn mission_creation_persists_the_pinned_planning_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = planning_engine(dir.path()).await;
+    let id = engine
+        .create_mission(
+            &dir.path().to_string_lossy(),
+            "make the tests pass",
+            BASE_SHA,
+        )
+        .await
+        .expect("create mission");
+    let state = engine.load_state(&id).await.expect("state");
+
+    assert_eq!(state.config, engine.mission_type().mission_config());
+}
+
 #[tokio::test]
 async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
     let dir = tempfile::tempdir().unwrap();
@@ -263,19 +296,13 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
 
     // Drive the planning DAG: strategist → red-team → author → park on the
     // proposal. No contract exists yet — the proposal is gradeless.
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let state = engine.load_state(&id).await.unwrap();
     assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     assert!(state.plan.is_none(), "planning must not seed a plan");
@@ -288,7 +315,7 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
         .expect("parked on PlanProposal");
 
     // A malformed advance can't launder past approval: still no contract.
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     assert!(engine.load_state(&id).await.unwrap().plan.is_none());
 
     // Approve: derive_promotion seeds the contract for the first time.
@@ -302,7 +329,7 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
     assert_eq!(state.revision, 1);
 
     // Execute: implementer commits, cargo-test passes at the new head → Verified.
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let state = engine.load_state(&id).await.unwrap();
     assert_eq!(
         state.phase,
@@ -326,16 +353,10 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let state = engine.load_state(&id).await.unwrap();
     let approve = state
         .open_attention
@@ -373,7 +394,7 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
         assert!(runtime.feedback.is_empty());
     }
 
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let events = engine.store().load(&id).await.unwrap();
     let second_strategist_prompt = events
         .iter()
@@ -410,12 +431,6 @@ async fn replanning_prompt_combines_the_accepted_plan_rejected_candidate_and_gui
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -442,7 +457,7 @@ async fn replanning_prompt_combines_the_accepted_plan_rejected_candidate_and_gui
         .await
         .unwrap();
 
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let events = engine.store().load(&id).await.unwrap();
     let prompt_ref = events
         .iter()
@@ -476,12 +491,6 @@ async fn ratification_can_revise_a_to_b_to_c_and_then_approve() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -580,12 +589,6 @@ async fn ratification_revisions_are_unbounded_and_keep_only_the_newest_input() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -638,10 +641,11 @@ async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
             let mut calls = seen.lock().unwrap();
             *calls += 1;
             if *calls == 4 {
-                return Err(RoleRunFailure {
-                    kind: RunErrorKind::Timeout,
-                    detail: "temporary provider timeout".to_string(),
-                });
+                return Err(TypedFailure::transient(
+                    "runtime.fixture",
+                    "temporary provider timeout".to_string(),
+                    None,
+                ));
             }
         }
         Ok(successful_role_outcome(request))
@@ -652,18 +656,12 @@ async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
             &dir.path().to_string_lossy(),
             "refine without spending recovery",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: RecoveryConfig { max_attempts: 3 },
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
 
     for cycle in 0..3 {
-        engine.advance(&id).await.unwrap();
+        advance_through_checkpoints(&engine, &id).await;
         engine
             .decide(
                 &id,
@@ -675,7 +673,7 @@ async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
             .unwrap();
     }
 
-    let view = engine.advance(&id).await.unwrap();
+    let view = advance_through_checkpoints(&engine, &id).await;
     assert_eq!(view.state.phase, MissionPhase::AttentionNeeded);
     assert!(view.state.proposal.is_some());
     assert_eq!(*strategist_calls.lock().unwrap(), 5);
@@ -695,12 +693,6 @@ async fn revise_guidance_preserves_whitespace_verbatim() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -735,12 +727,6 @@ async fn aborting_a_plan_proposal_records_the_generic_decision_atomically() {
             &dir.path().to_string_lossy(),
             "make the tests pass",
             BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                terminal_review: None,
-            },
         )
         .await
         .unwrap();
@@ -791,10 +777,11 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
     // A runner that fails the first planning node.
     let runner = MockRoleRunner::new(Box::new(|req: &RoleRunRequest| {
         if req.role.name.as_str() == "strategist" {
-            return Err(lionclaw::ports::RoleRunFailure {
-                kind: lionclaw::model::RunErrorKind::Timeout,
-                detail: "crashed mid-planning".to_string(),
-            });
+            return Err(TypedFailure::transient(
+                "runtime.fixture",
+                "crashed mid-planning".to_string(),
+                None,
+            ));
         }
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
@@ -803,7 +790,8 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
                 request_attention: false,
             },
             artifact: None,
-            model_id: None,
+            runtime_configuration: Default::default(),
+            final_response: String::new(),
         })
     }));
     let engine = Engine::new(
@@ -819,21 +807,11 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
         ),
     );
     let id = engine
-        .create_mission(
-            &dir.path().to_string_lossy(),
-            "obj",
-            BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                terminal_review: None,
-            },
-        )
+        .create_mission(&dir.path().to_string_lossy(), "obj", BASE_SHA)
         .await
         .unwrap();
 
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let state = engine.load_state(&id).await.unwrap();
     assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     let node_failed = state
@@ -877,7 +855,8 @@ async fn park_after_author(
         Ok(RoleRunOutcome {
             handoff,
             artifact: None,
-            model_id: None,
+            runtime_configuration: Default::default(),
+            final_response: String::new(),
         })
     }));
     let engine = Engine::new(
@@ -893,20 +872,10 @@ async fn park_after_author(
         ),
     );
     let id = engine
-        .create_mission(
-            &dir.to_string_lossy(),
-            "obj",
-            BASE_SHA,
-            MissionConfig {
-                stop: StopBar::Verified,
-                planning: planning_dag(),
-                recovery: Default::default(),
-                terminal_review: None,
-            },
-        )
+        .create_mission(&dir.to_string_lossy(), "obj", BASE_SHA)
         .await
         .unwrap();
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     engine.load_state(&id).await.unwrap()
 }
 

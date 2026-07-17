@@ -7,14 +7,15 @@ use std::{
 
 use super::{
     canonical_events, clear_state_value, execute_program_backed_turn, load_ready_state_value,
-    safe_relative_path, ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter,
-    RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeControlInput, RuntimeControlOrigin,
+    safe_relative_path, ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAdapterInfo,
+    RuntimeCancellation, RuntimeCapabilityResult, RuntimeControlInput, RuntimeControlOrigin,
     RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext, RuntimeMessageLane,
     RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
-    RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
-    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalConfig,
-    RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode, TurnEvent,
-    RUNTIME_SESSION_READY_MARKER,
+    RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutLine,
+    RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady,
+    RuntimeSessionStartInput, RuntimeTerminalConfig, RuntimeTurnInput, RuntimeTurnJournalSender,
+    RuntimeTurnMode, TurnEvent, RUNTIME_PROGRAM_STDOUT_LINE_LIMIT, RUNTIME_SESSION_READY_MARKER,
+    RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -24,18 +25,12 @@ use tokio::{
 };
 
 #[test]
-fn canonical_events_drops_retained_raw_payloads() {
+fn canonical_events_projects_the_bounded_public_stream() {
     let journal = vec![
-        TurnEvent::with_raw(
-            RuntimeEvent::MessageDelta {
-                lane: RuntimeMessageLane::Answer,
-                text: "hi".to_string(),
-            },
-            RawTurnPayload {
-                driver: "test-driver".to_string(),
-                payload: "{\"method\":\"message/delta\"}".to_string(),
-            },
-        ),
+        TurnEvent::canonical(RuntimeEvent::MessageDelta {
+            lane: RuntimeMessageLane::Answer,
+            text: "hi".to_string(),
+        }),
         TurnEvent::canonical(RuntimeEvent::Done),
     ];
 
@@ -165,8 +160,12 @@ impl RuntimeAdapter for TestProgramAdapter {
         Ok(())
     }
 
-    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
-        Ok(())
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<RuntimeCancellation> {
+        Ok(RuntimeCancellation::NoActiveTurn)
     }
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
@@ -191,7 +190,7 @@ impl RuntimeProgramExecutor for StubExecutor {
     async fn execute_streaming(
         &mut self,
         _program: RuntimeProgramSpec,
-        stdout: mpsc::UnboundedSender<String>,
+        stdout: super::RuntimeProgramStdoutSender,
     ) -> Result<ExecutionOutput> {
         let attempt = self
             .attempts
@@ -200,7 +199,10 @@ impl RuntimeProgramExecutor for StubExecutor {
             .pop_front()
             .ok_or_else(|| anyhow!("no attempt configured"))?;
         for line in attempt.stdout_lines {
-            stdout.send(line).map_err(|_| anyhow!("stdout closed"))?;
+            stdout
+                .send(RuntimeProgramStdoutLine::new(line)?)
+                .await
+                .map_err(|_| anyhow!("stdout closed"))?;
         }
         Ok(attempt.output)
     }
@@ -479,7 +481,7 @@ async fn program_backed_turn_streams_output_and_finishes() {
         stdout_lines: vec!["answer:hello".to_string()],
         output: success_output(),
     }]);
-    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (events, mut event_rx) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     let result = execute_program_backed_turn(
         &adapter,
@@ -495,15 +497,12 @@ async fn program_backed_turn_streams_output_and_finishes() {
 
     assert!(result.capability_requests.is_empty());
     assert!(matches!(
-        event_rx.recv().await,
-        Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "hello"
+        event_rx.recv().await.map(TurnEvent::into_event),
+        Some(RuntimeEvent::MessageDelta { text, .. }) if text == "hello"
     ));
     assert!(matches!(
-        event_rx.recv().await,
-        Some(TurnEvent {
-            event: RuntimeEvent::Done,
-            raw: None
-        })
+        event_rx.recv().await.map(TurnEvent::into_event),
+        Some(RuntimeEvent::Done)
     ));
 }
 
@@ -520,7 +519,7 @@ async fn program_backed_turn_retries_with_fresh_prompt_before_emitting_error() {
             output: success_output(),
         },
     ]);
-    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (events, mut event_rx) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     execute_program_backed_turn(
         &adapter,
@@ -535,15 +534,12 @@ async fn program_backed_turn_retries_with_fresh_prompt_before_emitting_error() {
     .expect("turn should retry and succeed");
 
     assert!(matches!(
-        event_rx.recv().await,
-        Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "fresh"
+        event_rx.recv().await.map(TurnEvent::into_event),
+        Some(RuntimeEvent::MessageDelta { text, .. }) if text == "fresh"
     ));
     assert!(matches!(
-        event_rx.recv().await,
-        Some(TurnEvent {
-            event: RuntimeEvent::Done,
-            raw: None
-        })
+        event_rx.recv().await.map(TurnEvent::into_event),
+        Some(RuntimeEvent::Done)
     ));
     assert!(
         event_rx.try_recv().is_err(),
@@ -560,11 +556,14 @@ async fn program_backed_turn_surfaces_failure_after_retry() {
             output: failed_output(),
         },
         StubAttempt {
-            stdout_lines: vec!["error:second".to_string()],
+            stdout_lines: vec![
+                "answer:partial work".to_string(),
+                "error:second".to_string(),
+            ],
             output: failed_output(),
         },
     ]);
-    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (events, mut event_rx) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     let err = execute_program_backed_turn(
         &adapter,
@@ -579,9 +578,19 @@ async fn program_backed_turn_surfaces_failure_after_retry() {
     .expect_err("turn should fail");
 
     assert!(err.to_string().contains("second"));
+    let failure = err
+        .downcast_ref::<super::TypedFailure>()
+        .expect("process exit is typed at the runtime boundary");
+    assert_eq!(failure.evidence().final_response, "partial work");
+    assert_eq!(failure.evidence().exit_code, Some(1));
+    assert_eq!(failure.evidence().stderr, "failed");
     assert!(matches!(
-        event_rx.recv().await,
-        Some(TurnEvent { event: RuntimeEvent::Error { text, .. }, raw: None }) if text == "second"
+        event_rx.recv().await.map(TurnEvent::into_event),
+        Some(RuntimeEvent::MessageDelta { text, .. }) if text == "partial work"
+    ));
+    assert!(matches!(
+        event_rx.recv().await.map(TurnEvent::into_event),
+        Some(RuntimeEvent::Error { text, .. }) if text == "second"
     ));
     assert!(
         event_rx.try_recv().is_err(),
@@ -596,7 +605,7 @@ async fn program_backed_turn_does_not_deadlock_when_process_finishes_before_stdo
         stdout_lines: Vec::new(),
         output: success_output(),
     }]);
-    let (events, _event_rx) = mpsc::unbounded_channel();
+    let (events, _event_rx) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     timeout(
         Duration::from_millis(100),
@@ -624,11 +633,12 @@ async fn program_backed_turn_observes_slow_stdout_before_completion() {
         async fn execute_streaming(
             &mut self,
             _program: RuntimeProgramSpec,
-            stdout: mpsc::UnboundedSender<String>,
+            stdout: super::RuntimeProgramStdoutSender,
         ) -> Result<ExecutionOutput> {
             sleep(Duration::from_millis(20)).await;
             stdout
-                .send("answer:slow".to_string())
+                .send(RuntimeProgramStdoutLine::new("answer:slow".to_string())?)
+                .await
                 .map_err(|_| anyhow!("stdout closed"))?;
             Ok(success_output())
         }
@@ -650,7 +660,7 @@ async fn program_backed_turn_observes_slow_stdout_before_completion() {
 
     let adapter = TestProgramAdapter::default();
     let executor = SlowExecutor;
-    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (events, mut event_rx) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     execute_program_backed_turn(
         &adapter,
@@ -665,9 +675,99 @@ async fn program_backed_turn_observes_slow_stdout_before_completion() {
     .expect("turn should succeed");
 
     assert!(matches!(
-        event_rx.recv().await,
-        Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "slow"
+        event_rx.recv().await.map(TurnEvent::into_event),
+        Some(RuntimeEvent::MessageDelta { text, .. }) if text == "slow"
     ));
+}
+
+#[tokio::test]
+async fn program_backed_stdout_transport_applies_bounded_backpressure() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct SaturatingExecutor(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl RuntimeProgramExecutor for SaturatingExecutor {
+        async fn execute_streaming(
+            &mut self,
+            _program: RuntimeProgramSpec,
+            stdout: super::RuntimeProgramStdoutSender,
+        ) -> Result<ExecutionOutput> {
+            assert_eq!(stdout.max_capacity(), RUNTIME_TURN_JOURNAL_CAPACITY);
+            for _ in 0..RUNTIME_TURN_JOURNAL_CAPACITY {
+                stdout
+                    .try_send(RuntimeProgramStdoutLine::new("answer:x".to_string()).unwrap())
+                    .expect("declared stdout capacity");
+            }
+            assert!(matches!(
+                stdout.try_send(
+                    RuntimeProgramStdoutLine::new("answer:overflow".to_string()).unwrap()
+                ),
+                Err(mpsc::error::TrySendError::Full(_))
+            ));
+            self.0.store(true, Ordering::Release);
+            Ok(success_output())
+        }
+
+        async fn execute_captured(
+            &mut self,
+            _program: RuntimeProgramSpec,
+        ) -> Result<ExecutionOutput> {
+            Err(anyhow!("captured execution is not used by this test"))
+        }
+
+        async fn spawn(
+            &mut self,
+            _program: RuntimeProgramSpec,
+        ) -> Result<Box<dyn RuntimeProgramSession>> {
+            Err(anyhow!("interactive execution is not used by this test"))
+        }
+    }
+
+    let saturated = Arc::new(AtomicBool::new(false));
+    let executor = SaturatingExecutor(saturated.clone());
+    let (journal, mut journal_rx) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+    let drain = tokio::spawn(async move {
+        let mut count = 0;
+        while journal_rx.recv().await.is_some() {
+            count += 1;
+        }
+        count
+    });
+
+    execute_program_backed_turn(
+        &TestProgramAdapter::default(),
+        RuntimeProgramTurnExecution {
+            input: turn_input(None),
+            context: execution_context(),
+            executor: Box::new(executor),
+        },
+        journal,
+    )
+    .await
+    .expect("bounded stream completes while its journal is drained");
+
+    assert!(saturated.load(Ordering::Acquire));
+    assert_eq!(
+        drain.await.expect("journal drain"),
+        RUNTIME_TURN_JOURNAL_CAPACITY + 1
+    );
+}
+
+#[test]
+fn program_backed_stdout_transport_rejects_an_oversized_raw_record() {
+    let (stdout, _receiver) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+    stdout
+        .try_send(
+            RuntimeProgramStdoutLine::new("x".repeat(RUNTIME_PROGRAM_STDOUT_LINE_LIMIT))
+                .expect("record at the byte limit"),
+        )
+        .expect("queue accepts a checked record");
+
+    assert!(
+        RuntimeProgramStdoutLine::new("x".repeat(RUNTIME_PROGRAM_STDOUT_LINE_LIMIT + 1)).is_err(),
+        "raw provider records must be byte-bounded before entering the queue"
+    );
 }
 
 // ---- RUNTIME-SKILL-IDS-REMOVED regression coverage ----

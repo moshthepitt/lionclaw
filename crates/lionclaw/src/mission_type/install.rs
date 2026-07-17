@@ -4,7 +4,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::authority::AuthorityCeiling;
 
-use super::{load_mission_type, MissionType};
+use super::bounded_tree::BoundedTree;
+use super::{load_materialized_mission_type, MissionType};
 
 pub(crate) const INSTALL_WORK_DIR_PREFIX: &str = ".lionclaw-install@";
 
@@ -27,7 +28,7 @@ pub fn materialize_mission_type(
         let _ = std::fs::remove_dir_all(destination);
         return Err(err);
     }
-    match load_mission_type(destination, ceiling) {
+    match load_materialized_mission_type(destination, ceiling) {
         Ok(mission_type) => Ok(mission_type),
         Err(err) => {
             let _ = std::fs::remove_dir_all(destination);
@@ -43,30 +44,24 @@ pub fn install_mission_type(
     force: bool,
     ceiling: &AuthorityCeiling,
 ) -> Result<InstallOutcome> {
-    let source_type = load_mission_type(source, ceiling)
-        .with_context(|| format!("mission type at '{}' is invalid", source.display()))?;
     std::fs::create_dir_all(destination_dir)
         .with_context(|| format!("creating '{}'", destination_dir.display()))?;
-    let destination = destination_dir.join(&source_type.name);
-    if destination.exists() && !force {
-        return Ok(InstallOutcome {
-            name: source_type.name,
-            installed: false,
-        });
-    }
-
     let staging_parent = tempfile::Builder::new()
         .prefix(&format!("{INSTALL_WORK_DIR_PREFIX}staging-"))
         .tempdir_in(destination_dir)
         .context("creating mission-type staging directory")?;
     let staging = staging_parent.path().join("bundle");
     let prepared = materialize_mission_type(source, &staging, ceiling)?;
-    if prepared.name != source_type.name {
-        bail!("mission type name changed while it was installed");
+    let destination = destination_dir.join(&prepared.name);
+    if destination.exists() && !force {
+        return Ok(InstallOutcome {
+            name: prepared.name.clone(),
+            installed: false,
+        });
     }
     replace_directory(&staging, &destination)?;
     Ok(InstallOutcome {
-        name: source_type.name,
+        name: prepared.name.clone(),
         installed: true,
     })
 }
@@ -115,58 +110,17 @@ pub(crate) fn replace_directory(prepared: &Path, destination: &Path) -> Result<(
 }
 
 pub(crate) fn copy_tree_strict(source: &Path, destination: &Path) -> Result<()> {
-    walk_tree_strict(source, Some(destination))
+    BoundedTree::open(source)?.copy_to(destination)
 }
 
 pub(crate) fn validate_closed_tree(source: &Path) -> Result<()> {
-    walk_tree_strict(source, None)
-}
-
-fn walk_tree_strict(source: &Path, destination: Option<&Path>) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(source)
-        .with_context(|| format!("statting '{}'", source.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!(
-            "source '{}' must be a directory, not a symlink",
-            source.display()
-        );
-    }
-    if let Some(destination) = destination {
-        std::fs::create_dir_all(destination)
-            .with_context(|| format!("creating '{}'", destination.display()))?;
-    }
-    let mut entries = std::fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        if entry.file_name() == ".git" {
-            continue;
-        }
-        let from = entry.path();
-        let to = destination.map(|destination| destination.join(entry.file_name()));
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            bail!("source entry '{}' must not be a symlink", from.display());
-        }
-        if file_type.is_dir() {
-            walk_tree_strict(&from, to.as_deref())?;
-        } else if file_type.is_file() {
-            if let Some(to) = &to {
-                std::fs::copy(&from, to)
-                    .with_context(|| format!("copying '{}'", from.display()))?;
-                std::fs::set_permissions(to, entry.metadata()?.permissions())?;
-            }
-        } else {
-            bail!(
-                "source entry '{}' must be a regular file or directory",
-                from.display()
-            );
-        }
-    }
-    Ok(())
+    BoundedTree::open(source).map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::mission_type::load_mission_type;
+
     use super::*;
 
     #[test]

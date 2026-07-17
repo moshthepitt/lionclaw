@@ -7,7 +7,8 @@
 //!
 //! Non-deterministic or side-effecting steps are two events: `…Requested`
 //! (intent + content-derived effect ID; consumed by the effect driver)
-//! then `…Completed`/`…Failed` (outcome fact; consumed by the fold). The log
+//! then `…Completed` with a typed success/failure result (outcome fact;
+//! consumed by the fold). The log
 //! stores outcomes, never executable intentions.
 //!
 //! Events are additive-only and version-stamped; never rewrite history.
@@ -15,11 +16,49 @@
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
-use super::plan::{PlanProposal, PlanningDag};
+use super::plan::{OutputSemantics, PlanInventory, PlanProposal, PlanningDag};
+use crate::prelude::*;
+use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
 
-/// Bumped for the strict decision/proposal/abort wire break that removes
-/// caller-supplied provenance from authoritative events.
-pub const SCHEMA_VERSION: u32 = 4;
+/// Bumped for the replay-authoritative plan inventory in `MissionConfig`.
+pub const SCHEMA_VERSION: u32 = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskNamespace {
+    Planning,
+    Execution,
+}
+
+/// Largest whole-second duration that has an exact positive `i64`
+/// millisecond representation for an immutable effect request.
+pub const MAX_EXECUTION_DURATION_SECS: u64 = i64::MAX as u64 / 1_000;
+
+/// Resolve one immutable absolute deadline without truncation or saturation.
+/// Callers validate stored duration shape separately, then use this exact
+/// check at the epoch where an effect can actually be scheduled.
+pub fn resolve_execution_deadline_ms(
+    requested_at_ms: i64,
+    duration_secs: u64,
+) -> Result<i64, String> {
+    let duration_ms = duration_secs
+        .checked_mul(1_000)
+        .ok_or_else(|| "execution duration overflows milliseconds".to_string())?;
+    let duration_ms =
+        i64::try_from(duration_ms).map_err(|_| "execution duration is too large".to_string())?;
+    requested_at_ms
+        .checked_add(duration_ms)
+        .ok_or_else(|| "execution deadline overflows epoch milliseconds".to_string())
+}
+
+impl TaskNamespace {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Execution => "execution",
+        }
+    }
+}
 
 /// Reference to a content-addressed blob on durable-fs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +80,29 @@ pub enum PayloadRef {
 impl PayloadRef {
     pub fn inline(text: impl Into<String>) -> Self {
         Self::Inline { text: text.into() }
+    }
+
+    /// SHA-256 identity of the bytes the runner will resolve. Blob contents
+    /// are verified against their reference by the durable blob store.
+    pub fn content_sha256(&self) -> Option<String> {
+        match self {
+            Self::Inline { text } => {
+                use sha2::{Digest, Sha256};
+
+                Some(super::ids::lowercase_hex(&Sha256::digest(text.as_bytes())))
+            }
+            Self::Blob(blob)
+                if blob.algo == "sha256"
+                    && blob.hex.len() == 64
+                    && blob
+                        .hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+            {
+                Some(blob.hex.clone())
+            }
+            Self::Blob(_) => None,
+        }
     }
 }
 
@@ -76,6 +138,9 @@ pub struct MissionTypeRef {
 #[serde(deny_unknown_fields)]
 pub struct MissionConfig {
     pub stop: StopBar,
+    /// Resolved role outputs and oracle names available to every plan. This
+    /// immutable copy makes complete plan validation replayable.
+    pub plan_inventory: PlanInventory,
     /// The mission type's planning DAG (how an objective becomes a proposed
     /// contract). Empty ⇒ no in-engine planning; the mission awaits a manually
     /// proposed plan.
@@ -83,6 +148,8 @@ pub struct MissionConfig {
     pub planning: PlanningDag,
     #[serde(default)]
     pub recovery: RecoveryConfig,
+    #[serde(default)]
+    pub execution: ExecutionPolicy,
     /// The mission type's closing review (a fresh-context judge of the final
     /// tree against the objective). `None` ⇒ feature off: every derivation
     /// short-circuits, so pre-feature event logs re-derive identically.
@@ -95,10 +162,65 @@ impl Default for MissionConfig {
     fn default() -> Self {
         Self {
             stop: StopBar::Verified,
+            plan_inventory: PlanInventory::default(),
             planning: PlanningDag::default(),
             recovery: RecoveryConfig::default(),
+            execution: ExecutionPolicy::default(),
             terminal_review: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ExecutionPolicy {
+    pub default_timeout_secs: u64,
+    pub max_task_time_secs: u64,
+    pub extension_step_secs: u64,
+    #[serde(default)]
+    pub auto_continue_candidate: bool,
+    #[serde(default)]
+    pub auto_continue_proof: bool,
+}
+
+impl Default for ExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            default_timeout_secs: 30 * 60,
+            max_task_time_secs: 30 * 60,
+            extension_step_secs: 5 * 60,
+            auto_continue_candidate: false,
+            auto_continue_proof: false,
+        }
+    }
+}
+
+impl ExecutionPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.default_timeout_secs == 0 || self.extension_step_secs == 0 {
+            return Err("execution durations must be greater than zero".into());
+        }
+        if self.max_task_time_secs < self.default_timeout_secs {
+            return Err("max-task-time-secs must be at least default-timeout-secs".into());
+        }
+        if [
+            self.default_timeout_secs,
+            self.max_task_time_secs,
+            self.extension_step_secs,
+        ]
+        .into_iter()
+        .any(|duration| duration > MAX_EXECUTION_DURATION_SECS)
+        {
+            return Err(format!(
+                "execution durations must not exceed {MAX_EXECUTION_DURATION_SECS} seconds"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_at(&self, requested_at_ms: i64) -> Result<(), String> {
+        self.validate()?;
+        resolve_execution_deadline_ms(requested_at_ms, self.max_task_time_secs).map(|_| ())
     }
 }
 
@@ -130,10 +252,10 @@ pub struct VersionStamps {
     pub schema_version: u32,
     pub engine_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_hash: Option<String>,
 }
+
+pub type RuntimeConfigurationEvidence = AppliedRuntimeConfiguration;
 
 /// What a role's agent handed back. Written by the agent as
 /// `/mission/handoff/handoff.json`, parsed strictly by the runner.
@@ -175,6 +297,34 @@ pub enum Handoff {
         proposal: Option<PlanProposal>,
         request_attention: bool,
     },
+}
+
+impl Handoff {
+    /// Whether this payload has the exact schema promised by a role effect.
+    /// The predicate lives in the model so parsing, execution, and replay use
+    /// one closed contract rather than independently matching handoff tags.
+    pub const fn matches_output(&self, output: OutputSemantics) -> bool {
+        matches!(
+            (self, output),
+            (Self::Validate { .. }, OutputSemantics::EmitsVerdict)
+                | (Self::Review { .. }, OutputSemantics::EmitsGapVerdict)
+                | (Self::Plan { .. }, OutputSemantics::ProposesPlan)
+                | (
+                    Self::Work { .. },
+                    OutputSemantics::ProducesReport | OutputSemantics::ProducesArtifact
+                )
+        )
+    }
+
+    /// Narrative report carried by every role handoff variant.
+    pub const fn report(&self) -> &PayloadRef {
+        match self {
+            Self::Work { report, .. }
+            | Self::Validate { report, .. }
+            | Self::Review { report, .. }
+            | Self::Plan { report, .. } => report,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,23 +390,72 @@ pub struct ArtifactOutcome {
     pub head_sha: String,
 }
 
+/// Validate the parts of a role success that are authoritative at the effect
+/// boundary. Writers may legitimately report no artifact when the requested
+/// work was already satisfied, but only writers may return one and its base
+/// must be the immutable assignment base.
+pub fn role_success_contract_error(
+    output: OutputSemantics,
+    handoff: &Handoff,
+    artifact: Option<&ArtifactOutcome>,
+    requested_base_sha: &str,
+) -> Option<&'static str> {
+    if !handoff.matches_output(output) {
+        return Some("role handoff does not match the effect output contract");
+    }
+    match handoff {
+        Handoff::Work { done: false, .. } => return Some("role reported done=false"),
+        Handoff::Plan { done: false, .. } => return Some("planning author reported done=false"),
+        _ => {}
+    }
+    let artifact = artifact?;
+    if output != OutputSemantics::ProducesArtifact {
+        return Some("only a produces-artifact role may return an artifact");
+    }
+    if artifact.base_sha != requested_base_sha {
+        return Some("artifact base does not match the effect assignment base");
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedInputRef {
     pub name: InputName,
     pub digest: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunErrorKind {
-    Launch,
-    TurnFailed,
-    Timeout,
-    HandoffMissing,
-    HandoffInvalid,
-    DirtyWorktree,
-    Infra,
-    Interrupted,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleRunSuccess {
+    pub handoff: Handoff,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ArtifactOutcome>,
+    pub final_response: PayloadRef,
+    pub runtime_configuration: RuntimeConfigurationEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OracleRunSuccess {
+    pub exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
+    pub stdout: PayloadRef,
+    pub stderr: PayloadRef,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepared_inputs: Vec<PreparedInputRef>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalReviewSuccess {
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<Gap>,
+    pub report: PayloadRef,
+    pub final_response: PayloadRef,
+    pub runtime_configuration: RuntimeConfigurationEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,7 +463,7 @@ pub enum RunErrorKind {
 pub enum EffectResource {
     Container,
     RuntimeSecret,
-    AttemptDirectory,
+    EffectDirectory,
     WriterRef,
 }
 
@@ -293,10 +492,13 @@ pub enum MissionEvent {
         plan_hash: String,
     },
     RoleRunRequested {
+        namespace: TaskNamespace,
         task_id: TaskId,
         attempt_no: u32,
         effect_id: super::EffectId,
         role: RoleName,
+        /// Closed output contract resolved from the pinned mission type.
+        output: OutputSemantics,
         /// Effective runtime profile, resolved before the request is recorded.
         runtime: String,
         /// Assembled prompt, persisted before the request is recorded so a
@@ -304,20 +506,38 @@ pub enum MissionEvent {
         prompt: PayloadRef,
         /// Commit the role's workspace is created at.
         base_sha: String,
+        /// Monotonic identity for a fresh task assignment. Retries and
+        /// continues retain the epoch and workspace.
+        assignment_epoch: u32,
+        /// True only when a fresh assignment moved the required base.
+        recreate_workspace: bool,
+        requested_at_ms: i64,
+        not_before_ms: i64,
+        deadline_ms: i64,
+        budget_deadline_ms: i64,
+    },
+    /// Kernel-observed confirmation that the task-owned writable checkout
+    /// exists at the assignment base. Request intent never updates workspace
+    /// provenance; only this post-materialization fact does.
+    TaskWorkspacePrepared {
+        task_id: TaskId,
+        effect_id: super::EffectId,
+        base_sha: String,
+        assignment_epoch: u32,
+    },
+    /// Structured adapter evidence for the exact active effect. This is the
+    /// one runtime journal fact promoted into mission authority so crash
+    /// recovery can report configuration truth without trusting activity.json.
+    EffectRuntimeConfigured {
+        effect_id: super::EffectId,
+        configuration: RuntimeConfigurationEvidence,
     },
     RoleRunCompleted {
+        namespace: TaskNamespace,
         task_id: TaskId,
         attempt_no: u32,
         effect_id: super::EffectId,
-        handoff: Handoff,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        artifact: Option<ArtifactOutcome>,
-    },
-    RoleRunFailed {
-        task_id: TaskId,
-        attempt_no: u32,
-        effect_id: super::EffectId,
-        failure: super::RunFailure,
+        outcome: Result<RoleRunSuccess, TypedFailure>,
     },
     OracleRunRequested {
         assertion_ids: Vec<AssertionId>,
@@ -325,6 +545,9 @@ pub enum MissionEvent {
         judged_sha: String,
         attempt_no: u32,
         effect_id: super::EffectId,
+        requested_at_ms: i64,
+        not_before_ms: i64,
+        deadline_ms: i64,
     },
     OracleRunCompleted {
         assertion_ids: Vec<AssertionId>,
@@ -332,22 +555,7 @@ pub enum MissionEvent {
         judged_sha: String,
         attempt_no: u32,
         effect_id: super::EffectId,
-        exit_code: i32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        exit_signal: Option<i32>,
-        stdout: PayloadRef,
-        stderr: PayloadRef,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        prepared_inputs: Vec<PreparedInputRef>,
-        duration_ms: u64,
-    },
-    OracleRunFailed {
-        assertion_ids: Vec<AssertionId>,
-        oracle: OracleName,
-        judged_sha: String,
-        attempt_no: u32,
-        effect_id: super::EffectId,
-        failure: super::RunFailure,
+        outcome: Result<OracleRunSuccess, TypedFailure>,
     },
     /// The closing review was dispatched: a fresh-context `emits-gap-verdict`
     /// role judging the tree at `judged_sha` against the objective,
@@ -368,6 +576,10 @@ pub enum MissionEvent {
         /// its handoff. Rides the event so the runner's forgery check
         /// survives crash/resume (the inflight effect rebuilds from here).
         nonce: String,
+        requested_at_ms: i64,
+        not_before_ms: i64,
+        deadline_ms: i64,
+        budget_deadline_ms: i64,
     },
     /// The reviewer's verdict — advisory by construction: the fold stores it
     /// in `terminal_review`, never in any assertion's `last_authoritative`,
@@ -378,25 +590,27 @@ pub enum MissionEvent {
         judged_sha: String,
         /// The reviewer's own summary bit. A blocking gap dominates it
         /// (fail-closed) — see `TerminalReviewVerdict::blocking`.
-        passed: bool,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        gaps: Vec<Gap>,
-        report: PayloadRef,
+        outcome: Result<TerminalReviewSuccess, TypedFailure>,
     },
-    /// The reviewer failed to *run or hand off a verdict* (infrastructure or
-    /// an unfinished review), distinct from a verdict with gaps.
-    TerminalReviewFailed {
-        attempt_no: u32,
+    /// A durable control for one exact effect generation.
+    ControlRequested {
         effect_id: super::EffectId,
-        judged_sha: String,
-        failure: super::RunFailure,
+        action: ControlAction,
+        reason: String,
+    },
+    /// The driver durably won the exact deadline race and may now cancel this
+    /// generation. Later extensions are stale; an earlier extension changes
+    /// the deadline and makes this fact inapplicable in the fold.
+    EffectDeadlineReached {
+        effect_id: super::EffectId,
+        deadline_ms: i64,
     },
     /// Cleanup failed without settling the original request. The next driver
     /// retries the same exact resource operation before any new dispatch.
     EffectCleanupFailed {
         effect_id: super::EffectId,
         resource: EffectResource,
-        failure: super::RunFailure,
+        failure: TypedFailure,
     },
     MissionAborted {
         reason: String,
@@ -409,6 +623,22 @@ pub enum MissionEvent {
         attention_id: String,
         action: DecisionAction,
         justification: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ControlAction {
+    Stop,
+    ExtendDeadline {
+        old_deadline_ms: i64,
+        new_deadline_ms: i64,
+        #[serde(default)]
+        automatic: bool,
+    },
+    Continue {
+        #[serde(default)]
+        automatic: bool,
     },
 }
 
@@ -457,14 +687,15 @@ impl MissionEvent {
             Self::MissionCreated { .. } => "mission_created",
             Self::PlanProposed { .. } => "plan_proposed",
             Self::RoleRunRequested { .. } => "role_run_requested",
+            Self::TaskWorkspacePrepared { .. } => "task_workspace_prepared",
+            Self::EffectRuntimeConfigured { .. } => "effect_runtime_configured",
             Self::RoleRunCompleted { .. } => "role_run_completed",
-            Self::RoleRunFailed { .. } => "role_run_failed",
             Self::OracleRunRequested { .. } => "oracle_run_requested",
             Self::OracleRunCompleted { .. } => "oracle_run_completed",
-            Self::OracleRunFailed { .. } => "oracle_run_failed",
             Self::TerminalReviewRequested { .. } => "terminal_review_requested",
             Self::TerminalReviewCompleted { .. } => "terminal_review_completed",
-            Self::TerminalReviewFailed { .. } => "terminal_review_failed",
+            Self::ControlRequested { .. } => "control_requested",
+            Self::EffectDeadlineReached { .. } => "effect_deadline_reached",
             Self::EffectCleanupFailed { .. } => "effect_cleanup_failed",
             Self::MissionAborted { .. } => "mission_aborted",
             Self::DecisionRecorded { .. } => "decision_recorded",
@@ -481,21 +712,104 @@ impl MissionEvent {
                 Some((EffectEventClass::Request, effect_id.as_str()))
             }
             Self::RoleRunCompleted { effect_id, .. }
-            | Self::RoleRunFailed { effect_id, .. }
             | Self::OracleRunCompleted { effect_id, .. }
-            | Self::OracleRunFailed { effect_id, .. }
-            | Self::TerminalReviewCompleted { effect_id, .. }
-            | Self::TerminalReviewFailed { effect_id, .. } => {
+            | Self::TerminalReviewCompleted { effect_id, .. } => {
                 Some((EffectEventClass::Outcome, effect_id.as_str()))
             }
-            // Fact events carry no effect ID. Exhaustive on purpose: a new
-            // effect-style event must decide its class here.
+            // Facts are not members of the request/outcome pair, even when
+            // they identify the effect they describe. Exhaustive on purpose.
             Self::MissionCreated { .. }
             | Self::PlanProposed { .. }
+            | Self::TaskWorkspacePrepared { .. }
+            | Self::EffectRuntimeConfigured { .. }
+            | Self::ControlRequested { .. }
+            | Self::EffectDeadlineReached { .. }
             | Self::MissionAborted { .. }
             | Self::DecisionRecorded { .. }
             | Self::EffectCleanupFailed { .. } => None,
         }
+    }
+
+    pub(crate) fn outcome_effect_id(&self) -> Option<&super::EffectId> {
+        match self {
+            Self::RoleRunCompleted { effect_id, .. }
+            | Self::OracleRunCompleted { effect_id, .. }
+            | Self::TerminalReviewCompleted { effect_id, .. } => Some(effect_id),
+            _ => None,
+        }
+    }
+
+    /// The typed failure already carried by an outcome, if it has one.
+    pub fn outcome_failure(&self) -> Option<&TypedFailure> {
+        match self {
+            Self::RoleRunCompleted {
+                outcome: Err(failure),
+                ..
+            }
+            | Self::OracleRunCompleted {
+                outcome: Err(failure),
+                ..
+            }
+            | Self::TerminalReviewCompleted {
+                outcome: Err(failure),
+                ..
+            } => Some(failure),
+            _ => None,
+        }
+    }
+
+    /// Canonical bounded evidence available at an effect outcome boundary.
+    /// Blob payloads stay referenced by the success event; pure replay cannot
+    /// resolve storage and therefore does not duplicate them into a failure.
+    pub fn outcome_failure_evidence(&self) -> Option<TypedFailureEvidence> {
+        match self {
+            Self::RoleRunCompleted { outcome, .. } => Some(match outcome {
+                Ok(success) => TypedFailureEvidence {
+                    final_response: inline_payload(&success.final_response),
+                    configuration: success.runtime_configuration.clone(),
+                    ..Default::default()
+                },
+                Err(failure) => failure.evidence().clone(),
+            }),
+            Self::OracleRunCompleted { outcome, .. } => Some(match outcome {
+                Ok(success) => TypedFailureEvidence {
+                    exit_code: Some(success.exit_code),
+                    stderr: inline_payload(&success.stderr),
+                    ..Default::default()
+                },
+                Err(failure) => failure.evidence().clone(),
+            }),
+            Self::TerminalReviewCompleted { outcome, .. } => Some(match outcome {
+                Ok(success) => TypedFailureEvidence {
+                    final_response: inline_payload(&success.final_response),
+                    configuration: success.runtime_configuration.clone(),
+                    ..Default::default()
+                },
+                Err(failure) => failure.evidence().clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn outcome_final_response(&self) -> Option<&PayloadRef> {
+        match self {
+            Self::RoleRunCompleted {
+                outcome: Ok(success),
+                ..
+            } => Some(&success.final_response),
+            Self::TerminalReviewCompleted {
+                outcome: Ok(success),
+                ..
+            } => Some(&success.final_response),
+            _ => None,
+        }
+    }
+}
+
+fn inline_payload(payload: &PayloadRef) -> String {
+    match payload {
+        PayloadRef::Inline { text } => text.clone(),
+        PayloadRef::Blob(_) => String::new(),
     }
 }
 
@@ -540,7 +854,7 @@ mod compat_tests {
 
     #[test]
     fn plan_proposal_round_trips_strict_requirement_dispositions() {
-        use crate::model::{
+        use crate::{
             Assertion, Plan, Requirement, RequirementDisposition, RequirementId, RequirementKind,
         };
 
@@ -574,7 +888,7 @@ mod compat_tests {
     fn empty_plan_proposal() -> PlanProposal {
         PlanProposal {
             base_revision: 0,
-            plan: crate::model::Plan {
+            plan: crate::Plan {
                 requirements: vec![],
                 assertions: vec![],
                 tasks: vec![],
@@ -625,6 +939,58 @@ mod compat_tests {
             })
         );
         assert_eq!(serde_json::from_value::<MissionEvent>(json).unwrap(), event);
+    }
+
+    #[test]
+    fn role_effect_task_namespace_and_output_contract_are_required_on_the_wire() {
+        let event = MissionEvent::RoleRunRequested {
+            namespace: TaskNamespace::Planning,
+            task_id: TaskId::new("author").unwrap(),
+            attempt_no: 1,
+            effect_id: crate::EffectId::for_parts(&["test", "author"]),
+            role: RoleName::new("planner").unwrap(),
+            output: OutputSemantics::ProposesPlan,
+            runtime: "codex".into(),
+            prompt: PayloadRef::inline("prompt"),
+            base_sha: "base".into(),
+            assignment_epoch: 1,
+            recreate_workspace: true,
+            requested_at_ms: 1,
+            not_before_ms: 1,
+            deadline_ms: 2,
+            budget_deadline_ms: 3,
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["namespace"], "planning");
+        assert_eq!(json["output"], "proposes-plan");
+        assert_eq!(
+            serde_json::from_value::<MissionEvent>(json.clone()).unwrap(),
+            event
+        );
+        for field in ["namespace", "output"] {
+            let mut missing = json.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<MissionEvent>(missing).is_err(),
+                "missing {field} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_policy_rejects_the_first_unrepresentable_duration() {
+        let invalid = ExecutionPolicy {
+            max_task_time_secs: super::MAX_EXECUTION_DURATION_SECS + 1,
+            ..ExecutionPolicy::default()
+        };
+        assert!(invalid.validate().is_err());
+
+        let maximum = ExecutionPolicy {
+            max_task_time_secs: super::MAX_EXECUTION_DURATION_SECS,
+            ..ExecutionPolicy::default()
+        };
+        assert!(maximum.validate().is_ok());
     }
 
     #[test]

@@ -338,10 +338,10 @@ Before finalizing, self-check both ways:
   preference or speculation.
 
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:
-   {\"schema\": \"lionclaw.mission.review-handoff.v1\",
+   {\"schema\": \"lionclaw.mission.review-handoff.v2\",
     \"type\": \"review\",
     \"done\": true,
-    \"report\": {\"kind\": \"inline\", \"text\": \"<your requirement map, what you ran, what you observed>\"},
+    \"report\": \"<your requirement map, what you ran, what you observed>\",
     \"passed\": false,
     \"nonce\": \"<the nonce given below>\",
     \"gaps\": [{\"severity\": \"blocking\",
@@ -370,10 +370,10 @@ When you are finished you MUST:
    already satisfied, verify it, do not create an empty commit, and leave the
    unchanged HEAD in place. The engine accepts either outcome.
 2. Write /mission/handoff/handoff.json exactly like:
-   {\"schema\": \"lionclaw.mission.work-handoff.v1\",
+   {\"schema\": \"lionclaw.mission.work-handoff.v2\",
     \"type\": \"work\",
     \"done\": true,
-    \"report\": {\"kind\": \"inline\", \"text\": \"<what you did and why>\"},
+    \"report\": \"<what you did and why>\",
     \"request_attention\": false}
    Set done=false if you could not complete the task; set
    request_attention=true only if a human must look before the mission
@@ -388,10 +388,10 @@ Your workspace is mounted READ-ONLY at /workspace. You cannot and must not
 modify it.
 
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:
-   {\"schema\": \"lionclaw.mission.validate-handoff.v1\",
+   {\"schema\": \"lionclaw.mission.validate-handoff.v2\",
     \"type\": \"validate\",
     \"done\": true,
-    \"report\": {\"kind\": \"inline\", \"text\": \"<your findings>\"},
+    \"report\": \"<your findings>\",
     \"items\": [{\"item_id\": \"<ASSERTION-ID>\", \"passed\": false}],
     \"passed\": false,
     \"request_attention\": false}
@@ -405,10 +405,10 @@ read-only at /workspace) and produce the report the task asks for — research,
 a draft plan, or an adversarial critique. You do not modify anything.
 
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:
-   {\"schema\": \"lionclaw.mission.work-handoff.v1\",
+   {\"schema\": \"lionclaw.mission.work-handoff.v2\",
     \"type\": \"work\",
     \"done\": true,
-    \"report\": {\"kind\": \"inline\", \"text\": \"<your report>\"},
+    \"report\": \"<your report>\",
     \"request_attention\": false}";
 
 const PROPOSES_PLAN_SKELETON: &str = "\
@@ -441,10 +441,10 @@ available inventories. Angle-bracketed values in the shape example below are
 placeholders.
 
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:
-   {\"schema\": \"lionclaw.mission.plan-handoff.v1\",
+   {\"schema\": \"lionclaw.mission.plan-handoff.v2\",
     \"type\": \"plan\",
     \"done\": true,
-    \"report\": {\"kind\": \"inline\", \"text\": \"<why this contract>\"},
+    \"report\": \"<why this contract>\",
     \"proposal\": {\"base_revision\": <the proposal base revision below>,
                    \"plan\": {
                      \"requirements\": [{\"id\": \"OBJECTIVE-MET\", \"kind\": \"capability\",
@@ -470,6 +470,7 @@ mod tests {
             name: RoleName::new(name).unwrap(),
             output,
             runtime: None,
+            timeout_secs: None,
             network: false,
             secrets: false,
             skills: Vec::new(),

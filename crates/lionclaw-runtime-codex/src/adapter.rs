@@ -10,7 +10,7 @@ use lionclaw_runtime_api::{
     RuntimeMcpServerSpec, RuntimeNativeHomeArtifactDir, RuntimeProgramExecutor, RuntimeProgramSpec,
     RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
     RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
-    RuntimeTurnResult,
+    RuntimeTurnResult, TypedFailure,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -19,15 +19,16 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::app_server::{
-    extract_app_server_thread_id, extract_app_server_turn_id, finish_app_server_session,
-    thread_resume_params, thread_start_params, turn_start_params, AppServerTransport,
-    CodexAppServerClient, CodexAppServerEventSink, ExecutionSessionTransport,
+    extract_app_server_model, extract_app_server_thread_id, extract_app_server_turn_id,
+    finish_app_server_session, thread_resume_params, thread_start_params, turn_start_params,
+    AppServerTransport, CodexAppServerClient, CodexAppServerEventSink, ExecutionSessionTransport,
     CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR,
 };
 use crate::driver::CodexRuntimeConfig;
 use crate::program::{build_codex_app_server_program, build_codex_terminal_program};
 use crate::state::{
-    load_ready_saved_thread_id, CodexInterruptRequest, CodexSessionState, CodexThreadState,
+    load_ready_saved_thread_id, validate_protocol_id, CodexInterruptRequest, CodexSessionState,
+    CodexThreadState,
 };
 
 #[derive(Debug)]
@@ -40,6 +41,19 @@ struct CodexAppServerTurnRunner<'a> {
     adapter: &'a CodexRuntimeAdapter,
     context: RuntimeExecutionContext,
     executor: Box<dyn RuntimeProgramExecutor>,
+}
+
+fn validate_app_server_model(requested: Option<&str>, applied: Option<&str>) -> Result<()> {
+    match (requested, applied) {
+        (None, _) => Ok(()),
+        (Some(requested), Some(applied)) if requested == applied => Ok(()),
+        (Some(requested), Some(applied)) => Err(anyhow!(
+            "codex app-server applied model '{applied}', expected '{requested}'"
+        )),
+        (Some(_), None) => Err(anyhow!(
+            "codex app-server did not report the applied model in turn/start"
+        )),
+    }
 }
 
 impl CodexAppServerTurnRunner<'_> {
@@ -57,6 +71,7 @@ impl CodexAppServerTurnRunner<'_> {
         let mut client =
             CodexAppServerClient::new_with_runtime_context(transport, self.context.clone());
         let sink = CodexAppServerEventSink::journal(&journal);
+        let mut applied_configuration = None;
 
         let result = async {
             client.initialize(sink, &thread_state).await?;
@@ -83,6 +98,33 @@ impl CodexAppServerTurnRunner<'_> {
                 )
                 .await?;
             let turn_id = extract_app_server_turn_id(&response);
+            if let Some(turn_id) = turn_id.as_deref() {
+                validate_protocol_id(turn_id)?;
+            }
+            let applied_model = extract_app_server_model(&response);
+            let configuration = lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                requested_model: self.adapter.config.model.clone(),
+                applied_model: applied_model.clone(),
+                model_confirmation: applied_model
+                    .as_ref()
+                    .map(|_| lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed),
+                requested_mode: None,
+                applied_mode: None,
+                mode_confirmation: None,
+            }
+            .projected();
+            applied_configuration = Some(configuration.clone());
+            validate_app_server_model(
+                self.adapter.config.model.as_deref(),
+                applied_model.as_deref(),
+            )?;
+            drop(
+                journal
+                    .send(lionclaw_runtime_api::TurnEvent::canonical(
+                        lionclaw_runtime_api::RuntimeEvent::Configuration { configuration },
+                    ))
+                    .await,
+            );
             let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
             client
                 .wait_for_turn_completed(
@@ -94,11 +136,43 @@ impl CodexAppServerTurnRunner<'_> {
                     Some(&mut interrupt_rx),
                 )
                 .await?;
-            Ok(RuntimeTurnResult::default())
+            let final_response = client.take_final_response();
+            Ok(RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_model: self.adapter.config.model.clone(),
+                    model_confirmation: applied_model
+                        .as_ref()
+                        .map(|_| lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed),
+                    applied_model,
+                    requested_mode: None,
+                    applied_mode: None,
+                    mode_confirmation: None,
+                },
+                final_response,
+                ..Default::default()
+            }
+            .projected())
         }
         .await;
 
-        finish_app_server_session(client, result).await
+        let failed_final_response = if let Ok(completed) = &result {
+            completed.final_response.clone()
+        } else {
+            client.take_final_response()
+        };
+        finish_app_server_session(client, result)
+            .await
+            .map_err(|error| {
+                let mut failure = error
+                    .downcast_ref::<TypedFailure>()
+                    .cloned()
+                    .unwrap_or_else(|| TypedFailure::permanent("codex.runtime", error.to_string()));
+                if let Some(configuration) = applied_configuration {
+                    failure.evidence_mut().configuration = configuration;
+                }
+                failure.evidence_mut().final_response = failed_final_response;
+                anyhow::Error::new(failure.projected())
+            })
     }
 }
 
@@ -303,13 +377,17 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         Ok(())
     }
 
-    async fn cancel(&self, handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+    async fn cancel(
+        &self,
+        handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<lionclaw_runtime_api::RuntimeCancellation> {
         let active_turn = self
             .session_state(&handle.runtime_session_id)
             .ok()
             .and_then(|state| state.active_turn);
         let Some(active_turn) = active_turn else {
-            return Ok(());
+            return Ok(lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn);
         };
 
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -323,7 +401,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
                 )
             })?;
 
-        timeout(Duration::from_secs(5), ack_rx)
+        let result = timeout(Duration::from_secs(5), ack_rx)
             .await
             .map_err(|_| {
                 anyhow!(
@@ -338,7 +416,9 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
                     active_turn.thread_id,
                     active_turn.turn_id
                 )
-            })?
+            })?;
+        result?;
+        Ok(lionclaw_runtime_api::RuntimeCancellation::Acknowledged)
     }
 
     async fn close(&self, handle: &RuntimeSessionHandle) -> Result<()> {
@@ -347,5 +427,18 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
             .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
             .remove(&handle.runtime_session_id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+
+    #[test]
+    fn app_server_model_evidence_must_match_the_codex_request() {
+        validate_app_server_model(Some("gpt-5.5"), Some("gpt-5.5")).unwrap();
+        assert!(validate_app_server_model(Some("gpt-5.5"), Some("fallback")).is_err());
+        assert!(validate_app_server_model(Some("gpt-5.5"), None).is_err());
+        validate_app_server_model(None, Some("runtime-default")).unwrap();
     }
 }

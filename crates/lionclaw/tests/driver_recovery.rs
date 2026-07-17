@@ -7,16 +7,22 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use common::{
-    approve_plan, default_config, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
+    approve_plan, fault_append_events, initialize_repository, proposal, simple_plan,
+    test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
-use lionclaw::model::{ArtifactOutcome, EffectResource, Handoff, PayloadRef, RunErrorKind};
-use lionclaw::ports::{
-    EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, RoleRunFailure, RoleRunOutcome,
-    RoleRunRequest, RoleRunner,
+use lionclaw::model::{
+    EffectResource, Handoff, MissionEvent, PayloadRef, RuntimeConfigurationEvidence,
 };
-use lionclaw::store::MissionStore;
-use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
+use lionclaw::ports::{
+    EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, RoleRunOutcome, RoleRunRequest,
+    RoleRunner,
+};
+use lionclaw::store::{MissionStore, NewEvent};
+use lionclaw::testing::{
+    capture_test_artifact, MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner,
+};
+use lionclaw_runtime_api::TypedFailure;
 use tokio::sync::Barrier;
 
 struct BlockingRunner {
@@ -25,23 +31,32 @@ struct BlockingRunner {
     calls: Arc<AtomicUsize>,
 }
 
+fn test_repository() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    initialize_repository(dir.path());
+    dir
+}
+
 #[async_trait]
 impl RoleRunner for BlockingRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.wait().await;
         self.release.wait().await;
+        let artifact = capture_test_artifact(&request, HEAD_SHA).await?;
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("done"),
                 request_attention: false,
             },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha,
-                head_sha: HEAD_SHA.to_string(),
-            }),
-            model_id: Some("blocking-test".to_string()),
+            artifact: Some(artifact),
+            runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
+                requested_model: Some("blocking-test".to_string()),
+                applied_model: Some("blocking-test".to_string()),
+                ..Default::default()
+            },
+            final_response: String::new(),
         })
     }
 }
@@ -74,7 +89,7 @@ impl EffectCleaner for FailOnceCleaner {
         self.calls.lock().unwrap().push(request);
         if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(EffectCleanupFailure {
-                resource: EffectResource::AttemptDirectory,
+                resource: EffectResource::EffectDirectory,
                 detail: "injected attempt-directory cleanup failure".to_string(),
             });
         }
@@ -91,7 +106,6 @@ async fn create_approved_mission(
             repo.to_str().unwrap(),
             "exercise mission driver ownership",
             BASE_SHA,
-            default_config(),
         )
         .await
         .unwrap();
@@ -105,7 +119,7 @@ async fn create_approved_mission(
 
 #[tokio::test]
 async fn concurrent_advance_reports_running_and_never_double_dispatches() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let started = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -147,8 +161,64 @@ async fn concurrent_advance_reports_running_and_never_double_dispatches() {
 }
 
 #[tokio::test]
+async fn detached_startup_waits_out_a_short_observer_lock_probe() {
+    let dir = test_repository();
+    let engine = Arc::new(Engine::new(
+        MissionStore::open(dir.path()).await.unwrap(),
+        test_mission_type(),
+        "codex".to_string(),
+        "test-image".to_string(),
+        EngineServices::new(
+            Arc::new(MockRoleRunner::happy(HEAD_SHA)),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    ));
+    let mission_id = create_approved_mission(&engine, dir.path()).await;
+    let lock_path = engine
+        .store()
+        .lionclaw_dir()
+        .join("missions")
+        .join(mission_id.as_str())
+        .join("driver.lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let observer_probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    rustix::fs::flock(&observer_probe, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    let handshake = dir.path().join("detached.ready");
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let mission_id = mission_id.clone();
+        let handshake = handshake.clone();
+        async move {
+            engine
+                .advance_with_handshake(&mission_id, Some(&handshake))
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert!(
+        !handshake.exists(),
+        "handshake requires actual lock ownership"
+    );
+    rustix::fs::flock(&observer_probe, rustix::fs::FlockOperation::Unlock).unwrap();
+    drop(observer_probe);
+
+    let finished = driver.await.unwrap();
+    assert!(handshake.exists());
+    assert_eq!(finished.disposition, MissionDisposition::Terminal);
+}
+
+#[tokio::test]
 async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let runner = Arc::new(MockRoleRunner::happy(HEAD_SHA));
     let cleaner = Arc::new(FailOnceCleaner::default());
     let engine = Engine::new(
@@ -172,12 +242,37 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
         vec!["mission advance", "mission log"]
     );
     let failure = blocked.state.cleanup_failure.as_ref().unwrap();
-    assert_eq!(failure.resource, EffectResource::AttemptDirectory);
+    assert_eq!(failure.resource, EffectResource::EffectDirectory);
     assert_eq!(
-        failure.failure.detail,
+        failure.failure.detail(),
         "injected attempt-directory cleanup failure"
     );
     assert_eq!(runner.calls.lock().unwrap().len(), 1);
+
+    let state = engine.load_state(&mission_id).await.unwrap();
+    let effect_id = state.inflight.keys().next().unwrap().clone();
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        state.head,
+        &[NewEvent::new(MissionEvent::EffectRuntimeConfigured {
+            effect_id,
+            configuration: RuntimeConfigurationEvidence {
+                requested_model: Some("requested-model".into()),
+                applied_model: Some("applied-model".into()),
+                model_confirmation: Some(
+                    lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+                ),
+                requested_mode: Some("build".into()),
+                applied_mode: Some("build".into()),
+                mode_confirmation: Some(
+                    lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+                ),
+            },
+        })],
+        1,
+    )
+    .await;
 
     let parked = engine.advance(&mission_id).await.unwrap();
     assert_eq!(parked.disposition, MissionDisposition::Parked);
@@ -190,9 +285,20 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
         .get(&lionclaw::model::TaskId::new("fix").unwrap())
         .unwrap();
     assert_eq!(
-        task.last_failure.as_ref().unwrap().kind,
-        RunErrorKind::Interrupted
+        task.last_failure.as_ref().unwrap().category(),
+        "interrupted"
     );
+    let configuration = &task.last_failure.as_ref().unwrap().evidence().configuration;
+    assert_eq!(
+        configuration.requested_model.as_deref(),
+        Some("requested-model")
+    );
+    assert_eq!(
+        configuration.applied_model.as_deref(),
+        Some("applied-model")
+    );
+    assert_eq!(configuration.requested_mode.as_deref(), Some("build"));
+    assert_eq!(configuration.applied_mode.as_deref(), Some("build"));
     let attention = parked.state.open_attention.values().next().unwrap();
     assert!(attention.report.contains("previous mission driver exited"));
     assert!(attention.report.contains("effect was not replayed"));
@@ -206,7 +312,7 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
 
 #[tokio::test]
 async fn persistent_cleanup_failure_never_settles_or_replays_the_effect() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_repository();
     let runner = Arc::new(MockRoleRunner::happy(HEAD_SHA));
     let cleaner = Arc::new(AlwaysFailCleaner::default());
     let engine = Engine::new(
@@ -234,7 +340,7 @@ async fn persistent_cleanup_failure_never_settles_or_replays_the_effect() {
                 .as_ref()
                 .unwrap()
                 .failure
-                .detail,
+                .detail(),
             "injected persistent runtime-secret cleanup failure"
         );
     }

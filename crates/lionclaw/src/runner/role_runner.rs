@@ -1,8 +1,8 @@
 //! `OciRoleRunner`: the production [`RoleRunner`]. One dispatch =
 //! isolate the workspace, compile the plan through the moat, run one full
 //! agent turn under confinement, capture the handoff (and, for writers, the
-//! resulting commit). Timeouts are enforced here (`process.rs` does not);
-//! `kill_on_drop` reaps the container when a timed-out future is dropped.
+//! resulting commit). The engine owns deadlines; this boundary observes its
+//! control channel throughout setup, execution, and capture.
 
 use std::sync::Arc;
 
@@ -12,6 +12,7 @@ use lionclaw_runtime_acp::AcpRuntimeDriver;
 use lionclaw_runtime_api::{
     RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider,
     RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTurnInput,
+    TypedFailure, TypedFailureEvidence,
 };
 use lionclaw_runtime_codex::{
     CodexRuntimeAuthProvider, CodexRuntimeDriver, CODEX_RUNTIME_AUTH_KIND,
@@ -22,13 +23,13 @@ use crate::authority::{
     compile_authority, compile_role_plan, AuthorityCeiling, MissionMounts, RolePlanRequest,
 };
 use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig, RuntimeProfiles};
-use crate::model::{ArtifactOutcome, OutputSemantics, RunErrorKind};
-use crate::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest, RoleRunner};
+use crate::model::OutputSemantics;
+use crate::ports::{ExecutionControl, RoleRunOutcome, RoleRunRequest, RoleRunner};
 
 use super::executor::{mission_execution_context, MissionProgramExecutor};
 use super::handoff::read_handoff;
 use super::native_home_auth::NativeHomeAuthProvider;
-use super::{prepare_skill_mounts, AttemptDirs, SCRATCH_MOUNT_TARGET};
+use super::{await_controlled, prepare_skill_mounts, EffectDirs, TaskDirs, SCRATCH_MOUNT_TARGET};
 use crate::workspace;
 
 pub struct OciRoleRunner {
@@ -50,7 +51,7 @@ impl OciRoleRunner {
         }
     }
 
-    fn profile(&self, runtime: &str) -> Result<MissionRuntimeProfile, RoleRunFailure> {
+    fn profile(&self, runtime: &str) -> Result<MissionRuntimeProfile, TypedFailure> {
         let mut profile = self
             .profiles
             .get(runtime)
@@ -115,16 +116,204 @@ impl OciRoleRunner {
     }
 }
 
-fn launch(detail: String) -> RoleRunFailure {
-    RoleRunFailure {
-        kind: RunErrorKind::Launch,
-        detail,
+fn launch(detail: String) -> TypedFailure {
+    TypedFailure::permanent("kernel.launch", detail)
+}
+
+#[derive(Clone, Copy)]
+enum CancellationKind {
+    Deadline,
+    Stop,
+    Abort,
+}
+
+impl CancellationKind {
+    fn setup_detail(self) -> &'static str {
+        match self {
+            Self::Deadline => "effect deadline reached before or after the runtime turn",
+            Self::Stop => "effect stopped before or after the runtime turn",
+            Self::Abort => "mission aborted before or after the runtime turn",
+        }
     }
+
+    fn setup_code(self) -> &'static str {
+        match self {
+            Self::Deadline => "kernel.deadline",
+            Self::Stop => "kernel.stopped",
+            Self::Abort => "kernel.aborted",
+        }
+    }
+
+    fn active_detail(self) -> &'static str {
+        match self {
+            Self::Deadline => "agent turn exceeded its recorded effect deadline",
+            Self::Stop => "agent turn stopped by operator",
+            Self::Abort => "mission aborted by operator",
+        }
+    }
+
+    fn failure(self, evidence: lionclaw_runtime_api::TypedFailureEvidence) -> TypedFailure {
+        match self {
+            Self::Deadline => TypedFailure::DeadlineExhausted {
+                evidence: Box::new(evidence),
+            },
+            Self::Stop => TypedFailure::OperatorStopped {
+                evidence: Box::new(evidence),
+            },
+            Self::Abort => TypedFailure::OperatorAborted {
+                evidence: Box::new(evidence),
+            },
+        }
+    }
+}
+
+fn setup_control_failure(
+    profile: &MissionRuntimeProfile,
+    control: &ExecutionControl,
+) -> Option<TypedFailure> {
+    let (kind, reason) = match control {
+        ExecutionControl::RunUntil(_) => return None,
+        ExecutionControl::DeadlineExhausted => (
+            CancellationKind::Deadline,
+            "effect deadline exhausted".to_string(),
+        ),
+        ExecutionControl::Stop(reason) => (CancellationKind::Stop, reason.clone()),
+        ExecutionControl::Abort(reason) => (CancellationKind::Abort, reason.clone()),
+    };
+    let mut evidence = turn_failure_evidence(
+        profile,
+        kind.setup_detail().into(),
+        String::new(),
+        String::new(),
+    );
+    evidence.code = Some(kind.setup_code().into());
+    evidence.stop_reason = Some(reason);
+    Some(kind.failure(evidence))
+}
+
+async fn cancellation_acknowledged<A, T, O>(
+    acknowledgement: A,
+    mut turn: std::pin::Pin<&mut T>,
+    timeout: std::time::Duration,
+) -> (bool, Option<O>)
+where
+    A: std::future::Future<Output = anyhow::Result<lionclaw_runtime_api::RuntimeCancellation>>,
+    T: std::future::Future<Output = O>,
+{
+    tokio::pin!(acknowledgement);
+    let mut cancellation_acknowledged = false;
+    let mut turn_result = None;
+    let completed_in_time = tokio::time::timeout(timeout, async {
+        while !cancellation_acknowledged || turn_result.is_none() {
+            tokio::select! {
+                result = &mut acknowledgement, if !cancellation_acknowledged => {
+                    match result {
+                        Ok(lionclaw_runtime_api::RuntimeCancellation::Acknowledged) => {
+                            cancellation_acknowledged = true;
+                        }
+                        Ok(lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn) | Err(_) => {
+                            return;
+                        }
+                    }
+                }
+                result = turn.as_mut(), if turn_result.is_none() => turn_result = Some(result),
+            }
+        }
+    })
+    .await
+    .is_ok();
+    (
+        completed_in_time && cancellation_acknowledged && turn_result.is_some(),
+        turn_result,
+    )
+}
+
+fn completed_turn_evidence(
+    completed: Option<anyhow::Result<lionclaw_runtime_api::RuntimeTurnResult>>,
+) -> Option<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String)> {
+    completed.and_then(|completed| match completed {
+        Ok(result) => Some((result.configuration, result.final_response)),
+        Err(error) => error.downcast_ref::<TypedFailure>().map(|failure| {
+            (
+                failure.evidence().configuration.clone(),
+                failure.evidence().final_response.clone(),
+            )
+        }),
+    })
+}
+
+async fn prepare_writer_checkout(
+    repo: &std::path::Path,
+    workspace: &std::path::Path,
+    observer_index: &std::path::Path,
+    base_sha: &str,
+    recreate_workspace: bool,
+) -> Result<(), TypedFailure> {
+    let mut replace = !workspace.exists();
+    if workspace.exists() {
+        let head = workspace::task_head_sha(workspace)
+            .await
+            .map_err(|e| launch(format!("failed to inspect retained checkout HEAD: {e}")))?;
+        if !recreate_workspace {
+            if workspace::task_commit_exists(workspace, base_sha).await
+                && workspace::task_is_ancestor(workspace, base_sha, &head)
+                    .await
+                    .map_err(|e| {
+                        launch(format!("failed to compare retained checkout ancestry: {e}"))
+                    })?
+            {
+                workspace::prepare_task_observer_index(repo, observer_index, base_sha, false)
+                    .await
+                    .map_err(|e| launch(format!("failed to prepare workspace observer: {e}")))?;
+                return Ok(());
+            }
+            return Err(launch(format!(
+                "retained task workspace HEAD {head} does not descend from its recorded base {base_sha}"
+            )));
+        }
+        if head == base_sha {
+            replace = false;
+        } else {
+            if workspace::task_is_dirty(workspace)
+                .await
+                .map_err(|e| launch(format!("failed to inspect retained checkout: {e}")))?
+            {
+                return Err(launch(
+                    "refusing to recreate a dirty task workspace on a moved base".to_string(),
+                ));
+            }
+            if !workspace::commit_exists(repo, &head).await
+                || !workspace::is_ancestor(repo, &head, base_sha)
+                    .await
+                    .map_err(|e| {
+                        launch(format!("failed to compare retained checkout ancestry: {e}"))
+                    })?
+            {
+                return Err(launch(format!(
+                    "refusing to recreate task workspace with uncaptured commits at {head}"
+                )));
+            }
+            replace = true;
+        }
+    }
+    if replace {
+        workspace::replace_checkout(repo, workspace, base_sha)
+            .await
+            .map_err(|e| launch(format!("failed to create checkout: {e}")))?;
+    }
+    workspace::prepare_task_observer_index(
+        repo,
+        observer_index,
+        base_sha,
+        recreate_workspace || replace,
+    )
+    .await
+    .map_err(|e| launch(format!("failed to prepare workspace observer: {e}")))
 }
 
 #[async_trait]
 impl RoleRunner for OciRoleRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         if let Some(declared) = &request.role.runtime {
             if declared != &request.runtime {
                 return Err(launch(format!(
@@ -135,17 +324,14 @@ impl RoleRunner for OciRoleRunner {
         }
         let profile = self.profile(&request.runtime)?;
 
-        let dirs = AttemptDirs::prepare(
+        let dirs = EffectDirs::prepare(
             &request.state_dir,
             request.mission_id.as_str(),
             &request.effect_id,
         )
         .map_err(|e| launch(format!("failed to prepare attempt dirs: {e}")))?;
 
-        // Keep every fallible stage in one result. The engine owns the one
-        // cleanup path after this runner returns, including failures before a
-        // turn starts and recovery after this process exits.
-        let result: Result<RoleRunOutcome, RoleRunFailure> = async {
+        let setup = async {
             let skill_mounts = prepare_skill_mounts(
                 &dirs.runtime_home,
                 &request.skills,
@@ -155,23 +341,67 @@ impl RoleRunner for OciRoleRunner {
             let authority = compile_authority(&request.role, &self.ceiling)
                 .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
             let is_writer = authority.output() == OutputSemantics::ProducesArtifact;
-            // Every role gets the same complete checkout. Compiled authority is
-            // the only source of workspace mutability.
-            let workspace_source = dirs.root.join("work");
+            let (workspace_source, scratch_source, observer_index) = if is_writer {
+                let capture = request.artifact_capture.as_ref().ok_or_else(|| {
+                    launch("artifact-producing role has no capture authority".into())
+                })?;
+                let task_dirs = TaskDirs::prepare(
+                    &request.state_dir,
+                    request.mission_id.as_str(),
+                    &request.task_id,
+                )
+                .map_err(|e| launch(format!("failed to prepare task dirs: {e}")))?;
+                if capture.checkout_dir() != task_dirs.work {
+                    return Err(launch(
+                        "artifact capture authority names a different task checkout".into(),
+                    ));
+                }
+                (
+                    capture.checkout_dir().to_path_buf(),
+                    task_dirs.scratch.clone(),
+                    Some(task_dirs.observer_index.clone()),
+                )
+            } else {
+                if request.artifact_capture.is_some() {
+                    return Err(launch(
+                        "read-only role received artifact capture authority".into(),
+                    ));
+                }
+                (dirs.root.join("work"), dirs.read_scratch.clone(), None)
+            };
             {
                 let _guard = self.repo_lock.lock().await;
-                workspace::create_checkout(
-                    &request.workspace_dir,
-                    &workspace_source,
-                    &request.base_sha,
-                )
-                .await
-                .map_err(|e| launch(format!("failed to create checkout: {e}")))?;
+                if is_writer {
+                    prepare_writer_checkout(
+                        &request.workspace_dir,
+                        &workspace_source,
+                        observer_index.as_deref().expect("writer observer index"),
+                        &request.base_sha,
+                        request.recreate_workspace,
+                    )
+                    .await?;
+                    request
+                        .updates
+                        .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
+                            base_sha: request.base_sha.clone(),
+                            assignment_epoch: request.assignment_epoch,
+                        })
+                        .await
+                        .map_err(|_| launch("kernel role update receiver closed".into()))?;
+                } else {
+                    workspace::create_checkout(
+                        &request.workspace_dir,
+                        &workspace_source,
+                        &request.base_sha,
+                    )
+                    .await
+                    .map_err(|e| launch(format!("failed to create checkout: {e}")))?;
+                }
             }
             // Compile the plan through the moat. Judged roots = the workspace
             // the verdict is about (only meaningful for verdict roles, but the
             // predicate is applied uniformly).
-            let mut extras = dirs.agent_mounts();
+            let mut extras = dirs.effect_mounts(&scratch_source);
             extras.extend(skill_mounts);
             let environment = mission_environment(&dirs);
             let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
@@ -185,50 +415,78 @@ impl RoleRunner for OciRoleRunner {
                 },
                 judged_roots: &judged_roots,
                 environment,
-                hard_timeout: profile.hard_timeout,
             })
             .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
+            Ok((is_writer, compiled.plan().clone()))
+        };
+        let (is_writer, plan) = await_controlled(setup, request.control.clone(), |control| {
+            setup_control_failure(&profile, control)
+        })
+        .await?;
 
-            // Run the agent turn under confinement, then capture the artifact
-            // (writer only) before the workspace is torn down.
-            let model_id = self
-                .run_turn(&profile, &request, compiled.plan().clone())
-                .await?;
-            let handoff = read_handoff(&dirs.handoff, request.role.output)?;
+        // The adapter owns cancellation acknowledgement while its turn is
+        // live. Setup and capture use the same engine control, but are simply
+        // dropped: their child processes are kill-on-drop and task work is not.
+        let (applied, final_response) = self.run_turn(&profile, &request, plan).await?;
+        let cancellation_configuration = applied.clone();
+        let cancellation_response = final_response.clone();
+        let finish = async {
+            let handoff =
+                read_handoff(&dirs.handoff, request.role.output).map_err(|mut failure| {
+                    failure.evidence_mut().final_response = final_response.clone();
+                    failure.evidence_mut().configuration = applied.clone();
+                    failure
+                })?;
             let artifact = if is_writer {
                 let _guard = self.repo_lock.lock().await;
-                let head_sha = workspace::capture_worker_result(
-                    &request.workspace_dir,
-                    &workspace_source,
-                    request.mission_id.as_str(),
-                    &request.effect_id,
-                )
-                .await
-                .map_err(|e| RoleRunFailure {
-                    // Only an uncommitted tree is agent behavior; Git
-                    // infrastructure failures remain infrastructure.
-                    kind: match e {
-                        workspace::CaptureError::DirtyWorktree(_) => RunErrorKind::DirtyWorktree,
-                        workspace::CaptureError::Infra(_) => RunErrorKind::Infra,
-                    },
-                    detail: e.to_string(),
-                })?;
-                Some(ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha,
-                })
+                let artifact = request
+                    .artifact_capture
+                    .as_ref()
+                    .expect("writer capture authority was checked during setup")
+                    .capture()
+                    .await
+                    .map_err(|e| {
+                        let mut failure = match e {
+                            workspace::CaptureError::DirtyWorktree(_) => {
+                                TypedFailure::invalid("workspace.dirty", e.to_string())
+                            }
+                            workspace::CaptureError::HistoryDiverged { .. } => {
+                                TypedFailure::permanent("workspace.history", e.to_string())
+                            }
+                            workspace::CaptureError::Infra(_) => {
+                                TypedFailure::permanent("workspace.capture", e.to_string())
+                            }
+                        };
+                        failure.evidence_mut().final_response = final_response.clone();
+                        failure.evidence_mut().configuration = applied.clone();
+                        failure
+                    })?;
+                Some(artifact)
             } else {
                 None
             };
             Ok(RoleRunOutcome {
                 handoff,
                 artifact,
-                model_id,
+                runtime_configuration: crate::model::RuntimeConfigurationEvidence {
+                    requested_model: applied.requested_model,
+                    applied_model: applied.applied_model,
+                    model_confirmation: applied.model_confirmation,
+                    requested_mode: applied.requested_mode,
+                    applied_mode: applied.applied_mode,
+                    mode_confirmation: applied.mode_confirmation,
+                },
+                final_response,
             })
-        }
-        .await;
-
-        result
+        };
+        await_controlled(finish, request.control.clone(), |control| {
+            setup_control_failure(&profile, control).map(|mut failure| {
+                failure.evidence_mut().configuration = cancellation_configuration.clone();
+                failure.evidence_mut().final_response = cancellation_response.clone();
+                failure
+            })
+        })
+        .await
     }
 }
 
@@ -238,7 +496,7 @@ impl OciRoleRunner {
         profile: &MissionRuntimeProfile,
         request: &RoleRunRequest,
         plan: lionclaw_confinement::EffectiveExecutionPlan,
-    ) -> Result<Option<String>, RoleRunFailure> {
+    ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
         let driver = Self::driver(profile)
             .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
         let config = Self::driver_config(profile)
@@ -260,30 +518,37 @@ impl OciRoleRunner {
             .iter()
             .find(|m| m.target == lionclaw_confinement::RUNTIME_MOUNT_TARGET)
             .map(|m| m.source.clone());
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: uuid_from_key(request.effect_id.as_str()),
-                working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
-                environment: plan.environment.clone(),
-                runtime_state_root: state_root,
-                runtime_session_ready: RuntimeSessionReady::not_ready(),
-            })
-            .await
-            .map_err(|e| launch(format!("session_start failed: {e}")))?;
+        let start = async {
+            adapter
+                .session_start(RuntimeSessionStartInput {
+                    session_id: uuid_from_key(request.effect_id.as_str()),
+                    working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
+                    environment: plan.environment.clone(),
+                    runtime_state_root: state_root,
+                    runtime_session_ready: RuntimeSessionReady::not_ready(),
+                })
+                .await
+                .map_err(|e| launch(format!("session_start failed: {e}")))
+        };
+        let handle = await_controlled(start, request.control.clone(), |control| {
+            setup_control_failure(profile, control)
+        })
+        .await?;
 
-        let (journal_tx, mut journal_rx) =
-            tokio::sync::mpsc::unbounded_channel::<lionclaw_runtime_api::TurnEvent>();
-        let drain = tokio::spawn(async move {
-            let mut last_error = None;
-            while let Some(event) = journal_rx.recv().await {
-                if let lionclaw_runtime_api::RuntimeEvent::Error { text, .. } = &event.event {
-                    last_error = Some(text.clone());
-                }
-            }
-            last_error
-        });
+        let (journal_tx, journal_rx) = tokio::sync::mpsc::channel::<lionclaw_runtime_api::TurnEvent>(
+            lionclaw_runtime_api::RUNTIME_TURN_JOURNAL_CAPACITY,
+        );
+        let updates = request.updates.clone();
+        let activity = request.activity.clone();
+        let activity_effect_id = request.effect_id.clone();
+        let drain = tokio::spawn(drain_runtime_journal(
+            journal_rx,
+            updates,
+            activity,
+            activity_effect_id,
+        ));
 
-        let turn = adapter.program_backed_turn(
+        let mut turn = Box::pin(adapter.program_backed_turn(
             RuntimeProgramTurnExecution {
                 input: RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
@@ -298,26 +563,176 @@ impl OciRoleRunner {
                 )),
             },
             journal_tx,
-        );
-
-        let result = tokio::time::timeout(profile.hard_timeout, turn).await;
+        ));
+        let mut control = request.control.clone();
+        enum TurnEnd {
+            Completed(anyhow::Result<lionclaw_runtime_api::RuntimeTurnResult>),
+            Cancel {
+                reason: String,
+                kind: CancellationKind,
+            },
+        }
+        let end = loop {
+            let current_control = control.borrow().clone();
+            match current_control {
+                ExecutionControl::RunUntil(_) => {}
+                ExecutionControl::DeadlineExhausted => {
+                    break TurnEnd::Cancel {
+                        reason: "effect deadline exhausted".into(),
+                        kind: CancellationKind::Deadline,
+                    };
+                }
+                ExecutionControl::Stop(reason) => {
+                    break TurnEnd::Cancel {
+                        reason,
+                        kind: CancellationKind::Stop,
+                    };
+                }
+                ExecutionControl::Abort(reason) => {
+                    break TurnEnd::Cancel {
+                        reason,
+                        kind: CancellationKind::Abort,
+                    };
+                }
+            }
+            tokio::select! {
+                biased;
+                changed = control.changed() => {
+                    if changed.is_err() {
+                        continue;
+                    }
+                }
+                completed = &mut turn => break TurnEnd::Completed(completed),
+            }
+        };
+        let result = match end {
+            TurnEnd::Completed(completed) => completed.map_err(|err| {
+                err.downcast_ref::<TypedFailure>()
+                    .cloned()
+                    .unwrap_or_else(|| TypedFailure::permanent("runtime.unknown", err.to_string()))
+            }),
+            TurnEnd::Cancel { reason, kind } => {
+                let (acknowledged, completed) = cancellation_acknowledged(
+                    adapter.cancel(&handle, Some(reason.clone())),
+                    turn.as_mut(),
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+                let mut evidence = turn_failure_evidence(
+                    profile,
+                    kind.active_detail().into(),
+                    String::new(),
+                    String::new(),
+                );
+                if let Some((configuration, final_response)) = completed_turn_evidence(completed) {
+                    evidence.configuration = configuration;
+                    evidence.final_response = final_response;
+                }
+                evidence.code = Some(
+                    if acknowledged {
+                        "runtime.cancel_acknowledged"
+                    } else {
+                        "runtime.cancel_forced"
+                    }
+                    .into(),
+                );
+                evidence.stop_reason = Some(reason);
+                Err(kind.failure(evidence))
+            }
+        };
+        drop(turn);
         let _ = adapter.close(&handle).await;
-        let last_error = drain.await.ok().flatten();
+        let fallback_final_response = drain.await.unwrap_or_default();
 
         match result {
-            Err(_) => Err(RoleRunFailure {
-                kind: RunErrorKind::Timeout,
-                detail: format!("agent turn exceeded {:?}", profile.hard_timeout),
-            }),
-            Ok(Err(err)) => Err(RoleRunFailure {
-                kind: RunErrorKind::TurnFailed,
-                detail: match last_error {
-                    Some(e) => format!("{err}: {e}"),
-                    None => err.to_string(),
-                },
-            }),
-            Ok(Ok(_)) => Ok(profile.model.clone()),
+            Err(failure) => Err(project_turn_failure(
+                profile,
+                failure,
+                &fallback_final_response,
+            )),
+            Ok(result) => validate_completed_turn(profile, result),
         }
+    }
+}
+
+async fn drain_runtime_journal(
+    mut journal: tokio::sync::mpsc::Receiver<lionclaw_runtime_api::TurnEvent>,
+    updates: tokio::sync::mpsc::Sender<crate::ports::RoleRunUpdate>,
+    activity: tokio::sync::watch::Sender<
+        Option<(crate::model::EffectId, lionclaw_runtime_api::TurnEvent)>,
+    >,
+    effect_id: crate::model::EffectId,
+) -> String {
+    let mut final_response = String::new();
+    while let Some(event) = journal.recv().await {
+        lionclaw_runtime_api::observe_final_response(&mut final_response, event.event());
+        if let lionclaw_runtime_api::RuntimeEvent::Configuration { configuration } = event.event() {
+            let _ = updates
+                .send(crate::ports::RoleRunUpdate::RuntimeConfigured(
+                    configuration.clone(),
+                ))
+                .await;
+        }
+        activity.send_replace(Some((effect_id.clone(), event)));
+    }
+    final_response.trim_end().to_string()
+}
+
+fn project_turn_failure(
+    profile: &MissionRuntimeProfile,
+    mut failure: TypedFailure,
+    fallback_final_response: &str,
+) -> TypedFailure {
+    let evidence = failure.evidence_mut();
+    evidence.configuration.requested_model = profile.model.clone();
+    evidence.configuration.requested_mode = profile.mode.clone();
+    if evidence.final_response.is_empty() {
+        evidence.final_response = fallback_final_response.to_string();
+    }
+    failure.projected()
+}
+
+fn validate_completed_turn(
+    profile: &MissionRuntimeProfile,
+    result: lionclaw_runtime_api::RuntimeTurnResult,
+) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
+    let result = result.projected();
+    let configuration = result.configuration;
+    let final_response = result.final_response;
+    if configuration.requested_model != profile.model
+        || configuration.requested_mode != profile.mode
+        || profile.model.is_some() && configuration.applied_model.is_none()
+        || profile.model.is_some() && configuration.model_confirmation.is_none()
+        || profile.mode.is_some() && configuration.applied_mode.is_none()
+        || profile.mode.is_some() && configuration.mode_confirmation.is_none()
+    {
+        let mut failure = launch(format!(
+            "runtime did not prove requested configuration was applied: requested model={:?} mode={:?}, evidence={configuration:?}",
+            profile.model, profile.mode
+        ));
+        failure.evidence_mut().configuration = configuration;
+        failure.evidence_mut().final_response = final_response;
+        return Err(project_turn_failure(profile, failure, ""));
+    }
+    Ok((configuration, final_response))
+}
+
+fn turn_failure_evidence(
+    profile: &MissionRuntimeProfile,
+    detail: String,
+    stderr: String,
+    final_response: String,
+) -> TypedFailureEvidence {
+    TypedFailureEvidence {
+        detail: lionclaw_runtime_api::bounded_text(&detail),
+        stderr: lionclaw_runtime_api::bounded_text(&stderr),
+        final_response: lionclaw_runtime_api::bounded_text(&final_response),
+        configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+            requested_model: profile.model.clone(),
+            requested_mode: profile.mode.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 
@@ -325,7 +740,7 @@ impl OciRoleRunner {
 /// cargo (CARGO_HOME/CARGO_TARGET_DIR) under the writable scratch mount so
 /// builds stay out of the read-only rootfs. Kept minimal and mission-specific
 /// rather than importing the kernel planner's env builder.
-fn mission_environment(dirs: &AttemptDirs) -> Vec<(String, String)> {
+fn mission_environment(dirs: &EffectDirs) -> Vec<(String, String)> {
     let home = lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET;
     vec![
         ("HOME".to_string(), home.to_string()),
@@ -350,7 +765,7 @@ fn mission_environment(dirs: &AttemptDirs) -> Vec<(String, String)> {
     ]
     .into_iter()
     .chain(std::iter::once((
-        "MISSION_ATTEMPT".to_string(),
+        "MISSION_EFFECT".to_string(),
         dirs.root.to_string_lossy().into_owned(),
     )))
     .collect()
@@ -439,5 +854,430 @@ mod tests {
         assert!(prepare_skill_mounts(Path::new("/runtime-home"), &[], None)
             .unwrap()
             .is_empty());
+    }
+
+    async fn git(repo: &Path, args: &[&str]) -> String {
+        let output = tokio::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    async fn prepare_test_writer(
+        repo: &Path,
+        task_work: &Path,
+        base: &str,
+        recreate: bool,
+    ) -> Result<(), TypedFailure> {
+        let observer_index = task_work
+            .parent()
+            .expect("test task work has a parent")
+            .join("observer.index");
+        prepare_writer_checkout(repo, task_work, &observer_index, base, recreate).await
+    }
+
+    #[tokio::test]
+    async fn cancellation_polls_the_turn_that_must_deliver_its_acknowledgement() {
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let mut sent = Some(sent);
+        let mut turn = std::future::poll_fn(move |_| {
+            if let Some(sent) = sent.take() {
+                let _ = sent.send(());
+            }
+            std::task::Poll::Ready(())
+        });
+        let acknowledgement = async move {
+            received.await.map_err(anyhow::Error::from)?;
+            Ok(lionclaw_runtime_api::RuntimeCancellation::Acknowledged)
+        };
+
+        let (acknowledged, turn_result) = cancellation_acknowledged(
+            acknowledgement,
+            std::pin::Pin::new(&mut turn),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(acknowledged);
+        assert_eq!(turn_result, Some(()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_without_an_active_turn_drops_setup_immediately() {
+        let mut turn = Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            "provider turn started"
+        });
+        let started = tokio::time::Instant::now();
+        let (acknowledged, turn_result) = cancellation_acknowledged(
+            std::future::ready(Ok(lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn)),
+            turn.as_mut(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(!acknowledged);
+        assert_eq!(turn_result, None);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn cancellation_reclassification_preserves_runtime_evidence() {
+        let expected = lionclaw_runtime_api::AppliedRuntimeConfiguration {
+            requested_mode: Some("build".into()),
+            applied_mode: Some("build".into()),
+            mode_confirmation: Some(
+                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+            ),
+            ..Default::default()
+        };
+        let mut failure = TypedFailure::permanent("runtime.cancelled", "cancelled");
+        failure.evidence_mut().configuration = expected.clone();
+        failure.evidence_mut().final_response = "work before stop".into();
+        assert_eq!(
+            completed_turn_evidence(Some(Err(anyhow::Error::new(failure)))),
+            Some((expected, "work before stop".into()))
+        );
+    }
+
+    #[test]
+    fn completed_turn_accepts_only_confirmed_adapter_canonicalization() {
+        let profiles = RuntimeProfiles::from_toml(
+            "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\nmodel = \"requested\"\n\
+             [runtimes.mode]\ndriver = \"acp\"\ncommand = \"example\"\nmode = \"build\"\n",
+            Path::new("/home/alice"),
+        )
+        .unwrap();
+        let profile = profiles.get("example").unwrap();
+        let canonical = validate_completed_turn(
+            &profile,
+            lionclaw_runtime_api::RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_model: Some("requested".into()),
+                    applied_model: Some("provider:requested".into()),
+                    model_confirmation: Some(
+                        lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged,
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("the adapter owns advertised name-to-ID equivalence");
+        assert_eq!(
+            canonical.0.applied_model.as_deref(),
+            Some("provider:requested")
+        );
+
+        let oversized_applied = "x".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT + 1);
+        let bounded = validate_completed_turn(
+            &profile,
+            lionclaw_runtime_api::RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_model: Some("requested".into()),
+                    applied_model: Some(oversized_applied),
+                    model_confirmation: Some(
+                        lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged,
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("the durable outcome boundary bounds adapter evidence");
+        assert!(bounded.0.applied_model.unwrap().len() <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT);
+
+        let failure = validate_completed_turn(
+            &profile,
+            lionclaw_runtime_api::RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_model: Some("requested".into()),
+                    applied_model: None,
+                    ..Default::default()
+                },
+                final_response: "useful work before configuration rejection".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            failure.evidence().final_response,
+            "useful work before configuration rejection"
+        );
+        assert_eq!(
+            failure.evidence().configuration.applied_model.as_deref(),
+            None
+        );
+
+        let unconfirmed = validate_completed_turn(
+            &profile,
+            lionclaw_runtime_api::RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_model: Some("requested".into()),
+                    applied_model: Some("unrelated-fallback".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            unconfirmed
+                .evidence()
+                .configuration
+                .applied_model
+                .as_deref(),
+            Some("unrelated-fallback")
+        );
+
+        let mode_profile = profiles.get("mode").unwrap();
+        let unconfirmed_mode = validate_completed_turn(
+            &mode_profile,
+            lionclaw_runtime_api::RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_mode: Some("build".into()),
+                    applied_mode: Some("build".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            unconfirmed_mode
+                .evidence()
+                .configuration
+                .applied_mode
+                .as_deref(),
+            Some("build")
+        );
+    }
+
+    #[test]
+    fn runner_projection_preserves_adapter_process_stderr() {
+        let profiles = RuntimeProfiles::from_toml(
+            "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\n",
+            Path::new("/home/alice"),
+        )
+        .unwrap();
+        let profile = profiles.get("example").unwrap();
+        let mut failure = TypedFailure::permanent("runtime.process", "process failed");
+        failure.evidence_mut().stderr = "adapter-captured stderr".into();
+
+        let projected = project_turn_failure(&profile, failure, "");
+
+        assert_eq!(projected.evidence().stderr, "adapter-captured stderr");
+    }
+
+    #[tokio::test]
+    async fn journal_drain_retains_a_bounded_response_for_forced_cancellation() {
+        let (journal_tx, journal_rx) = tokio::sync::mpsc::channel(1);
+        let (updates, _update_rx) = tokio::sync::mpsc::channel(1);
+        let (activity, _activity_rx) = tokio::sync::watch::channel(None);
+        journal_tx
+            .send(lionclaw_runtime_api::TurnEvent::canonical(
+                lionclaw_runtime_api::RuntimeEvent::MessageDelta {
+                    lane: lionclaw_runtime_api::RuntimeMessageLane::Answer,
+                    text: "partial response before forced stop".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        drop(journal_tx);
+
+        let response = drain_runtime_journal(
+            journal_rx,
+            updates,
+            activity,
+            crate::model::EffectId::for_parts(&["test", "forced-response"]),
+        )
+        .await;
+
+        assert_eq!(response, "partial response before forced stop");
+    }
+
+    #[tokio::test]
+    async fn writer_workspace_reuse_preserves_dirty_work_and_clean_rebase_moves_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.name", "test"]).await;
+        git(&repo, &["config", "user.email", "test@local"]).await;
+        git(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "base"]).await;
+        let base = git(&repo, &["rev-parse", "HEAD"]).await;
+        let task_work = temp.path().join("task/work");
+        prepare_test_writer(&repo, &task_work, &base, true)
+            .await
+            .unwrap();
+
+        std::fs::write(task_work.join("substantial-uncommitted"), "preserve me\n").unwrap();
+        prepare_test_writer(&repo, &task_work, &base, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(task_work.join("substantial-uncommitted")).unwrap(),
+            "preserve me\n"
+        );
+
+        std::fs::remove_file(task_work.join("substantial-uncommitted")).unwrap();
+        std::fs::write(repo.join("tracked"), "moved\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "moved"]).await;
+        let moved = git(&repo, &["rev-parse", "HEAD"]).await;
+        prepare_test_writer(&repo, &task_work, &moved, true)
+            .await
+            .unwrap();
+        assert_eq!(workspace::task_head_sha(&task_work).await.unwrap(), moved);
+    }
+
+    #[tokio::test]
+    async fn retry_reuses_a_clean_committed_descendant_of_the_recorded_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.name", "test"]).await;
+        git(&repo, &["config", "user.email", "test@local"]).await;
+        git(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "base"]).await;
+        let base = git(&repo, &["rev-parse", "HEAD"]).await;
+        let task_work = temp.path().join("task/work");
+        prepare_test_writer(&repo, &task_work, &base, true)
+            .await
+            .unwrap();
+
+        std::fs::write(task_work.join("committed-rework"), "preserve this commit\n").unwrap();
+        git(&task_work, &["add", "committed-rework"]).await;
+        git(&task_work, &["commit", "-q", "-m", "partial rework"]).await;
+        let partial = git(&task_work, &["rev-parse", "HEAD"]).await;
+
+        prepare_test_writer(&repo, &task_work, &base, false)
+            .await
+            .unwrap();
+        assert_eq!(workspace::task_head_sha(&task_work).await.unwrap(), partial);
+        assert_eq!(
+            std::fs::read_to_string(task_work.join("committed-rework")).unwrap(),
+            "preserve this commit\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn moved_base_never_recreates_a_dirty_writer_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.name", "test"]).await;
+        git(&repo, &["config", "user.email", "test@local"]).await;
+        git(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "base"]).await;
+        let base = git(&repo, &["rev-parse", "HEAD"]).await;
+        let task_work = temp.path().join("task/work");
+        prepare_test_writer(&repo, &task_work, &base, true)
+            .await
+            .unwrap();
+        std::fs::write(task_work.join("substantial-uncommitted"), "preserve me\n").unwrap();
+
+        std::fs::write(repo.join("tracked"), "moved\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "moved"]).await;
+        let moved = git(&repo, &["rev-parse", "HEAD"]).await;
+
+        let error = prepare_test_writer(&repo, &task_work, &moved, true)
+            .await
+            .unwrap_err();
+        assert!(error.detail().contains("refusing to recreate"));
+        assert_eq!(
+            std::fs::read_to_string(task_work.join("substantial-uncommitted")).unwrap(),
+            "preserve me\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn moved_base_never_discards_clean_uncaptured_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.name", "test"]).await;
+        git(&repo, &["config", "user.email", "test@local"]).await;
+        git(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "base"]).await;
+        let base = git(&repo, &["rev-parse", "HEAD"]).await;
+        let task_work = temp.path().join("task/work");
+        prepare_test_writer(&repo, &task_work, &base, true)
+            .await
+            .unwrap();
+
+        std::fs::write(task_work.join("worker-only"), "committed work\n").unwrap();
+        git(&task_work, &["add", "worker-only"]).await;
+        git(&task_work, &["commit", "-q", "-m", "uncaptured"]).await;
+        let uncaptured = git(&task_work, &["rev-parse", "HEAD"]).await;
+
+        std::fs::write(repo.join("tracked"), "other task\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "other-task"]).await;
+        let moved = git(&repo, &["rev-parse", "HEAD"]).await;
+        let error = prepare_test_writer(&repo, &task_work, &moved, true)
+            .await
+            .unwrap_err();
+        assert!(error.detail().contains("uncaptured commits"));
+        assert_eq!(
+            workspace::task_head_sha(&task_work).await.unwrap(),
+            uncaptured
+        );
+        assert_eq!(
+            std::fs::read_to_string(task_work.join("worker-only")).unwrap(),
+            "committed work\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_reuse_intent_fails_closed_instead_of_replacing_disk_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.name", "test"]).await;
+        git(&repo, &["config", "user.email", "test@local"]).await;
+        git(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "base"]).await;
+        let base = git(&repo, &["rev-parse", "HEAD"]).await;
+        let task_work = temp.path().join("task/work");
+        prepare_test_writer(&repo, &task_work, &base, true)
+            .await
+            .unwrap();
+
+        std::fs::write(repo.join("tracked"), "moved\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "moved"]).await;
+        let moved = git(&repo, &["rev-parse", "HEAD"]).await;
+        let error = prepare_test_writer(&repo, &task_work, &moved, false)
+            .await
+            .unwrap_err();
+        assert!(error
+            .detail()
+            .contains("does not descend from its recorded base"));
+        assert_eq!(workspace::task_head_sha(&task_work).await.unwrap(), base);
     }
 }

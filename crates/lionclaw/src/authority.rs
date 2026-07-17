@@ -14,7 +14,6 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use lionclaw_confinement::{
     parse_runtime_tmpfs_entry, ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset,
@@ -109,6 +108,7 @@ pub fn compile_authority(
     role: &RoleDefinition,
     ceiling: &AuthorityCeiling,
 ) -> Result<CompiledAuthority, MoatViolation> {
+    validate_role_authority_request(role)?;
     let workspace_access = match role.output {
         // Only a writer gets the workspace read-write. Judges and every planning
         // role (report / proposal) are read-only.
@@ -118,14 +118,6 @@ pub fn compile_authority(
         | OutputSemantics::EmitsGapVerdict
         | OutputSemantics::ProposesPlan => WorkspaceAccess::ReadOnly,
     };
-    if role.secrets && role.output != OutputSemantics::ProducesArtifact {
-        // Fail closed rather than silently clamp: only a writer may hold
-        // secrets; a read-only judge or planner asking for them is a
-        // mission-type bug the author must see.
-        return Err(MoatViolation::SecretsForJudge {
-            role: role.name.to_string(),
-        });
-    }
     let preset = ExecutionPreset {
         workspace_access,
         // Enforced from the role's `network` flag (default on — agent roles
@@ -150,6 +142,18 @@ pub fn compile_authority(
         output: role.output,
         preset,
     })
+}
+
+/// Validate role-authored authority before any operator ceiling is applied.
+/// A ceiling may remove grants; it can never legalize a request that breaks
+/// the semantic moat.
+pub(crate) fn validate_role_authority_request(role: &RoleDefinition) -> Result<(), MoatViolation> {
+    if role.secrets && role.output != OutputSemantics::ProducesArtifact {
+        return Err(MoatViolation::SecretsForJudge {
+            role: role.name.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// The authority an engine-run oracle executes under: a verdict node with
@@ -209,7 +213,6 @@ pub struct RolePlanRequest<'a> {
     /// Canonical roots of the tree(s) any verdict from this node is about.
     pub judged_roots: &'a [PathBuf],
     pub environment: Vec<(String, String)>,
-    pub hard_timeout: Duration,
 }
 
 /// A moat-vetted execution plan. Private field, no other constructor: the
@@ -343,7 +346,6 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         working_dir: Some(working_dir),
         environment: request.environment,
         mcp_servers: Vec::new(),
-        hard_timeout: request.hard_timeout,
         mounts,
         mount_runtime_secrets: authority.preset.mount_runtime_secrets,
         escape_classes: authority.preset.escape_classes.clone(),
@@ -377,6 +379,7 @@ mod tests {
             name: RoleName::new("probe").expect("role name"),
             output,
             runtime: None,
+            timeout_secs: None,
             network: true,
             secrets,
             skills: Vec::new(),
@@ -407,7 +410,6 @@ mod tests {
             mounts: m,
             judged_roots: judged,
             environment: Vec::new(),
-            hard_timeout: Duration::from_secs(120),
         }
     }
 

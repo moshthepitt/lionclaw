@@ -16,12 +16,12 @@
 //!   `end_mission`; when nothing is runnable, inflight, or owed, the phase
 //!   derivation closes the mission. Attention parks keep the human pauses.
 
-use std::collections::BTreeMap;
-
 use super::fold::{oracle_obligation_outstanding, terminal_review_outstanding};
 use super::ids::{AssertionId, OracleName, RoleName, TaskId};
 use super::plan::TaskKind;
 use super::state::{MissionPhase, MissionState, ReviewOutcome, TaskStatus};
+use super::TaskNamespace;
+use crate::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepDecision {
@@ -46,6 +46,7 @@ pub enum StepDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleDispatchIntent {
+    pub namespace: TaskNamespace,
     pub task_id: TaskId,
     pub role: RoleName,
     pub attempt_no: u32,
@@ -130,13 +131,14 @@ fn step_planning(state: &MissionState) -> StepDecision {
     };
     let attempt_no = state.planning.tasks.get(&task.id).map_or(0, |t| t.attempts) + 1;
     StepDecision::DispatchRole(RoleDispatchIntent {
+        namespace: TaskNamespace::Planning,
         task_id: task.id.clone(),
         role: task.role.clone(),
         attempt_no,
         body: task.body.clone(),
         // Planning has no contract; its roles are read-only at the base commit.
         targets: Vec::new(),
-        base_sha: state.current_sha.clone(),
+        base_sha: state.deliverable_head().to_string(),
     })
 }
 
@@ -179,6 +181,7 @@ fn step_running(state: &MissionState) -> StepDecision {
     if let Some(task) = runnable(TaskKind::Work).or_else(|| runnable(TaskKind::Validate)) {
         let attempt_no = state.tasks.get(&task.id).map_or(0, |t| t.attempts) + 1;
         return StepDecision::DispatchRole(RoleDispatchIntent {
+            namespace: TaskNamespace::Execution,
             task_id: task.id.clone(),
             role: task
                 .role
@@ -188,7 +191,7 @@ fn step_running(state: &MissionState) -> StepDecision {
             body: task.body.clone(),
             targets: task.targets.clone(),
             // Work stacks on the latest artifact; a validator judges it.
-            base_sha: state.current_sha.clone(),
+            base_sha: state.deliverable_head().to_string(),
         });
     }
 
@@ -197,22 +200,16 @@ fn step_running(state: &MissionState) -> StepDecision {
     // they park for a human (see `oracle_failures`) rather than loop.
     if oracle_obligation_outstanding(state) {
         let mut by_oracle: BTreeMap<OracleName, Vec<AssertionId>> = BTreeMap::new();
-        for (id, assertion) in &state.contract {
+        for assertion in state.contract.values() {
             let Some(oracle) = &assertion.oracle else {
                 continue;
             };
-            if state.oracle_failures.contains_key(oracle) || state.waived_oracles.contains(oracle) {
+            if !state.oracle_dispatchable(oracle) || by_oracle.contains_key(oracle) {
                 continue;
             }
-            let fresh = assertion
-                .last_authoritative
-                .as_ref()
-                .is_some_and(|v| v.is_fresh_at(&state.current_sha));
-            if !fresh {
-                by_oracle
-                    .entry(oracle.clone())
-                    .or_default()
-                    .push(id.clone());
+            let owed = state.owed_assertions_for_oracle(oracle);
+            if !owed.is_empty() {
+                by_oracle.insert(oracle.clone(), owed);
             }
         }
         let intents = by_oracle
@@ -222,7 +219,7 @@ fn step_running(state: &MissionState) -> StepDecision {
                 OracleDispatchIntent {
                     oracle,
                     assertion_ids,
-                    judged_sha: state.current_sha.clone(),
+                    judged_sha: state.deliverable_head().to_string(),
                     attempt_no,
                 }
             })
@@ -255,7 +252,7 @@ fn step_running(state: &MissionState) -> StepDecision {
         return StepDecision::ReviewTerminal(TerminalReviewDispatchIntent {
             role: config.role.clone(),
             attempt_no: state.terminal_review.attempts + 1,
-            judged_sha: state.current_sha.clone(),
+            judged_sha: state.deliverable_head().to_string(),
         });
     }
 
@@ -267,15 +264,44 @@ fn step_running(state: &MissionState) -> StepDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::event::{
-        ArtifactOutcome, EventEnvelope, Handoff, MissionConfig, MissionEvent, PayloadRef,
-        RunErrorKind, VersionStamps,
+    use crate::event::{
+        ArtifactOutcome, EventEnvelope, Handoff, MissionConfig, MissionEvent, OracleRunSuccess,
+        PayloadRef, RoleRunSuccess, RuntimeConfigurationEvidence, TerminalReviewSuccess,
+        VersionStamps,
     };
-    use crate::model::fold::fold;
-    use crate::model::ids::{EffectId, MissionId};
-    use crate::model::plan::{Assertion, Plan, Task};
-    use crate::model::state::RunFailure;
-    use crate::model::verdict::FinishClass;
+    use crate::fold::fold;
+    use crate::ids::{EffectId, MissionId};
+    use crate::plan::{
+        Assertion, Plan, PlanInventory, Requirement, RequirementDisposition, RequirementKind, Task,
+    };
+    use crate::verdict::FinishClass;
+    use crate::{TypedFailure, TypedFailureEvidence};
+
+    const TEST_PROMPT_HASH: &str =
+        "ffc66f942549cd63f0fc01e069c3ca49ff918d55d78e633e0f2d72bd7221d5c9";
+
+    fn mission_id() -> MissionId {
+        MissionId::parse("mabc123abc123").expect("valid mission id")
+    }
+
+    fn role_effect(task: &str, attempt_no: u32) -> EffectId {
+        EffectId::for_role_request(
+            TaskNamespace::Execution,
+            &mission_id(),
+            &tid(task),
+            attempt_no,
+            1,
+            TEST_PROMPT_HASH,
+        )
+    }
+
+    fn oracle_effect(name: &str, judged_sha: &str, attempt_no: u32) -> EffectId {
+        EffectId::for_oracle_request(&mission_id(), &oname(name), judged_sha, attempt_no)
+    }
+
+    fn review_effect(judged_sha: &str, attempt_no: u32) -> EffectId {
+        EffectId::for_terminal_review_request(&mission_id(), judged_sha, attempt_no)
+    }
 
     fn aid(raw: &str) -> AssertionId {
         AssertionId::new(raw).expect("valid assertion id")
@@ -297,7 +323,7 @@ mod tests {
         Assertion {
             id: aid(id),
             prose: format!("claim {id}"),
-            oracle: None,
+            oracle: Some(oname("tests")),
         }
     }
 
@@ -358,7 +384,7 @@ mod tests {
     fn created(base_sha: &str) -> MissionEvent {
         MissionEvent::MissionCreated {
             objective: "ship it".to_string(),
-            mission_type: crate::model::MissionTypeRef {
+            mission_type: crate::MissionTypeRef {
                 name: "software-dev".into(),
                 digest: "d".into(),
             },
@@ -367,18 +393,58 @@ mod tests {
             workspace_dir: "/workspace".to_string(),
             base_sha: base_sha.to_string(),
             config: MissionConfig {
-                recovery: crate::model::RecoveryConfig { max_attempts: 1 },
+                plan_inventory: PlanInventory {
+                    roles: BTreeMap::from([
+                        (
+                            rname("implementer"),
+                            crate::OutputSemantics::ProducesArtifact,
+                        ),
+                        (rname("checker"), crate::OutputSemantics::EmitsVerdict),
+                    ]),
+                    oracles: [oname("build"), oname("tests")].into_iter().collect(),
+                },
+                recovery: crate::RecoveryConfig { max_attempts: 1 },
                 ..Default::default()
             },
         }
     }
 
-    fn plan(assertions: Vec<Assertion>, tasks: Vec<Task>) -> MissionEvent {
+    fn plan(assertions: Vec<Assertion>, mut tasks: Vec<Task>) -> MissionEvent {
+        let assertion_ids = assertions
+            .iter()
+            .map(|assertion| assertion.id.clone())
+            .collect::<Vec<_>>();
+        let covered = tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Work)
+            .flat_map(|task| task.targets.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if let Some(first_writer) = tasks.iter_mut().find(|task| task.kind == TaskKind::Work) {
+            first_writer.targets.extend(
+                assertion_ids
+                    .iter()
+                    .filter(|id| !covered.contains(*id))
+                    .cloned(),
+            );
+        }
+        let requirements = assertions
+            .iter()
+            .enumerate()
+            .map(|(index, assertion)| Requirement {
+                id: crate::RequirementId::new(format!("REQ-{}", index + 1))
+                    .expect("requirement id"),
+                kind: RequirementKind::Capability,
+                prose: format!("requirement for {}", assertion.id),
+                disposition: RequirementDisposition::Covered {
+                    assertion_ids: vec![assertion.id.clone()],
+                },
+            })
+            .collect();
         MissionEvent::PlanProposed {
-            proposal: crate::model::PlanProposal {
+            proposal: crate::PlanProposal {
                 base_revision: 0,
                 plan: Plan {
-                    requirements: vec![],
+                    requirements,
                     assertions,
                     tasks,
                 },
@@ -388,43 +454,83 @@ mod tests {
     }
 
     fn role_requested(task: &str, attempt_no: u32, key: &str) -> MissionEvent {
+        role_requested_at_base(
+            task,
+            attempt_no,
+            key,
+            "implementer",
+            crate::OutputSemantics::ProducesArtifact,
+            "sha-0",
+        )
+    }
+
+    fn role_requested_at_base(
+        task: &str,
+        attempt_no: u32,
+        _key: &str,
+        role: &str,
+        output: crate::OutputSemantics,
+        base_sha: &str,
+    ) -> MissionEvent {
         MissionEvent::RoleRunRequested {
+            namespace: TaskNamespace::Execution,
             task_id: tid(task),
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
-            role: rname("implementer"),
+            effect_id: role_effect(task, attempt_no),
+            role: rname(role),
+            output,
             runtime: "codex".to_string(),
             prompt: PayloadRef::inline("assembled prompt"),
-            base_sha: "sha-0".to_string(),
+            base_sha: base_sha.to_string(),
+            assignment_epoch: 1,
+            recreate_workspace: attempt_no == 1,
+            requested_at_ms: 0,
+            not_before_ms: 0,
+            deadline_ms: 100_000,
+            budget_deadline_ms: 100_000,
         }
     }
 
     fn work_done(task: &str, key: &str, artifact: Option<(&str, &str)>) -> MissionEvent {
+        work_done_at(task, 1, key, artifact)
+    }
+
+    fn work_done_at(
+        task: &str,
+        attempt_no: u32,
+        _key: &str,
+        artifact: Option<(&str, &str)>,
+    ) -> MissionEvent {
         MissionEvent::RoleRunCompleted {
+            namespace: TaskNamespace::Execution,
             task_id: tid(task),
-            attempt_no: 1,
-            effect_id: EffectId::for_parts(&["test", key]),
-            handoff: Handoff::Work {
-                done: true,
-                report: PayloadRef::inline("done"),
-                request_attention: false,
-            },
-            artifact: artifact.map(|(base_sha, head_sha)| ArtifactOutcome {
-                base_sha: base_sha.to_string(),
-                head_sha: head_sha.to_string(),
+            attempt_no,
+            effect_id: role_effect(task, attempt_no),
+            outcome: Ok(RoleRunSuccess {
+                handoff: Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("done"),
+                    request_attention: false,
+                },
+                artifact: artifact.map(|(base_sha, head_sha)| ArtifactOutcome {
+                    base_sha: base_sha.to_string(),
+                    head_sha: head_sha.to_string(),
+                }),
+                final_response: PayloadRef::inline("done"),
+                runtime_configuration: RuntimeConfigurationEvidence::default(),
             }),
         }
     }
 
-    fn role_failed(task: &str, key: &str) -> MissionEvent {
-        MissionEvent::RoleRunFailed {
+    fn role_failed(task: &str, _key: &str) -> MissionEvent {
+        MissionEvent::RoleRunCompleted {
+            namespace: TaskNamespace::Execution,
             task_id: tid(task),
             attempt_no: 1,
-            effect_id: EffectId::for_parts(&["test", key]),
-            failure: RunFailure {
-                kind: RunErrorKind::Timeout,
-                detail: "runner timed out".to_string(),
-            },
+            effect_id: role_effect(task, 1),
+            outcome: Err(TypedFailure::DeadlineExhausted {
+                evidence: Box::new(TypedFailureEvidence::new(None, "runner timed out")),
+            }),
         }
     }
 
@@ -433,14 +539,17 @@ mod tests {
         oracle: &str,
         judged_sha: &str,
         attempt_no: u32,
-        key: &str,
+        _key: &str,
     ) -> MissionEvent {
         MissionEvent::OracleRunRequested {
             assertion_ids: ids.iter().map(|a| aid(a)).collect(),
             oracle: oname(oracle),
             judged_sha: judged_sha.to_string(),
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: oracle_effect(oracle, judged_sha, attempt_no),
+            requested_at_ms: 0,
+            not_before_ms: 0,
+            deadline_ms: 100_000,
         }
     }
 
@@ -449,7 +558,7 @@ mod tests {
         oracle: &str,
         judged_sha: &str,
         attempt_no: u32,
-        key: &str,
+        _key: &str,
         exit_code: i32,
     ) -> MissionEvent {
         MissionEvent::OracleRunCompleted {
@@ -457,13 +566,15 @@ mod tests {
             oracle: oname(oracle),
             judged_sha: judged_sha.to_string(),
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
-            exit_code,
-            exit_signal: None,
-            stdout: PayloadRef::inline("oracle stdout"),
-            stderr: PayloadRef::inline(""),
-            prepared_inputs: Vec::new(),
-            duration_ms: 0,
+            effect_id: oracle_effect(oracle, judged_sha, attempt_no),
+            outcome: Ok(OracleRunSuccess {
+                exit_code,
+                exit_signal: None,
+                stdout: PayloadRef::inline("oracle stdout"),
+                stderr: PayloadRef::inline(""),
+                prepared_inputs: Vec::new(),
+                duration_ms: 0,
+            }),
         }
     }
 
@@ -474,18 +585,24 @@ mod tests {
             let approve = matches!(&event, MissionEvent::PlanProposed { .. }).then(|| {
                 MissionEvent::DecisionRecorded {
                     attention_id: "plan_proposal:mission".into(),
-                    action: crate::model::DecisionAction::Approve,
+                    action: crate::DecisionAction::Approve,
                     justification: "test fixture approves the plan".into(),
                 }
             });
             std::iter::once(event).chain(approve)
         });
-        fold(events.enumerate().map(|(i, event)| EventEnvelope {
-            mission_id: MissionId::parse("mabc123abc123").expect("valid mission id"),
-            sequence_no: i as u64 + 1,
-            recorded_at_ms: 0,
-            stamps: VersionStamps::default(),
-            event,
+        fold(events.enumerate().map(|(i, event)| {
+            let mut stamps = VersionStamps::default();
+            if matches!(event, MissionEvent::RoleRunRequested { .. }) {
+                stamps.prompt_hash = Some(TEST_PROMPT_HASH.to_string());
+            }
+            EventEnvelope {
+                mission_id: mission_id(),
+                sequence_no: i as u64 + 1,
+                recorded_at_ms: 0,
+                stamps,
+                event,
+            }
         }))
         .expect("log begins with MissionCreated")
     }
@@ -533,18 +650,19 @@ mod tests {
         assert!(matches!(aborted.phase, MissionPhase::Aborted { .. }));
         assert_eq!(step(&aborted), StepDecision::Terminal);
 
-        // All tasks cleared, nothing owed → the fold auto-closes; A1 has no
-        // oracle binding and no advisory pass, so the finish is Unverified.
+        // All tasks and proof obligations cleared → the fold auto-closes.
         let done = fold_log(vec![
             created("sha-0"),
             plan(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]),
             role_requested("w1", 1, "k-w1-1"),
             work_done("w1", "k-w1-1", None),
+            oracle_requested(&["A1"], "tests", "sha-0", 1, "k-tests-1"),
+            oracle_completed(&["A1"], "tests", "sha-0", 1, "k-tests-1", 0),
         ]);
         assert_eq!(
             done.phase,
             MissionPhase::Done {
-                finish: FinishClass::Unverified
+                finish: FinishClass::Verified
             }
         );
         assert_eq!(step(&done), StepDecision::Terminal);
@@ -660,9 +778,26 @@ mod tests {
         };
         let state = fold_log(vec![
             created("sha-0"),
-            plan(vec![assertion("A1")], vec![validate("v1", &["A1"]), g]),
-            role_requested("v1", 1, "k-v1-1"),
+            plan(
+                vec![assertion("A1")],
+                vec![work("w1", &["A1"], &[]), validate("v1", &["A1"]), g],
+            ),
+            role_requested("w1", 1, "k-w1-1"),
+            work_done("w1", "k-w1-1", Some(("sha-0", "sha-1"))),
+            role_requested_at_base(
+                "v1",
+                1,
+                "k-v1-1",
+                "checker",
+                crate::OutputSemantics::EmitsVerdict,
+                "sha-1",
+            ),
         ]);
+        let effect_id = role_effect("v1", 1);
+        assert!(matches!(
+            state.inflight.get(&effect_id),
+            Some(crate::InflightEffect::RoleRun { task_id, .. }) if task_id == &tid("v1")
+        ));
         // v1 is running (inflight), so the step idles rather than dispatching.
         assert_eq!(step(&state), StepDecision::Idle);
     }
@@ -701,6 +836,7 @@ mod tests {
         assert_eq!(
             step(&state),
             StepDecision::DispatchRole(RoleDispatchIntent {
+                namespace: TaskNamespace::Execution,
                 task_id: tid("w2"),
                 role: rname("implementer"),
                 attempt_no: 1,
@@ -720,7 +856,7 @@ mod tests {
         ]);
         assert_eq!(state.tasks[&tid("w1")].attempts, 1);
         // Hand-apply the post-state of the failure→retry re-pend (a
-        // RoleRunFailed + DecisionRecorded(Retry, node_failed:…) sequence,
+        // Failed RoleRunCompleted outcome + DecisionRecorded(Retry, node_failed:…) sequence,
         // covered in the fold tests) to pin the attempt-numbering contract here.
         state.inflight.clear();
         state.tasks.get_mut(&tid("w1")).expect("w1 exists").status = TaskStatus::Pending;
@@ -779,7 +915,14 @@ mod tests {
             work_done("w1", "k-w1-1", Some(("sha-0", "sha-1"))),
             oracle_requested(&["A1"], "tests", "sha-1", 1, "k-tests-1"),
             oracle_completed(&["A1"], "tests", "sha-1", 1, "k-tests-1", 0),
-            role_requested("w2", 1, "k-w2-1"),
+            role_requested_at_base(
+                "w2",
+                1,
+                "k-w2-1",
+                "implementer",
+                crate::OutputSemantics::ProducesArtifact,
+                "sha-1",
+            ),
             work_done("w2", "k-w2-1", Some(("sha-1", "sha-2"))),
         ]);
         assert_eq!(state.phase, MissionPhase::Running);
@@ -812,7 +955,7 @@ mod tests {
                 oracle_requested(&["A1"], "tests", "sha-1", 1, "k-tests-1"),
                 oracle_completed(&["A1"], "tests", "sha-1", 1, "k-tests-1", exit_code),
             ]);
-            assert_eq!(crate::model::classify_finish(&state), finish);
+            assert_eq!(crate::classify_finish(&state), finish);
             let expected = if exit_code == 0 {
                 MissionPhase::Done { finish }
             } else {
@@ -838,47 +981,55 @@ mod tests {
         let MissionEvent::MissionCreated { config, .. } = &mut event else {
             unreachable!("created() builds MissionCreated");
         };
-        config.terminal_review = Some(crate::model::event::TerminalReviewConfig {
+        config.terminal_review = Some(crate::event::TerminalReviewConfig {
             role: rname("gap-reviewer"),
         });
         event
     }
 
-    fn review_requested(attempt_no: u32, key: &str, judged_sha: &str) -> MissionEvent {
+    fn review_requested(attempt_no: u32, _key: &str, judged_sha: &str) -> MissionEvent {
         MissionEvent::TerminalReviewRequested {
             attempt_no,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: review_effect(judged_sha, attempt_no),
             role: rname("gap-reviewer"),
             runtime: "codex".to_string(),
             prompt: PayloadRef::inline("review prompt"),
             judged_sha: judged_sha.to_string(),
             nonce: "n0".to_string(),
+            requested_at_ms: 0,
+            not_before_ms: 0,
+            deadline_ms: 100_000,
+            budget_deadline_ms: 100_000,
         }
     }
 
     fn review_completed(
-        key: &str,
+        _key: &str,
         judged_sha: &str,
         passed: bool,
         blocking_gaps: usize,
     ) -> MissionEvent {
-        use crate::model::event::{Gap, GapSeverity};
+        use crate::event::{Gap, GapSeverity};
         MissionEvent::TerminalReviewCompleted {
             attempt_no: 1,
-            effect_id: EffectId::for_parts(&["test", key]),
+            effect_id: review_effect(judged_sha, 1),
             judged_sha: judged_sha.to_string(),
-            passed,
-            gaps: (0..blocking_gaps)
-                .map(|_| Gap {
-                    id: None,
-                    severity: GapSeverity::Blocking,
-                    requirement: "r".into(),
-                    expected: "e".into(),
-                    observed: "o".into(),
-                    evidence: "v".into(),
-                })
-                .collect(),
-            report: PayloadRef::inline("map + observations"),
+            outcome: Ok(TerminalReviewSuccess {
+                passed,
+                gaps: (0..blocking_gaps)
+                    .map(|_| Gap {
+                        id: None,
+                        severity: GapSeverity::Blocking,
+                        requirement: "r".into(),
+                        expected: "e".into(),
+                        observed: "o".into(),
+                        evidence: "v".into(),
+                    })
+                    .collect(),
+                report: PayloadRef::inline("map + observations"),
+                final_response: PayloadRef::inline("review complete"),
+                runtime_configuration: RuntimeConfigurationEvidence::default(),
+            }),
         }
     }
 
@@ -943,18 +1094,25 @@ mod tests {
         let mut events = review_brink();
         events.push(review_requested(1, "k-tr-1", "sha-1"));
         events.push(review_completed("k-tr-1", "sha-1", true, 0));
-        // New work moves the head; the oracle re-judges; the clean sha-1
-        // verdict is stale — a second review dispatches at the new head.
-        events.push(work_done("w1", "k-w1-2", Some(("sha-1", "sha-2"))));
-        events.push(oracle_completed(
-            &["A1"],
-            "tests",
-            "sha-2",
-            2,
-            "k-tests-2",
+        let mut state = fold_log(events);
+        // Later slices may produce a new deliverable through a different
+        // lineage. With proof fresh at sha-2, the sha-1 closing review is
+        // stale and must dispatch again.
+        state.current_sha = "sha-2".into();
+        state
+            .contract
+            .get_mut(&aid("A1"))
+            .expect("assertion")
+            .last_authoritative = Some(crate::AuthoritativeVerdict::from_oracle_outcome(
+            oname("tests"),
+            "sha-2".into(),
             0,
+            None,
+            PayloadRef::inline("pass"),
+            PayloadRef::inline(""),
+            Vec::new(),
         ));
-        let state = fold_log(events);
+        state.phase = MissionPhase::Running;
         let intent = review_dispatched(&state);
         assert_eq!(intent.attempt_no, 2);
         assert_eq!(intent.judged_sha, "sha-2");
@@ -962,7 +1120,7 @@ mod tests {
 
     #[test]
     fn a_gap_park_steps_park_and_retry_redispatches_fresh() {
-        use crate::model::event::DecisionAction;
+        use crate::event::DecisionAction;
         let mut events = review_brink();
         events.push(review_requested(1, "k-tr-1", "sha-1"));
         events.push(review_completed("k-tr-1", "sha-1", false, 1));

@@ -11,8 +11,8 @@ pre-launch branch. Until the replacement docs land, the code is authoritative.)*
 
 - Product entrypoint and everyday command path: `crates/lionclaw/src/cli.rs`
 - Architecture, the determinism wall, and the honesty moat:
-  `crates/lionclaw/src/lib.rs`, `crates/lionclaw/src/model/mod.rs`,
-  `crates/lionclaw/src/authority.rs`, and `crates/lionclaw/src/model/verdict.rs`
+  `crates/lionclaw/src/lib.rs`, `crates/lionclaw-model/src/lib.rs`,
+  `crates/lionclaw/src/authority.rs`, and `crates/lionclaw-model/src/verdict.rs`
 - Mission-type contract: `crates/lionclaw/src/mission_type/` and
   `mission-types/software-dev/`
 
@@ -22,8 +22,9 @@ Two invariants *are* the product. Changing either needs a fault-injection test
 that fails first, and a note in the PR. Use the source-of-truth files above for
 what they mean and why.
 
-- **The determinism wall** — `crates/lionclaw/src/model/` stays pure (only
-  `std` / `serde` / `thiserror`; no I/O, clock, RNG, or async).
+- **The determinism wall** — `lionclaw-model` is the inward kernel dependency.
+  Its production dependencies stay limited to `serde`, `sha2`, and
+  `thiserror`; no I/O, clock, RNG, async, or runtime API dependency.
 - **The honesty moat** — one mint site for an authoritative verdict, one path to
   a `Verified` finish, and no non-artifact role that can write or hold secrets.
   The terminal review (the engine-owned, contract-blind closing judge a mission

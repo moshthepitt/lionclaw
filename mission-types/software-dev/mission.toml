@@ -15,29 +15,23 @@ role = "gap-reviewer"
 [recovery]
 max-attempts = 3
 
+[execution]
+default-timeout-secs = 1800
+max-task-time-secs = 3600
+extension-step-secs = 600
+auto-continue-candidate = false
+auto-continue-proof = false
+
 [[inputs]]
 name = "cargo-home"
 network = true
 key-files = ["Cargo.lock"]
 environment = { CARGO_HOME = "/inputs/cargo-home" }
 
-# The planning DAG: an objective becomes a proposed contract via research →
-# adversarial critique → authored proposal. All read-only; the author (the
-# unique sink) emits the complete proposal, which mission policy approves
-# before execution.
+# One planner owns repository investigation, adversarial contract review, and
+# the complete proposal. Additional planning perspectives are a proportional
+# team choice, not default ceremony for every software change.
 [[planning.tasks]]
 id = "strategist"
 role = "strategist"
-body = "Investigate the repository and draft a contract of falsifiable assertions plus a task plan for the objective. Bind assertions to oracles where a command can prove them."
-
-[[planning.tasks]]
-id = "red-team"
-role = "red-team"
-body = "Adversarially critique the strategist's draft: unfalsifiable assertions, vacuous oracle bindings, uncovered objective, weakenable tests."
-depends_on = ["strategist"]
-
-[[planning.tasks]]
-id = "author"
-role = "author"
-body = "Propose the final contract and task DAG, addressing the red-team's critique. Under this mission type's 'verified' bar, every assertion must bind an oracle."
-depends_on = ["strategist", "red-team"]
+body = "Investigate the repository, build the objective-to-contract coverage map, adversarially review it for gaps and vacuous proof, then propose the complete contract and coherent task DAG. Under this mission type's verified bar, every assertion must bind an oracle."

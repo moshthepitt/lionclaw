@@ -6,12 +6,16 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{advisory_plan, approve_plan, proposal, test_mission_type, BASE_SHA, HEAD_SHA};
+use common::{
+    advisory_plan, approve_plan, initialize_repository, proposal, review_mission_type, BASE_SHA,
+    HEAD_SHA,
+};
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::model::{
-    AdvisoryStatus, FinishClass, Handoff, MissionPhase, PayloadRef, ValidationItem,
+    AdvisoryStatus, FinishClass, Handoff, MissionEvent, MissionPhase, MissionState,
+    OutputSemantics, PayloadRef, StopBar, ValidationItem,
 };
-use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
+use lionclaw::ports::{CapturedArtifact, RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
@@ -19,49 +23,57 @@ use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectC
 /// handoff that "commits" HEAD_SHA.
 fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
     MockRoleRunner::new(Box::new(move |req: &RoleRunRequest| {
-        use lionclaw::model::OutputSemantics;
-        let handoff = if req.role.output == OutputSemantics::EmitsVerdict {
-            Handoff::Validate {
-                done: true,
-                report: PayloadRef::inline("reviewed"),
-                items: vec![ValidationItem {
-                    item_id: lionclaw::model::AssertionId::new("STYLE-OK").unwrap(),
+        let outcome = match req.role.output {
+            OutputSemantics::EmitsVerdict => RoleRunOutcome {
+                handoff: Handoff::Validate {
+                    done: true,
+                    report: PayloadRef::inline("reviewed"),
+                    items: vec![ValidationItem {
+                        item_id: lionclaw::model::AssertionId::new("STYLE-OK").unwrap(),
+                        passed: reviewer_passes,
+                    }],
                     passed: reviewer_passes,
-                }],
-                passed: reviewer_passes,
-                request_attention: false,
+                    request_attention: false,
+                },
+                artifact: None,
+                runtime_configuration: Default::default(),
+                final_response: String::new(),
+            },
+            OutputSemantics::EmitsGapVerdict => {
+                lionclaw::testing::review_verdict(req, true, vec![])
             }
-        } else {
-            Handoff::Work {
-                done: true,
-                report: PayloadRef::inline("wrote it"),
-                request_attention: false,
-            }
+            OutputSemantics::ProducesArtifact => RoleRunOutcome {
+                handoff: Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("wrote it"),
+                    request_attention: false,
+                },
+                artifact: Some(CapturedArtifact::for_testing(
+                    req.base_sha.clone(),
+                    HEAD_SHA,
+                )),
+                runtime_configuration: Default::default(),
+                final_response: String::new(),
+            },
+            output => panic!("unexpected output contract {output:?}"),
         };
-        let artifact = (req.role.output == OutputSemantics::ProducesArtifact).then(|| {
-            lionclaw::model::ArtifactOutcome {
-                base_sha: req.base_sha.clone(),
-                head_sha: HEAD_SHA.to_string(),
-            }
-        });
-        Ok(RoleRunOutcome {
-            handoff,
-            artifact,
-            model_id: None,
-        })
+        Ok(outcome)
     }))
 }
 
-async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
+async fn drive(role_runner: MockRoleRunner) -> (MissionState, Vec<lionclaw::model::EventEnvelope>) {
     let dir = tempfile::tempdir().expect("tempdir");
+    initialize_repository(dir.path());
     let store = MissionStore::open(dir.path()).await.expect("store");
+    let mut mission_type = review_mission_type();
+    mission_type.edit_for_testing(|definition| definition.stop = StopBar::Reviewed);
     let engine = Engine::new(
-        store,
-        test_mission_type(),
+        store.clone(),
+        mission_type,
         "codex".to_string(),
         "test-image".to_string(),
         EngineServices::new(
-            Arc::new(role_aware_runner(reviewer_passes)),
+            Arc::new(role_runner),
             Arc::new(MockOracleRunner::exiting(0)),
             Arc::new(NoopEffectCleaner),
             Arc::new(MockClock::default()),
@@ -72,9 +84,6 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
             dir.path().to_str().unwrap(),
             "advisory-only mission",
             BASE_SHA,
-            lionclaw::model::MissionConfig {
-                ..Default::default()
-            },
         )
         .await
         .expect("create");
@@ -85,6 +94,12 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
     approve_plan(&engine, &mission_id).await;
     engine.advance(&mission_id).await.expect("advance");
     let state = engine.load_state(&mission_id).await.expect("state");
+    let events = store.load(&mission_id).await.expect("events");
+    (state, events)
+}
+
+async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
+    let (state, _) = drive(role_aware_runner(reviewer_passes)).await;
     let advisory = state
         .contract
         .get(&lionclaw::model::AssertionId::new("STYLE-OK").unwrap())
@@ -117,4 +132,58 @@ async fn advisory_fail_is_unverified() {
             finish: FinishClass::Unverified
         }
     );
+}
+
+#[tokio::test]
+async fn read_only_validator_artifacts_are_rejected_before_the_fold() {
+    let runner = MockRoleRunner::new(Box::new(|req: &RoleRunRequest| {
+        let (handoff, artifact) = match req.role.output {
+            OutputSemantics::ProducesArtifact => (
+                Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("wrote it"),
+                    request_attention: false,
+                },
+                Some(CapturedArtifact::for_testing(
+                    req.base_sha.clone(),
+                    HEAD_SHA,
+                )),
+            ),
+            OutputSemantics::EmitsVerdict => (
+                Handoff::Validate {
+                    done: true,
+                    report: PayloadRef::inline("reviewed"),
+                    items: vec![ValidationItem {
+                        item_id: lionclaw::model::AssertionId::new("STYLE-OK").unwrap(),
+                        passed: true,
+                    }],
+                    passed: true,
+                    request_attention: false,
+                },
+                Some(CapturedArtifact::for_testing(
+                    req.base_sha.clone(),
+                    "forged-validator-head",
+                )),
+            ),
+            output => panic!("unexpected output contract {output:?}"),
+        };
+        Ok(RoleRunOutcome {
+            handoff,
+            artifact,
+            runtime_configuration: Default::default(),
+            final_response: String::new(),
+        })
+    }));
+
+    let (state, events) = drive(runner).await;
+
+    assert_eq!(state.current_sha, HEAD_SHA);
+    assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.event,
+            MissionEvent::RoleRunCompleted { outcome: Err(failure), .. }
+                if failure.evidence().code.as_deref() == Some("workspace.capture_authority")
+        )
+    }));
 }

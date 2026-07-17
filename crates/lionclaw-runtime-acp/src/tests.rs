@@ -16,13 +16,15 @@ use lionclaw_runtime_api::{
     RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
     RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput,
     RuntimeTerminalConfig, RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnMode,
-    RUNTIME_SESSION_READY_MARKER,
+    TurnEvent, RUNTIME_SESSION_READY_MARKER, RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 
 use super::{
     acp_permission_denial, acp_turn_events, AcpMessage, AcpRuntimeAdapter, AcpRuntimeConfig,
     ACP_SESSION_ID_STATE_FILE,
 };
+use crate::client::AcpClient;
+use crate::protocol::AcpSessionSelections;
 
 fn opencode_acp_config(model: Option<String>, mode: Option<String>) -> AcpRuntimeConfig {
     AcpRuntimeConfig {
@@ -351,13 +353,10 @@ fn project_opencode_acp_fixture_events() -> Vec<RuntimeEvent> {
         .iter()
         .flat_map(|raw| {
             let value = serde_json::from_str(raw).expect("fixture raw JSON-RPC line");
-            let message = AcpMessage {
-                raw: raw.clone(),
-                value,
-            };
+            let message = AcpMessage { value };
             acp_turn_events(&message)
         })
-        .map(|record| record.event)
+        .map(TurnEvent::into_event)
         .collect()
 }
 
@@ -481,6 +480,104 @@ fn opencode_acp_config_options_fixture_pins_model_and_mode_protocol() {
     );
 }
 
+#[tokio::test]
+async fn advertised_first_class_model_and_mode_are_applied_by_typed_methods() {
+    let state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+    let session = FakeAcpProgramSession {
+        inbound: VecDeque::from([
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{}}"#.to_string(),
+        ]),
+        output: ExecutionOutput::default(),
+        state: Arc::clone(&state),
+    };
+    let mut client = AcpClient::new(Box::new(session));
+    let selections = AcpSessionSelections::from_session_result(&json!({
+        "models": {
+            "currentModelId": "openrouter:old",
+            "availableModels": [
+                {"modelId": "openrouter:gpt-5.5", "name": "gpt-5.5"}
+            ]
+        },
+        "modes": {
+            "currentModeId": "default",
+            "availableModes": [
+                {"id": "dont_ask", "name": "Don't Ask"}
+            ]
+        },
+        "configOptions": []
+    }));
+    let applied = client
+        .configure_session(
+            &opencode_acp_config(Some("gpt-5.5".into()), Some("dont_ask".into())),
+            "session-1",
+            &selections,
+        )
+        .await
+        .expect("typed selections apply");
+
+    assert_eq!(applied.requested_model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(applied.applied_model.as_deref(), Some("openrouter:gpt-5.5"));
+    assert_eq!(
+        applied.model_confirmation,
+        Some(lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged)
+    );
+    assert_eq!(applied.applied_mode.as_deref(), Some("dont_ask"));
+    assert_eq!(
+        applied.mode_confirmation,
+        Some(lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged)
+    );
+    let sent = state.lock().unwrap().sent.clone();
+    assert_eq!(sent[0]["method"], "session/set_model");
+    assert_eq!(sent[0]["params"]["modelId"], "openrouter:gpt-5.5");
+    assert_eq!(sent[1]["method"], "session/set_mode");
+    assert_eq!(sent[1]["params"]["modeId"], "dont_ask");
+}
+
+#[tokio::test]
+async fn unadvertised_or_unconfirmed_configuration_is_rejected() {
+    let selections = AcpSessionSelections::from_session_result(&json!({
+        "configOptions": [{
+            "id": "model",
+            "currentValue": "old",
+            "options": [{"value": "advertised"}]
+        }]
+    }));
+    let state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+    let mut client = AcpClient::new(Box::new(FakeAcpProgramSession {
+        inbound: VecDeque::new(),
+        output: ExecutionOutput::default(),
+        state,
+    }));
+    let error = client
+        .configure_session(
+            &opencode_acp_config(Some("missing".into()), None),
+            "session-1",
+            &selections,
+        )
+        .await
+        .expect_err("unadvertised model must fail before an RPC");
+    assert!(error
+        .to_string()
+        .contains("does not advertise requested model"));
+
+    let state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+    let mut client = AcpClient::new(Box::new(FakeAcpProgramSession {
+        inbound: VecDeque::from([r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string()]),
+        output: ExecutionOutput::default(),
+        state,
+    }));
+    let error = client
+        .configure_session(
+            &opencode_acp_config(Some("advertised".into()), None),
+            "session-1",
+            &selections,
+        )
+        .await
+        .expect_err("an ack without applied evidence must fail");
+    assert!(error.to_string().contains("did not confirm applied model"));
+}
+
 fn acp_response_by_id(messages: &[Value], id: u64) -> Option<&Value> {
     messages
         .iter()
@@ -518,13 +615,20 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
         })
         .await
         .expect("start");
+    assert_eq!(
+        adapter
+            .cancel(&handle, Some("pre-start".into()))
+            .await
+            .unwrap(),
+        lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn
+    );
     let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
     let executor = FakeAcpProgramExecutor {
         inbound: VecDeque::from([
             opencode_initialize_response(1),
-            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_program","configOptions":[]}}"#.to_string(),
-            r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string(),
-            r#"{"jsonrpc":"2.0","id":4,"result":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_program","configOptions":[{"id":"model","currentValue":"old","options":[{"value":"gpt-5"}]},{"id":"mode","currentValue":"build","options":[{"value":"plan"}]}]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"model","currentValue":"gpt-5"}]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"mode","currentValue":"plan"}]}}"#.to_string(),
             r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_program","update":{"sessionUpdate":"agent_thought_chunk","messageId":"msg_1","content":{"type":"text","text":"thinking"}}}}"#.to_string(),
             r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_program","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_1","content":{"type":"text","text":"answer"}}}}"#.to_string(),
             r#"{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
@@ -532,11 +636,11 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
         expected_auth: Some(expected_auth),
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
     let mut context = acp_driver_context(runtime_state_root.clone());
     context.working_dir = Some("/workspace/crates/example".to_string());
 
-    adapter
+    let result = adapter
         .program_backed_turn(
             RuntimeProgramTurnExecution {
                 input: RuntimeTurnInput {
@@ -551,6 +655,22 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
         )
         .await
         .expect("ACP turn");
+    assert_eq!(
+        result.configuration,
+        lionclaw_runtime_api::AppliedRuntimeConfiguration {
+            requested_model: Some("gpt-5".to_string()),
+            applied_model: Some("gpt-5".to_string()),
+            model_confirmation: Some(
+                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+            ),
+            requested_mode: Some("plan".to_string()),
+            applied_mode: Some("plan".to_string()),
+            mode_confirmation: Some(
+                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+            ),
+        }
+    );
+    assert_eq!(result.final_response, "answer");
 
     let mut journal = Vec::new();
     while let Some(record) = journal_rx.recv().await {
@@ -559,6 +679,9 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
     assert_eq!(
         canonical_events(&journal).cloned().collect::<Vec<_>>(),
         vec![
+            RuntimeEvent::Configuration {
+                configuration: result.configuration.clone(),
+            },
             RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Reasoning,
                 text: "thinking".to_string(),
@@ -570,7 +693,6 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
             RuntimeEvent::Done,
         ]
     );
-    assert!(journal.iter().all(|record| record.raw.is_some()));
     assert_eq!(
         std::fs::read_to_string(runtime_state_root.join(ACP_SESSION_ID_STATE_FILE))
             .expect("saved session id"),
@@ -623,7 +745,7 @@ async fn acp_program_backed_turn_projects_runtime_mcp_servers() {
         expected_auth: None,
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, _journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, _journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
     let mut context = acp_driver_context(runtime_state_root);
     context.mcp_servers = vec![RuntimeMcpServerSpec {
         name: "lionclaw".to_string(),
@@ -710,7 +832,7 @@ async fn acp_cancel_sends_session_cancel_for_active_prompt() {
         .await
         .expect("start");
     let state = CancelableAcpProgramState::new();
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
     let adapter_for_task = Arc::clone(&adapter);
     let handle_for_task = handle.clone();
     let state_for_task = Arc::clone(&state);
@@ -751,10 +873,14 @@ async fn acp_cancel_sends_session_cancel_for_active_prompt() {
         "ACP prompt request was not sent"
     );
 
-    adapter
+    let cancellation = adapter
         .cancel(&handle, Some("operator cancelled".to_string()))
         .await
         .expect("cancel active ACP prompt");
+    assert_eq!(
+        cancellation,
+        lionclaw_runtime_api::RuntimeCancellation::Acknowledged
+    );
     assert!(
         state.is_shutdown(),
         "ACP cancel should wait until the prompt response path has shut down the session"
@@ -801,6 +927,35 @@ fn acp_permission_requests_are_denied_by_default() {
     assert_eq!(
         acp_permission_denial(Some(&json!({ "options": [] }))),
         json!({ "outcome": { "outcome": "cancelled" } })
+    );
+
+    assert_eq!(
+        acp_permission_denial(Some(&json!({
+            "options": [
+                {
+                    "optionId": "allow",
+                    "kind": "allow_once",
+                    "name": "Do not deny this request"
+                }
+            ]
+        }))),
+        json!({ "outcome": { "outcome": "cancelled" } }),
+        "display prose must never turn an allow option into a structured denial"
+    );
+    assert_eq!(
+        acp_permission_denial(Some(&json!({
+            "options": [
+                { "optionId": "always", "kind": "reject_always" },
+                { "optionId": "one", "kind": "reject_once" }
+            ]
+        }))),
+        json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": "one"
+            }
+        }),
+        "reject_once is the least-persistent structured denial"
     );
 }
 
@@ -861,7 +1016,7 @@ async fn acp_resume_uses_effective_working_directory() {
         expected_auth: None,
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
     let mut context = acp_driver_context(runtime_state_root);
     context.working_dir = Some("/workspace/packages/runtime".to_string());
 
@@ -934,7 +1089,7 @@ async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
         expected_auth: None,
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
     let mut context = acp_driver_context(runtime_state_root);
     context.working_dir = Some("/workspace/packages/runtime".to_string());
 
@@ -1008,7 +1163,7 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
         expected_auth: None,
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     adapter
         .program_backed_turn(
@@ -1080,7 +1235,7 @@ async fn acp_ready_session_without_reopen_capability_falls_back_to_fresh_prompt(
         expected_auth: None,
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     adapter
         .program_backed_turn(

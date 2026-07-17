@@ -11,17 +11,103 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lionclaw::engine::{Engine, EngineServices};
-use lionclaw::mission_type::{MissionType, RoleDefinition};
+use lionclaw::mission_type::{MissionType, MissionTypeDefinition, RoleDefinition};
 use lionclaw::model::{
-    Assertion, AssertionId, MissionConfig, OracleName, OutputSemantics, Plan, PlanProposal,
-    Requirement, RequirementDisposition, RequirementId, RequirementKind, RoleName, StopBar, Task,
-    TaskKind,
+    Assertion, AssertionId, OracleName, OutputSemantics, Plan, PlanProposal, Requirement,
+    RequirementDisposition, RequirementId, RequirementKind, RoleName, StopBar, Task, TaskKind,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
-pub const BASE_SHA: &str = "0000000000000000000000000000000000000001";
-pub const HEAD_SHA: &str = "0000000000000000000000000000000000000002";
+pub const BASE_SHA: &str = "68416f3db8602142a2b732a91cfb8cc86b898f17";
+pub const HEAD_SHA: &str = "27c714953fa5f62e2d627b2cd0e7a7e67aabba37";
+
+pub fn initialize_repository(workspace: &Path) {
+    if workspace.join(".git").is_dir() {
+        return;
+    }
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(workspace)
+            .args(args)
+            .status()
+            .expect("run Git for integration repository");
+        assert!(status.success(), "git {} failed", args.join(" "));
+    };
+    run(&["init", "--quiet"]);
+    run(&["config", "user.name", "LionClaw Test Base"]);
+    run(&["config", "user.email", "test@lionclaw.local"]);
+    run(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(workspace.join("fixture.txt"), "base\n").expect("write base fixture");
+    run(&["add", "fixture.txt"]);
+    let status = std::process::Command::new("git")
+        .current_dir(workspace)
+        .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+        .args(["commit", "--quiet", "-m", "LionClaw test base"])
+        .status()
+        .expect("commit integration repository base");
+    assert!(status.success(), "git commit failed");
+    let actual = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("resolve integration repository base");
+    assert!(actual.status.success());
+    assert_eq!(String::from_utf8(actual.stdout).unwrap().trim(), BASE_SHA);
+}
+
+/// Test-only fault injection that writes directly to the on-disk log. Raw
+/// production append is kernel-private; crash/replay tests deliberately bypass
+/// that boundary through SQLite rather than reopening it in the public API.
+pub async fn fault_append_events(
+    workspace: &Path,
+    mission_id: &lionclaw::model::MissionId,
+    expected_head: u64,
+    events: &[lionclaw::store::NewEvent],
+    now_ms: i64,
+) -> u64 {
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        workspace.join(".lionclaw/mission.db").display()
+    ))
+    .await
+    .expect("open mission database for fault injection");
+    let mut transaction = database.begin().await.expect("begin fault append");
+    let actual: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sequence_no), 0) FROM mission_events WHERE mission_id = ?1",
+    )
+    .bind(mission_id.as_str())
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("read fault append head");
+    assert_eq!(actual as u64, expected_head, "fault append head changed");
+
+    let mut sequence = expected_head;
+    for event in events {
+        sequence += 1;
+        let payload = serde_json::to_string(&serde_json::json!({
+            "stamps": event.stamps,
+            "event": event.event,
+        }))
+        .expect("encode fault event");
+        sqlx::query(
+            "INSERT INTO mission_events
+                 (mission_id, sequence_no, recorded_at_ms, schema_version, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(mission_id.as_str())
+        .bind(sequence as i64)
+        .bind(now_ms)
+        .bind(event.stamps.schema_version)
+        .bind(payload)
+        .execute(&mut *transaction)
+        .await
+        .expect("inject fault event");
+    }
+    transaction.commit().await.expect("commit fault events");
+    sequence
+}
 
 pub fn effect_id(label: &str) -> lionclaw::model::EffectId {
     lionclaw::model::EffectId::for_parts(&["test", label])
@@ -42,22 +128,18 @@ pub async fn approve_plan(engine: &Engine, mission_id: &lionclaw::model::Mission
 pub fn test_mission_type() -> MissionType {
     let implementer = RoleName::new("implementer").expect("role name");
     let cargo_test = OracleName::new("cargo-test").expect("oracle name");
-    MissionType {
+    MissionType::for_testing(MissionTypeDefinition {
         name: "software-dev-test".to_string(),
-        digest: "test-digest".to_string(),
-        // `Reviewed` so the shared harness accepts both oracle-bound and
-        // advisory plans; the `Verified` proposal-reachability check is exercised
-        // in the plan_validation unit tests. A reviewed-bar type must declare
-        // a terminal review (the loader/engine invariant) — the shipped
-        // `reviewer` judge serves; missions only run it when their CONFIG
-        // carries it (`review_config`), so `default_config` tests are untouched.
-        stop: StopBar::Reviewed,
+        stop: StopBar::Verified,
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
         planning: Default::default(),
         recovery: Default::default(),
-        terminal_review: Some(lionclaw::model::TerminalReviewConfig {
-            role: RoleName::new("reviewer").expect("role name"),
-        }),
+        execution: lionclaw::model::ExecutionPolicy {
+            auto_continue_candidate: true,
+            auto_continue_proof: true,
+            ..Default::default()
+        },
+        terminal_review: None,
         playbook: None,
         roles: BTreeMap::from([
             (
@@ -66,6 +148,7 @@ pub fn test_mission_type() -> MissionType {
                     name: implementer,
                     output: OutputSemantics::ProducesArtifact,
                     runtime: None,
+                    timeout_secs: None,
                     network: false,
                     secrets: false,
                     skills: Vec::new(),
@@ -78,6 +161,7 @@ pub fn test_mission_type() -> MissionType {
                     name: RoleName::new("reviewer").expect("role name"),
                     output: OutputSemantics::EmitsVerdict,
                     runtime: None,
+                    timeout_secs: None,
                     network: false,
                     secrets: false,
                     skills: Vec::new(),
@@ -91,7 +175,7 @@ pub fn test_mission_type() -> MissionType {
             cargo_test,
             "/nonexistent-mission-type/oracles/cargo-test".into(),
         )]),
-    }
+    })
 }
 
 /// `test_mission_type` plus a declared closing review: a fresh-context
@@ -99,20 +183,23 @@ pub fn test_mission_type() -> MissionType {
 pub fn review_mission_type() -> MissionType {
     let gap_reviewer = RoleName::new("gap-reviewer").expect("role name");
     let mut mission_type = test_mission_type();
-    mission_type.roles.insert(
-        gap_reviewer.clone(),
-        RoleDefinition {
-            name: gap_reviewer.clone(),
-            output: OutputSemantics::EmitsGapVerdict,
-            runtime: Some("opencode".to_string()),
-            network: false,
-            secrets: false,
-            skills: Vec::new(),
-            prompt_body: "Hunt product gaps against the objective.".to_string(),
-        },
-    );
-    mission_type.terminal_review =
-        Some(lionclaw::model::TerminalReviewConfig { role: gap_reviewer });
+    mission_type.edit_for_testing(|definition| {
+        definition.roles.insert(
+            gap_reviewer.clone(),
+            RoleDefinition {
+                name: gap_reviewer.clone(),
+                output: OutputSemantics::EmitsGapVerdict,
+                runtime: Some("opencode".to_string()),
+                timeout_secs: None,
+                network: false,
+                secrets: false,
+                skills: Vec::new(),
+                prompt_body: "Hunt product gaps against the objective.".to_string(),
+            },
+        );
+        definition.terminal_review =
+            Some(lionclaw::model::TerminalReviewConfig { role: gap_reviewer });
+    });
     mission_type
 }
 
@@ -217,6 +304,7 @@ pub async fn harness_with_type(
     role_runner: MockRoleRunner,
     oracle_runner: MockOracleRunner,
 ) -> TestHarness {
+    initialize_repository(workspace);
     let store = MissionStore::open(workspace).await.expect("open store");
     let role_runner = Arc::new(role_runner);
     let oracle_runner = Arc::new(oracle_runner);
@@ -239,20 +327,6 @@ pub async fn harness_with_type(
     }
 }
 
-pub fn default_config() -> MissionConfig {
-    MissionConfig::default()
-}
-
-/// `default_config` plus the closing review (matches `review_mission_type`).
-pub fn review_config() -> MissionConfig {
-    MissionConfig {
-        terminal_review: Some(lionclaw::model::TerminalReviewConfig {
-            role: RoleName::new("gap-reviewer").expect("role name"),
-        }),
-        ..Default::default()
-    }
-}
-
 /// One blocking gap, fully evidenced.
 pub fn blocking_gap() -> lionclaw::model::Gap {
     lionclaw::model::Gap {
@@ -269,8 +343,8 @@ pub fn blocking_gap() -> lionclaw::model::Gap {
 /// are scripted per invocation (the last one repeats). The reviewer echoes
 /// the prompt's nonce, exactly as a real agent must.
 pub fn review_runner(verdicts: Vec<(bool, Vec<lionclaw::model::Gap>)>) -> MockRoleRunner {
-    use lionclaw::model::{ArtifactOutcome, Handoff, PayloadRef};
-    use lionclaw::ports::RoleRunOutcome;
+    use lionclaw::model::{Handoff, PayloadRef};
+    use lionclaw::ports::{CapturedArtifact, RoleRunOutcome};
     let reviews = std::sync::Mutex::new(0usize);
     MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == lionclaw::engine::TERMINAL_REVIEW_TASK_TAG {
@@ -286,11 +360,12 @@ pub fn review_runner(verdicts: Vec<(bool, Vec<lionclaw::model::Gap>)>) -> MockRo
                     report: PayloadRef::inline("committed the change"),
                     request_attention: false,
                 },
-                artifact: Some(ArtifactOutcome {
-                    base_sha: request.base_sha.clone(),
-                    head_sha: HEAD_SHA.to_string(),
-                }),
-                model_id: None,
+                artifact: Some(CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    HEAD_SHA,
+                )),
+                runtime_configuration: Default::default(),
+                final_response: String::new(),
             })
         }
     }))

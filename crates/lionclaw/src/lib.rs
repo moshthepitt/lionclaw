@@ -15,7 +15,7 @@ mod effect_cleanup;
 pub mod engine;
 pub mod evidence;
 pub mod mission_type;
-pub mod model;
+pub use lionclaw_model as model;
 pub mod oracle;
 pub mod ports;
 pub mod prompt;
@@ -24,5 +24,6 @@ pub mod selftest;
 pub mod store;
 pub mod workspace;
 
+pub mod activity;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

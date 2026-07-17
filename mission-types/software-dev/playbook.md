@@ -34,6 +34,13 @@ proves it.
    the validators AND-aggregates their verdicts over its targets. A cleared
    gate still pauses for a human checkpoint; a blocked gate raises attention.
 
+5. **Review the proposal before handing it off.** The default planning pass is
+   deliberately one strategist turn. Build an explicit objective-to-contract
+   coverage map, attack every assertion for vacuous proof or weakenable tests,
+   and repair the complete proposal before writing the handoff. Add another
+   planning perspective only when novelty, security impact, public API change,
+   prior blocking findings, or a concrete coverage gap justifies it.
+
 ## Binding assertions to checks (dynamically)
 
 The engine does not know your domain. You choose, per assertion, whether it

@@ -11,11 +11,10 @@
 //! verdicts — never an event. A cleared gate still pauses for a human
 //! checkpoint (zenith's discipline); a failed gate raises `gate_failed`.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use super::ids::TaskId;
 use super::plan::{Plan, TaskKind};
 use super::state::MissionState;
+use crate::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateResult {
@@ -102,13 +101,29 @@ fn blocked(reason: String) -> GateResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::event::{
+    use crate::event::{
         EventEnvelope, Handoff, MissionEvent, PayloadRef, ValidationItem, VersionStamps,
     };
-    use crate::model::fold::fold;
-    use crate::model::ids::{AssertionId, EffectId, MissionId, RoleName};
-    use crate::model::plan::{Assertion, Task};
-    use crate::model::MissionConfig;
+    use crate::fold::fold;
+    use crate::ids::{AssertionId, EffectId, MissionId, OracleName, RequirementId, RoleName};
+    use crate::plan::{
+        Assertion, PlanInventory, Requirement, RequirementDisposition, RequirementKind, Task,
+    };
+    use crate::MissionConfig;
+
+    const TEST_PROMPT_HASH: &str =
+        "148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940";
+
+    fn role_effect(mission_id: &MissionId, task_id: &TaskId) -> EffectId {
+        EffectId::for_role_request(
+            crate::TaskNamespace::Execution,
+            mission_id,
+            task_id,
+            1,
+            1,
+            TEST_PROMPT_HASH,
+        )
+    }
 
     fn aid(s: &str) -> AssertionId {
         AssertionId::new(s).unwrap()
@@ -118,8 +133,20 @@ mod tests {
     }
 
     fn plan_with(assertions: Vec<Assertion>, tasks: Vec<Task>) -> Plan {
+        let requirements = assertions
+            .iter()
+            .enumerate()
+            .map(|(index, assertion)| Requirement {
+                id: RequirementId::new(format!("REQ-{}", index + 1)).unwrap(),
+                kind: RequirementKind::Capability,
+                prose: format!("requirement for {}", assertion.id),
+                disposition: RequirementDisposition::Covered {
+                    assertion_ids: vec![assertion.id.clone()],
+                },
+            })
+            .collect();
         Plan {
-            requirements: vec![],
+            requirements,
             assertions,
             tasks,
         }
@@ -156,8 +183,8 @@ mod tests {
         }
     }
 
-    /// Build a state by folding: create → accept a plan → validators report
-    /// the given verdicts.
+    /// Build a state by folding the same dispatch order as the scheduler:
+    /// create, accept, clear writers, then collect validator verdicts.
     fn state_with_verdicts(plan: Plan, verdicts: &[(&str, &[(&str, bool)])]) -> MissionState {
         let mission_id = MissionId::from_digest_prefix("abcdef0123456789");
         let mut events = vec![
@@ -166,7 +193,7 @@ mod tests {
                 1,
                 MissionEvent::MissionCreated {
                     objective: "o".into(),
-                    mission_type: crate::model::MissionTypeRef {
+                    mission_type: crate::MissionTypeRef {
                         name: "p".into(),
                         digest: "d".into(),
                     },
@@ -175,6 +202,19 @@ mod tests {
                     workspace_dir: "/w".into(),
                     base_sha: "s0".into(),
                     config: MissionConfig {
+                        plan_inventory: PlanInventory {
+                            roles: BTreeMap::from([
+                                (
+                                    RoleName::new("implementer").unwrap(),
+                                    crate::OutputSemantics::ProducesArtifact,
+                                ),
+                                (
+                                    RoleName::new("reviewer").unwrap(),
+                                    crate::OutputSemantics::EmitsVerdict,
+                                ),
+                            ]),
+                            oracles: BTreeSet::from([OracleName::new("tests").unwrap()]),
+                        },
                         ..Default::default()
                     },
                 },
@@ -183,7 +223,7 @@ mod tests {
                 &mission_id,
                 2,
                 MissionEvent::PlanProposed {
-                    proposal: crate::model::PlanProposal {
+                    proposal: crate::PlanProposal {
                         base_revision: 0,
                         plan: plan.clone(),
                     },
@@ -195,24 +235,33 @@ mod tests {
                 3,
                 MissionEvent::DecisionRecorded {
                     attention_id: "plan_proposal:mission".into(),
-                    action: crate::model::DecisionAction::Approve,
+                    action: crate::DecisionAction::Approve,
                     justification: "test fixture approves the plan".into(),
                 },
             ),
         ];
         let mut seq = 4;
-        for (validator, items) in verdicts {
+        for task in plan.tasks.iter().filter(|task| task.kind == TaskKind::Work) {
+            let effect_id = role_effect(&mission_id, &task.id);
             events.push(env(
                 &mission_id,
                 seq,
                 MissionEvent::RoleRunRequested {
-                    task_id: tid(validator),
+                    namespace: crate::TaskNamespace::Execution,
+                    task_id: task.id.clone(),
                     attempt_no: 1,
-                    effect_id: EffectId::for_parts(&["test", validator]),
-                    role: RoleName::new("reviewer").unwrap(),
+                    effect_id: effect_id.clone(),
+                    role: RoleName::new("implementer").unwrap(),
+                    output: crate::OutputSemantics::ProducesArtifact,
                     runtime: "codex".into(),
                     prompt: PayloadRef::inline("p"),
                     base_sha: "s0".into(),
+                    assignment_epoch: 1,
+                    recreate_workspace: true,
+                    requested_at_ms: 0,
+                    not_before_ms: 0,
+                    deadline_ms: 100_000,
+                    budget_deadline_ms: 100_000,
                 },
             ));
             seq += 1;
@@ -220,23 +269,73 @@ mod tests {
                 &mission_id,
                 seq,
                 MissionEvent::RoleRunCompleted {
+                    namespace: crate::TaskNamespace::Execution,
+                    task_id: task.id.clone(),
+                    attempt_no: 1,
+                    effect_id,
+                    outcome: Ok(crate::RoleRunSuccess {
+                        handoff: Handoff::Work {
+                            done: true,
+                            report: PayloadRef::inline("done"),
+                            request_attention: false,
+                        },
+                        artifact: None,
+                        final_response: PayloadRef::inline("done"),
+                        runtime_configuration: crate::RuntimeConfigurationEvidence::default(),
+                    }),
+                },
+            ));
+            seq += 1;
+        }
+        for (validator, items) in verdicts {
+            events.push(env(
+                &mission_id,
+                seq,
+                MissionEvent::RoleRunRequested {
+                    namespace: crate::TaskNamespace::Execution,
                     task_id: tid(validator),
                     attempt_no: 1,
-                    effect_id: EffectId::for_parts(&["test", validator]),
-                    handoff: Handoff::Validate {
-                        done: true,
-                        report: PayloadRef::inline("r"),
-                        items: items
-                            .iter()
-                            .map(|(a, p)| ValidationItem {
-                                item_id: aid(a),
-                                passed: *p,
-                            })
-                            .collect(),
-                        passed: items.iter().all(|(_, p)| *p),
-                        request_attention: false,
-                    },
-                    artifact: None,
+                    effect_id: role_effect(&mission_id, &tid(validator)),
+                    role: RoleName::new("reviewer").unwrap(),
+                    output: crate::OutputSemantics::EmitsVerdict,
+                    runtime: "codex".into(),
+                    prompt: PayloadRef::inline("p"),
+                    base_sha: "s0".into(),
+                    assignment_epoch: 1,
+                    recreate_workspace: true,
+                    requested_at_ms: 0,
+                    not_before_ms: 0,
+                    deadline_ms: 100_000,
+                    budget_deadline_ms: 100_000,
+                },
+            ));
+            seq += 1;
+            events.push(env(
+                &mission_id,
+                seq,
+                MissionEvent::RoleRunCompleted {
+                    namespace: crate::TaskNamespace::Execution,
+                    task_id: tid(validator),
+                    attempt_no: 1,
+                    effect_id: role_effect(&mission_id, &tid(validator)),
+                    outcome: Ok(crate::RoleRunSuccess {
+                        handoff: Handoff::Validate {
+                            done: true,
+                            report: PayloadRef::inline("r"),
+                            items: items
+                                .iter()
+                                .map(|(a, p)| ValidationItem {
+                                    item_id: aid(a),
+                                    passed: *p,
+                                })
+                                .collect(),
+                            passed: items.iter().all(|(_, p)| *p),
+                            request_attention: false,
+                        },
+                        artifact: None,
+                        final_response: PayloadRef::inline("reviewed"),
+                        runtime_configuration: crate::RuntimeConfigurationEvidence::default(),
+                    }),
                 },
             ));
             seq += 1;
@@ -245,11 +344,15 @@ mod tests {
     }
 
     fn env(mission_id: &MissionId, seq: u64, event: MissionEvent) -> EventEnvelope {
+        let mut stamps = VersionStamps::default();
+        if matches!(event, MissionEvent::RoleRunRequested { .. }) {
+            stamps.prompt_hash = Some(TEST_PROMPT_HASH.to_string());
+        }
         EventEnvelope {
             mission_id: mission_id.clone(),
             sequence_no: seq,
             recorded_at_ms: 0,
-            stamps: VersionStamps::default(),
+            stamps,
             event,
         }
     }
@@ -260,7 +363,7 @@ mod tests {
             vec![Assertion {
                 id: aid("AA"),
                 prose: "a".into(),
-                oracle: None,
+                oracle: Some(OracleName::new("tests").unwrap()),
             }],
             vec![
                 work("w", &["AA"]),
@@ -278,7 +381,7 @@ mod tests {
             vec![Assertion {
                 id: aid("AA"),
                 prose: "a".into(),
-                oracle: None,
+                oracle: Some(OracleName::new("tests").unwrap()),
             }],
             vec![
                 work("w", &["AA"]),
@@ -301,12 +404,12 @@ mod tests {
                 Assertion {
                     id: aid("AA"),
                     prose: "a".into(),
-                    oracle: None,
+                    oracle: Some(OracleName::new("tests").unwrap()),
                 },
                 Assertion {
                     id: aid("BB"),
                     prose: "b".into(),
-                    oracle: None,
+                    oracle: Some(OracleName::new("tests").unwrap()),
                 },
             ],
             vec![
@@ -328,7 +431,7 @@ mod tests {
             vec![Assertion {
                 id: aid("AA"),
                 prose: "a".into(),
-                oracle: None,
+                oracle: Some(OracleName::new("tests").unwrap()),
             }],
             vec![
                 work("w", &["AA"]),
@@ -350,7 +453,7 @@ mod tests {
             vec![Assertion {
                 id: aid("AA"),
                 prose: "a".into(),
-                oracle: None,
+                oracle: Some(OracleName::new("tests").unwrap()),
             }],
             vec![
                 work("w", &["AA"]),
