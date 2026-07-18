@@ -5762,4 +5762,119 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].body, "during");
     }
+
+    #[test]
+    fn delivery_failure_state_machine_preserves_boundary_and_reports_retry_uncertainty() {
+        let mut checkpoint = role_completed("w", "checkpoint", work_handoff(true, false), None);
+        let MissionEvent::RoleRunCompleted {
+            outcome: Ok(success),
+            ..
+        } = &mut checkpoint
+        else {
+            unreachable!()
+        };
+        success.handoff = None;
+        let seed = vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "first"),
+            checkpoint,
+        ];
+        let state = fold_log(seed.clone()).unwrap();
+        let (conversation_id, conversation) = state.conversations.iter().next().unwrap();
+        let initially_consumed_through = conversation.consumed_through;
+        let recipient = super::super::event::ConversationRecipient {
+            conversation_id: conversation_id.clone(),
+            role: conversation.role.clone(),
+            namespace: conversation.namespace,
+            task_id: conversation.task_id.clone(),
+            assignment_epoch: conversation.assignment_epoch,
+        };
+
+        let requested = |events: &mut Vec<MissionEvent>| {
+            events.push(MissionEvent::MessageSent {
+                recipients: vec![recipient.clone()],
+                body: "before".into(),
+                references: vec![],
+            });
+            let mut request = role_requested("w", "second");
+            if let MissionEvent::RoleRunRequested {
+                attempt_no,
+                effect_id,
+                ..
+            } = &mut request
+            {
+                *attempt_no = 2;
+                *effect_id = role_effect(crate::TaskNamespace::Execution, "w", 2, 1);
+            }
+            events.push(request);
+            events.push(MissionEvent::MessageSent {
+                recipients: vec![recipient.clone()],
+                body: "during".into(),
+                references: vec![],
+            });
+        };
+        let failed = |failure: TypedFailure| {
+            let mut completed = role_completed_at(
+                crate::TaskNamespace::Execution,
+                "w",
+                2,
+                "failure",
+                work_handoff(true, false),
+                None,
+            );
+            let MissionEvent::RoleRunCompleted { outcome, .. } = &mut completed else {
+                unreachable!()
+            };
+            *outcome = Err(failure);
+            completed
+        };
+
+        let mut launch_events = seed.clone();
+        requested(&mut launch_events);
+        launch_events.push(failed(TypedFailure::permanent(
+            "kernel.launch",
+            "session was never opened",
+        )));
+        let launch = fold_log(launch_events).unwrap();
+        let launch_delivery = &launch.conversations[conversation_id];
+        assert_eq!(launch_delivery.queued.len(), 2);
+        assert!(launch_delivery
+            .queued
+            .iter()
+            .all(|message| message.marker == super::super::state::DeliveryMarker::Queued));
+        assert_eq!(launch_delivery.consumed_through, initially_consumed_through);
+        assert!(launch_delivery.active_delivery.is_none());
+
+        for (failure, expected) in [
+            (
+                TypedFailure::invalid("handoff.schema", "delivered malformed handoff"),
+                super::super::state::DeliveryMarker::PreviouslyDelivered,
+            ),
+            (
+                TypedFailure::Interrupted {
+                    evidence: Box::new(TypedFailureEvidence::new(
+                        None,
+                        "driver died after delivery",
+                    )),
+                },
+                super::super::state::DeliveryMarker::PossiblyDelivered,
+            ),
+        ] {
+            let mut events = seed.clone();
+            requested(&mut events);
+            events.push(failed(failure));
+            let state = fold_log(events).unwrap();
+            let delivery = &state.conversations[conversation_id];
+            assert_eq!(delivery.queued.len(), 2);
+            assert_eq!(delivery.queued[0].marker, expected);
+            assert_eq!(
+                delivery.queued[1].marker,
+                super::super::state::DeliveryMarker::Queued,
+                "a message beyond the immutable request boundary was not delivered"
+            );
+            assert_eq!(delivery.consumed_through, initially_consumed_through);
+            assert!(delivery.active_delivery.is_none());
+        }
+    }
 }
