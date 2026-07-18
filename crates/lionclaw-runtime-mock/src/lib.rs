@@ -35,10 +35,9 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use lionclaw_runtime_api::{
-    HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult,
-    RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
-    RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-    RuntimeTurnJournalSender, RuntimeTurnResult, TurnEvent,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeEvent, RuntimeMessageLane, RuntimeResumeMode,
+    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnJournalSender, TurnEvent,
+    TurnExecution, TurnResult,
 };
 
 pub struct MockRuntimeAdapter;
@@ -53,25 +52,22 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         }
     }
 
-    fn hidden_turn_support(&self) -> HiddenTurnSupport {
-        HiddenTurnSupport::SideEffectFree
-    }
-
     async fn session_start(
         &self,
         _input: RuntimeSessionStartInput,
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("mock-{}", Uuid::new_v4()),
-            resumes_existing_session: false,
+            resume_mode: RuntimeResumeMode::Reconstructed,
         })
     }
 
     async fn turn(
         &self,
-        input: RuntimeTurnInput,
+        execution: TurnExecution,
         journal: RuntimeTurnJournalSender,
-    ) -> Result<RuntimeTurnResult> {
+    ) -> Result<TurnResult> {
+        let input = execution.input;
         let final_response = format!("[mock] prompt: {}", input.prompt);
         drop(
             journal
@@ -93,63 +89,10 @@ impl RuntimeAdapter for MockRuntimeAdapter {
 
         drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)).await);
 
-        Ok(RuntimeTurnResult {
-            capability_requests: Vec::new(),
+        Ok(TurnResult {
             configuration: Default::default(),
             final_response,
         })
-    }
-
-    async fn resolve_capability_requests(
-        &self,
-        _handle: &RuntimeSessionHandle,
-        results: Vec<RuntimeCapabilityResult>,
-        events: RuntimeEventSender,
-    ) -> Result<()> {
-        for result in results {
-            let verdict = if result.allowed { "granted" } else { "denied" };
-            drop(events.send(RuntimeEvent::Status {
-                code: None,
-                text: format!("capability:{}:{}", result.request_id, verdict),
-            }));
-            if let Some(reason) = result.reason {
-                drop(events.send(RuntimeEvent::Status {
-                    code: None,
-                    text: format!("capability:{}:reason:{}", result.request_id, reason),
-                }));
-            }
-        }
-        drop(events.send(RuntimeEvent::Done));
-        Ok(())
-    }
-
-    async fn runtime_control(
-        &self,
-        execution: RuntimeControlExecution,
-        events: RuntimeEventSender,
-    ) -> Result<RuntimeControlOutcome> {
-        let command = execution.input.command_name.as_str();
-        match command {
-            "handled" => {
-                drop(events.send(RuntimeEvent::Status {
-                    code: Some("mock.control".to_string()),
-                    text: "mock runtime saw handled control".to_string(),
-                }));
-                Ok(RuntimeControlOutcome::Handled {
-                    message: "mock runtime handled control".to_string(),
-                })
-            }
-            "failed" => Ok(RuntimeControlOutcome::Failed {
-                code: Some("mock.control_failed".to_string()),
-                message: "mock runtime control failed".to_string(),
-            }),
-            "interactive" => Ok(RuntimeControlOutcome::InteractiveOnly {
-                message: "mock runtime control is interactive-only".to_string(),
-            }),
-            _ => Ok(RuntimeControlOutcome::Unsupported {
-                message: format!("mock runtime does not support '/{command}'"),
-            }),
-        }
     }
 
     async fn cancel(
@@ -162,53 +105,5 @@ impl RuntimeAdapter for MockRuntimeAdapter {
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use lionclaw_runtime_api::RuntimeSessionReady;
-
-    /// The mock never derives capability requests from skill IDs — the dead
-    /// speculative-activation path is gone. A prompt packed with capability
-    /// markers produces zero requests.
-    #[tokio::test]
-    async fn mock_turn_never_activates_capabilities_from_skill_ids() {
-        let adapter = MockRuntimeAdapter;
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: uuid::Uuid::nil(),
-                working_dir: None,
-                environment: Vec::new(),
-                runtime_state_root: None,
-                runtime_session_ready: RuntimeSessionReady::not_ready(),
-            })
-            .await
-            .expect("session_start");
-
-        let (journal_tx, mut journal_rx) =
-            tokio::sync::mpsc::channel::<lionclaw_runtime_api::TurnEvent>(
-                lionclaw_runtime_api::RUNTIME_TURN_JOURNAL_CAPACITY,
-            );
-        let result = adapter
-            .turn(
-                RuntimeTurnInput {
-                    runtime_session_id: handle.runtime_session_id.clone(),
-                    prompt: "[cap:fs.read] [cap:net.egress] [cap:secret.request]".to_string(),
-                    fresh_prompt: None,
-                },
-                journal_tx,
-            )
-            .await
-            .expect("turn");
-
-        assert!(
-            result.capability_requests.is_empty(),
-            "no speculative capability activation from skill IDs"
-        );
-        // Drain events to satisfy the journal sender.
-        while journal_rx.try_recv().is_ok() {}
-        adapter.close(&handle).await.expect("close");
     }
 }

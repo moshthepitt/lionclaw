@@ -32,27 +32,21 @@
 
 mod adapter;
 mod auth;
-mod capability;
 mod context;
 mod driver;
 mod event;
 mod program;
-mod program_backed;
-mod registry;
 mod state;
+mod turn;
 
 pub use adapter::{
-    HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCancellation,
-    RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
-    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-    RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnMode,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCancellation, RuntimeResume, RuntimeResumeMode,
+    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput, TurnExecution,
+    TurnInput,
 };
 pub use auth::{
     RuntimeAuthContext, RuntimeAuthKind, RuntimeAuthPreparation, RuntimeAuthProvider,
     RuntimeAuthRegistry,
-};
-pub use capability::{
-    Capability, RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeTurnResult,
 };
 pub use context::{
     safe_relative_path, RuntimeExecutionContext, RuntimeMcpServerSpec,
@@ -74,13 +68,9 @@ pub use program::{
     RuntimeProgramSpec, RuntimeProgramStdoutLine, RuntimeProgramStdoutLineError,
     RuntimeProgramStdoutSender, RUNTIME_PROGRAM_STDOUT_LINE_LIMIT,
 };
-pub use program_backed::{execute_program_backed_turn, RuntimeProgramOutputParser};
-pub use registry::RuntimeRegistry;
 pub use state::{
     clear_state_value, load_ready_state_value, load_state_value,
     runtime_session_ready_marker_exists, save_state_value, RuntimeSessionReady,
     RUNTIME_SESSION_READY_MARKER,
 };
-
-#[cfg(test)]
-mod tests;
+pub use turn::TurnResult;

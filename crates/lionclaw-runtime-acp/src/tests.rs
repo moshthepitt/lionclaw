@@ -13,10 +13,10 @@ use uuid::Uuid;
 use lionclaw_runtime_api::{
     canonical_events, ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAuthKind, RuntimeEvent,
     RuntimeExecutionContext, RuntimeMcpServerSpec, RuntimeMessageLane, RuntimeProgramExecutor,
-    RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
-    RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput,
-    RuntimeTerminalConfig, RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnMode,
-    TurnEvent, RUNTIME_SESSION_READY_MARKER, RUNTIME_TURN_JOURNAL_CAPACITY,
+    RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeResume,
+    RuntimeResumeMode, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalConfig,
+    RuntimeTerminalProgramInput, TurnEvent, TurnExecution, TurnInput, RUNTIME_SESSION_READY_MARKER,
+    RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 
 use super::{
@@ -595,7 +595,7 @@ fn acp_config_current_value<'a>(message: &'a Value, config_id: &str) -> Option<&
 }
 
 #[tokio::test]
-async fn acp_program_backed_turn_uses_profile_driver_journal() {
+async fn acp_turn_uses_profile_driver_journal() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
@@ -603,15 +603,15 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
     let mut config = opencode_acp_config(Some("gpt-5".to_string()), Some("plan".to_string()));
     config.auth = Some(expected_auth.clone());
     let adapter = AcpRuntimeAdapter::new(config);
-    assert_eq!(adapter.turn_mode(), RuntimeTurnMode::ProgramBacked);
-
     let handle = adapter
         .session_start(RuntimeSessionStartInput {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root.clone()),
-            runtime_session_ready: runtime_not_ready(),
+            resume: RuntimeResume::Native {
+                state_root: runtime_state_root.clone(),
+                ready: runtime_not_ready(),
+            },
         })
         .await
         .expect("start");
@@ -641,9 +641,9 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
     context.working_dir = Some("/workspace/crates/example".to_string());
 
     let result = adapter
-        .program_backed_turn(
-            RuntimeProgramTurnExecution {
-                input: RuntimeTurnInput {
+        .turn(
+            TurnExecution {
+                input: TurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: "hello".to_string(),
                     fresh_prompt: None,
@@ -719,7 +719,7 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
 }
 
 #[tokio::test]
-async fn acp_program_backed_turn_projects_runtime_mcp_servers() {
+async fn acp_turn_projects_runtime_mcp_servers() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
@@ -729,8 +729,10 @@ async fn acp_program_backed_turn_projects_runtime_mcp_servers() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root.clone()),
-            runtime_session_ready: runtime_not_ready(),
+            resume: RuntimeResume::Native {
+                state_root: runtime_state_root.clone(),
+                ready: runtime_not_ready(),
+            },
         })
         .await
         .expect("start");
@@ -757,9 +759,9 @@ async fn acp_program_backed_turn_projects_runtime_mcp_servers() {
     }];
 
     adapter
-        .program_backed_turn(
-            RuntimeProgramTurnExecution {
-                input: RuntimeTurnInput {
+        .turn(
+            TurnExecution {
+                input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "hello".to_string(),
                     fresh_prompt: None,
@@ -826,8 +828,10 @@ async fn acp_cancel_sends_session_cancel_for_active_prompt() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root.clone()),
-            runtime_session_ready: runtime_not_ready(),
+            resume: RuntimeResume::Native {
+                state_root: runtime_state_root.clone(),
+                ready: runtime_not_ready(),
+            },
         })
         .await
         .expect("start");
@@ -838,9 +842,9 @@ async fn acp_cancel_sends_session_cancel_for_active_prompt() {
     let state_for_task = Arc::clone(&state);
     let turn_task = tokio::spawn(async move {
         adapter_for_task
-            .program_backed_turn(
-                RuntimeProgramTurnExecution {
-                    input: RuntimeTurnInput {
+            .turn(
+                TurnExecution {
+                    input: TurnInput {
                         runtime_session_id: handle_for_task.runtime_session_id,
                         prompt: "cancel me".to_string(),
                         fresh_prompt: None,
@@ -977,12 +981,14 @@ async fn acp_session_start_resumes_saved_ready_session() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root),
-            runtime_session_ready,
+            resume: RuntimeResume::Native {
+                state_root: runtime_state_root,
+                ready: runtime_session_ready,
+            },
         })
         .await
         .expect("start");
-    assert!(handle.resumes_existing_session);
+    assert!(handle.resume_mode == RuntimeResumeMode::Resumed);
 }
 
 #[tokio::test]
@@ -1001,8 +1007,10 @@ async fn acp_resume_uses_effective_working_directory() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root.clone()),
-            runtime_session_ready: mark_runtime_ready(&runtime_state_root),
+            resume: RuntimeResume::Native {
+                state_root: runtime_state_root.clone(),
+                ready: mark_runtime_ready(&runtime_state_root),
+            },
         })
         .await
         .expect("start");
@@ -1021,9 +1029,9 @@ async fn acp_resume_uses_effective_working_directory() {
     context.working_dir = Some("/workspace/packages/runtime".to_string());
 
     adapter
-        .program_backed_turn(
-            RuntimeProgramTurnExecution {
-                input: RuntimeTurnInput {
+        .turn(
+            TurnExecution {
+                input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "continue".to_string(),
                     fresh_prompt: None,
@@ -1074,8 +1082,10 @@ async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root.clone()),
-            runtime_session_ready: mark_runtime_ready(&runtime_state_root),
+            resume: RuntimeResume::Native {
+                state_root: runtime_state_root.clone(),
+                ready: mark_runtime_ready(&runtime_state_root),
+            },
         })
         .await
         .expect("start");
@@ -1094,9 +1104,9 @@ async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
     context.working_dir = Some("/workspace/packages/runtime".to_string());
 
     adapter
-        .program_backed_turn(
-            RuntimeProgramTurnExecution {
-                input: RuntimeTurnInput {
+        .turn(
+            TurnExecution {
+                input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "continue".to_string(),
                     fresh_prompt: None,
@@ -1147,8 +1157,10 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root.clone()),
-            runtime_session_ready: runtime_not_ready(),
+            resume: RuntimeResume::Native {
+                state_root: runtime_state_root.clone(),
+                ready: runtime_not_ready(),
+            },
         })
         .await
         .expect("start");
@@ -1166,9 +1178,9 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
     let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     adapter
-        .program_backed_turn(
-            RuntimeProgramTurnExecution {
-                input: RuntimeTurnInput {
+        .turn(
+            TurnExecution {
+                input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "hello".to_string(),
                     fresh_prompt: None,
@@ -1218,12 +1230,14 @@ async fn acp_ready_session_without_reopen_capability_falls_back_to_fresh_prompt(
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root.clone()),
-            runtime_session_ready: mark_runtime_ready(&runtime_state_root),
+            resume: RuntimeResume::Native {
+                state_root: runtime_state_root.clone(),
+                ready: mark_runtime_ready(&runtime_state_root),
+            },
         })
         .await
         .expect("start");
-    assert!(handle.resumes_existing_session);
+    assert!(handle.resume_mode == RuntimeResumeMode::Resumed);
     let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
     let executor = FakeAcpProgramExecutor {
         inbound: VecDeque::from([
@@ -1238,9 +1252,9 @@ async fn acp_ready_session_without_reopen_capability_falls_back_to_fresh_prompt(
     let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     adapter
-        .program_backed_turn(
-            RuntimeProgramTurnExecution {
-                input: RuntimeTurnInput {
+        .turn(
+            TurnExecution {
+                input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "resume prompt".to_string(),
                     fresh_prompt: Some("fresh prompt".to_string()),

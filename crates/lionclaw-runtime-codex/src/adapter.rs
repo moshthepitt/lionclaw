@@ -5,12 +5,10 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use lionclaw_runtime_api::{
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeControlExecution,
-    RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext,
-    RuntimeMcpServerSpec, RuntimeNativeHomeArtifactDir, RuntimeProgramExecutor, RuntimeProgramSpec,
-    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-    RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
-    RuntimeTurnResult, TypedFailure,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeExecutionContext, RuntimeMcpServerSpec,
+    RuntimeNativeHomeArtifactDir, RuntimeProgramExecutor, RuntimeProgramSpec, RuntimeResume,
+    RuntimeResumeMode, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+    RuntimeTurnJournalSender, TurnExecution, TurnInput, TurnResult, TypedFailure,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -59,9 +57,9 @@ fn validate_app_server_model(requested: Option<&str>, applied: Option<&str>) -> 
 impl CodexAppServerTurnRunner<'_> {
     async fn run_turn(
         &mut self,
-        input: RuntimeTurnInput,
+        input: TurnInput,
         journal: RuntimeTurnJournalSender,
-    ) -> Result<RuntimeTurnResult> {
+    ) -> Result<TurnResult> {
         let network_mode = self.context.network_mode;
         let thread_state = self.adapter.thread_state_for(&input.runtime_session_id);
         let transport = self
@@ -137,7 +135,7 @@ impl CodexAppServerTurnRunner<'_> {
                 )
                 .await?;
             let final_response = client.take_final_response();
-            Ok(RuntimeTurnResult {
+            Ok(TurnResult {
                 configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
                     requested_model: self.adapter.config.model.clone(),
                     model_confirmation: applied_model
@@ -149,7 +147,6 @@ impl CodexAppServerTurnRunner<'_> {
                     mode_confirmation: None,
                 },
                 final_response,
-                ..Default::default()
             }
             .projected())
         }
@@ -186,10 +183,10 @@ impl CodexRuntimeAdapter {
 
     async fn run_app_server_turn(
         &self,
-        execution: RuntimeProgramTurnExecution,
+        execution: TurnExecution,
         journal: RuntimeTurnJournalSender,
-    ) -> Result<RuntimeTurnResult> {
-        let RuntimeProgramTurnExecution {
+    ) -> Result<TurnResult> {
+        let TurnExecution {
             input,
             context,
             executor,
@@ -304,10 +301,6 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         }
     }
 
-    fn turn_mode(&self) -> RuntimeTurnMode {
-        RuntimeTurnMode::ProgramBacked
-    }
-
     fn native_home_artifact_dirs(&self) -> Result<Vec<RuntimeNativeHomeArtifactDir>> {
         Ok(vec![RuntimeNativeHomeArtifactDir::new(
             CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR,
@@ -316,9 +309,12 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("codex-{}", Uuid::new_v4());
-        let thread_id = match input.runtime_state_root.as_deref() {
-            Some(root) => load_ready_saved_thread_id(root, input.runtime_session_ready)?,
-            None => None,
+        let (runtime_state_root, thread_id) = match input.resume {
+            RuntimeResume::Native { state_root, ready } => {
+                let thread_id = load_ready_saved_thread_id(&state_root, ready)?;
+                (Some(state_root), thread_id)
+            }
+            RuntimeResume::Reconstruct => (None, None),
         };
         let resumes_existing_session = thread_id.is_some();
         self.sessions
@@ -327,7 +323,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
             .insert(
                 runtime_session_id.clone(),
                 CodexSessionState {
-                    runtime_state_root: input.runtime_state_root,
+                    runtime_state_root,
                     thread_id,
                     active_turn: None,
                 },
@@ -335,15 +331,19 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
         Ok(RuntimeSessionHandle {
             runtime_session_id,
-            resumes_existing_session,
+            resume_mode: if resumes_existing_session {
+                RuntimeResumeMode::Resumed
+            } else {
+                RuntimeResumeMode::Reconstructed
+            },
         })
     }
 
-    async fn program_backed_turn(
+    async fn turn(
         &self,
-        execution: RuntimeProgramTurnExecution,
+        execution: TurnExecution,
         journal: RuntimeTurnJournalSender,
-    ) -> Result<RuntimeTurnResult> {
+    ) -> Result<TurnResult> {
         self.run_app_server_turn(execution, journal).await
     }
 
@@ -352,29 +352,6 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         _input: RuntimeTerminalProgramInput,
     ) -> Result<RuntimeProgramSpec> {
         Ok(build_codex_terminal_program(&self.config))
-    }
-
-    async fn runtime_control(
-        &self,
-        execution: RuntimeControlExecution,
-        events: RuntimeEventSender,
-    ) -> Result<RuntimeControlOutcome> {
-        self.run_app_server_control(execution, events).await
-    }
-
-    async fn resolve_capability_requests(
-        &self,
-        _handle: &RuntimeSessionHandle,
-        results: Vec<RuntimeCapabilityResult>,
-        events: RuntimeEventSender,
-    ) -> Result<()> {
-        if !results.is_empty() {
-            return Err(anyhow!(
-                "codex adapter does not support runtime-side capability request resolution"
-            ));
-        }
-        drop(events.send(RuntimeEvent::Done));
-        Ok(())
     }
 
     async fn cancel(

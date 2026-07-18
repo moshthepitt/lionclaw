@@ -11,14 +11,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw_runtime_api::{
     append_streamed_text_boundary, append_streamed_text_delta, canonical_events, ExecutionOutput,
-    NetworkMode, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
-    RuntimeControlOrigin, RuntimeControlOutcome, RuntimeDriverConfig, RuntimeDriverProvider,
-    RuntimeEvent, RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMcpServerSpec,
-    RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession,
-    RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeProgramTurnExecution,
-    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
-    RuntimeTerminalProgramInput, RuntimeTurnInput, TurnEvent, TypedFailure,
-    RUNTIME_SESSION_READY_MARKER,
+    NetworkMode, RuntimeAdapter, RuntimeDriverConfig, RuntimeDriverProvider, RuntimeEvent,
+    RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMcpServerSpec, RuntimeMessageLane,
+    RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+    RuntimeProgramStdoutSender, RuntimeResume, RuntimeResumeMode, RuntimeSessionHandle,
+    RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput, TurnEvent,
+    TurnExecution, TurnInput, TypedFailure, RUNTIME_SESSION_READY_MARKER,
 };
 
 use crate::codex_runtime_auth_kind;
@@ -83,30 +81,6 @@ impl FakeAppServerTransport {
                 ..ExecutionOutput::default()
             },
         }
-    }
-}
-
-struct UnusedRuntimeProgramExecutor;
-
-#[async_trait]
-impl RuntimeProgramExecutor for UnusedRuntimeProgramExecutor {
-    async fn execute_streaming(
-        &mut self,
-        _program: RuntimeProgramSpec,
-        _stdout: RuntimeProgramStdoutSender,
-    ) -> Result<ExecutionOutput> {
-        anyhow::bail!("test did not expect streaming runtime execution")
-    }
-
-    async fn execute_captured(&mut self, _program: RuntimeProgramSpec) -> Result<ExecutionOutput> {
-        anyhow::bail!("test did not expect captured runtime execution")
-    }
-
-    async fn spawn(
-        &mut self,
-        _program: RuntimeProgramSpec,
-    ) -> Result<Box<dyn RuntimeProgramSession>> {
-        anyhow::bail!("test did not expect interactive runtime execution")
     }
 }
 
@@ -185,8 +159,13 @@ async fn start_codex_test_session_with_config(
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root,
-            runtime_session_ready,
+            resume: match runtime_state_root {
+                Some(state_root) => RuntimeResume::Native {
+                    state_root,
+                    ready: runtime_session_ready,
+                },
+                None => RuntimeResume::Reconstruct,
+            },
         })
         .await
         .expect("start");
@@ -697,9 +676,9 @@ async fn app_server_rejects_oversized_turn_id_from_start_response() {
     let (journal, _journal_rx) = tokio::sync::mpsc::channel(4);
 
     let error = adapter
-        .program_backed_turn(
-            RuntimeProgramTurnExecution {
-                input: RuntimeTurnInput {
+        .turn(
+            TurnExecution {
+                input: TurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: "test".into(),
                     fresh_prompt: None,
@@ -740,8 +719,10 @@ async fn codex_session_rejects_oversized_restored_thread_id() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root),
-            runtime_session_ready: ready,
+            resume: RuntimeResume::Native {
+                state_root: runtime_state_root,
+                ready,
+            },
         })
         .await
         .expect_err("oversized restored thread id must fail closed");
@@ -853,107 +834,6 @@ async fn app_server_agent_message_items_emit_answer_boundaries() {
             }
         ] if intro == "Intro." && body == "**Project**"
     ));
-}
-
-#[test]
-fn model_list_control_arguments_only_allow_listing_flags() {
-    assert_eq!(super::model_list_include_hidden(""), Ok(false));
-    assert_eq!(super::model_list_include_hidden("--hidden"), Ok(true));
-    assert_eq!(
-        super::model_list_include_hidden("--include-hidden"),
-        Ok(true)
-    );
-
-    let outcome = super::model_list_include_hidden("gpt-5-codex")
-        .expect_err("model selection should not be faked as a list request");
-    assert!(matches!(
-        outcome,
-        RuntimeControlOutcome::InteractiveOnly { message } if message.contains("model selection is interactive")
-    ));
-
-    let outcome = super::model_list_include_hidden("--unknown")
-        .expect_err("unknown model list flags should be rejected");
-    assert!(matches!(
-        outcome,
-        RuntimeControlOutcome::Failed { code, message }
-            if code.as_deref() == Some("runtime.control.invalid_arguments")
-                && message.contains("--hidden")
-    ));
-}
-
-#[test]
-fn thread_control_argument_validation_rejects_ambiguous_forms() {
-    assert!(matches!(
-        super::invalid_thread_control_arguments("rename", ""),
-        Some(RuntimeControlOutcome::Failed { code, message })
-            if code.as_deref() == Some("runtime.control.invalid_arguments")
-                && message.contains("non-empty name")
-    ));
-    assert!(matches!(
-        super::invalid_thread_control_arguments("compact", "now"),
-        Some(RuntimeControlOutcome::Failed { code, message })
-            if code.as_deref() == Some("runtime.control.invalid_arguments")
-                && message.contains("does not accept arguments")
-    ));
-}
-
-#[tokio::test]
-async fn review_control_is_unsupported_without_a_verified_native_mapping() {
-    let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let outcome = adapter
-        .run_app_server_control(
-            RuntimeControlExecution {
-                input: RuntimeControlInput {
-                    runtime_session_id: "codex-test".to_string(),
-                    raw: "/review base main".to_string(),
-                    command_name: "review".to_string(),
-                    arguments: "base main".to_string(),
-                    origin: RuntimeControlOrigin::SessionTurn,
-                },
-                context: RuntimeExecutionContext {
-                    network_mode: NetworkMode::On,
-                    working_dir: None,
-                    environment: Vec::new(),
-                    runtime_state_root: None,
-                    runtime_path_projections: Vec::new(),
-                    mcp_servers: Vec::new(),
-                },
-                executor: Box::new(UnusedRuntimeProgramExecutor),
-            },
-            event_tx,
-        )
-        .await
-        .expect("review outcome");
-
-    assert!(matches!(
-        outcome,
-        RuntimeControlOutcome::Unsupported { message }
-            if message.contains("not exposed through LionClaw")
-    ));
-}
-
-#[test]
-fn model_list_description_uses_codex_app_server_display_fields() {
-    let response = json!({
-        "data": [
-            {
-                "id": "model-id",
-                "model": "gpt-5-codex",
-                "displayName": "GPT-5 Codex"
-            },
-            {
-                "id": "fallback-id",
-                "model": "fallback-model"
-            }
-        ]
-    });
-
-    assert_eq!(
-        super::describe_model_list_response(&response),
-        "Available Codex models: GPT-5 Codex, fallback-model."
-    );
 }
 
 #[test]
@@ -2282,7 +2162,7 @@ async fn missing_or_invalid_thread_file_starts_fresh_codex_thread() {
         .expect("write invalid thread id");
 
     let (adapter, handle, _) = start_codex_test_session(Some(runtime_state_root)).await;
-    assert!(!handle.resumes_existing_session);
+    assert_eq!(handle.resume_mode, RuntimeResumeMode::Reconstructed);
 
     adapter.close(&handle).await.expect("close");
 }
@@ -2299,7 +2179,7 @@ async fn saved_thread_file_without_ready_marker_starts_fresh_codex_thread() {
     .expect("write thread id");
 
     let (adapter, handle, _) = start_codex_test_session(Some(runtime_state_root)).await;
-    assert!(!handle.resumes_existing_session);
+    assert_eq!(handle.resume_mode, RuntimeResumeMode::Reconstructed);
 
     adapter.close(&handle).await.expect("close");
 }
@@ -2322,8 +2202,10 @@ async fn symlinked_thread_file_is_rejected() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root),
-            runtime_session_ready,
+            resume: RuntimeResume::Native {
+                state_root: runtime_state_root,
+                ready: runtime_session_ready,
+            },
         })
         .await
         .expect_err("symlinked thread state should fail");
@@ -2350,8 +2232,10 @@ async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_a),
-            runtime_session_ready: runtime_a_ready,
+            resume: RuntimeResume::Native {
+                state_root: runtime_a,
+                ready: runtime_a_ready,
+            },
         })
         .await
         .expect("start a");
@@ -2360,8 +2244,10 @@ async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_b),
-            runtime_session_ready: runtime_b_ready,
+            resume: RuntimeResume::Native {
+                state_root: runtime_b,
+                ready: runtime_b_ready,
+            },
         })
         .await
         .expect("start b");
@@ -2397,8 +2283,10 @@ async fn start_codex_ready_test_session(
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root),
-            runtime_session_ready,
+            resume: RuntimeResume::Native {
+                state_root: runtime_state_root,
+                ready: runtime_session_ready,
+            },
         })
         .await
         .expect("start");

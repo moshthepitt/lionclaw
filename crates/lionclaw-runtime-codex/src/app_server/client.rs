@@ -53,6 +53,7 @@ impl<T> CodexAppServerClient<T>
 where
     T: AppServerTransport + Send,
 {
+    #[cfg(test)]
     pub(crate) fn new(transport: T) -> Self {
         Self::new_with_optional_runtime_context(transport, None)
     }
@@ -224,6 +225,7 @@ where
         result
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_for_context_compaction_completed<'a>(
         &mut self,
         thread_id: &str,
@@ -447,6 +449,7 @@ where
         }
     }
 
+    #[cfg(test)]
     fn context_compaction_completed(&self, thread_id: &str) -> bool {
         self.unmatched_context_compaction_completed
             || self

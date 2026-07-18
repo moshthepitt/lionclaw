@@ -32,7 +32,6 @@
 
 mod adapter;
 mod app_server;
-mod control;
 mod driver;
 mod host_auth;
 mod program;
@@ -54,10 +53,6 @@ pub(crate) use app_server::{
     codex_default_generated_image_path, codex_generated_image_path, completed_turn_error_text,
     describe_app_server_item, extract_app_server_turn_id, finish_app_server_session, response_id,
     turn_start_params, AppServerMessage, AppServerTransport, CodexAppServerClient,
-};
-#[cfg(test)]
-pub(crate) use control::{
-    describe_model_list_response, invalid_thread_control_arguments, model_list_include_hidden,
 };
 #[cfg(test)]
 pub(crate) use program::{

@@ -11,8 +11,8 @@ use lionclaw_confinement::WORKSPACE_MOUNT_TARGET;
 use lionclaw_runtime_acp::AcpRuntimeDriver;
 use lionclaw_runtime_api::{
     RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider,
-    RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTurnInput,
-    TypedFailure, TypedFailureEvidence,
+    RuntimeSessionReady, RuntimeSessionStartInput, TurnExecution, TurnInput, TypedFailure,
+    TypedFailureEvidence,
 };
 use lionclaw_runtime_codex::{
     CodexRuntimeAuthProvider, CodexRuntimeDriver, CODEX_RUNTIME_AUTH_KIND,
@@ -231,7 +231,7 @@ where
 }
 
 fn completed_turn_evidence(
-    completed: Option<anyhow::Result<lionclaw_runtime_api::RuntimeTurnResult>>,
+    completed: Option<anyhow::Result<lionclaw_runtime_api::TurnResult>>,
 ) -> Option<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String)> {
     completed.and_then(|completed| match completed {
         Ok(result) => Some((result.configuration, result.final_response)),
@@ -561,8 +561,13 @@ impl OciRoleRunner {
                     session_id: uuid_from_key(request.effect_id.as_str()),
                     working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
                     environment: plan.environment.clone(),
-                    runtime_state_root: state_root.clone(),
-                    runtime_session_ready,
+                    resume: match state_root.clone() {
+                        Some(state_root) => lionclaw_runtime_api::RuntimeResume::Native {
+                            state_root,
+                            ready: runtime_session_ready,
+                        },
+                        None => lionclaw_runtime_api::RuntimeResume::Reconstruct,
+                    },
                 })
                 .await
                 .map_err(|e| launch(format!("session_start failed: {e}")))
@@ -585,9 +590,9 @@ impl OciRoleRunner {
             activity_effect_id,
         ));
 
-        let mut turn = Box::pin(adapter.program_backed_turn(
-            RuntimeProgramTurnExecution {
-                input: RuntimeTurnInput {
+        let mut turn = Box::pin(adapter.turn(
+            TurnExecution {
+                input: TurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: request.prompt.clone(),
                     fresh_prompt: None,
@@ -603,7 +608,7 @@ impl OciRoleRunner {
         ));
         let mut control = request.control.clone();
         enum TurnEnd {
-            Completed(anyhow::Result<lionclaw_runtime_api::RuntimeTurnResult>),
+            Completed(anyhow::Result<lionclaw_runtime_api::TurnResult>),
             Cancel {
                 reason: String,
                 kind: CancellationKind,
@@ -681,6 +686,19 @@ impl OciRoleRunner {
         let _ = adapter.close(&handle).await;
         let fallback_final_response = drain.await.unwrap_or_default();
 
+        // Native identity is conversation state, not successful-effect state.
+        // Once a turn has launched, retain whatever opaque identity the
+        // adapter durably recorded even when the delivered outcome is a
+        // failure, interruption, or deadline. Adapters with no saved identity
+        // truthfully reconstruct on the next request.
+        if let Some(root) = state_root {
+            std::fs::write(
+                root.join(lionclaw_runtime_api::RUNTIME_SESSION_READY_MARKER),
+                b"ready\n",
+            )
+            .map_err(|e| launch(format!("failed to commit native session state: {e}")))?;
+        }
+
         match result {
             Err(failure) => Err(project_turn_failure(
                 profile,
@@ -689,13 +707,6 @@ impl OciRoleRunner {
             )),
             Ok(result) => {
                 let result = validate_completed_turn(profile, result)?;
-                if let Some(root) = state_root {
-                    std::fs::write(
-                        root.join(lionclaw_runtime_api::RUNTIME_SESSION_READY_MARKER),
-                        b"ready\n",
-                    )
-                    .map_err(|e| launch(format!("failed to commit native session state: {e}")))?;
-                }
                 Ok(result)
             }
         }
@@ -741,7 +752,7 @@ fn project_turn_failure(
 
 fn validate_completed_turn(
     profile: &MissionRuntimeProfile,
-    result: lionclaw_runtime_api::RuntimeTurnResult,
+    result: lionclaw_runtime_api::TurnResult,
 ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
     let result = result.projected();
     let configuration = result.configuration;
@@ -1005,7 +1016,7 @@ mod tests {
         let profile = profiles.get("example").unwrap();
         let canonical = validate_completed_turn(
             &profile,
-            lionclaw_runtime_api::RuntimeTurnResult {
+            lionclaw_runtime_api::TurnResult {
                 configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
                     requested_model: Some("requested".into()),
                     applied_model: Some("provider:requested".into()),
@@ -1026,7 +1037,7 @@ mod tests {
         let oversized_applied = "x".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT + 1);
         let bounded = validate_completed_turn(
             &profile,
-            lionclaw_runtime_api::RuntimeTurnResult {
+            lionclaw_runtime_api::TurnResult {
                 configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
                     requested_model: Some("requested".into()),
                     applied_model: Some(oversized_applied),
@@ -1043,14 +1054,13 @@ mod tests {
 
         let failure = validate_completed_turn(
             &profile,
-            lionclaw_runtime_api::RuntimeTurnResult {
+            lionclaw_runtime_api::TurnResult {
                 configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
                     requested_model: Some("requested".into()),
                     applied_model: None,
                     ..Default::default()
                 },
                 final_response: "useful work before configuration rejection".into(),
-                ..Default::default()
             },
         )
         .unwrap_err();
@@ -1066,7 +1076,7 @@ mod tests {
 
         let unconfirmed = validate_completed_turn(
             &profile,
-            lionclaw_runtime_api::RuntimeTurnResult {
+            lionclaw_runtime_api::TurnResult {
                 configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
                     requested_model: Some("requested".into()),
                     applied_model: Some("unrelated-fallback".into()),
@@ -1088,7 +1098,7 @@ mod tests {
         let mode_profile = profiles.get("mode").unwrap();
         let unconfirmed_mode = validate_completed_turn(
             &mode_profile,
-            lionclaw_runtime_api::RuntimeTurnResult {
+            lionclaw_runtime_api::TurnResult {
                 configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
                     requested_mode: Some("build".into()),
                     applied_mode: Some("build".into()),

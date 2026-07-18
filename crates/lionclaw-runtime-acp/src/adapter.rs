@@ -10,10 +10,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 use lionclaw_runtime_api::{
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
-    RuntimeMcpServerSpec, RuntimeProgramExecutor, RuntimeProgramSpec, RuntimeProgramTurnExecution,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTurnInput,
-    RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult, TypedFailure,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeMcpServerSpec, RuntimeProgramExecutor,
+    RuntimeProgramSpec, RuntimeResume, RuntimeResumeMode, RuntimeSessionHandle,
+    RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTurnJournalSender, TurnExecution,
+    TurnInput, TurnResult, TypedFailure,
 };
 
 use crate::client::{finish_acp_session, AcpClient, AcpEnsureSession};
@@ -51,10 +51,6 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
         }
     }
 
-    fn turn_mode(&self) -> RuntimeTurnMode {
-        RuntimeTurnMode::ProgramBacked
-    }
-
     fn build_terminal_program(
         &self,
         _input: RuntimeTerminalProgramInput,
@@ -65,11 +61,12 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_id = self.config.normalized_runtime_id();
         let runtime_session_id = format!("{runtime_id}-{}", Uuid::new_v4());
-        let session_id = match input.runtime_state_root.as_deref() {
-            Some(root) => {
-                load_ready_acp_session_id(&self.config, root, input.runtime_session_ready)?
+        let (runtime_state_root, session_id) = match input.resume {
+            RuntimeResume::Native { state_root, ready } => {
+                let session_id = load_ready_acp_session_id(&self.config, &state_root, ready)?;
+                (Some(state_root), session_id)
             }
-            None => None,
+            RuntimeResume::Reconstruct => (None, None),
         };
         let resumes_existing_session = session_id.is_some();
         self.sessions
@@ -78,7 +75,7 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
             .insert(
                 runtime_session_id.clone(),
                 AcpSessionState {
-                    runtime_state_root: input.runtime_state_root,
+                    runtime_state_root,
                     session_id,
                     active_turn: None,
                 },
@@ -86,16 +83,20 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
 
         Ok(RuntimeSessionHandle {
             runtime_session_id,
-            resumes_existing_session,
+            resume_mode: if resumes_existing_session {
+                RuntimeResumeMode::Resumed
+            } else {
+                RuntimeResumeMode::Reconstructed
+            },
         })
     }
 
-    async fn program_backed_turn(
+    async fn turn(
         &self,
-        execution: RuntimeProgramTurnExecution,
+        execution: TurnExecution,
         journal: RuntimeTurnJournalSender,
-    ) -> Result<RuntimeTurnResult> {
-        let RuntimeProgramTurnExecution {
+    ) -> Result<TurnResult> {
+        let TurnExecution {
             input,
             context,
             executor,
@@ -110,21 +111,6 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
             executor,
         };
         driver.run_turn(input, journal).await
-    }
-
-    async fn resolve_capability_requests(
-        &self,
-        _handle: &RuntimeSessionHandle,
-        results: Vec<RuntimeCapabilityResult>,
-        events: RuntimeEventSender,
-    ) -> Result<()> {
-        if !results.is_empty() {
-            return Err(anyhow!(
-                "ACP adapter does not support runtime-side capability request resolution"
-            ));
-        }
-        drop(events.send(RuntimeEvent::Done));
-        Ok(())
     }
 
     async fn cancel(
@@ -206,9 +192,9 @@ struct AcpTurnRunner {
 impl AcpTurnRunner {
     async fn run_turn(
         &mut self,
-        input: RuntimeTurnInput,
+        input: TurnInput,
         journal: RuntimeTurnJournalSender,
-    ) -> Result<RuntimeTurnResult> {
+    ) -> Result<TurnResult> {
         let runtime_session_id = input.runtime_session_id.clone();
         let session_state = get_runtime_session(&self.sessions, &runtime_session_id)?;
         let program = build_acp_program(&self.config);
@@ -266,10 +252,9 @@ impl AcpTurnRunner {
                 .prompt(&opened_session.session_id, prompt, &journal, &mut cancel_rx)
                 .await;
             let final_response = prompt_result?;
-            Ok(RuntimeTurnResult {
+            Ok(TurnResult {
                 configuration,
                 final_response,
-                ..Default::default()
             }
             .projected())
         }
