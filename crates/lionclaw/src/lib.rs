@@ -12,6 +12,7 @@ pub mod cli;
 pub mod config;
 mod driver_lock;
 mod effect_cleanup;
+pub use effect_cleanup::LocalEffectCleaner;
 pub mod engine;
 pub mod evidence;
 pub mod mission_type;
