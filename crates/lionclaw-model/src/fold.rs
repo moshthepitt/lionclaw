@@ -28,7 +28,7 @@ use crate::{RoleName, TypedFailure};
 /// discarded and rebuilt from sequence zero.
 /// Bumped because durable request ingress now verifies model-derived effect
 /// identity and task-assignment generation before reserving an effect.
-pub const REDUCER_VERSION: u32 = 24;
+pub const REDUCER_VERSION: u32 = 25;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -899,7 +899,8 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         effect_id,
         role,
         output,
-        prompt,
+        prompt_template: _,
+        prompt_hash,
         base_sha,
         assignment_epoch,
         conversation_id,
@@ -935,9 +936,6 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         &intent.base_sha,
         state.config.recovery.max_attempts,
     );
-    let Some(prompt_hash) = prompt.content_sha256() else {
-        return false;
-    };
     if envelope.stamps.prompt_hash.as_deref() != Some(prompt_hash.as_str()) {
         return false;
     }
@@ -947,7 +945,7 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         task_id,
         *attempt_no,
         *assignment_epoch,
-        &prompt_hash,
+        prompt_hash,
     );
     let expected_conversation = crate::ConversationId::for_role_instance(
         &state.mission_id,
@@ -2117,7 +2115,8 @@ mod tests {
                         role,
                         output,
                         runtime: "codex".into(),
-                        prompt: PayloadRef::inline("prompt"),
+                        prompt_template: crate::RolePromptTemplate::Execution,
+                        prompt_hash: PayloadRef::inline("prompt").content_sha256().unwrap(),
                         base_sha: success
                             .artifact
                             .as_ref()
@@ -2211,7 +2210,8 @@ mod tests {
                     role,
                     output,
                     runtime,
-                    prompt,
+                    prompt_template,
+                    prompt_hash,
                     base_sha,
                     assignment_epoch,
                     message_boundary,
@@ -2239,8 +2239,8 @@ mod tests {
                             role: role.clone(),
                             output: *output,
                             runtime: runtime.clone(),
-                            prompt: prompt.clone(),
-                            prompt_hash: prompt.content_sha256().unwrap(),
+                            prompt_template: *prompt_template,
+                            prompt_hash: prompt_hash.clone(),
                             base_sha: base_sha.clone(),
                             recreate_workspace: *recreate_workspace,
                             message_boundary: *message_boundary,
@@ -2491,10 +2491,12 @@ mod tests {
     #[test]
     fn a_role_request_with_a_prompt_that_does_not_match_its_stamp_is_inert() {
         let mut request = role_requested("w", "mismatched-prompt");
-        let MissionEvent::RoleRunRequested { prompt, .. } = &mut request else {
+        let MissionEvent::RoleRunRequested { prompt_hash, .. } = &mut request else {
             unreachable!("role_requested returns a role request")
         };
-        *prompt = PayloadRef::inline("different prompt");
+        *prompt_hash = PayloadRef::inline("different prompt")
+            .content_sha256()
+            .unwrap();
 
         let state = fold_log(vec![
             created(),
@@ -2606,7 +2608,8 @@ mod tests {
             role,
             output,
             runtime: "codex".into(),
-            prompt: PayloadRef::inline("prompt"),
+            prompt_template: crate::RolePromptTemplate::Execution,
+            prompt_hash: PayloadRef::inline("prompt").content_sha256().unwrap(),
             base_sha: "base".into(),
             assignment_epoch: 1,
             message_boundary: 0,
@@ -2714,7 +2717,7 @@ mod tests {
             output,
             runtime: "codex".into(),
             prompt_hash: prompt.content_sha256().unwrap(),
-            prompt,
+            prompt_template: crate::RolePromptTemplate::Execution,
             base_sha: base_sha.into(),
             recreate_workspace,
             message_boundary: 0,
@@ -2865,7 +2868,10 @@ mod tests {
                 role: RoleName::new("implementer").unwrap(),
                 output: OutputSemantics::ProducesArtifact,
                 runtime: "codex".into(),
-                prompt: PayloadRef::inline("moved-base prompt"),
+                prompt_template: crate::RolePromptTemplate::Execution,
+                prompt_hash: PayloadRef::inline("moved-base prompt")
+                    .content_sha256()
+                    .unwrap(),
                 base_sha: "moved".into(),
                 assignment_epoch: 2,
                 message_boundary: 0,
@@ -4131,7 +4137,10 @@ mod tests {
                 role: RoleName::new("implementer").expect("role name"),
                 output: OutputSemantics::ProducesArtifact,
                 runtime: "codex".into(),
-                prompt: PayloadRef::inline("forged prompt"),
+                prompt_template: crate::RolePromptTemplate::Execution,
+                prompt_hash: PayloadRef::inline("forged prompt")
+                    .content_sha256()
+                    .unwrap(),
                 base_sha: "h1".into(),
                 assignment_epoch: 2,
                 message_boundary: 0,
@@ -4252,7 +4261,7 @@ mod tests {
                 5 => request.role = RoleName::new("reviewer").unwrap(),
                 6 => request.output = OutputSemantics::EmitsVerdict,
                 7 => request.runtime = "other-profile".into(),
-                8 => request.prompt = PayloadRef::inline("other prompt"),
+                8 => request.prompt_template = crate::RolePromptTemplate::Planning,
                 9 => request.prompt_hash = "0".repeat(64),
                 10 => request.base_sha = "other-base".into(),
                 11 => request.recreate_workspace = !request.recreate_workspace,

@@ -242,6 +242,74 @@ const MAX_LOOP_ITERATIONS: usize = 10_000;
 pub use crate::model::TERMINAL_REVIEW_TASK_TAG;
 
 impl Engine {
+    /// Reconstruct a role turn from durable identities without making its
+    /// transient prose part of the log or any projection.
+    async fn reconstruct_role_prompt(
+        &self,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+    ) -> Result<String> {
+        let events = self.store.load(mission_id).await?;
+        let request = events.iter().find(|envelope| {
+            matches!(&envelope.event, MissionEvent::RoleRunRequested { effect_id: id, .. } if id == effect_id)
+        }).context("role request not found")?;
+        let request_seq = request.sequence_no;
+        let (template, expected_hash, role_name) = match &request.event {
+            MissionEvent::RoleRunRequested {
+                prompt_template,
+                prompt_hash,
+                role,
+                ..
+            } => (*prompt_template, prompt_hash.clone(), role.clone()),
+            _ => unreachable!(),
+        };
+        let prefix: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.sequence_no < request_seq)
+            .collect();
+        let state =
+            crate::model::fold(prefix).context("role request prefix has no creation event")?;
+        let StepDecision::DispatchRole(intent) = step(&state) else {
+            bail!("role request prefix no longer reconstructs its dispatch")
+        };
+        let role = self
+            .mission_type
+            .roles
+            .get(&role_name)
+            .context("role missing from mission type")?;
+        let dialogue = materialize_conversation_messages(self, &state, &intent).await?;
+        let prompt = match intent.namespace {
+            TaskNamespace::Planning => {
+                self.assemble_planning_request(&state, role, &intent, &dialogue)?
+            }
+            TaskNamespace::Execution => {
+                self.assemble_execution_request(&state, role, &intent, &dialogue)?
+            }
+        };
+        let actual_template = match intent.namespace {
+            TaskNamespace::Planning => crate::model::RolePromptTemplate::Planning,
+            TaskNamespace::Execution
+                if role.output == crate::model::OutputSemantics::EmitsVerdict =>
+            {
+                crate::model::RolePromptTemplate::Judgment
+            }
+            TaskNamespace::Execution => crate::model::RolePromptTemplate::Execution,
+        };
+        let actual_hash = hex::encode(Sha256::digest(prompt.as_bytes()));
+        if template != actual_template || expected_hash != actual_hash {
+            bail!("canonical role prompt drift")
+        }
+        Ok(prompt)
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn reconstruct_role_prompt_for_testing(
+        &self,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+    ) -> Result<String> {
+        self.reconstruct_role_prompt(mission_id, effect_id).await
+    }
     fn resolve_role_skills(
         &self,
         role: &crate::mission_type::RoleDefinition,
@@ -999,7 +1067,6 @@ impl Engine {
             role: role_name,
             output,
             runtime,
-            prompt,
             base_sha,
             assignment_epoch,
             recreate_workspace,
@@ -1031,7 +1098,18 @@ impl Engine {
                 "the pinned mission role no longer matches the effect output contract",
             ))));
         }
-        let prompt_text = self.store.blobs().resolve(prompt)?;
+        let prompt_text = match self
+            .reconstruct_role_prompt(&state.mission_id, effect_id)
+            .await
+        {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return Ok(completed(Err(TypedFailure::permanent(
+                    "role.prompt_drift",
+                    format!("canonical turn reconstruction failed: {error:#}"),
+                ))))
+            }
+        };
         let skills = match self.resolve_role_skills(role) {
             Ok(skills) => skills,
             Err(detail) => {
@@ -1638,10 +1716,6 @@ impl Engine {
             }
         };
         let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));
-        let prompt = self
-            .store
-            .blobs()
-            .externalize(PayloadRef::inline(prompt_text))?;
         let (base_sha, assignment_epoch, recreate_workspace) =
             crate::model::resolve_task_assignment(
                 state.tasks_in(intent.namespace).get(&intent.task_id),
@@ -1679,7 +1753,16 @@ impl Engine {
                 .runtime
                 .clone()
                 .unwrap_or_else(|| state.runtime.clone()),
-            prompt,
+            prompt_template: match intent.namespace {
+                TaskNamespace::Planning => crate::model::RolePromptTemplate::Planning,
+                TaskNamespace::Execution
+                    if role.output == crate::model::OutputSemantics::EmitsVerdict =>
+                {
+                    crate::model::RolePromptTemplate::Judgment
+                }
+                TaskNamespace::Execution => crate::model::RolePromptTemplate::Execution,
+            },
+            prompt_hash: prompt_hash.clone(),
             base_sha,
             assignment_epoch,
             message_boundary,
@@ -2160,6 +2243,135 @@ pub async fn record_control(
                 effect_id: effect_id.clone(),
                 action,
                 reason: reason.trim().to_string(),
+            })],
+            now_ms,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Atomically resolve and record one sender-free lead message.  Resolution is
+/// performed against one folded head and is never repeated after the CAS.
+pub struct MessageCommand {
+    pub selectors: Vec<String>,
+    pub all: bool,
+    pub body: String,
+    pub references: Vec<crate::model::MessageReference>,
+}
+
+pub async fn record_message(
+    store: &MissionStore,
+    repo: &std::path::Path,
+    mission_id: &MissionId,
+    command: MessageCommand,
+    now_ms: i64,
+) -> Result<()> {
+    let MessageCommand {
+        selectors,
+        all,
+        body,
+        references,
+    } = command;
+    if body.len() > crate::model::MAX_MESSAGE_BYTES {
+        bail!("message exceeds {} bytes", crate::model::MAX_MESSAGE_BYTES);
+    }
+    if all && !selectors.is_empty() {
+        bail!("--all cannot be mixed with explicit recipients");
+    }
+    if !all && selectors.is_empty() {
+        bail!("recipient set is empty");
+    }
+    if references.len() > crate::model::MAX_MESSAGE_REFERENCES {
+        bail!("message has too many references");
+    }
+    let events = store.load(mission_id).await?;
+    let state = crate::model::fold(events.clone()).context("mission has no creation event")?;
+    let current: Vec<_> = state
+        .conversations
+        .iter()
+        .filter(|(_, conversation)| {
+            conversation.lifecycle != crate::model::ConversationLifecycle::Completed
+                && state
+                    .tasks_in(conversation.namespace)
+                    .get(&conversation.task_id)
+                    .is_some_and(|task| task.assignment_epoch == conversation.assignment_epoch)
+        })
+        .collect();
+    let selected: Vec<_> = if all {
+        current
+    } else {
+        let mut selected = Vec::new();
+        for selector in &selectors {
+            let matches: Vec<_> = current
+                .iter()
+                .copied()
+                .filter(|(id, conversation)| {
+                    id.as_str() == selector || conversation.task_id.as_str() == selector
+                })
+                .collect();
+            match matches.as_slice() {
+                [] => bail!("recipient '{selector}' is not a current conversation or task"),
+                [one] => selected.push(*one),
+                _ => bail!("task name '{selector}' is ambiguous; use a conversation id"),
+            }
+        }
+        selected
+    };
+    if selected.is_empty() {
+        bail!("recipient set is empty");
+    }
+    if selected.len() > crate::model::MAX_MESSAGE_RECIPIENTS {
+        bail!("message has too many recipients");
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    if selected.iter().any(|(id, _)| !ids.insert((*id).clone())) {
+        bail!("recipient set contains a duplicate conversation");
+    }
+    for reference in &references {
+        let valid = match reference {
+            crate::model::MessageReference::AuthoritativeReceipt { effect_id } => {
+                state.authoritative_receipts.contains(effect_id)
+            }
+            crate::model::MessageReference::ParkEvidence { effect_id } => {
+                state.parked_effects.contains_key(effect_id)
+            }
+            crate::model::MessageReference::ReachableCommit { sha } => {
+                state.reachable_commits.contains(sha)
+            }
+        };
+        if !valid {
+            bail!("reference is not valid authority in this mission");
+        }
+    }
+    crate::reference_materialization::materialize_references(
+        &state,
+        &events,
+        store.blobs(),
+        repo,
+        &references,
+    )
+    .await
+    .context("message reference validation failed")?;
+    let recipients = selected
+        .into_iter()
+        .map(
+            |(conversation_id, conversation)| crate::model::ConversationRecipient {
+                conversation_id: conversation_id.clone(),
+                role: conversation.role.clone(),
+                namespace: conversation.namespace,
+                task_id: conversation.task_id.clone(),
+                assignment_epoch: conversation.assignment_epoch,
+            },
+        )
+        .collect();
+    store
+        .append(
+            mission_id,
+            state.head,
+            &[NewEvent::new(MissionEvent::MessageSent {
+                recipients,
+                body,
+                references,
             })],
             now_ms,
         )

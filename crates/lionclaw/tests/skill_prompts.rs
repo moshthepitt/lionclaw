@@ -60,27 +60,34 @@ async fn persisted_prompt(
     role: &str,
 ) -> String {
     let events = engine.store().load(mission_id).await.expect("load events");
-    let prompt = events
+    let request = events
         .iter()
         .find_map(|envelope| match &envelope.event {
             lionclaw::model::MissionEvent::RoleRunRequested {
                 role: requested_role,
-                prompt,
+                effect_id,
                 ..
-            }
-            | lionclaw::model::MissionEvent::TerminalReviewRequested {
+            } if requested_role.as_str() == role => Some((Some(effect_id), None)),
+            lionclaw::model::MissionEvent::TerminalReviewRequested {
                 role: requested_role,
                 prompt,
                 ..
-            } if requested_role.as_str() == role => Some(prompt),
+            } if requested_role.as_str() == role => Some((None, Some(prompt))),
             _ => None,
         })
         .unwrap_or_else(|| panic!("persisted prompt for role {role}"));
-    engine
-        .store()
-        .blobs()
-        .resolve(prompt)
-        .expect("resolve prompt")
+    match request {
+        (Some(effect_id), None) => engine
+            .reconstruct_role_prompt_for_testing(mission_id, effect_id)
+            .await
+            .expect("reconstruct prompt"),
+        (None, Some(prompt)) => engine
+            .store()
+            .blobs()
+            .resolve(prompt)
+            .expect("resolve prompt"),
+        _ => unreachable!(),
+    }
 }
 
 fn assert_no_skill_section(prompt: &str) {

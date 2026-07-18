@@ -487,7 +487,10 @@ mod tests {
             role: rname(role),
             output,
             runtime: "codex".to_string(),
-            prompt: PayloadRef::inline("assembled prompt"),
+            prompt_template: crate::RolePromptTemplate::Execution,
+            prompt_hash: PayloadRef::inline("assembled prompt")
+                .content_sha256()
+                .unwrap(),
             base_sha: base_sha.to_string(),
             assignment_epoch: 1,
             message_boundary: 0,
@@ -566,7 +569,7 @@ mod tests {
             output: crate::OutputSemantics::ProducesArtifact,
             runtime: "codex".into(),
             prompt_hash: prompt.content_sha256().unwrap(),
-            prompt,
+            prompt_template: crate::RolePromptTemplate::Execution,
             base_sha: base_sha.into(),
             recreate_workspace: attempt_no == 1,
             message_boundary: 0,

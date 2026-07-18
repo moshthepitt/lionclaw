@@ -396,22 +396,21 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
 
     advance_through_checkpoints(&engine, &id).await;
     let events = engine.store().load(&id).await.unwrap();
-    let second_strategist_prompt = events
+    let second_strategist_effect = events
         .iter()
         .find_map(|envelope| match &envelope.event {
             MissionEvent::RoleRunRequested {
                 task_id,
                 attempt_no: 2,
-                prompt,
+                effect_id,
                 ..
-            } if task_id == &tid("strategist") => Some(prompt),
+            } if task_id == &tid("strategist") => Some(effect_id),
             _ => None,
         })
         .expect("second strategist prompt");
     let prompt = engine
-        .store()
-        .blobs()
-        .resolve(second_strategist_prompt)
+        .reconstruct_role_prompt_for_testing(&id, second_strategist_effect)
+        .await
         .unwrap();
     assert_eq!(
         markdown_section(&prompt, "Active planning input"),
@@ -459,16 +458,19 @@ async fn replanning_prompt_combines_the_accepted_plan_rejected_candidate_and_gui
 
     advance_through_checkpoints(&engine, &id).await;
     let events = engine.store().load(&id).await.unwrap();
-    let prompt_ref = events
+    let effect_id = events
         .iter()
         .find_map(|envelope| match &envelope.event {
             MissionEvent::RoleRunRequested {
-                task_id, prompt, ..
-            } if task_id == &tid("strategist") => Some(prompt),
+                task_id, effect_id, ..
+            } if task_id == &tid("strategist") => Some(effect_id),
             _ => None,
         })
         .expect("strategist prompt");
-    let prompt = engine.store().blobs().resolve(prompt_ref).unwrap();
+    let prompt = engine
+        .reconstruct_role_prompt_for_testing(&id, effect_id)
+        .await
+        .unwrap();
 
     let accepted = markdown_section(&prompt, "Current accepted plan");
     assert!(accepted.contains("TESTS-PASS"));

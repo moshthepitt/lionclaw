@@ -20,13 +20,12 @@ use crate::mission_type::{
     MissionTypeLocator, SkillSource,
 };
 use crate::model::{
-    fold, short_hex, ControlAction, ConversationLifecycle, ConversationRecipient, DecisionAction,
-    EffectId, FinishClass, MissionEvent, MissionId, MissionPhase, MAX_MESSAGE_BYTES,
+    fold, short_hex, ControlAction, DecisionAction, EffectId, FinishClass, MissionId, MissionPhase,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, SystemClock};
 use crate::runner::OciRoleRunner;
-use crate::store::{BlobStore, MissionStore, NewEvent};
+use crate::store::{BlobStore, MissionStore};
 use crate::workspace;
 
 #[derive(Parser)]
@@ -1369,71 +1368,10 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
 }
 
 async fn cmd_send(args: SendArgs) -> Result<()> {
-    if args.message.len() > MAX_MESSAGE_BYTES {
-        bail!("message exceeds {MAX_MESSAGE_BYTES} bytes");
-    }
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    let events = store.load(&mission_id).await?;
-    let state = fold(events.clone()).context("mission has no creation event")?;
-    let current: Vec<_> = state
-        .conversations
-        .iter()
-        .filter(|(_, conversation)| {
-            conversation.lifecycle != ConversationLifecycle::Completed
-                && state
-                    .tasks_in(conversation.namespace)
-                    .get(&conversation.task_id)
-                    .is_some_and(|task| task.assignment_epoch == conversation.assignment_epoch)
-        })
-        .collect();
-    let selected: Vec<_> = if args.all {
-        current
-    } else {
-        let mut selected = Vec::new();
-        for selector in &args.to {
-            let matches: Vec<_> = current
-                .iter()
-                .copied()
-                .filter(|(id, conversation)| {
-                    id.as_str() == selector || conversation.task_id.as_str() == selector
-                })
-                .collect();
-            match matches.as_slice() {
-                [] => bail!("recipient '{selector}' is not a current conversation or task"),
-                [one] => selected.push(*one),
-                _ => bail!("task name '{selector}' is ambiguous; use a conversation id"),
-            }
-        }
-        selected
-    };
-    if selected.is_empty() {
-        bail!("recipient set is empty");
-    }
-    if selected.len() > crate::model::MAX_MESSAGE_RECIPIENTS {
-        bail!("message has too many recipients");
-    }
-    let mut ids = std::collections::BTreeSet::new();
-    if selected.iter().any(|(id, _)| !ids.insert((*id).clone())) {
-        bail!("recipient set contains a duplicate conversation");
-    }
-    let recipients: Vec<_> = selected
-        .into_iter()
-        .map(|(conversation_id, conversation)| ConversationRecipient {
-            conversation_id: conversation_id.clone(),
-            role: conversation.role.clone(),
-            namespace: conversation.namespace,
-            task_id: conversation.task_id.clone(),
-            assignment_epoch: conversation.assignment_epoch,
-        })
-        .collect();
     let mut references =
         Vec::with_capacity(args.receipts.len() + args.parks.len() + args.commits.len());
-    if args.receipts.len() + args.parks.len() + args.commits.len()
-        > crate::model::MAX_MESSAGE_REFERENCES
-    {
-        bail!("message has too many references");
-    }
     for effect_id in &args.receipts {
         references.push(crate::model::MessageReference::AuthoritativeReceipt {
             effect_id: EffectId::parse(effect_id)?,
@@ -1447,43 +1385,19 @@ async fn cmd_send(args: SendArgs) -> Result<()> {
     for sha in args.commits {
         references.push(crate::model::MessageReference::ReachableCommit { sha });
     }
-    for reference in &references {
-        let valid = match reference {
-            crate::model::MessageReference::AuthoritativeReceipt { effect_id } => {
-                state.authoritative_receipts.contains(effect_id)
-            }
-            crate::model::MessageReference::ParkEvidence { effect_id } => {
-                state.parked_effects.contains_key(effect_id)
-            }
-            crate::model::MessageReference::ReachableCommit { sha } => {
-                state.reachable_commits.contains(sha)
-            }
-        };
-        if !valid {
-            bail!("reference is not valid authority in this mission");
-        }
-    }
-    crate::reference_materialization::materialize_references(
-        &state,
-        &events,
-        store.blobs(),
+    crate::engine::record_message(
+        &store,
         &repo,
-        &references,
+        &mission_id,
+        crate::engine::MessageCommand {
+            selectors: args.to,
+            all: args.all,
+            body: args.message,
+            references,
+        },
+        SystemClock.now_ms(),
     )
-    .await
-    .context("message reference validation failed")?;
-    store
-        .append(
-            &mission_id,
-            state.head,
-            &[NewEvent::new(MissionEvent::MessageSent {
-                recipients,
-                body: args.message,
-                references,
-            })],
-            SystemClock.now_ms(),
-        )
-        .await?;
+    .await?;
     println!("message recorded for mission {mission_id}");
     Ok(())
 }
@@ -3455,7 +3369,8 @@ mod tests {
                 role: RoleName::new("implementer").unwrap(),
                 output: OutputSemantics::ProducesArtifact,
                 runtime: "codex".into(),
-                prompt: PayloadRef::inline("prompt"),
+                prompt_template: crate::model::RolePromptTemplate::Execution,
+                prompt_hash: REVIEW_PROMPT_HASH.into(),
                 base_sha: "base".into(),
                 assignment_epoch: 1,
                 message_boundary: 3,
@@ -3484,7 +3399,7 @@ mod tests {
                     output: OutputSemantics::ProducesArtifact,
                     runtime: "codex".into(),
                     prompt_hash: REVIEW_PROMPT_HASH.into(),
-                    prompt: PayloadRef::inline("prompt"),
+                    prompt_template: crate::model::RolePromptTemplate::Execution,
                     base_sha: "base".into(),
                     recreate_workspace: true,
                     message_boundary: 3,

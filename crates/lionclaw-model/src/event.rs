@@ -22,7 +22,7 @@ use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
 
 /// Bumped for durable conversations, sender-free messages, and checkpoint
 /// role outcomes. Unreleased older logs intentionally fail loudly.
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -30,6 +30,16 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_MESSAGE_RECIPIENTS: usize = 64;
 pub const MAX_MESSAGE_REFERENCES: usize = 32;
 pub const MAX_FINAL_RESPONSE_BYTES: u64 = 64 * 1024;
+
+/// Closed renderer identity for a durable role request.  The rendered turn is
+/// deliberately shell-owned and reconstructed from the request's log prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolePromptTemplate {
+    Execution,
+    Planning,
+    Judgment,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -497,7 +507,7 @@ pub struct RoleRunRequestIdentity {
     pub role: RoleName,
     pub output: OutputSemantics,
     pub runtime: String,
-    pub prompt: PayloadRef,
+    pub prompt_template: RolePromptTemplate,
     pub prompt_hash: String,
     pub base_sha: String,
     pub recreate_workspace: bool,
@@ -574,9 +584,10 @@ pub enum MissionEvent {
         output: OutputSemantics,
         /// Effective runtime profile, resolved before the request is recorded.
         runtime: String,
-        /// Assembled prompt, persisted before the request is recorded so a
-        /// resume re-dispatches byte-identical input.
-        prompt: PayloadRef,
+        /// Closed renderer branch and hash of the canonical transient turn.
+        /// Turn prose is never durable request authority.
+        prompt_template: RolePromptTemplate,
+        prompt_hash: String,
         /// Commit the role's workspace is created at.
         base_sha: String,
         /// Monotonic identity for a fresh task assignment. Retries and
@@ -1043,7 +1054,8 @@ mod compat_tests {
             role: RoleName::new("planner").unwrap(),
             output: OutputSemantics::ProposesPlan,
             runtime: "codex".into(),
-            prompt: PayloadRef::inline("prompt"),
+            prompt_template: RolePromptTemplate::Planning,
+            prompt_hash: "0".repeat(64),
             base_sha: "base".into(),
             assignment_epoch: 1,
             message_boundary: 0,
@@ -1058,6 +1070,9 @@ mod compat_tests {
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["namespace"], "planning");
         assert_eq!(json["output"], "proposes-plan");
+        assert_eq!(json["prompt_template"], "planning");
+        assert!(json.get("prompt").is_none());
+        assert!(!json.to_string().contains("assembled prompt"));
         assert_eq!(
             serde_json::from_value::<MissionEvent>(json.clone()).unwrap(),
             event

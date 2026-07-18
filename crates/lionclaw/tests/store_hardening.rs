@@ -6,7 +6,7 @@ mod common;
 use common::{
     approve_plan, fault_append_events, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA,
 };
-use lionclaw::model::{MissionEvent, OutputSemantics, PayloadRef, RoleName, TaskId};
+use lionclaw::model::{MissionEvent, OutputSemantics, RoleName, TaskId};
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
@@ -59,7 +59,8 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
             role: RoleName::new("implementer").unwrap(),
             output: OutputSemantics::ProducesArtifact,
             runtime: "codex".to_string(),
-            prompt: PayloadRef::inline("prompt"),
+            prompt_template: lionclaw::model::RolePromptTemplate::Execution,
+            prompt_hash: prompt_hash.into(),
             base_sha: BASE_SHA.to_string(),
             assignment_epoch: 1,
             message_boundary: state.head,
