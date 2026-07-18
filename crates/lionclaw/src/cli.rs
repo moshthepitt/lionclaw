@@ -215,6 +215,8 @@ pub struct InboxArgs {
 #[derive(Args)]
 #[command(group(ArgGroup::new("recipients").required(true).args(["to", "all"])))]
 pub struct SendArgs {
+    /// Mission id (defaults to the only active mission in the repository).
+    #[arg(long)]
     pub mission_id: Option<String>,
     /// Current conversation id or an unambiguous current task name. Repeatable.
     #[arg(long = "to", action = clap::ArgAction::Append, conflicts_with = "all")]
@@ -1407,10 +1409,15 @@ async fn cmd_send(args: SendArgs) -> Result<()> {
     if selected.is_empty() {
         bail!("recipient set is empty");
     }
+    if selected.len() > crate::model::MAX_MESSAGE_RECIPIENTS {
+        bail!("message has too many recipients");
+    }
     let mut ids = std::collections::BTreeSet::new();
+    if selected.iter().any(|(id, _)| !ids.insert((*id).clone())) {
+        bail!("recipient set contains a duplicate conversation");
+    }
     let recipients: Vec<_> = selected
         .into_iter()
-        .filter(|(id, _)| ids.insert((*id).clone()))
         .map(|(conversation_id, conversation)| ConversationRecipient {
             conversation_id: conversation_id.clone(),
             role: conversation.role.clone(),
@@ -1421,6 +1428,11 @@ async fn cmd_send(args: SendArgs) -> Result<()> {
         .collect();
     let mut references =
         Vec::with_capacity(args.receipts.len() + args.parks.len() + args.commits.len());
+    if args.receipts.len() + args.parks.len() + args.commits.len()
+        > crate::model::MAX_MESSAGE_REFERENCES
+    {
+        bail!("message has too many references");
+    }
     for effect_id in &args.receipts {
         references.push(crate::model::MessageReference::AuthoritativeReceipt {
             effect_id: EffectId::parse(effect_id)?,
@@ -1433,6 +1445,22 @@ async fn cmd_send(args: SendArgs) -> Result<()> {
     }
     for sha in args.commits {
         references.push(crate::model::MessageReference::ReachableCommit { sha });
+    }
+    for reference in &references {
+        let valid = match reference {
+            crate::model::MessageReference::AuthoritativeReceipt { effect_id } => {
+                state.authoritative_receipts.contains(effect_id)
+            }
+            crate::model::MessageReference::ParkEvidence { effect_id } => {
+                state.parked_effects.contains_key(effect_id)
+            }
+            crate::model::MessageReference::ReachableCommit { sha } => {
+                state.reachable_commits.contains(sha)
+            }
+        };
+        if !valid {
+            bail!("reference is not valid authority in this mission");
+        }
     }
     store
         .append(
@@ -2604,7 +2632,8 @@ fn conversation_views(
                     .transpose()?,
                 "queued_messages": conversation.queued,
                 "consumed_through": conversation.consumed_through,
-                "active_message_boundary": conversation.active_message_boundary,
+                "active_message_boundary": conversation.active_delivery.as_ref().map(|delivery| delivery.message_boundary),
+                "presented_messages": conversation.active_delivery.as_ref().map(|delivery| &delivery.presented_messages),
                 "invalid_handoff_reworks": conversation.invalid_handoff_reworks,
                 "runtime_resume_mode": resume_mode,
                 "legal_actions": match conversation.lifecycle {
@@ -3185,6 +3214,33 @@ mod tests {
     }
 
     #[test]
+    fn mission_send_cli_has_an_unambiguous_message_and_recipient_shape() {
+        let parsed = Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            "mabc123def456",
+            "--to",
+            "task-a",
+            "--to",
+            "task-b",
+            "lead feedback",
+        ])
+        .expect("valid send command");
+        let Command::Mission(MissionCommand::Send(args)) = parsed.command else {
+            panic!("expected send command");
+        };
+        assert_eq!(args.mission_id.as_deref(), Some("mabc123def456"));
+        assert_eq!(args.to, ["task-a", "task-b"]);
+        assert_eq!(args.message, "lead feedback");
+        assert!(Cli::try_parse_from([
+            "lionclaw", "mission", "send", "--all", "--to", "task-a", "feedback",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn apply_refuses_a_mission_that_produced_no_commit() {
         // current == base ⇒ nothing to apply (never an empty branch).
         assert!(apply_target(&mid(), "base", "base").is_err());
@@ -3374,6 +3430,13 @@ mod tests {
                 justification: "test fixture approves the plan".into(),
             },
             MissionEvent::RoleRunRequested {
+                conversation_id: crate::model::ConversationId::for_role_instance(
+                    &review_mission_id(),
+                    TaskNamespace::Execution,
+                    &TaskId::new("fix").unwrap(),
+                    &RoleName::new("implementer").unwrap(),
+                    1,
+                ),
                 namespace: TaskNamespace::Execution,
                 task_id: TaskId::new("fix").unwrap(),
                 attempt_no: 1,
@@ -3384,6 +3447,8 @@ mod tests {
                 prompt: PayloadRef::inline("prompt"),
                 base_sha: "base".into(),
                 assignment_epoch: 1,
+                message_boundary: 3,
+                presented_messages: vec![],
                 recreate_workspace: true,
                 requested_at_ms: 0,
                 not_before_ms: 0,
@@ -3620,7 +3685,7 @@ mod tests {
                     marker: crate::model::DeliveryMarker::PossiblyDelivered,
                 }],
                 consumed_through: 3,
-                active_message_boundary: None,
+                active_delivery: None,
                 invalid_handoff_reworks: 1,
             },
         );

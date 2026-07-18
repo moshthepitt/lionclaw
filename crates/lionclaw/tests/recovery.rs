@@ -92,6 +92,13 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
     .await
     .expect("reserve the orphan outcome identity");
     let request = lionclaw::store::NewEvent::new(MissionEvent::RoleRunRequested {
+        conversation_id: lionclaw::model::ConversationId::for_role_instance(
+            &mission_id,
+            TaskNamespace::Execution,
+            &task_id,
+            &RoleName::new("implementer").unwrap(),
+            1,
+        ),
         namespace: TaskNamespace::Execution,
         task_id,
         attempt_no: 1,
@@ -102,6 +109,8 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
         prompt: PayloadRef::inline("prompt"),
         base_sha: BASE_SHA.into(),
         assignment_epoch: 1,
+        message_boundary: head,
+        presented_messages: vec![],
         recreate_workspace: true,
         requested_at_ms: 0,
         not_before_ms: 0,

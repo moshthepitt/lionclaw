@@ -229,6 +229,13 @@ async fn controlled_effect_log_satisfies_every_prefix_and_snapshot_law() {
         state.head,
         &[
             NewEvent::new(MissionEvent::RoleRunRequested {
+                conversation_id: lionclaw::model::ConversationId::for_role_instance(
+                    &mission_id,
+                    lionclaw::model::TaskNamespace::Execution,
+                    &task_id,
+                    &RoleName::new("implementer").unwrap(),
+                    1,
+                ),
                 namespace: lionclaw::model::TaskNamespace::Execution,
                 task_id: task_id.clone(),
                 attempt_no: 1,
@@ -239,6 +246,8 @@ async fn controlled_effect_log_satisfies_every_prefix_and_snapshot_law() {
                 prompt: PayloadRef::inline("prompt"),
                 base_sha: BASE_SHA.into(),
                 assignment_epoch: 1,
+                message_boundary: state.head,
+                presented_messages: vec![],
                 recreate_workspace: true,
                 requested_at_ms: 1_000,
                 not_before_ms: 1_000,

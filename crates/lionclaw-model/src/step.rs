@@ -473,6 +473,13 @@ mod tests {
         base_sha: &str,
     ) -> MissionEvent {
         MissionEvent::RoleRunRequested {
+            conversation_id: crate::ConversationId::for_role_instance(
+                &mission_id(),
+                TaskNamespace::Execution,
+                &tid(task),
+                &rname(role),
+                1,
+            ),
             namespace: TaskNamespace::Execution,
             task_id: tid(task),
             attempt_no,
@@ -483,6 +490,8 @@ mod tests {
             prompt: PayloadRef::inline("assembled prompt"),
             base_sha: base_sha.to_string(),
             assignment_epoch: 1,
+            message_boundary: 0,
+            presented_messages: vec![],
             recreate_workspace: attempt_no == 1,
             requested_at_ms: 0,
             not_before_ms: 0,
@@ -591,14 +600,21 @@ mod tests {
             });
             std::iter::once(event).chain(approve)
         });
-        fold(events.enumerate().map(|(i, event)| {
+        fold(events.enumerate().map(|(i, mut event)| {
+            let sequence_no = i as u64 + 1;
+            if let MissionEvent::RoleRunRequested {
+                message_boundary, ..
+            } = &mut event
+            {
+                *message_boundary = sequence_no - 1;
+            }
             let mut stamps = VersionStamps::default();
             if matches!(event, MissionEvent::RoleRunRequested { .. }) {
                 stamps.prompt_hash = Some(TEST_PROMPT_HASH.to_string());
             }
             EventEnvelope {
                 mission_id: mission_id(),
-                sequence_no: i as u64 + 1,
+                sequence_no,
                 recorded_at_ms: 0,
                 stamps,
                 event,

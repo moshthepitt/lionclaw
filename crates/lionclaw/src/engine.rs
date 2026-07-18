@@ -1470,12 +1470,13 @@ impl Engine {
             .find(|t| t.id == intent.task_id)
             .context("dispatched task not in plan")?;
         let upstream_reports = self.resolve_upstream_reports(&state.tasks, &task.depends_on)?;
-        let feedback = state
+        let mut feedback = state
             .tasks
             .get(&task.id)
             .map(|runtime| self.resolve_task_feedback(runtime))
             .transpose()?
             .unwrap_or_default();
+        feedback.extend(conversation_messages(state, intent));
         let context = if role.output == crate::model::OutputSemantics::EmitsVerdict {
             TurnContext::Judgment(
                 role,
@@ -1519,13 +1520,14 @@ impl Engine {
             .context("dispatched planning task not in the DAG")?;
         let upstream_reports =
             self.resolve_upstream_reports(&state.planning.tasks, &task.depends_on)?;
-        let task_feedback = state
+        let mut task_feedback = state
             .planning
             .tasks
             .get(&task.id)
             .map(|runtime| self.resolve_task_feedback(runtime))
             .transpose()?
             .unwrap_or_default();
+        task_feedback.extend(conversation_messages(state, intent));
         let planning_input = self.resolve_planning_prompt_input(state)?;
         let oracle_inventory: Vec<String> = self
             .mission_type
@@ -1588,6 +1590,31 @@ impl Engine {
         // Planning and execution assemble prompts and namespace effect IDs
         // separately, so a planning report can never reach an execution judge and
         // a planning effect can never collide with an execution one.
+        let conversation_id = crate::model::ConversationId::for_role_instance(
+            &state.mission_id,
+            intent.namespace,
+            &intent.task_id,
+            &intent.role,
+            crate::model::resolve_task_assignment(
+                state.tasks_in(intent.namespace).get(&intent.task_id),
+                &intent.base_sha,
+                state.config.recovery.max_attempts,
+            )
+            .1,
+        );
+        let message_boundary = state.head;
+        let presented_messages =
+            state
+                .conversations
+                .get(&conversation_id)
+                .map_or_else(Vec::new, |conversation| {
+                    conversation
+                        .queued
+                        .iter()
+                        .filter(|message| message.sequence_no <= message_boundary)
+                        .map(|message| message.sequence_no)
+                        .collect()
+                });
         let prompt_text = match intent.namespace {
             TaskNamespace::Planning => self.assemble_planning_request(state, role, &intent)?,
             TaskNamespace::Execution => self.assemble_execution_request(state, role, &intent)?,
@@ -1623,6 +1650,7 @@ impl Engine {
             .timeout_secs
             .unwrap_or(state.config.execution.default_timeout_secs);
         let event = NewEvent::new(MissionEvent::RoleRunRequested {
+            conversation_id,
             namespace: intent.namespace,
             task_id: intent.task_id,
             attempt_no: intent.attempt_no,
@@ -1636,6 +1664,8 @@ impl Engine {
             prompt,
             base_sha,
             assignment_epoch,
+            message_boundary,
+            presented_messages,
             recreate_workspace,
             requested_at_ms,
             not_before_ms,
@@ -2237,6 +2267,54 @@ fn with_role_outcome_evidence(
     failure.evidence_mut().configuration =
         runtime_configuration_evidence(&outcome.runtime_configuration);
     failure.projected()
+}
+
+fn conversation_messages(state: &MissionState, intent: &RoleDispatchIntent) -> Vec<String> {
+    let Some((_, conversation)) = state.conversations.iter().find(|(_, conversation)| {
+        conversation.namespace == intent.namespace
+            && conversation.task_id == intent.task_id
+            && conversation.lifecycle != crate::model::ConversationLifecycle::Completed
+    }) else {
+        return Vec::new();
+    };
+    conversation
+        .queued
+        .iter()
+        .map(|message| {
+            let marker = match message.marker {
+                crate::model::DeliveryMarker::Queued => "queued",
+                crate::model::DeliveryMarker::PreviouslyDelivered => "previously delivered",
+                crate::model::DeliveryMarker::PossiblyDelivered => "possibly delivered",
+            };
+            let references = message
+                .references
+                .iter()
+                .map(|reference| match reference {
+                    crate::model::MessageReference::AuthoritativeReceipt { effect_id } => {
+                        format!("authoritative receipt {effect_id}")
+                    }
+                    crate::model::MessageReference::ParkEvidence { effect_id } => {
+                        format!("park evidence {effect_id}")
+                    }
+                    crate::model::MessageReference::ReachableCommit { sha } => {
+                        format!("reachable commit {sha}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if references.is_empty() {
+                format!(
+                    "Lead message [{}; sequence {}]: {}",
+                    marker, message.sequence_no, message.body
+                )
+            } else {
+                format!(
+                    "Lead message [{}; sequence {}; references: {}]: {}",
+                    marker, message.sequence_no, references, message.body
+                )
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -98,6 +98,13 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
         &mission_id,
         state.head,
         &[NewEvent::new(MissionEvent::RoleRunRequested {
+            conversation_id: lionclaw::model::ConversationId::for_role_instance(
+                &mission_id,
+                lionclaw::model::TaskNamespace::Execution,
+                &task_id,
+                &lionclaw::model::RoleName::new("implementer").unwrap(),
+                1,
+            ),
             namespace: lionclaw::model::TaskNamespace::Execution,
             task_id,
             attempt_no: 1,
@@ -108,6 +115,8 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
             prompt: lionclaw::model::PayloadRef::inline("prompt"),
             base_sha: BASE_SHA.to_string(),
             assignment_epoch: 1,
+            message_boundary: state.head,
+            presented_messages: vec![],
             recreate_workspace: true,
             requested_at_ms: 0,
             not_before_ms: 0,
@@ -175,6 +184,13 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
         state.head,
         &[
             NewEvent::new(MissionEvent::RoleRunRequested {
+                conversation_id: lionclaw::model::ConversationId::for_role_instance(
+                    &mission_id,
+                    lionclaw::model::TaskNamespace::Execution,
+                    &task_id,
+                    &lionclaw::model::RoleName::new("implementer").unwrap(),
+                    1,
+                ),
                 namespace: lionclaw::model::TaskNamespace::Execution,
                 task_id: task_id.clone(),
                 attempt_no: 1,
@@ -185,6 +201,8 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                 prompt: PayloadRef::inline("prompt"),
                 base_sha: BASE_SHA.to_string(),
                 assignment_epoch: 1,
+                message_boundary: state.head,
+                presented_messages: vec![],
                 recreate_workspace: true,
                 requested_at_ms: 0,
                 not_before_ms: 0,
@@ -275,6 +293,13 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
         &mission_id,
         state.head,
         &[NewEvent::new(MissionEvent::RoleRunRequested {
+            conversation_id: lionclaw::model::ConversationId::for_role_instance(
+                &mission_id,
+                lionclaw::model::TaskNamespace::Execution,
+                &task_id,
+                &lionclaw::model::RoleName::new("implementer").unwrap(),
+                1,
+            ),
             namespace: lionclaw::model::TaskNamespace::Execution,
             task_id,
             attempt_no: 1,
@@ -285,6 +310,8 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
             prompt: lionclaw::model::PayloadRef::inline("prompt"),
             base_sha: BASE_SHA.to_string(),
             assignment_epoch: 1,
+            message_boundary: state.head,
+            presented_messages: vec![],
             recreate_workspace: true,
             requested_at_ms: 0,
             not_before_ms: 0,

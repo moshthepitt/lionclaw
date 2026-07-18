@@ -28,7 +28,7 @@ use crate::{RoleName, TypedFailure};
 /// discarded and rebuilt from sequence zero.
 /// Bumped because durable request ingress now verifies model-derived effect
 /// identity and task-assignment generation before reserving an effect.
-pub const REDUCER_VERSION: u32 = 23;
+pub const REDUCER_VERSION: u32 = 24;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -154,12 +154,16 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }
         }
         MissionEvent::RoleRunRequested {
+            conversation_id,
             namespace,
             task_id,
             attempt_no,
             role,
             base_sha,
             assignment_epoch,
+            message_boundary,
+            presented_messages,
+            effect_id,
             ..
         } => {
             if !role_request_matches_dispatch(state, envelope) {
@@ -175,7 +179,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 .or_insert_with(pending_task);
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
-            let conversation_id = crate::ConversationId::for_role_instance(
+            let expected_conversation_id = crate::ConversationId::for_role_instance(
                 &state.mission_id,
                 *namespace,
                 task_id,
@@ -184,7 +188,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             );
             let conversation = state
                 .conversations
-                .entry(conversation_id)
+                .entry(expected_conversation_id.clone())
                 .or_insert_with(|| super::state::ConversationState {
                     role: role.clone(),
                     namespace: *namespace,
@@ -194,11 +198,28 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     lifecycle: super::state::ConversationLifecycle::Ready,
                     queued: Vec::new(),
                     consumed_through: 0,
-                    active_message_boundary: None,
+                    active_delivery: None,
                     invalid_handoff_reworks: 0,
                 });
+            let expected_presented: Vec<_> = conversation
+                .queued
+                .iter()
+                .filter(|message| message.sequence_no <= *message_boundary)
+                .map(|message| message.sequence_no)
+                .collect();
+            if conversation_id != &expected_conversation_id
+                || *message_boundary != seq.saturating_sub(1)
+                || presented_messages != &expected_presented
+            {
+                finish_apply(state, seq);
+                return;
+            }
             conversation.lifecycle = super::state::ConversationLifecycle::Running;
-            conversation.active_message_boundary = Some(seq.saturating_sub(1));
+            conversation.active_delivery = Some(super::state::ActiveDelivery {
+                effect_id: effect_id.clone(),
+                message_boundary: *message_boundary,
+                presented_messages: presented_messages.clone(),
+            });
             track_inflight(state, &envelope.event, seq);
         }
         MissionEvent::MessageSent {
@@ -415,6 +436,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                             state,
                             *namespace,
                             task_id,
+                            effect_id,
                             success.handoff.is_some(),
                         );
                     } else {
@@ -436,7 +458,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     }
                 }
                 Err(failure) => {
-                    settle_failed_conversation_delivery(state, *namespace, task_id, failure);
+                    settle_failed_conversation_delivery(
+                        state, *namespace, task_id, effect_id, failure,
+                    );
                     apply_role_failure(
                         state,
                         TaskAddress::new(*namespace, task_id.clone()),
@@ -777,16 +801,25 @@ fn settle_conversation_delivery(
     state: &mut MissionState,
     namespace: super::TaskNamespace,
     task_id: &TaskId,
+    effect_id: &crate::EffectId,
     has_handoff: bool,
 ) {
     let Some((_, conversation)) = state.conversations.iter_mut().find(|(_, conversation)| {
         conversation.namespace == namespace
             && &conversation.task_id == task_id
             && conversation.lifecycle == super::state::ConversationLifecycle::Running
+            && conversation
+                .active_delivery
+                .as_ref()
+                .is_some_and(|delivery| &delivery.effect_id == effect_id)
     }) else {
         return;
     };
-    let boundary = conversation.active_message_boundary.take().unwrap_or(0);
+    let boundary = conversation
+        .active_delivery
+        .take()
+        .expect("matched above")
+        .message_boundary;
     conversation.consumed_through = conversation.consumed_through.max(boundary);
     conversation
         .queued
@@ -802,16 +835,25 @@ fn settle_failed_conversation_delivery(
     state: &mut MissionState,
     namespace: super::TaskNamespace,
     task_id: &TaskId,
+    effect_id: &crate::EffectId,
     failure: &TypedFailure,
 ) {
     let Some((_, conversation)) = state.conversations.iter_mut().find(|(_, conversation)| {
         conversation.namespace == namespace
             && &conversation.task_id == task_id
             && conversation.lifecycle == super::state::ConversationLifecycle::Running
+            && conversation
+                .active_delivery
+                .as_ref()
+                .is_some_and(|delivery| &delivery.effect_id == effect_id)
     }) else {
         return;
     };
-    let boundary = conversation.active_message_boundary.take().unwrap_or(0);
+    let boundary = conversation
+        .active_delivery
+        .take()
+        .expect("matched above")
+        .message_boundary;
     if failure.evidence().code.as_deref() == Some("kernel.launch") {
         conversation.lifecycle = super::state::ConversationLifecycle::Ready;
         return;
@@ -875,6 +917,9 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         prompt,
         base_sha,
         assignment_epoch,
+        conversation_id,
+        message_boundary,
+        presented_messages,
         recreate_workspace,
         ..
     } = &envelope.event
@@ -919,6 +964,25 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         *assignment_epoch,
         &prompt_hash,
     );
+    let expected_conversation = crate::ConversationId::for_role_instance(
+        &state.mission_id,
+        *namespace,
+        task_id,
+        role,
+        *assignment_epoch,
+    );
+    let expected_presented: Vec<_> =
+        state
+            .conversations
+            .get(&expected_conversation)
+            .map_or_else(Vec::new, |conversation| {
+                conversation
+                    .queued
+                    .iter()
+                    .filter(|message| message.sequence_no <= *message_boundary)
+                    .map(|message| message.sequence_no)
+                    .collect()
+            });
     output_matches
         && intent.namespace == *namespace
         && &intent.task_id == task_id
@@ -928,6 +992,9 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         && expected_epoch == *assignment_epoch
         && expected_recreate == *recreate_workspace
         && expected_effect == *effect_id
+        && expected_conversation == *conversation_id
+        && *message_boundary == envelope.sequence_no.saturating_sub(1)
+        && expected_presented == *presented_messages
 }
 
 fn oracle_request_matches_obligation(
@@ -2045,6 +2112,13 @@ mod tests {
                         ),
                     };
                     valid_log.push(MissionEvent::RoleRunRequested {
+                        conversation_id: crate::ConversationId::for_role_instance(
+                            &mission_id(),
+                            *namespace,
+                            task_id,
+                            &role,
+                            1,
+                        ),
                         namespace: *namespace,
                         task_id: task_id.clone(),
                         attempt_no: *attempt_no,
@@ -2058,6 +2132,8 @@ mod tests {
                             .as_ref()
                             .map_or_else(|| "base".into(), |artifact| artifact.base_sha.clone()),
                         assignment_epoch: 1,
+                        message_boundary: 0,
+                        presented_messages: vec![],
                         recreate_workspace: true,
                         requested_at_ms: 0,
                         not_before_ms: 0,
@@ -2122,11 +2198,42 @@ mod tests {
             });
             std::iter::once(event).chain(approve)
         });
-        fold(
-            events
-                .enumerate()
-                .map(|(i, event)| envelope(i as u64, event)),
-        )
+        let mut queued: BTreeMap<crate::ConversationId, Vec<u64>> = BTreeMap::new();
+        fold(events.enumerate().map(|(i, mut event)| {
+            let sequence_no = i as u64;
+            match &mut event {
+                MissionEvent::MessageSent { recipients, .. } => {
+                    for recipient in recipients {
+                        queued
+                            .entry(recipient.conversation_id.clone())
+                            .or_default()
+                            .push(sequence_no);
+                    }
+                }
+                MissionEvent::RoleRunRequested {
+                    conversation_id,
+                    namespace,
+                    task_id,
+                    role,
+                    assignment_epoch,
+                    message_boundary,
+                    presented_messages,
+                    ..
+                } => {
+                    *conversation_id = crate::ConversationId::for_role_instance(
+                        &mission_id(),
+                        *namespace,
+                        task_id,
+                        role,
+                        *assignment_epoch,
+                    );
+                    *message_boundary = sequence_no.saturating_sub(1);
+                    *presented_messages = queued.get(conversation_id).cloned().unwrap_or_default();
+                }
+                _ => {}
+            }
+            envelope(sequence_no, event)
+        }))
     }
 
     fn created() -> MissionEvent {
@@ -2451,6 +2558,13 @@ mod tests {
         output: OutputSemantics,
     ) -> MissionEvent {
         MissionEvent::RoleRunRequested {
+            conversation_id: crate::ConversationId::for_role_instance(
+                &mission_id(),
+                namespace,
+                &tid(task),
+                &role,
+                1,
+            ),
             namespace,
             task_id: tid(task),
             attempt_no: 1,
@@ -2461,6 +2575,8 @@ mod tests {
             prompt: PayloadRef::inline("prompt"),
             base_sha: "base".into(),
             assignment_epoch: 1,
+            message_boundary: 0,
+            presented_messages: vec![],
             recreate_workspace: true,
             requested_at_ms: 0,
             not_before_ms: 0,
@@ -2652,6 +2768,13 @@ mod tests {
             },
             role_completed("w", "workspace-first", work_handoff(true, false), None),
             MissionEvent::RoleRunRequested {
+                conversation_id: crate::ConversationId::for_role_instance(
+                    &mission_id(),
+                    crate::TaskNamespace::Execution,
+                    &tid("w"),
+                    &RoleName::new("implementer").unwrap(),
+                    2,
+                ),
                 namespace: crate::TaskNamespace::Execution,
                 task_id: tid("w"),
                 attempt_no: 2,
@@ -2662,6 +2785,8 @@ mod tests {
                 prompt: PayloadRef::inline("moved-base prompt"),
                 base_sha: "moved".into(),
                 assignment_epoch: 2,
+                message_boundary: 0,
+                presented_messages: vec![],
                 recreate_workspace: true,
                 requested_at_ms: 1,
                 not_before_ms: 1,
@@ -3867,6 +3992,13 @@ mod tests {
             ),
             oracle_completed("TESTS-PASS", "h1", "oracle", 0),
             MissionEvent::RoleRunRequested {
+                conversation_id: crate::ConversationId::for_role_instance(
+                    &mission_id(),
+                    crate::TaskNamespace::Execution,
+                    &tid("work"),
+                    &RoleName::new("implementer").unwrap(),
+                    2,
+                ),
                 namespace: crate::TaskNamespace::Execution,
                 task_id: tid("work"),
                 attempt_no: 2,
@@ -3877,6 +4009,8 @@ mod tests {
                 prompt: PayloadRef::inline("forged prompt"),
                 base_sha: "h1".into(),
                 assignment_epoch: 2,
+                message_boundary: 0,
+                presented_messages: vec![],
                 recreate_workspace: false,
                 requested_at_ms: 0,
                 not_before_ms: 0,

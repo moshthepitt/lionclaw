@@ -50,8 +50,15 @@ pub struct ConversationState {
     pub lifecycle: ConversationLifecycle,
     pub queued: Vec<QueuedMessage>,
     pub consumed_through: u64,
-    pub active_message_boundary: Option<u64>,
+    pub active_delivery: Option<ActiveDelivery>,
     pub invalid_handoff_reworks: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveDelivery {
+    pub effect_id: super::EffectId,
+    pub message_boundary: u64,
+    pub presented_messages: Vec<u64>,
 }
 
 /// A durable cancellation fact that dominates any later effect outcome.
@@ -551,6 +558,7 @@ pub struct AttentionItem {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InflightEffect {
     RoleRun {
+        conversation_id: super::ConversationId,
         namespace: super::TaskNamespace,
         task_id: TaskId,
         attempt_no: u32,
@@ -560,6 +568,8 @@ pub enum InflightEffect {
         prompt: PayloadRef,
         base_sha: String,
         assignment_epoch: u32,
+        message_boundary: u64,
+        presented_messages: Vec<u64>,
         recreate_workspace: bool,
         runtime_configuration: Option<super::RuntimeConfigurationEvidence>,
         requested_at_ms: i64,
@@ -655,6 +665,7 @@ impl InflightEffect {
         use super::event::MissionEvent;
         match event {
             MissionEvent::RoleRunRequested {
+                conversation_id,
                 namespace,
                 task_id,
                 attempt_no,
@@ -665,6 +676,8 @@ impl InflightEffect {
                 prompt,
                 base_sha,
                 assignment_epoch,
+                message_boundary,
+                presented_messages,
                 recreate_workspace,
                 requested_at_ms,
                 not_before_ms,
@@ -673,6 +686,7 @@ impl InflightEffect {
             } => Some((
                 effect_id.clone(),
                 Self::RoleRun {
+                    conversation_id: conversation_id.clone(),
                     namespace: *namespace,
                     task_id: task_id.clone(),
                     attempt_no: *attempt_no,
@@ -682,6 +696,8 @@ impl InflightEffect {
                     prompt: prompt.clone(),
                     base_sha: base_sha.clone(),
                     assignment_epoch: *assignment_epoch,
+                    message_boundary: *message_boundary,
+                    presented_messages: presented_messages.clone(),
                     recreate_workspace: *recreate_workspace,
                     runtime_configuration: None,
                     requested_at_ms: *requested_at_ms,

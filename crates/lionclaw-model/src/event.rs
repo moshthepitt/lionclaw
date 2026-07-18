@@ -22,7 +22,7 @@ use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
 
 /// Bumped for durable conversations, sender-free messages, and checkpoint
 /// role outcomes. Unreleased older logs intentionally fail loudly.
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -541,6 +541,8 @@ pub enum MissionEvent {
         plan_hash: String,
     },
     RoleRunRequested {
+        /// Exact durable dialogue instance receiving this turn.
+        conversation_id: ConversationId,
         namespace: TaskNamespace,
         task_id: TaskId,
         attempt_no: u32,
@@ -558,6 +560,10 @@ pub enum MissionEvent {
         /// Monotonic identity for a fresh task assignment. Retries and
         /// continues retain the epoch and workspace.
         assignment_epoch: u32,
+        /// Immutable log boundary and exact message identities presented by
+        /// this request. Messages appended later belong to the next turn.
+        message_boundary: u64,
+        presented_messages: Vec<u64>,
         /// True only when a fresh assignment moved the required base.
         recreate_workspace: bool,
         requested_at_ms: i64,
@@ -1003,6 +1009,13 @@ mod compat_tests {
     #[test]
     fn role_effect_task_namespace_and_output_contract_are_required_on_the_wire() {
         let event = MissionEvent::RoleRunRequested {
+            conversation_id: ConversationId::for_role_instance(
+                &MissionId::from_digest_prefix("abcdef0123456789"),
+                TaskNamespace::Planning,
+                &TaskId::new("author").unwrap(),
+                &RoleName::new("planner").unwrap(),
+                1,
+            ),
             namespace: TaskNamespace::Planning,
             task_id: TaskId::new("author").unwrap(),
             attempt_no: 1,
@@ -1013,6 +1026,8 @@ mod compat_tests {
             prompt: PayloadRef::inline("prompt"),
             base_sha: "base".into(),
             assignment_epoch: 1,
+            message_boundary: 0,
+            presented_messages: vec![],
             recreate_workspace: true,
             requested_at_ms: 1,
             not_before_ms: 1,

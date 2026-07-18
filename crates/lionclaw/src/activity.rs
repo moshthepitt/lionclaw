@@ -380,14 +380,20 @@ pub async fn publish_observed(
                         .iter()
                         .filter(|message| {
                             conversation
-                                .active_message_boundary
+                                .active_delivery
+                                .as_ref()
+                                .map(|delivery| delivery.message_boundary)
                                 .is_none_or(|boundary| message.sequence_no > boundary)
                         })
                         .count()
                 }),
                 conversation_lifecycle: conversation.map(|conversation| conversation.lifecycle),
-                message_boundary: conversation
-                    .and_then(|conversation| conversation.active_message_boundary),
+                message_boundary: conversation.and_then(|conversation| {
+                    conversation
+                        .active_delivery
+                        .as_ref()
+                        .map(|delivery| delivery.message_boundary)
+                }),
                 delivery_markers: conversation.map_or_else(Vec::new, |conversation| {
                     conversation
                         .queued
