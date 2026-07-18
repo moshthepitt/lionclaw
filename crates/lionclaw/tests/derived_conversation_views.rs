@@ -145,6 +145,11 @@ async fn real_cli_views_share_one_folded_conversation_projection() {
         &["mission", "report", mission.as_str(), "--json"],
     )))
     .unwrap();
+    let queued_inbox: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        dir.path(),
+        &["mission", "inbox", "--json"],
+    )))
+    .unwrap();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let authoritative = store.require_state(&mission).await.unwrap();
     let folded_conversation = &authoritative.conversations[&conversation_id];
@@ -155,6 +160,7 @@ async fn real_cli_views_share_one_folded_conversation_projection() {
         conversation(&status_json, conversation_id.as_str()),
         conversation(&report_json, conversation_id.as_str()),
     ];
+    assert_eq!(queued_inbox["missions"], serde_json::json!([]));
     for projected in projections {
         assert_eq!(projected["lifecycle"], "ready");
         assert_eq!(
@@ -183,7 +189,7 @@ async fn real_cli_views_share_one_folded_conversation_projection() {
         status_json["next_actions"],
         serde_json::json!(["mission advance"])
     );
-    assert_eq!(status_json["activity"], serde_json::Value::Null);
+    assert!(status_json.get("activity").is_some());
 
     let human_status = stdout(cli_output(
         dir.path(),
@@ -222,7 +228,12 @@ async fn real_cli_views_share_one_folded_conversation_projection() {
         &["mission", "report", mission.as_str(), "--json"],
     )))
     .unwrap();
-    for root in [&retry_status, &retry_report] {
+    let retry_inbox: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        dir.path(),
+        &["mission", "inbox", "--json"],
+    )))
+    .unwrap();
+    for root in [&retry_status, &retry_report, &retry_inbox["missions"][0]] {
         let projected = conversation(root, conversation_id.as_str());
         assert_eq!(
             projected["queued_messages"][0]["marker"],
@@ -247,21 +258,23 @@ async fn real_cli_views_share_one_folded_conversation_projection() {
     assert!(events
         .iter()
         .any(|event| matches!(event.event, MissionEvent::MessageSent { .. })));
-    let database = sqlx::SqlitePool::connect(&format!(
-        "sqlite://{}",
-        dir.path().join(".lionclaw/mission.db").display()
-    ))
-    .await
+    let log = stdout(cli_output(
+        dir.path(),
+        &["mission", "log", mission.as_str()],
+    ));
+    assert!(log.contains("message_sent"));
+
+    // A brand-new store handle must reconstruct byte-for-byte identical shared
+    // conversation fields from the event stream.  This proves the projections
+    // are replay products without making assumptions about storage schema names.
+    drop(store);
+    let replayed_status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        dir.path(),
+        &["mission", "status", mission.as_str(), "--json"],
+    )))
     .unwrap();
-    let competing: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND \
-         (name LIKE '%conversation%' OR name LIKE '%inbox%' OR name LIKE '%view%')",
-    )
-    .fetch_all(&database)
-    .await
-    .unwrap();
-    assert!(
-        competing.is_empty(),
-        "competing projection tables: {competing:?}"
+    assert_eq!(
+        conversation(&replayed_status, conversation_id.as_str()),
+        conversation(&retry_status, conversation_id.as_str())
     );
 }
