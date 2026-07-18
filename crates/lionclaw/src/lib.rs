@@ -19,6 +19,7 @@ pub use lionclaw_model as model;
 pub mod oracle;
 pub mod ports;
 pub mod prompt;
+pub mod reference_materialization;
 pub mod runner;
 pub mod selftest;
 pub mod store;

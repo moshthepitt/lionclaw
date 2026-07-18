@@ -614,6 +614,18 @@ pub async fn diff(repo: &Path, from: &str, to: &str) -> Result<String> {
     .await
 }
 
+/// Render one trusted, already-authorized commit for transient message context.
+pub async fn show_commit(repo: &Path, sha: &str) -> Result<Vec<u8>> {
+    if !valid_object_id(sha) || !commit_exists(repo, sha).await {
+        bail!("commit is missing from the mission workspace");
+    }
+    git_bytes(
+        repo,
+        &["show", "--format=fuller", "--no-ext-diff", "--binary", sha],
+    )
+    .await
+}
+
 /// Create a branch `name` at `sha` without touching HEAD or the worktree. With
 /// `force`, move an existing branch; otherwise fail if it already exists.
 pub async fn create_branch(repo: &Path, name: &str, sha: &str, force: bool) -> Result<()> {

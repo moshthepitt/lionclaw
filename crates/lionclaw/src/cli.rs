@@ -1372,9 +1372,10 @@ async fn cmd_send(args: SendArgs) -> Result<()> {
     if args.message.len() > MAX_MESSAGE_BYTES {
         bail!("message exceeds {MAX_MESSAGE_BYTES} bytes");
     }
-    let (_repo, store) = open_store(args.repo).await?;
+    let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    let state = fold(store.load(&mission_id).await?).context("mission has no creation event")?;
+    let events = store.load(&mission_id).await?;
+    let state = fold(events.clone()).context("mission has no creation event")?;
     let current: Vec<_> = state
         .conversations
         .iter()
@@ -1462,6 +1463,15 @@ async fn cmd_send(args: SendArgs) -> Result<()> {
             bail!("reference is not valid authority in this mission");
         }
     }
+    crate::reference_materialization::materialize_references(
+        &state,
+        &events,
+        store.blobs(),
+        &repo,
+        &references,
+    )
+    .await
+    .context("message reference validation failed")?;
     store
         .append(
             &mission_id,

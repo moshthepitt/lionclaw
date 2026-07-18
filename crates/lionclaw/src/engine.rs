@@ -1465,6 +1465,7 @@ impl Engine {
         state: &MissionState,
         role: &crate::mission_type::RoleDefinition,
         intent: &RoleDispatchIntent,
+        dialogue: &[String],
     ) -> Result<String> {
         let plan = state
             .plan
@@ -1487,7 +1488,7 @@ impl Engine {
             .map(|runtime| self.resolve_task_feedback(runtime))
             .transpose()?
             .unwrap_or_default();
-        feedback.extend(conversation_messages(state, intent));
+        feedback.extend_from_slice(dialogue);
         let context = if role.output == crate::model::OutputSemantics::EmitsVerdict {
             TurnContext::Judgment(
                 role,
@@ -1521,6 +1522,7 @@ impl Engine {
         state: &MissionState,
         role: &crate::mission_type::RoleDefinition,
         intent: &RoleDispatchIntent,
+        dialogue: &[String],
     ) -> Result<String> {
         let task = state
             .config
@@ -1538,7 +1540,7 @@ impl Engine {
             .map(|runtime| self.resolve_task_feedback(runtime))
             .transpose()?
             .unwrap_or_default();
-        task_feedback.extend(conversation_messages(state, intent));
+        task_feedback.extend_from_slice(dialogue);
         let planning_input = self.resolve_planning_prompt_input(state)?;
         let oracle_inventory: Vec<String> = self
             .mission_type
@@ -1626,9 +1628,14 @@ impl Engine {
                         .map(|message| message.sequence_no)
                         .collect()
                 });
+        let dialogue = materialize_conversation_messages(self, state, &intent).await?;
         let prompt_text = match intent.namespace {
-            TaskNamespace::Planning => self.assemble_planning_request(state, role, &intent)?,
-            TaskNamespace::Execution => self.assemble_execution_request(state, role, &intent)?,
+            TaskNamespace::Planning => {
+                self.assemble_planning_request(state, role, &intent, &dialogue)?
+            }
+            TaskNamespace::Execution => {
+                self.assemble_execution_request(state, role, &intent, &dialogue)?
+            }
         };
         let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));
         let prompt = self
@@ -2058,6 +2065,36 @@ pub async fn record_decision(
     Ok(())
 }
 
+async fn materialize_conversation_messages(
+    engine: &Engine,
+    state: &MissionState,
+    intent: &RoleDispatchIntent,
+) -> Result<Vec<String>> {
+    let Some((_, conversation)) = state.conversations.iter().find(|(_, conversation)| {
+        conversation.namespace == intent.namespace
+            && conversation.task_id == intent.task_id
+            && conversation.lifecycle != crate::model::ConversationLifecycle::Completed
+    }) else {
+        return Ok(Vec::new());
+    };
+    let events = engine.store.load(&state.mission_id).await?;
+    let repo = std::path::Path::new(&state.workspace_dir);
+    let mut rendered = Vec::with_capacity(conversation.queued.len());
+    for message in &conversation.queued {
+        let expanded = crate::reference_materialization::materialize_references(
+            state,
+            &events,
+            engine.store.blobs(),
+            repo,
+            &message.references,
+        )
+        .await
+        .with_context(|| format!("materializing lead message {}", message.sequence_no))?;
+        rendered.push(render_conversation_message(message, &expanded));
+    }
+    Ok(rendered)
+}
+
 /// Validate and append a control against the exact replayed effect generation.
 /// A concurrent outcome makes the optimistic append conflict, so stale races
 /// fail instead of leaking onto a successor.
@@ -2287,52 +2324,36 @@ fn with_role_outcome_evidence(
     failure.projected()
 }
 
-fn conversation_messages(state: &MissionState, intent: &RoleDispatchIntent) -> Vec<String> {
-    let Some((_, conversation)) = state.conversations.iter().find(|(_, conversation)| {
-        conversation.namespace == intent.namespace
-            && conversation.task_id == intent.task_id
-            && conversation.lifecycle != crate::model::ConversationLifecycle::Completed
-    }) else {
-        return Vec::new();
+fn render_conversation_message(
+    message: &crate::model::QueuedMessage,
+    expanded: &[crate::reference_materialization::MaterializedReference],
+) -> String {
+    let marker = match message.marker {
+        crate::model::DeliveryMarker::Queued => "queued",
+        crate::model::DeliveryMarker::PreviouslyDelivered => "previously delivered",
+        crate::model::DeliveryMarker::PossiblyDelivered => "possibly delivered",
     };
-    conversation
-        .queued
+    let references = expanded
         .iter()
-        .map(|message| {
-            let marker = match message.marker {
-                crate::model::DeliveryMarker::Queued => "queued",
-                crate::model::DeliveryMarker::PreviouslyDelivered => "previously delivered",
-                crate::model::DeliveryMarker::PossiblyDelivered => "possibly delivered",
-            };
-            let references = message
-                .references
-                .iter()
-                .map(|reference| match reference {
-                    crate::model::MessageReference::AuthoritativeReceipt { effect_id } => {
-                        format!("authoritative receipt {effect_id}")
-                    }
-                    crate::model::MessageReference::ParkEvidence { effect_id } => {
-                        format!("park evidence {effect_id}")
-                    }
-                    crate::model::MessageReference::ReachableCommit { sha } => {
-                        format!("reachable commit {sha}")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            if references.is_empty() {
-                format!(
-                    "Lead message [{}; sequence {}]: {}",
-                    marker, message.sequence_no, message.body
-                )
-            } else {
-                format!(
-                    "Lead message [{}; sequence {}; references: {}]: {}",
-                    marker, message.sequence_no, references, message.body
-                )
-            }
+        .map(|reference| {
+            format!(
+                "{} {}:\n{}",
+                reference.label, reference.identity, reference.content
+            )
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if references.is_empty() {
+        format!(
+            "Lead message [{}; sequence {}]: {}",
+            marker, message.sequence_no, message.body
+        )
+    } else {
+        format!(
+            "Lead message [{}; sequence {}; references: {}]: {}",
+            marker, message.sequence_no, references, message.body
+        )
+    }
 }
 
 #[cfg(test)]
