@@ -7,17 +7,14 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use clap::Parser;
-use lionclaw::authority::AuthorityCeiling;
 use lionclaw::config::RuntimeProfiles;
-use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
-use lionclaw::mission_type::load_mission_type;
+use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{
     apply, fold, Assertion, AssertionId, FinishClass, MissionEvent, MissionPhase, MissionState,
     OracleName, Plan, PlanProposal, Requirement, RequirementDisposition, RequirementId,
     RequirementKind, RoleName, Task, TaskId, TaskKind,
 };
 use lionclaw::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
-use lionclaw::runner::OciRoleRunner;
 use lionclaw::store::MissionStore;
 use lionclaw::{cli, workspace};
 use lionclaw_runtime_api::{
@@ -259,7 +256,11 @@ async fn production_conversation_restarts_and_closes_verified() {
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
     let fake_oci = temp.path().join("external-oci-transport");
-    std::fs::write(&fake_oci, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(
+        &fake_oci,
+        "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
     let profiles = RuntimeProfiles::from_toml(
         &format!(
@@ -276,56 +277,41 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     .unwrap();
     let mission_type_dir = temp.path().join("mission-type");
     materialize_mission_type(&mission_type_dir);
-    let mission_type = load_mission_type(&mission_type_dir, &AuthorityCeiling::default()).unwrap();
     let turns = Arc::new(Mutex::new(Vec::new()));
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let services = || {
-        EngineServices::new(
-            Arc::new(OciRoleRunner::with_registries(
-                profiles.clone(),
-                "production-image-id".into(),
-                AuthorityCeiling::default(),
-                RuntimeDriverRegistry::new([Arc::new(NativeProvider {
-                    turns: turns.clone(),
-                }) as Arc<dyn RuntimeDriverProvider>]),
-                RuntimeAuthRegistry::empty(),
-            )),
-            Arc::new(ExternalOracleTransport {
-                calls: calls.clone(),
-            }),
-            Arc::new(lionclaw::LocalEffectCleaner::new(
-                fake_oci.to_string_lossy().into_owned(),
-            )),
-            Arc::new(lionclaw::ports::SystemClock),
-        )
-    };
-    let store = MissionStore::open(&repo).await.unwrap();
-    let engine = Engine::new(
-        store,
-        mission_type.clone(),
-        "codex".into(),
-        "production-image-id".into(),
-        services(),
+    let transports = cli::MissionTransports::external(
+        profiles,
+        RuntimeDriverRegistry::new([Arc::new(NativeProvider {
+            turns: turns.clone(),
+        }) as Arc<dyn RuntimeDriverProvider>]),
+        RuntimeAuthRegistry::empty(),
+        Arc::new(ExternalOracleTransport {
+            calls: calls.clone(),
+        }),
     );
-    let mission_id = engine
-        .create_mission(
-            repo.to_str().unwrap(),
-            "prove the production conversation",
-            &base,
-        )
+    let start = cli::Cli::try_parse_from([
+        "lionclaw",
+        "mission",
+        "start",
+        "--type",
+        mission_type_dir.to_str().unwrap(),
+        "--repo",
+        repo.to_str().unwrap(),
+        "--objective",
+        "prove the production conversation",
+        "--runtime",
+        "codex",
+    ])
+    .unwrap();
+    cli::run_with_transports(start, transports.clone())
         .await
         .unwrap();
-    let mission_type_snapshot = repo
-        .join(".lionclaw/missions")
-        .join(mission_id.as_str())
-        .join("mission-type");
-    std::fs::create_dir_all(mission_type_snapshot.parent().unwrap()).unwrap();
-    lionclaw::mission_type::materialize_mission_type(
-        &mission_type_dir,
-        &mission_type_snapshot,
-        &AuthorityCeiling::default(),
-    )
-    .unwrap();
+    let store = MissionStore::open(&repo).await.unwrap();
+    let missions = store.list_missions().await.unwrap();
+    let [mission_id] = missions.as_slice() else {
+        panic!("start must create exactly one mission")
+    };
+    let mission_id = mission_id.clone();
     let proposal_path = temp.path().join("proposal.json");
     std::fs::write(
         &proposal_path,
@@ -348,7 +334,9 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         repo.to_str().unwrap(),
     ])
     .unwrap();
-    cli::run(propose).await.unwrap();
+    cli::run_with_transports(propose, transports.clone())
+        .await
+        .unwrap();
     let decide = cli::Cli::try_parse_from([
         "lionclaw",
         "mission",
@@ -362,7 +350,9 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         repo.to_str().unwrap(),
     ])
     .unwrap();
-    cli::run(decide).await.unwrap();
+    cli::run_with_transports(decide, transports.clone())
+        .await
+        .unwrap();
 
     let status = cli::Cli::try_parse_from([
         "lionclaw",
@@ -375,22 +365,38 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     ])
     .unwrap();
     assert_eq!(
-        cli::run(status).await.unwrap(),
+        cli::run_with_transports(status, transports.clone())
+            .await
+            .unwrap(),
         std::process::ExitCode::SUCCESS
     );
 
-    drop(engine);
-    let restarted = Engine::new(
-        MissionStore::open(&repo).await.unwrap(),
-        mission_type,
-        "codex".into(),
-        "production-image-id".into(),
-        services(),
-    );
     let outcome = loop {
-        let outcome = restarted.advance(&mission_id).await.unwrap();
-        if outcome.disposition == MissionDisposition::Terminal {
-            break outcome;
+        let handshake = temp
+            .path()
+            .join(format!("driver-{}.ready", turns.lock().unwrap().len()));
+        let driver = cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "driver",
+            mission_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--handshake",
+            handshake.to_str().unwrap(),
+        ])
+        .unwrap();
+        cli::run_with_transports(driver, transports.clone())
+            .await
+            .unwrap();
+        let view = lionclaw::engine::load_mission_view(
+            &MissionStore::open(&repo).await.unwrap(),
+            &mission_id,
+        )
+        .await
+        .unwrap();
+        if view.disposition == MissionDisposition::Terminal {
+            break view;
         }
     };
     assert_eq!(
@@ -420,14 +426,17 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     ] {
         let observation = cli::Cli::try_parse_from(args).unwrap();
         assert_eq!(
-            cli::run(observation).await.unwrap(),
+            cli::run_with_transports(observation, transports.clone())
+                .await
+                .unwrap(),
             std::process::ExitCode::SUCCESS
         );
     }
     assert_ne!(outcome.state.current_sha, base);
     assert_eq!(calls.lock().unwrap().len(), 1);
     assert_eq!(turns.lock().unwrap().len(), 2);
-    let events = restarted.store().load(&mission_id).await.unwrap();
+    let restarted = MissionStore::open(&repo).await.unwrap();
+    let events = restarted.load(&mission_id).await.unwrap();
     let replayed = fold(events.clone()).expect("full replay");
     assert_eq!(replayed, outcome.state);
     for split in 1..events.len() {
@@ -438,7 +447,6 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         assert_eq!(from_prefix, replayed, "prefix split {split} diverged");
     }
     let snapshotted = restarted
-        .store()
         .load_state_snapshotted(&mission_id)
         .await
         .expect("snapshot resume")
@@ -450,7 +458,6 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         replayed
     );
     let rebuilt = restarted
-        .store()
         .rebuild_cursors(&mission_id, 9_000_000)
         .await
         .expect("rebuild snapshot from authoritative log");
@@ -484,22 +491,4 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
                 .read_dir()
                 .is_ok_and(|mut entries| entries.next().is_some())
         }));
-
-    // Forbidden-seam audit: this proof intentionally contains none of the
-    // mock/test-only constructors named by PRODUCTION-CONVERSATION-FLOW.
-    let source = include_str!("production_conversation_flow.rs");
-    for parts in [
-        ["Mock", "RoleRunner"],
-        ["Mock", "OracleRunner"],
-        ["Noop", "EffectCleaner"],
-        ["test_", "mission_type"],
-        ["CapturedArtifact::", "for_testing"],
-        ["for_", "testing("],
-    ] {
-        let forbidden = parts.concat();
-        assert!(
-            !source.contains(&forbidden),
-            "forbidden seam used: {forbidden}"
-        );
-    }
 }

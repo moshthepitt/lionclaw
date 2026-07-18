@@ -156,6 +156,24 @@ impl OciRoleRunner {
         runner.auth_registry(profile)?;
         driver.validate_config(&config)
     }
+
+    pub(crate) fn validate_profile_with_registries(
+        profile: &MissionRuntimeProfile,
+        drivers: RuntimeDriverRegistry,
+        auth: RuntimeAuthRegistry,
+    ) -> anyhow::Result<()> {
+        let runner = Self::with_registries(
+            RuntimeProfiles::single(profile.clone()),
+            String::new(),
+            AuthorityCeiling::default(),
+            drivers,
+            auth,
+        );
+        let driver = runner.driver(profile)?;
+        let config = Self::driver_config(profile)?;
+        runner.auth_registry(profile)?;
+        driver.validate_config(&config)
+    }
 }
 
 fn launch(detail: String) -> TypedFailure {

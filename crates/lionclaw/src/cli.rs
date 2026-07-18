@@ -23,10 +23,51 @@ use crate::model::{
     fold, short_hex, ControlAction, DecisionAction, EffectId, FinishClass, MissionId, MissionPhase,
 };
 use crate::oracle::OciOracleRunner;
-use crate::ports::{Clock, SystemClock};
+use crate::ports::{Clock, OracleRunner, SystemClock};
 use crate::runner::OciRoleRunner;
 use crate::store::{BlobStore, MissionStore};
 use crate::workspace;
+use lionclaw_runtime_api::{RuntimeAuthRegistry, RuntimeDriverRegistry};
+
+/// External transports used by the canonical mission-command dispatcher.
+///
+/// The ordinary executable uses [`MissionTransports::production`]. Integration
+/// tests may replace only the native runtime/auth registries and oracle
+/// transport; engine, store, workspace, capture, cleanup, and fold behavior
+/// remain the production implementations selected below.
+#[derive(Clone)]
+pub struct MissionTransports {
+    profiles: Option<RuntimeProfiles>,
+    runtime: Option<(RuntimeDriverRegistry, RuntimeAuthRegistry)>,
+    oracle: Option<Arc<dyn OracleRunner>>,
+}
+
+impl MissionTransports {
+    pub fn production() -> Self {
+        Self {
+            profiles: None,
+            runtime: None,
+            oracle: None,
+        }
+    }
+
+    pub fn external(
+        profiles: RuntimeProfiles,
+        drivers: RuntimeDriverRegistry,
+        auth: RuntimeAuthRegistry,
+        oracle: Arc<dyn OracleRunner>,
+    ) -> Self {
+        Self {
+            profiles: Some(profiles),
+            runtime: Some((drivers, auth)),
+            oracle: Some(oracle),
+        }
+    }
+
+    fn profiles(&self) -> Result<RuntimeProfiles> {
+        self.profiles.clone().map_or_else(runtime_profiles, Ok)
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "lionclaw", about = "LionClaw mission engine")]
@@ -392,12 +433,21 @@ pub struct SelfTestArgs {
 /// Run a command, returning the process exit code (so callers can gate on
 /// e.g. `type check` without the command itself calling `process::exit`).
 pub async fn run(cli: Cli) -> Result<std::process::ExitCode> {
+    run_with_transports(cli, MissionTransports::production()).await
+}
+
+/// Run the same parsed-command dispatcher as the executable while replacing
+/// only transports that cross the process/runtime boundary.
+pub async fn run_with_transports(
+    cli: Cli,
+    transports: MissionTransports,
+) -> Result<std::process::ExitCode> {
     use std::process::ExitCode;
     match cli.command {
         Command::Install(args) => cmd_install(args).await.map(|()| ExitCode::SUCCESS),
         Command::Doctor => cmd_doctor().await,
         Command::Skill(cmd) => cmd_skill(cmd).await.map(|()| ExitCode::SUCCESS),
-        Command::Mission(cmd) => run_mission(cmd).await,
+        Command::Mission(cmd) => run_mission(cmd, &transports).await,
         Command::Man => {
             clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
             Ok(ExitCode::SUCCESS)
@@ -405,13 +455,16 @@ pub async fn run(cli: Cli) -> Result<std::process::ExitCode> {
     }
 }
 
-async fn run_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
+async fn run_mission(
+    cmd: MissionCommand,
+    transports: &MissionTransports,
+) -> Result<std::process::ExitCode> {
     // One error policy for every command: a `--json` command reports failure as
     // a structured `{"ok":false,"error":…}` envelope on stdout and exits 1; a
     // human command lets the error bubble to stderr. Success output is each
     // command's own concern.
     let json = cmd.is_json();
-    match dispatch_mission(cmd).await {
+    match dispatch_mission(cmd, transports).await {
         Ok(code) => Ok(code),
         Err(err) if json => {
             // `{err:#}` renders the full anyhow context chain (outer: cause: …),
@@ -470,12 +523,17 @@ impl TypeCommand {
     }
 }
 
-async fn dispatch_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
+async fn dispatch_mission(
+    cmd: MissionCommand,
+    transports: &MissionTransports,
+) -> Result<std::process::ExitCode> {
     use std::process::ExitCode;
     match cmd {
-        MissionCommand::Start(args) => cmd_start(args).await.map(|()| ExitCode::SUCCESS),
-        MissionCommand::Advance(args) => cmd_advance(args).await,
-        MissionCommand::Driver(args) => cmd_driver(args).await,
+        MissionCommand::Start(args) => cmd_start(args, transports)
+            .await
+            .map(|()| ExitCode::SUCCESS),
+        MissionCommand::Advance(args) => cmd_advance(args, transports).await,
+        MissionCommand::Driver(args) => cmd_driver(args, transports).await,
         MissionCommand::DriverStderr(args) => cmd_driver_stderr(args).await,
         MissionCommand::Status(args) => cmd_status(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Report(args) => cmd_report(args).await.map(|()| ExitCode::SUCCESS),
@@ -483,7 +541,7 @@ async fn dispatch_mission(cmd: MissionCommand) -> Result<std::process::ExitCode>
         MissionCommand::Log(args) => cmd_log(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Inbox(args) => cmd_inbox(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Send(args) => cmd_send(args).await.map(|()| ExitCode::SUCCESS),
-        MissionCommand::Plan(cmd) => cmd_plan(cmd).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Plan(cmd) => cmd_plan(cmd, transports).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Stop(args) => cmd_control(args, false).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Extend(args) => cmd_extend(args).await.map(|()| ExitCode::SUCCESS),
@@ -501,6 +559,7 @@ fn validated_role_profile(
     role: &crate::mission_type::RoleDefinition,
     runtime: &str,
     profiles: &RuntimeProfiles,
+    transports: &MissionTransports,
 ) -> Result<MissionRuntimeProfile> {
     let profile = profiles.get(runtime).with_context(|| {
         format!(
@@ -508,7 +567,7 @@ fn validated_role_profile(
             role.name
         )
     })?;
-    OciRoleRunner::validate_profile(&profile).with_context(|| {
+    validate_runtime_profile(&profile, transports).with_context(|| {
         format!(
             "role '{}' resolves to invalid runtime '{runtime}'",
             role.name
@@ -523,7 +582,7 @@ fn validate_explicit_role_runtimes(
 ) -> Result<()> {
     for role in mission_type.roles.values() {
         if let Some(runtime) = &role.runtime {
-            validated_role_profile(role, runtime, profiles)?;
+            validated_role_profile(role, runtime, profiles, &MissionTransports::production())?;
         }
     }
     Ok(())
@@ -533,14 +592,15 @@ fn validate_mission_runtimes(
     mission_type: &MissionType,
     default_runtime: &str,
     profiles: &RuntimeProfiles,
+    transports: &MissionTransports,
 ) -> Result<MissionRuntimeProfile> {
     let default_profile = profiles.get(default_runtime)?;
-    OciRoleRunner::validate_profile(&default_profile)
+    validate_runtime_profile(&default_profile, transports)
         .with_context(|| format!("default runtime '{default_runtime}' is invalid"))?;
     let default_engine = &default_profile.confinement.oci().engine;
     for role in mission_type.roles.values() {
         let runtime = role.runtime.as_deref().unwrap_or(default_runtime);
-        let profile = validated_role_profile(role, runtime, profiles)?;
+        let profile = validated_role_profile(role, runtime, profiles, transports)?;
         if profile.confinement.oci().engine != *default_engine {
             bail!(
                 "role '{}' resolves to runtime '{}' using OCI engine '{}', but mission default runtime '{}' uses '{}'; one mission requires one OCI engine",
@@ -555,6 +615,18 @@ fn validate_mission_runtimes(
     Ok(default_profile)
 }
 
+fn validate_runtime_profile(
+    profile: &MissionRuntimeProfile,
+    transports: &MissionTransports,
+) -> Result<()> {
+    match &transports.runtime {
+        Some((drivers, auth)) => {
+            OciRoleRunner::validate_profile_with_registries(profile, drivers.clone(), auth.clone())
+        }
+        None => OciRoleRunner::validate_profile(profile),
+    }
+}
+
 /// Build an engine over an open store, a loaded mission type, and a runtime
 /// profile (whose image the caller has already pinned).
 #[allow(clippy::too_many_arguments)]
@@ -567,14 +639,27 @@ async fn assemble_engine(
     profiles: RuntimeProfiles,
     mut default_profile: MissionRuntimeProfile,
     ceiling: AuthorityCeiling,
+    transports: &MissionTransports,
 ) -> Result<Engine> {
     workspace::ensure_excluded(repo).await?;
     default_profile.confinement.oci_mut().image = Some(image_id.clone());
-    let role_runner = Arc::new(OciRoleRunner::new(profiles, image_id.clone(), ceiling));
+    let role_runner = Arc::new(match &transports.runtime {
+        Some((drivers, auth)) => OciRoleRunner::with_registries(
+            profiles,
+            image_id.clone(),
+            ceiling,
+            drivers.clone(),
+            auth.clone(),
+        ),
+        None => OciRoleRunner::new(profiles, image_id.clone(), ceiling),
+    });
     let effect_cleaner = Arc::new(crate::effect_cleanup::LocalEffectCleaner::new(
         default_profile.confinement.oci().engine.clone(),
     ));
-    let oracle_runner = Arc::new(OciOracleRunner::new(default_profile));
+    let oracle_runner: Arc<dyn OracleRunner> = transports
+        .oracle
+        .clone()
+        .unwrap_or_else(|| Arc::new(OciOracleRunner::new(default_profile)));
     Ok(Engine::new(
         store,
         mission_type,
@@ -599,10 +684,11 @@ async fn build_engine_for_start(
     mission_type: MissionType,
     runtime: &str,
     image_override: Option<&str>,
+    transports: &MissionTransports,
 ) -> Result<Engine> {
     let ceiling = AuthorityCeiling::default();
-    let profiles = runtime_profiles()?;
-    let default_profile = validate_mission_runtimes(&mission_type, runtime, &profiles)?;
+    let profiles = transports.profiles()?;
+    let default_profile = validate_mission_runtimes(&mission_type, runtime, &profiles, transports)?;
     let engine = default_profile.confinement.oci().engine.clone();
     let image_ref = start_image_ref(&mission_type.image, image_override);
     let image_id =
@@ -618,6 +704,7 @@ async fn build_engine_for_start(
         profiles,
         default_profile,
         ceiling,
+        transports,
     )
     .await
 }
@@ -631,12 +718,14 @@ async fn build_engine_for_mission(
     store: MissionStore,
     repo: &Path,
     mission_id: &MissionId,
+    transports: &MissionTransports,
 ) -> Result<Engine> {
     let state = store.require_state(mission_id).await?;
     let ceiling = AuthorityCeiling::default();
     let mission_type = load_mission_type_snapshot(&store, mission_id, &ceiling)?;
-    let profiles = runtime_profiles()?;
-    let default_profile = validate_mission_runtimes(&mission_type, &state.runtime, &profiles)?;
+    let profiles = transports.profiles()?;
+    let default_profile =
+        validate_mission_runtimes(&mission_type, &state.runtime, &profiles, transports)?;
     let engine = assemble_engine(
         store,
         repo,
@@ -646,6 +735,7 @@ async fn build_engine_for_mission(
         profiles,
         default_profile,
         ceiling,
+        transports,
     )
     .await?;
     // Verify the pinned mission-type digest before anything runs.
@@ -727,7 +817,7 @@ fn read_json_arg<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_str(&text).context("invalid JSON")
 }
 
-async fn cmd_start(args: StartArgs) -> Result<()> {
+async fn cmd_start(args: StartArgs, transports: &MissionTransports) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
     let base_sha = workspace::head_sha(&repo).await?;
     let workspace_dir = repo.to_string_lossy();
@@ -746,6 +836,7 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
             mission_type,
             &args.runtime,
             args.image.as_deref(),
+            transports,
         )
         .await?;
         engine
@@ -861,10 +952,10 @@ async fn cmd_inbox(args: InboxArgs) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_plan(command: PlanCommand) -> Result<()> {
+async fn cmd_plan(command: PlanCommand, transports: &MissionTransports) -> Result<()> {
     match command {
         PlanCommand::Show(args) => cmd_plan_show(args).await,
-        PlanCommand::Propose(args) => cmd_plan_propose(args).await,
+        PlanCommand::Propose(args) => cmd_plan_propose(args, transports).await,
     }
 }
 
@@ -931,10 +1022,10 @@ async fn cmd_plan_show(args: PlanShowArgs) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_plan_propose(args: PlanProposeArgs) -> Result<()> {
+async fn cmd_plan_propose(args: PlanProposeArgs, transports: &MissionTransports) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
+    let engine = build_engine_for_mission(store, &repo, &mission_id, transports).await?;
     let proposal = read_json_arg(&args.file)?;
     engine
         .propose_plan(&mission_id, proposal)
@@ -1730,7 +1821,10 @@ async fn wait_for_existing_driver(store: &MissionStore, mission_id: &MissionId) 
     Ok(())
 }
 
-async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
+async fn cmd_advance(
+    args: AdvanceArgs,
+    transports: &MissionTransports,
+) -> Result<std::process::ExitCode> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let initial = load_mission_view(&store, &mission_id).await?;
@@ -1784,7 +1878,7 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
             wait_for_existing_driver(&store, &mission_id).await?;
         }
     }
-    let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
+    let engine = build_engine_for_mission(store, &repo, &mission_id, transports).await?;
     let view = load_mission_view(engine.store(), &mission_id).await?;
     let state = &view.state;
     print_mission_view(&view, engine.store(), args.json).await?;
@@ -1833,13 +1927,16 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     })
 }
 
-async fn cmd_driver(args: DriverArgs) -> Result<std::process::ExitCode> {
+async fn cmd_driver(
+    args: DriverArgs,
+    transports: &MissionTransports,
+) -> Result<std::process::ExitCode> {
     let mission_id = MissionId::parse(&args.mission_id)?;
     let store = MissionStore::open(&args.repo).await?;
     let mission_dir = store.mission_dir(&mission_id);
     crate::activity::clear_driver_error(&mission_dir)?;
     let result = async {
-        let engine = build_engine_for_mission(store, &args.repo, &mission_id).await?;
+        let engine = build_engine_for_mission(store, &args.repo, &mission_id, transports).await?;
         engine
             .advance_with_handshake(&mission_id, Some(&args.handshake))
             .await?;
@@ -3196,6 +3293,7 @@ mod tests {
             &mission_type_with_runtime(Some("missing")),
             "default",
             &profiles,
+            &MissionTransports::production(),
         )
         .expect_err("unknown role runtime");
         assert!(
@@ -3225,6 +3323,7 @@ mod tests {
             &mission_type_with_runtime(Some("other")),
             "default",
             &profiles,
+            &MissionTransports::production(),
         )
         .expect_err("mixed OCI engines");
         assert!(err
@@ -3244,8 +3343,13 @@ mod tests {
             Path::new("/home/alice"),
         )
         .expect("profiles");
-        let err = validate_mission_runtimes(&mission_type_with_runtime(None), "bad", &profiles)
-            .expect_err("incompatible auth");
+        let err = validate_mission_runtimes(
+            &mission_type_with_runtime(None),
+            "bad",
+            &profiles,
+            &MissionTransports::production(),
+        )
+        .expect_err("incompatible auth");
         assert!(
             err.to_string().contains("default runtime 'bad' is invalid"),
             "got {err:#}"
