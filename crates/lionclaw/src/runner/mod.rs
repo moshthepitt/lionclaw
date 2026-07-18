@@ -116,6 +116,41 @@ pub struct TaskDirs {
     pub observer_index: PathBuf,
 }
 
+/// Mission-private resources retained for one stable role instance. This tree
+/// is intentionally outside `effects/`, so effect cleanup cannot erase native
+/// session or checkout continuity.
+pub struct ConversationDirs {
+    pub root: PathBuf,
+    pub work: PathBuf,
+    pub scratch: PathBuf,
+    pub observer_index: PathBuf,
+    pub runtime: PathBuf,
+}
+
+impl ConversationDirs {
+    pub fn prepare(
+        state_dir: &Path,
+        mission_id: &str,
+        conversation_id: &crate::model::ConversationId,
+    ) -> std::io::Result<Self> {
+        let root = state_dir
+            .join("missions")
+            .join(mission_id)
+            .join("conversations")
+            .join(conversation_id.as_str());
+        let dirs = Self {
+            work: root.join("work"),
+            scratch: root.join("scratch"),
+            observer_index: root.join("observer.index"),
+            runtime: root.join("runtime"),
+            root,
+        };
+        std::fs::create_dir_all(&dirs.scratch)?;
+        std::fs::create_dir_all(&dirs.runtime)?;
+        Ok(dirs)
+    }
+}
+
 impl TaskDirs {
     pub fn new(state_dir: &Path, mission_id: &str, task_id: &TaskId) -> Self {
         let root = state_dir
@@ -300,5 +335,41 @@ mod control_tests {
             failure.evidence().stop_reason.as_deref(),
             Some("already recorded")
         );
+    }
+}
+
+#[cfg(test)]
+mod conversation_dir_tests {
+    use super::*;
+
+    #[test]
+    fn conversation_resources_are_stable_and_outside_effect_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let mission = crate::model::MissionId::for_creation("/workspace", "test", 1);
+        let task = crate::model::TaskId::new("worker").unwrap();
+        let role = crate::model::RoleName::new("implementer").unwrap();
+        let id = crate::model::ConversationId::for_role_instance(
+            &mission,
+            crate::model::TaskNamespace::Execution,
+            &task,
+            &role,
+            1,
+        );
+        let first = ConversationDirs::prepare(root.path(), mission.as_str(), &id).unwrap();
+        let second = ConversationDirs::prepare(root.path(), mission.as_str(), &id).unwrap();
+
+        assert_eq!(first.root, second.root);
+        assert!(first.root.starts_with(
+            root.path()
+                .join("missions")
+                .join(mission.as_str())
+                .join("conversations")
+        ));
+        assert!(!first
+            .root
+            .components()
+            .any(|part| part.as_os_str() == "effects"));
+        assert!(first.runtime.is_dir());
+        assert!(first.scratch.is_dir());
     }
 }

@@ -15,6 +15,7 @@ const DEFAULT_RUNTIMES_TOML: &str = r#"
 [runtimes.codex]
 driver = "codex"
 command = "codex"
+native-resume = true
 auth = "codex"
 skills-dir = ".agents/skills"
 confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
@@ -51,6 +52,8 @@ pub struct MissionRuntimeProfile {
     pub mode: Option<String>,
     pub auth: Option<RuntimeAuthConfig>,
     pub skills_dir: Option<RuntimeSkillsDir>,
+    /// Whether this profile can retain and reopen a native conversation.
+    pub native_resume: bool,
     pub confinement: ConfinementConfig,
 }
 
@@ -181,6 +184,8 @@ struct RuntimeProfileFile {
     auth: Option<RuntimeAuthConfigFile>,
     #[serde(default)]
     skills_dir: Option<PathBuf>,
+    #[serde(default)]
+    native_resume: bool,
     #[serde(default = "default_confinement")]
     confinement: ConfinementConfig,
 }
@@ -248,6 +253,7 @@ impl RuntimeProfileFile {
             mode: self.mode,
             auth,
             skills_dir,
+            native_resume: self.native_resume,
             confinement: self.confinement,
         })
     }
@@ -427,6 +433,27 @@ mod tests {
             profiles.get("example").unwrap().mode.as_deref(),
             Some("autonomous")
         );
+    }
+
+    #[test]
+    fn native_resume_is_profile_declared_and_defaults_to_reconstruction() {
+        let profiles = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.native]
+            driver = "acp"
+            command = "native"
+            native-resume = true
+
+            [runtimes.reconstructed]
+            driver = "acp"
+            command = "reconstructed"
+            "#,
+            Path::new("/home/alice"),
+        )
+        .expect("profiles");
+
+        assert!(profiles.get("native").unwrap().native_resume);
+        assert!(!profiles.get("reconstructed").unwrap().native_resume);
     }
 
     #[test]

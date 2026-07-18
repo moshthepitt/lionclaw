@@ -54,26 +54,6 @@ fn work_outcome(request: &RoleRunRequest) -> RoleRunOutcome {
     }
 }
 
-/// Extract the `## Assigned skills` section from a prompt (up to the next
-/// `## ` heading or end of prompt). Returns an empty string if absent.
-fn assigned_skill_section(prompt: &str) -> &str {
-    let start = prompt.find("## Assigned skills").map(|i| {
-        // Skip past the heading line.
-        let after = &prompt[i..];
-        after.find('\n').map(|n| i + n + 1).unwrap_or(prompt.len())
-    });
-    let Some(start) = start else {
-        return "";
-    };
-    let rest = &prompt[start..];
-    // The section ends at the next `## ` heading.
-    let end = rest
-        .find("\n## ")
-        .map(|e| start + e)
-        .unwrap_or(prompt.len());
-    &prompt[start..end]
-}
-
 async fn persisted_prompt(
     engine: &Engine,
     mission_id: &lionclaw::model::MissionId,
@@ -106,24 +86,6 @@ async fn persisted_prompt(
 fn assert_no_skill_section(prompt: &str) {
     assert!(!prompt.contains("## Assigned skills"));
     assert!(!prompt.contains("LionClaw mounted"));
-}
-
-fn assert_skill_section(prompt: &str, skills: &[(&str, &str)], schema: &str) {
-    assert_eq!(prompt.matches("## Assigned skills").count(), 1);
-    assert_eq!(prompt.matches("LionClaw mounted").count(), 1);
-    let section = assigned_skill_section(prompt);
-    for (name, description) in skills {
-        assert_eq!(section.matches(name).count(), 1, "skill name {name}");
-        assert_eq!(
-            section.matches(description).count(),
-            1,
-            "skill description {description}"
-        );
-    }
-    assert!(!section.contains("lionclaw.mission."));
-    assert!(!section.contains("\"schema\""));
-    assert!(!section.contains("handoff.json"));
-    assert_eq!(prompt.matches(schema).count(), 1);
 }
 
 /// Write a real SKILL.md with a description into `dir/skills/<name>/SKILL.md`.
@@ -228,7 +190,7 @@ fn execution_mission_type(
 }
 
 #[tokio::test]
-async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
+async fn execution_prompt_leaves_assigned_skills_to_native_loading() {
     let dir = tempfile::tempdir().unwrap();
     common::initialize_repository(dir.path());
     let (mission_type, _skills) = execution_mission_type(dir.path());
@@ -260,18 +222,13 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
 
     let prompt = persisted_prompt(&engine, &mission_id, "implementer").await;
 
-    assert_skill_section(
-        &prompt,
-        &[
-            ("zebra-skill", "Zebra comes first in declaration"),
-            ("alpha-skill", "Alpha comes second in declaration"),
-        ],
-        "lionclaw.mission.work-handoff.v2",
+    assert_no_skill_section(&prompt);
+    assert!(!prompt.contains("zebra-skill"));
+    assert!(!prompt.contains("alpha-skill"));
+    assert_eq!(
+        prompt.matches("lionclaw.mission.work-handoff.v2").count(),
+        1
     );
-    // Declaration order: zebra before alpha (NOT BTreeMap order where alpha < zebra).
-    let zebra_pos = prompt.find("zebra-skill").unwrap();
-    let alpha_pos = prompt.find("alpha-skill").unwrap();
-    assert!(zebra_pos < alpha_pos, "declaration order must be preserved");
     // The assigned-skill section is bounded — no handoff JSON, schema, or
     // completion-tool prose inside it.
 }
@@ -462,7 +419,7 @@ fn proposed_plan() -> PlanProposal {
 }
 
 #[tokio::test]
-async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
+async fn planning_prompt_leaves_assigned_skills_to_native_loading() {
     let dir = tempfile::tempdir().unwrap();
     let mission_type = planning_mission_type(dir.path());
 
@@ -507,10 +464,11 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
     engine.advance(&mission_id).await.unwrap();
 
     let prompt = persisted_prompt(&engine, &mission_id, "strategist").await;
-    assert_skill_section(
-        &prompt,
-        &[("planning-method", "A methodical planning approach")],
-        "lionclaw.mission.work-handoff.v2",
+    assert_no_skill_section(&prompt);
+    assert!(!prompt.contains("planning-method"));
+    assert_eq!(
+        prompt.matches("lionclaw.mission.work-handoff.v2").count(),
+        1
     );
 }
 
@@ -567,7 +525,7 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
 // ---- Terminal-review path ----
 
 #[tokio::test]
-async fn terminal_review_prompt_lists_assigned_skills() {
+async fn terminal_review_prompt_leaves_assigned_skills_to_native_loading() {
     let dir = tempfile::tempdir().unwrap();
     let skill_root = write_skill(dir.path(), "gap-check", "Hunt gaps in the product");
 
@@ -628,10 +586,11 @@ async fn terminal_review_prompt_lists_assigned_skills() {
     h.engine.advance(&mission_id).await.unwrap();
 
     let prompt = persisted_prompt(&h.engine, &mission_id, "gap-reviewer").await;
-    assert_skill_section(
-        &prompt,
-        &[("gap-check", "Hunt gaps in the product")],
-        "lionclaw.mission.review-handoff.v2",
+    assert_no_skill_section(&prompt);
+    assert!(!prompt.contains("gap-check"));
+    assert_eq!(
+        prompt.matches("lionclaw.mission.review-handoff.v2").count(),
+        1
     );
 }
 

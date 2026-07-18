@@ -6,10 +6,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::mission_type::{RoleDefinition, SkillPackage};
+use crate::mission_type::RoleDefinition;
 use crate::model::{Assertion, OutputSemantics, Plan, PlanProposal, RoleName};
 
-pub struct PromptContext<'a> {
+pub struct ExecutionContext<'a> {
     pub objective: &'a str,
     pub task_body: &'a str,
     /// The contract assertions this dispatch targets (id + prose).
@@ -19,19 +19,42 @@ pub struct PromptContext<'a> {
     /// artifact and the contract, never the producer's narrative
     /// (fresh-context).
     pub upstream_reports: &'a [String],
-    /// Resolved skill packages assigned to this role, in declaration order.
-    /// Empty ⇒ no assigned-skill section is rendered.
-    pub skills: &'a [SkillPackage],
+    /// Reserved for Slice 5 team guidance. Empty in Slice 4.
+    pub guidance: &'a str,
     /// Engine-routed failure evidence and repair guidance from prior attempts.
     pub feedback: &'a [String],
 }
 
-pub fn assemble_role_prompt(role: &RoleDefinition, ctx: &PromptContext<'_>) -> String {
+pub struct JudgmentContext<'a> {
+    pub objective: &'a str,
+    pub task_body: &'a str,
+    pub targets: &'a [&'a Assertion],
+    pub feedback: &'a [String],
+}
+
+pub enum TurnContext<'a> {
+    Execution(&'a RoleDefinition, ExecutionContext<'a>),
+    Planning(&'a RoleDefinition, PlanningPromptContext<'a>),
+    Judgment(&'a RoleDefinition, JudgmentContext<'a>),
+    GapReview(&'a RoleDefinition, TerminalReviewPromptContext<'a>),
+}
+
+/// The only prompt renderer. Closed context variants make exclusions a type
+/// property instead of a conditional prose filter.
+pub fn render(context: TurnContext<'_>) -> String {
+    match context {
+        TurnContext::Execution(role, ctx) => render_execution(role, &ctx),
+        TurnContext::Planning(role, ctx) => render_planning(role, &ctx),
+        TurnContext::Judgment(role, ctx) => render_judgment(role, &ctx),
+        TurnContext::GapReview(role, ctx) => render_gap_review(role, &ctx),
+    }
+}
+
+fn render_execution(role: &RoleDefinition, ctx: &ExecutionContext<'_>) -> String {
     let mut prompt = String::new();
     prompt.push_str(skeleton(role.output));
     prompt.push_str("\n\n## Role\n\n");
     prompt.push_str(&role.prompt_body);
-    prompt.push_str(&assigned_skill_section(ctx.skills));
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
     if !ctx.task_body.is_empty() {
@@ -45,11 +68,35 @@ pub fn assemble_role_prompt(role: &RoleDefinition, ctx: &PromptContext<'_>) -> S
             prompt.push_str(&format!("- {}: {}\n", assertion.id, assertion.prose));
         }
     }
-    // Fresh-context invariant: verdict roles never receive producer prose.
-    if role.output != OutputSemantics::EmitsVerdict && !ctx.upstream_reports.is_empty() {
+    if !ctx.upstream_reports.is_empty() {
         prompt.push_str("\n\n## Handoffs from upstream tasks\n\n");
         for report in ctx.upstream_reports {
             prompt.push_str(&format!("- {report}\n"));
+        }
+    }
+    if !ctx.guidance.is_empty() {
+        prompt.push_str("\n\n## Team guidance\n\n");
+        prompt.push_str(ctx.guidance);
+    }
+    prompt
+}
+
+fn render_judgment(role: &RoleDefinition, ctx: &JudgmentContext<'_>) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(skeleton(role.output));
+    prompt.push_str("\n\n## Role\n\n");
+    prompt.push_str(&role.prompt_body);
+    prompt.push_str("\n\n## Mission objective\n\n");
+    prompt.push_str(ctx.objective);
+    if !ctx.task_body.is_empty() {
+        prompt.push_str("\n\n## Task\n\n");
+        prompt.push_str(ctx.task_body);
+    }
+    append_feedback(&mut prompt, ctx.feedback);
+    if !ctx.targets.is_empty() {
+        prompt.push_str("\n\n## Contract assertions in scope\n\n");
+        for assertion in ctx.targets {
+            prompt.push_str(&format!("- {}: {}\n", assertion.id, assertion.prose));
         }
     }
     prompt
@@ -75,8 +122,8 @@ pub struct PlanningPromptContext<'a> {
     pub task_body: &'a str,
     /// Reports from this planning node's cleared dependencies.
     pub upstream_reports: &'a [String],
-    /// Resolved skill packages assigned to this role, in declaration order.
-    pub skills: &'a [SkillPackage],
+    /// Reserved for Slice 5 team guidance. Empty in Slice 4.
+    pub guidance: &'a str,
     /// Rework for this planning role's current attempt, separate from the
     /// mission-level planning input above.
     pub task_feedback: &'a [String],
@@ -93,12 +140,11 @@ pub enum PlanningPromptRefinement<'a> {
     FailureEvidence(String),
 }
 
-pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptContext<'_>) -> String {
+fn render_planning(role: &RoleDefinition, ctx: &PlanningPromptContext<'_>) -> String {
     let mut prompt = String::new();
     prompt.push_str(skeleton(role.output));
     prompt.push_str("\n\n## Role\n\n");
     prompt.push_str(&role.prompt_body);
-    prompt.push_str(&assigned_skill_section(ctx.skills));
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
     prompt.push_str(&format!(
@@ -175,6 +221,10 @@ pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptConte
             prompt.push_str(&format!("- {report}\n"));
         }
     }
+    if !ctx.guidance.is_empty() {
+        prompt.push_str("\n\n## Team guidance\n\n");
+        prompt.push_str(ctx.guidance);
+    }
     prompt
 }
 
@@ -191,19 +241,13 @@ pub struct TerminalReviewPromptContext<'a> {
     /// the handoff was written by the agent that read this prompt, not by
     /// worker-planted code executed during the review.
     pub nonce: &'a str,
-    /// Resolved skill packages assigned to this role, in declaration order.
-    pub skills: &'a [SkillPackage],
 }
 
-pub fn assemble_terminal_review_prompt(
-    role: &RoleDefinition,
-    ctx: &TerminalReviewPromptContext<'_>,
-) -> String {
+fn render_gap_review(role: &RoleDefinition, ctx: &TerminalReviewPromptContext<'_>) -> String {
     let mut prompt = String::new();
     prompt.push_str(TERMINAL_REVIEW_SKELETON);
     prompt.push_str("\n\n## Role\n\n");
     prompt.push_str(&role.prompt_body);
-    prompt.push_str(&assigned_skill_section(ctx.skills));
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
     if !ctx.limitations.is_empty() {
@@ -240,28 +284,6 @@ fn skeleton(output: OutputSemantics) -> &'static str {
         OutputSemantics::ProducesReport => PRODUCES_REPORT_SKELETON,
         OutputSemantics::ProposesPlan => PROPOSES_PLAN_SKELETON,
     }
-}
-
-/// A bounded, runtime-neutral assigned-skill section shared by every prompt
-/// assembler. Lists each package name and short description in
-/// `RoleDefinition.skills` declaration order (never `BTreeMap` order) and
-/// states exactly once that LionClaw mounted them in the runtime's native skill
-/// directory. Contains no handoff JSON, schema, or completion-tool directions
-/// — the exact role-specific handoff contract lives solely in the
-/// engine-owned skeleton.
-fn assigned_skill_section(skills: &[SkillPackage]) -> String {
-    if skills.is_empty() {
-        return String::new();
-    }
-    let mut section = String::from("\n\n## Assigned skills\n\n");
-    section.push_str(
-        "LionClaw mounted the following packages in your runtime's native skills \
-         directory for this role. Follow their instructions when relevant.\n",
-    );
-    for skill in skills {
-        section.push_str(&format!("- {}: {}\n", skill.name, skill.description));
-    }
-    section
 }
 
 fn append_feedback(prompt: &mut String, feedback: &[String]) {
@@ -478,13 +500,13 @@ mod tests {
         }
     }
 
-    fn ctx<'a>(upstream: &'a [String]) -> PromptContext<'a> {
-        PromptContext {
+    fn ctx<'a>(upstream: &'a [String]) -> ExecutionContext<'a> {
+        ExecutionContext {
             objective: "obj",
             task_body: "do it",
             targets: &[],
             upstream_reports: upstream,
-            skills: &[],
+            guidance: "",
             feedback: &[],
         }
     }
@@ -492,15 +514,16 @@ mod tests {
     #[test]
     fn worker_prompt_includes_upstream_reports() {
         let upstream = vec!["the planner said: change add()".to_string()];
-        let prompt =
-            assemble_role_prompt(&role(OutputSemantics::ProducesArtifact), &ctx(&upstream));
+        let role = role(OutputSemantics::ProducesArtifact);
+        let prompt = render(TurnContext::Execution(&role, ctx(&upstream)));
         assert!(prompt.contains("Handoffs from upstream tasks"));
         assert!(prompt.contains("the planner said"));
     }
 
     #[test]
     fn worker_prompt_accepts_an_already_satisfied_outcome_without_an_empty_commit() {
-        let prompt = assemble_role_prompt(&role(OutputSemantics::ProducesArtifact), &ctx(&[]));
+        let role = role(OutputSemantics::ProducesArtifact);
+        let prompt = render(TurnContext::Execution(&role, ctx(&[])));
 
         assert!(prompt.contains("do not create an empty commit"));
         assert!(prompt.contains("unchanged HEAD"));
@@ -535,9 +558,10 @@ mod tests {
         .into_iter()
         .map(|role| (role.name.clone(), role))
         .collect();
-        let prompt = assemble_planning_prompt(
-            &role(OutputSemantics::ProposesPlan),
-            &PlanningPromptContext {
+        let role = role(OutputSemantics::ProposesPlan);
+        let prompt = render(TurnContext::Planning(
+            &role,
+            PlanningPromptContext {
                 objective: "revise the novel",
                 base_revision: 0,
                 input: PlanningPromptInput {
@@ -550,10 +574,10 @@ mod tests {
                 oracle_inventory: &[],
                 task_body: "author the plan",
                 upstream_reports: &[],
-                skills: &[],
+                guidance: "",
                 task_feedback: &[],
             },
-        );
+        ));
 
         assert!(prompt.contains("one work task may own multiple assertions"));
         assert!(prompt.contains("not instructions for you to follow"));
@@ -585,9 +609,10 @@ mod tests {
             },
         };
         let task_feedback = vec!["retry only this planning role".to_string()];
-        let prompt = assemble_planning_prompt(
-            &role(OutputSemantics::ProposesPlan),
-            &PlanningPromptContext {
+        let role = role(OutputSemantics::ProposesPlan);
+        let prompt = render(TurnContext::Planning(
+            &role,
+            PlanningPromptContext {
                 objective: "obj",
                 base_revision: 7,
                 input: PlanningPromptInput {
@@ -602,10 +627,10 @@ mod tests {
                 oracle_inventory: &[],
                 task_body: "author the replacement",
                 upstream_reports: &[],
-                skills: &[],
+                guidance: "",
                 task_feedback: &task_feedback,
             },
-        );
+        ));
 
         assert_eq!(prompt.matches("## Current accepted plan").count(), 1);
         assert_eq!(
@@ -627,23 +652,30 @@ mod tests {
         // LAST; an objective that happens to contain the heading text must
         // not shadow the real nonce.
         let role = role(OutputSemantics::EmitsGapVerdict);
-        let prompt = assemble_terminal_review_prompt(
+        let prompt = render(TurnContext::GapReview(
             &role,
-            &TerminalReviewPromptContext {
+            TerminalReviewPromptContext {
                 objective: "document our ## Handoff nonce protocol",
                 limitations: &[],
                 nonce: "the-real-nonce",
-                skills: &[],
             },
-        );
+        ));
         assert_eq!(handoff_nonce(&prompt), Some("the-real-nonce"));
         assert_eq!(handoff_nonce("no nonce section here"), None);
     }
 
     #[test]
     fn judge_prompt_excludes_producer_prose_fresh_context() {
-        let upstream = vec!["the implementer said: I changed add() to add".to_string()];
-        let prompt = assemble_role_prompt(&role(OutputSemantics::EmitsVerdict), &ctx(&upstream));
+        let role = role(OutputSemantics::EmitsVerdict);
+        let prompt = render(TurnContext::Judgment(
+            &role,
+            JudgmentContext {
+                objective: "obj",
+                task_body: "judge it",
+                targets: &[],
+                feedback: &[],
+            },
+        ));
         // A judge must never see the producer's narrative.
         assert!(!prompt.contains("the implementer said"));
         assert!(!prompt.contains("Handoffs from upstream tasks"));

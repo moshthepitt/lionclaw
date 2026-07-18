@@ -29,7 +29,9 @@ use crate::ports::{ExecutionControl, RoleRunOutcome, RoleRunRequest, RoleRunner}
 use super::executor::{mission_execution_context, MissionProgramExecutor};
 use super::handoff::read_handoff;
 use super::native_home_auth::NativeHomeAuthProvider;
-use super::{await_controlled, prepare_skill_mounts, EffectDirs, TaskDirs, SCRATCH_MOUNT_TARGET};
+use super::{
+    await_controlled, prepare_skill_mounts, ConversationDirs, EffectDirs, SCRATCH_MOUNT_TARGET,
+};
 use crate::workspace;
 
 pub struct OciRoleRunner {
@@ -323,6 +325,27 @@ impl RoleRunner for OciRoleRunner {
             }
         }
         let profile = self.profile(&request.runtime)?;
+        let namespace = match request.role.output {
+            OutputSemantics::ProposesPlan | OutputSemantics::ProducesReport => {
+                crate::model::TaskNamespace::Planning
+            }
+            OutputSemantics::ProducesArtifact
+            | OutputSemantics::EmitsVerdict
+            | OutputSemantics::EmitsGapVerdict => crate::model::TaskNamespace::Execution,
+        };
+        let conversation_id = crate::model::ConversationId::for_role_instance(
+            &request.mission_id,
+            namespace,
+            &request.task_id,
+            &request.role.name,
+            request.assignment_epoch,
+        );
+        let conversation_dirs = ConversationDirs::prepare(
+            &request.state_dir,
+            request.mission_id.as_str(),
+            &conversation_id,
+        )
+        .map_err(|e| launch(format!("failed to prepare conversation dirs: {e}")))?;
 
         let dirs = EffectDirs::prepare(
             &request.state_dir,
@@ -345,21 +368,15 @@ impl RoleRunner for OciRoleRunner {
                 let capture = request.artifact_capture.as_ref().ok_or_else(|| {
                     launch("artifact-producing role has no capture authority".into())
                 })?;
-                let task_dirs = TaskDirs::prepare(
-                    &request.state_dir,
-                    request.mission_id.as_str(),
-                    &request.task_id,
-                )
-                .map_err(|e| launch(format!("failed to prepare task dirs: {e}")))?;
-                if capture.checkout_dir() != task_dirs.work {
+                if capture.checkout_dir() != conversation_dirs.work {
                     return Err(launch(
                         "artifact capture authority names a different task checkout".into(),
                     ));
                 }
                 (
                     capture.checkout_dir().to_path_buf(),
-                    task_dirs.scratch.clone(),
-                    Some(task_dirs.observer_index.clone()),
+                    conversation_dirs.scratch.clone(),
+                    Some(conversation_dirs.observer_index.clone()),
                 )
             } else {
                 if request.artifact_capture.is_some() {
@@ -367,7 +384,11 @@ impl RoleRunner for OciRoleRunner {
                         "read-only role received artifact capture authority".into(),
                     ));
                 }
-                (dirs.root.join("work"), dirs.read_scratch.clone(), None)
+                (
+                    conversation_dirs.work.clone(),
+                    conversation_dirs.scratch.clone(),
+                    None,
+                )
             };
             {
                 let _guard = self.repo_lock.lock().await;
@@ -402,6 +423,12 @@ impl RoleRunner for OciRoleRunner {
             // the verdict is about (only meaningful for verdict roles, but the
             // predicate is applied uniformly).
             let mut extras = dirs.effect_mounts(&scratch_source);
+            if let Some(runtime) = extras
+                .iter_mut()
+                .find(|mount| mount.target == lionclaw_confinement::RUNTIME_MOUNT_TARGET)
+            {
+                runtime.source = conversation_dirs.runtime.clone();
+            }
             extras.extend(skill_mounts);
             let environment = mission_environment(&dirs);
             let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
@@ -513,19 +540,29 @@ impl OciRoleRunner {
         let context = mission_execution_context(&plan)
             .map_err(|e| launch(format!("execution context failed: {e}")))?;
 
-        let state_root = plan
-            .mounts
-            .iter()
-            .find(|m| m.target == lionclaw_confinement::RUNTIME_MOUNT_TARGET)
-            .map(|m| m.source.clone());
+        let state_root = profile
+            .native_resume
+            .then(|| {
+                plan.mounts
+                    .iter()
+                    .find(|m| m.target == lionclaw_confinement::RUNTIME_MOUNT_TARGET)
+                    .map(|m| m.source.clone())
+            })
+            .flatten();
+        let runtime_session_ready = state_root
+            .as_deref()
+            .map(RuntimeSessionReady::from_runtime_state_root)
+            .transpose()
+            .map_err(|e| launch(format!("native session state invalid: {e}")))?
+            .unwrap_or_else(RuntimeSessionReady::not_ready);
         let start = async {
             adapter
                 .session_start(RuntimeSessionStartInput {
                     session_id: uuid_from_key(request.effect_id.as_str()),
                     working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
                     environment: plan.environment.clone(),
-                    runtime_state_root: state_root,
-                    runtime_session_ready: RuntimeSessionReady::not_ready(),
+                    runtime_state_root: state_root.clone(),
+                    runtime_session_ready,
                 })
                 .await
                 .map_err(|e| launch(format!("session_start failed: {e}")))
@@ -650,7 +687,17 @@ impl OciRoleRunner {
                 failure,
                 &fallback_final_response,
             )),
-            Ok(result) => validate_completed_turn(profile, result),
+            Ok(result) => {
+                let result = validate_completed_turn(profile, result)?;
+                if let Some(root) = state_root {
+                    std::fs::write(
+                        root.join(lionclaw_runtime_api::RUNTIME_SESSION_READY_MARKER),
+                        b"ready\n",
+                    )
+                    .map_err(|e| launch(format!("failed to commit native session state: {e}")))?;
+                }
+                Ok(result)
+            }
         }
     }
 }

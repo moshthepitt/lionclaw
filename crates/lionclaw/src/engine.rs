@@ -28,11 +28,10 @@ use crate::ports::{
     OracleRunRequest, OracleRunner, RoleRunRequest, RoleRunUpdate, RoleRunner,
 };
 use crate::prompt::{
-    assemble_planning_prompt, assemble_role_prompt, assemble_terminal_review_prompt,
-    PlanningPromptContext, PlanningPromptInput, PlanningPromptRefinement, PromptContext,
-    TerminalReviewPromptContext,
+    render, ExecutionContext, JudgmentContext, PlanningPromptContext, PlanningPromptInput,
+    PlanningPromptRefinement, TerminalReviewPromptContext, TurnContext,
 };
-use crate::runner::{TaskDirs, MAX_HANDOFF_REPORT_BYTES};
+use crate::runner::MAX_HANDOFF_REPORT_BYTES;
 use crate::store::{AppendError, MissionStore, NewEvent};
 
 pub struct Engine {
@@ -1032,12 +1031,21 @@ impl Engine {
         let (updates, update_rx) = tokio::sync::mpsc::channel(8);
         let artifact_capture =
             (*output == crate::model::OutputSemantics::ProducesArtifact).then(|| {
-                let checkout = TaskDirs::new(
-                    self.store.lionclaw_dir(),
-                    state.mission_id.as_str(),
+                let conversation_id = crate::model::ConversationId::for_role_instance(
+                    &state.mission_id,
+                    *namespace,
                     task_id,
-                )
-                .work;
+                    role_name,
+                    *assignment_epoch,
+                );
+                let checkout = self
+                    .store
+                    .lionclaw_dir()
+                    .join("missions")
+                    .join(state.mission_id.as_str())
+                    .join("conversations")
+                    .join(conversation_id.as_str())
+                    .join("work");
                 ArtifactCapture::new(
                     state.workspace_dir.clone().into(),
                     checkout,
@@ -1461,19 +1469,30 @@ impl Engine {
             .map(|runtime| self.resolve_task_feedback(runtime))
             .transpose()?
             .unwrap_or_default();
-        let skills = self.resolve_role_skills(role).map_err(anyhow::Error::msg)?;
-        let prompt = assemble_role_prompt(
-            role,
-            &PromptContext {
-                objective: &state.objective,
-                task_body: &intent.body,
-                targets: &targets,
-                upstream_reports: &upstream_reports,
-                skills: &skills,
-                feedback: &feedback,
-            },
-        );
-        Ok(prompt)
+        let context = if role.output == crate::model::OutputSemantics::EmitsVerdict {
+            TurnContext::Judgment(
+                role,
+                JudgmentContext {
+                    objective: &state.objective,
+                    task_body: &intent.body,
+                    targets: &targets,
+                    feedback: &feedback,
+                },
+            )
+        } else {
+            TurnContext::Execution(
+                role,
+                ExecutionContext {
+                    objective: &state.objective,
+                    task_body: &intent.body,
+                    targets: &targets,
+                    upstream_reports: &upstream_reports,
+                    guidance: "",
+                    feedback: &feedback,
+                },
+            )
+        };
+        Ok(render(context))
     }
 
     /// Assemble a planning role's prompt. Threads the mission type's playbook
@@ -1507,10 +1526,9 @@ impl Engine {
             .keys()
             .map(|o| o.as_str().to_string())
             .collect();
-        let skills = self.resolve_role_skills(role).map_err(anyhow::Error::msg)?;
-        let prompt = assemble_planning_prompt(
+        let prompt = render(TurnContext::Planning(
             role,
-            &PlanningPromptContext {
+            PlanningPromptContext {
                 objective: &state.objective,
                 base_revision: state.planning_base_revision.unwrap_or(state.revision),
                 input: planning_input,
@@ -1519,10 +1537,10 @@ impl Engine {
                 oracle_inventory: &oracle_inventory,
                 task_body: &intent.body,
                 upstream_reports: &upstream_reports,
-                skills: &skills,
+                guidance: "",
                 task_feedback: &task_feedback,
             },
-        );
+        ));
         Ok(prompt)
     }
 
@@ -1656,7 +1674,6 @@ impl Engine {
         // worker-planted code, which is the exact forgery this token defeats.
         #[expect(clippy::disallowed_methods)]
         let nonce = uuid::Uuid::new_v4().simple().to_string();
-        let skills = self.resolve_role_skills(role).map_err(anyhow::Error::msg)?;
         let limitations: Vec<String> = state
             .plan
             .iter()
@@ -1669,15 +1686,14 @@ impl Engine {
                 crate::model::RequirementDisposition::Covered { .. } => None,
             })
             .collect();
-        let prompt_text = assemble_terminal_review_prompt(
+        let prompt_text = render(TurnContext::GapReview(
             role,
-            &TerminalReviewPromptContext {
+            TerminalReviewPromptContext {
                 objective: &state.objective,
                 limitations: &limitations,
                 nonce: &nonce,
-                skills: &skills,
             },
-        );
+        ));
         let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));
         let prompt = self
             .store
