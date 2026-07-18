@@ -196,6 +196,85 @@ async fn snapshot_resume_matches_full_refold() {
 }
 
 #[tokio::test]
+async fn corrupted_snapshot_cursor_is_discarded_before_replay() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "reject snapshot authority",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+    h.engine.advance(&mission_id).await.expect("advance");
+
+    let events = h.engine.store().load(&mission_id).await.expect("events");
+    let expected = fold(events).expect("full replay");
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.path().join(".lionclaw/mission.db").display()
+    ))
+    .await
+    .expect("open database");
+    let mut corrupted = expected.clone();
+    corrupted.head -= 1;
+    sqlx::query(
+        "UPDATE mission_snapshots SET state_json = ?1 \
+         WHERE mission_id = ?2",
+    )
+    .bind(serde_json::to_string(&corrupted).expect("encode corruption"))
+    .bind(mission_id.as_str())
+    .execute(&database)
+    .await
+    .expect("corrupt snapshot cursor");
+
+    let resumed = h
+        .engine
+        .store()
+        .load_state_snapshotted(&mission_id)
+        .await
+        .expect("load must fall back")
+        .expect("state");
+    assert_eq!(
+        resumed, expected,
+        "corrupt snapshot must not become authority"
+    );
+
+    let mut future = expected.clone();
+    future.head += 10;
+    sqlx::query(
+        "UPDATE mission_snapshots SET upto_sequence_no = ?1, state_json = ?2 \
+         WHERE mission_id = ?3",
+    )
+    .bind(future.head as i64)
+    .bind(serde_json::to_string(&future).expect("encode future snapshot"))
+    .bind(mission_id.as_str())
+    .execute(&database)
+    .await
+    .expect("inject future snapshot");
+    let resumed = h
+        .engine
+        .store()
+        .load_state_snapshotted(&mission_id)
+        .await
+        .expect("load must reject future cursor")
+        .expect("state");
+    assert_eq!(resumed, expected, "future snapshot must not hide the log");
+}
+
+#[tokio::test]
 async fn controlled_effect_log_satisfies_every_prefix_and_snapshot_law() {
     let dir = tempfile::tempdir().expect("tempdir");
     let h = harness(

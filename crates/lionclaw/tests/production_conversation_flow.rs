@@ -12,9 +12,9 @@ use lionclaw::config::RuntimeProfiles;
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
 use lionclaw::mission_type::load_mission_type;
 use lionclaw::model::{
-    Assertion, AssertionId, DecisionAction, FinishClass, MissionEvent, MissionPhase, OracleName,
-    Plan, PlanProposal, Requirement, RequirementDisposition, RequirementId, RequirementKind,
-    RoleName, Task, TaskId, TaskKind,
+    apply, fold, Assertion, AssertionId, DecisionAction, FinishClass, MissionEvent, MissionPhase,
+    MissionState, OracleName, Plan, PlanProposal, Requirement, RequirementDisposition,
+    RequirementId, RequirementKind, RoleName, Task, TaskId, TaskKind,
 };
 use lionclaw::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
 use lionclaw::runner::OciRoleRunner;
@@ -374,6 +374,33 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert_eq!(calls.lock().unwrap().len(), 1);
     assert_eq!(turns.lock().unwrap().len(), 2);
     let events = restarted.store().load(&mission_id).await.unwrap();
+    let replayed = fold(events.clone()).expect("full replay");
+    assert_eq!(replayed, outcome.state);
+    for split in 1..events.len() {
+        let mut from_prefix = fold(events[..split].to_vec()).expect("substantive prefix");
+        for event in &events[split..] {
+            apply(&mut from_prefix, event);
+        }
+        assert_eq!(from_prefix, replayed, "prefix split {split} diverged");
+    }
+    let snapshotted = restarted
+        .store()
+        .load_state_snapshotted(&mission_id)
+        .await
+        .expect("snapshot resume")
+        .expect("mission state");
+    assert_eq!(snapshotted, replayed);
+    let snapshot_json = serde_json::to_string(&snapshotted).expect("encode snapshot state");
+    assert_eq!(
+        serde_json::from_str::<MissionState>(&snapshot_json).expect("decode snapshot state"),
+        replayed
+    );
+    let rebuilt = restarted
+        .store()
+        .rebuild_cursors(&mission_id, 9_000_000)
+        .await
+        .expect("rebuild snapshot from authoritative log");
+    assert_eq!(rebuilt, replayed);
     let role = events
         .iter()
         .position(|event| matches!(event.event, MissionEvent::RoleRunCompleted { .. }))

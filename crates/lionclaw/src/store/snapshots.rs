@@ -79,11 +79,23 @@ impl MissionStore {
         .bind(mission_id.as_str())
         .fetch_optional(self.pool())
         .await?;
+        let log_head: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence_no), 0) FROM mission_events WHERE mission_id = ?1",
+        )
+        .bind(mission_id.as_str())
+        .fetch_one(self.pool())
+        .await?;
 
         let base = match row {
             Some((upto, reducer, json)) if reducer as u32 == REDUCER_VERSION => {
                 serde_json::from_str::<MissionState>(&json)
                     .ok()
+                    .filter(|state| {
+                        upto >= 0
+                            && upto <= log_head
+                            && state.mission_id == *mission_id
+                            && state.head == upto as u64
+                    })
                     .map(|s| (upto as u64, s))
             }
             _ => None,
