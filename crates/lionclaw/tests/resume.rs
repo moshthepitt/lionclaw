@@ -198,11 +198,11 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                 attempt_no: 1,
                 effect_id: role_effect,
                 outcome: Ok(RoleRunSuccess {
-                    handoff: Handoff::Work {
+                    handoff: Some(Handoff::Work {
                         done: true,
                         report: PayloadRef::inline("done"),
                         request_attention: false,
-                    },
+                    }),
                     artifact: Some(ArtifactOutcome {
                         base_sha: BASE_SHA.to_string(),
                         head_sha: HEAD_SHA.to_string(),

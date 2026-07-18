@@ -113,6 +113,69 @@ id_type!(
     validate_requirement_id,
     "Objective requirement id."
 );
+
+/// Stable identity of one role instance's durable dialogue.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ConversationId(String);
+
+impl ConversationId {
+    pub fn parse(raw: impl Into<String>) -> Result<Self, IdError> {
+        let raw = raw.into();
+        if raw.len() != 64
+            || !raw
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(IdError(format!(
+                "conversation id '{raw}' must be 64 lowercase hexadecimal characters"
+            )));
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn for_role_instance(
+        mission: &MissionId,
+        namespace: crate::TaskNamespace,
+        task: &TaskId,
+        role: &RoleName,
+        epoch: u32,
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(lowercase_hex(&Sha256::digest(
+            [
+                mission.as_str(),
+                namespace.slug(),
+                task.as_str(),
+                role.as_str(),
+                &epoch.to_string(),
+            ]
+            .join("\u{1f}")
+            .as_bytes(),
+        )))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ConversationId {
+    type Error = IdError;
+    fn try_from(raw: String) -> Result<Self, IdError> {
+        Self::parse(raw)
+    }
+}
+impl From<ConversationId> for String {
+    fn from(id: ConversationId) -> String {
+        id.0
+    }
+}
+impl fmt::Display for ConversationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 id_type!(TaskId, validate_task_id, "Plan task id.");
 id_type!(RoleName, validate_component_name, "Mission-type role name.");
 id_type!(

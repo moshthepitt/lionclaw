@@ -1130,7 +1130,7 @@ impl Engine {
                     ..Default::default()
                 };
                 Ok(completed(Ok(RoleRunSuccess {
-                    handoff,
+                    handoff: Some(handoff),
                     artifact: outcome
                         .artifact
                         .map(crate::ports::CapturedArtifact::into_outcome),

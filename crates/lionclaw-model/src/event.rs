@@ -15,13 +15,53 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
+use super::ids::{AssertionId, ConversationId, InputName, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{OutputSemantics, PlanInventory, PlanProposal, PlanningDag};
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
 
-/// Bumped for the replay-authoritative plan inventory in `MissionConfig`.
-pub const SCHEMA_VERSION: u32 = 16;
+/// Bumped for durable conversations, sender-free messages, and checkpoint
+/// role outcomes. Unreleased older logs intentionally fail loudly.
+pub const SCHEMA_VERSION: u32 = 17;
+
+/// Maximum durable message body. Reference expansion is deliberately not
+/// represented here: the shell resolves it transiently for a turn.
+pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+pub const MAX_MESSAGE_RECIPIENTS: usize = 64;
+pub const MAX_MESSAGE_REFERENCES: usize = 32;
+pub const MAX_FINAL_RESPONSE_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MessageReference {
+    AuthoritativeReceipt { effect_id: super::EffectId },
+    ParkEvidence { effect_id: super::EffectId },
+    ReachableCommit { sha: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationRecipient {
+    pub conversation_id: ConversationId,
+    pub role: RoleName,
+    pub namespace: TaskNamespace,
+    pub task_id: TaskId,
+    pub assignment_epoch: u32,
+}
+
+impl ConversationRecipient {
+    pub fn validate(&self, mission_id: &MissionId) -> bool {
+        self.assignment_epoch > 0
+            && self.conversation_id
+                == ConversationId::for_role_instance(
+                    mission_id,
+                    self.namespace,
+                    &self.task_id,
+                    &self.role,
+                    self.assignment_epoch,
+                )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +142,13 @@ impl PayloadRef {
                 Some(blob.hex.clone())
             }
             Self::Blob(_) => None,
+        }
+    }
+
+    pub const fn declared_len(&self) -> u64 {
+        match self {
+            Self::Inline { text } => text.len() as u64,
+            Self::Blob(blob) => blob.len,
         }
     }
 }
@@ -427,7 +474,9 @@ pub struct PreparedInputRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleRunSuccess {
-    pub handoff: Handoff,
+    /// `None` is an ordinary dialogue checkpoint, never a failed handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactOutcome>,
     pub final_response: PayloadRef,
@@ -515,6 +564,14 @@ pub enum MissionEvent {
         not_before_ms: i64,
         deadline_ms: i64,
         budget_deadline_ms: i64,
+    },
+    /// Sender-free dialogue routed atomically to role instances as they
+    /// existed at this exact log position.
+    MessageSent {
+        recipients: Vec<ConversationRecipient>,
+        body: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        references: Vec<MessageReference>,
     },
     /// Kernel-observed confirmation that the task-owned writable checkout
     /// exists at the assignment base. Request intent never updates workspace
@@ -687,6 +744,7 @@ impl MissionEvent {
             Self::MissionCreated { .. } => "mission_created",
             Self::PlanProposed { .. } => "plan_proposed",
             Self::RoleRunRequested { .. } => "role_run_requested",
+            Self::MessageSent { .. } => "message_sent",
             Self::TaskWorkspacePrepared { .. } => "task_workspace_prepared",
             Self::EffectRuntimeConfigured { .. } => "effect_runtime_configured",
             Self::RoleRunCompleted { .. } => "role_run_completed",
@@ -720,6 +778,7 @@ impl MissionEvent {
             // they identify the effect they describe. Exhaustive on purpose.
             Self::MissionCreated { .. }
             | Self::PlanProposed { .. }
+            | Self::MessageSent { .. }
             | Self::TaskWorkspacePrepared { .. }
             | Self::EffectRuntimeConfigured { .. }
             | Self::ControlRequested { .. }

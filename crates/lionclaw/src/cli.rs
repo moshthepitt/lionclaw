@@ -20,12 +20,13 @@ use crate::mission_type::{
     MissionTypeLocator, SkillSource,
 };
 use crate::model::{
-    fold, short_hex, ControlAction, DecisionAction, EffectId, FinishClass, MissionId, MissionPhase,
+    fold, short_hex, ControlAction, ConversationLifecycle, ConversationRecipient, DecisionAction,
+    EffectId, FinishClass, MissionEvent, MissionId, MissionPhase, MAX_MESSAGE_BYTES,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, SystemClock};
 use crate::runner::OciRoleRunner;
-use crate::store::{BlobStore, MissionStore};
+use crate::store::{BlobStore, MissionStore, NewEvent};
 use crate::workspace;
 
 #[derive(Parser)]
@@ -120,6 +121,8 @@ pub enum MissionCommand {
     Log(LogArgs),
     /// List missions awaiting input or blocked on cleanup.
     Inbox(InboxArgs),
+    /// Send durable lead feedback to current role conversations.
+    Send(SendArgs),
     /// Inspect or propose complete plan revisions.
     #[command(subcommand)]
     Plan(PlanCommand),
@@ -207,6 +210,22 @@ pub struct InboxArgs {
     pub repo: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("recipients").required(true).args(["to", "all"])))]
+pub struct SendArgs {
+    pub mission_id: Option<String>,
+    /// Current conversation id or an unambiguous current task name. Repeatable.
+    #[arg(long = "to", action = clap::ArgAction::Append, conflicts_with = "all")]
+    pub to: Vec<String>,
+    /// Address every current role-instance conversation.
+    #[arg(long)]
+    pub all: bool,
+    /// Exact UTF-8 message body.
+    pub message: String,
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -413,6 +432,7 @@ impl MissionCommand {
             Self::Type(t) => t.is_json(),
             Self::Apply(_)
             | Self::Log(_)
+            | Self::Send(_)
             | Self::Decide(_)
             | Self::Stop(_)
             | Self::Extend(_)
@@ -452,6 +472,7 @@ async fn dispatch_mission(cmd: MissionCommand) -> Result<std::process::ExitCode>
         MissionCommand::Apply(args) => cmd_apply(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Log(args) => cmd_log(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Inbox(args) => cmd_inbox(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Send(args) => cmd_send(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Plan(cmd) => cmd_plan(cmd).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Stop(args) => cmd_control(args, false).await.map(|()| ExitCode::SUCCESS),
@@ -1330,6 +1351,75 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
         "recorded decision on '{}' for mission {mission_id}",
         args.item
     );
+    Ok(())
+}
+
+async fn cmd_send(args: SendArgs) -> Result<()> {
+    if args.message.len() > MAX_MESSAGE_BYTES {
+        bail!("message exceeds {MAX_MESSAGE_BYTES} bytes");
+    }
+    let (_repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    let state = fold(store.load(&mission_id).await?).context("mission has no creation event")?;
+    let current: Vec<_> = state
+        .conversations
+        .iter()
+        .filter(|(_, conversation)| {
+            conversation.lifecycle != ConversationLifecycle::Completed
+                && state
+                    .tasks_in(conversation.namespace)
+                    .get(&conversation.task_id)
+                    .is_some_and(|task| task.assignment_epoch == conversation.assignment_epoch)
+        })
+        .collect();
+    let selected: Vec<_> = if args.all {
+        current
+    } else {
+        let mut selected = Vec::new();
+        for selector in &args.to {
+            let matches: Vec<_> = current
+                .iter()
+                .copied()
+                .filter(|(id, conversation)| {
+                    id.as_str() == selector || conversation.task_id.as_str() == selector
+                })
+                .collect();
+            match matches.as_slice() {
+                [] => bail!("recipient '{selector}' is not a current conversation or task"),
+                [one] => selected.push(*one),
+                _ => bail!("task name '{selector}' is ambiguous; use a conversation id"),
+            }
+        }
+        selected
+    };
+    if selected.is_empty() {
+        bail!("recipient set is empty");
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let recipients: Vec<_> = selected
+        .into_iter()
+        .filter(|(id, _)| ids.insert((*id).clone()))
+        .map(|(conversation_id, conversation)| ConversationRecipient {
+            conversation_id: conversation_id.clone(),
+            role: conversation.role.clone(),
+            namespace: conversation.namespace,
+            task_id: conversation.task_id.clone(),
+            assignment_epoch: conversation.assignment_epoch,
+        })
+        .collect();
+    store
+        .append(
+            &mission_id,
+            state.head,
+            &[NewEvent::new(MissionEvent::MessageSent {
+                recipients,
+                body: args.message,
+                references: Vec::new(),
+            })],
+            SystemClock.now_ms(),
+        )
+        .await?;
+    println!("message recorded for mission {mission_id}");
     Ok(())
 }
 
@@ -3200,11 +3290,11 @@ mod tests {
                 attempt_no: 1,
                 effect_id: review_role_effect(),
                 outcome: Ok(RoleRunSuccess {
-                    handoff: Handoff::Work {
+                    handoff: Some(Handoff::Work {
                         done: true,
                         report: PayloadRef::inline("done"),
                         request_attention: false,
-                    },
+                    }),
                     artifact: Some(ArtifactOutcome {
                         base_sha: "base".into(),
                         head_sha: "h1".into(),

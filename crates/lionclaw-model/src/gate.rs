@@ -274,11 +274,11 @@ mod tests {
                     attempt_no: 1,
                     effect_id,
                     outcome: Ok(crate::RoleRunSuccess {
-                        handoff: Handoff::Work {
+                        handoff: Some(Handoff::Work {
                             done: true,
                             report: PayloadRef::inline("done"),
                             request_attention: false,
-                        },
+                        }),
                         artifact: None,
                         final_response: PayloadRef::inline("done"),
                         runtime_configuration: crate::RuntimeConfigurationEvidence::default(),
@@ -319,7 +319,7 @@ mod tests {
                     attempt_no: 1,
                     effect_id: role_effect(&mission_id, &tid(validator)),
                     outcome: Ok(crate::RoleRunSuccess {
-                        handoff: Handoff::Validate {
+                        handoff: Some(Handoff::Validate {
                             done: true,
                             report: PayloadRef::inline("r"),
                             items: items
@@ -331,7 +331,7 @@ mod tests {
                                 .collect(),
                             passed: items.iter().all(|(_, p)| *p),
                             request_attention: false,
-                        },
+                        }),
                         artifact: None,
                         final_response: PayloadRef::inline("reviewed"),
                         runtime_configuration: crate::RuntimeConfigurationEvidence::default(),

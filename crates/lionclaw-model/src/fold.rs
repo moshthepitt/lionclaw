@@ -28,7 +28,7 @@ use crate::{RoleName, TypedFailure};
 /// discarded and rebuilt from sequence zero.
 /// Bumped because durable request ingress now verifies model-derived effect
 /// identity and task-assignment generation before reserving an effect.
-pub const REDUCER_VERSION: u32 = 22;
+pub const REDUCER_VERSION: u32 = 23;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -87,6 +87,9 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         current_sha: base_sha.clone(),
         oracle_attempts: Default::default(),
         inflight: Default::default(),
+        conversations: Default::default(),
+        authoritative_receipts: Default::default(),
+        reachable_commits: BTreeSet::from([base_sha.clone()]),
         stop_requests: Default::default(),
         reached_deadlines: Default::default(),
         parked_effects: Default::default(),
@@ -154,6 +157,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             namespace,
             task_id,
             attempt_no,
+            role,
+            base_sha,
+            assignment_epoch,
             ..
         } => {
             if !role_request_matches_dispatch(state, envelope) {
@@ -169,7 +175,102 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 .or_insert_with(pending_task);
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
+            let conversation_id = crate::ConversationId::for_role_instance(
+                &state.mission_id,
+                *namespace,
+                task_id,
+                role,
+                *assignment_epoch,
+            );
+            let conversation = state
+                .conversations
+                .entry(conversation_id)
+                .or_insert_with(|| super::state::ConversationState {
+                    role: role.clone(),
+                    namespace: *namespace,
+                    task_id: task_id.clone(),
+                    assignment_epoch: *assignment_epoch,
+                    workspace_base_sha: base_sha.clone(),
+                    lifecycle: super::state::ConversationLifecycle::Ready,
+                    queued: Vec::new(),
+                    consumed_through: 0,
+                    active_message_boundary: None,
+                    invalid_handoff_reworks: 0,
+                });
+            conversation.lifecycle = super::state::ConversationLifecycle::Running;
+            conversation.active_message_boundary = Some(seq.saturating_sub(1));
             track_inflight(state, &envelope.event, seq);
+        }
+        MissionEvent::MessageSent {
+            recipients,
+            body,
+            references,
+        } => {
+            if body.len() > crate::MAX_MESSAGE_BYTES
+                || recipients.is_empty()
+                || recipients.len() > crate::MAX_MESSAGE_RECIPIENTS
+                || references.len() > crate::MAX_MESSAGE_REFERENCES
+                || recipients
+                    .iter()
+                    .any(|recipient| !recipient.validate(&state.mission_id))
+                || references.iter().any(|reference| match reference {
+                    super::event::MessageReference::AuthoritativeReceipt { effect_id } => {
+                        !state.authoritative_receipts.contains(effect_id)
+                    }
+                    super::event::MessageReference::ParkEvidence { effect_id } => {
+                        !state.parked_effects.contains_key(effect_id)
+                    }
+                    super::event::MessageReference::ReachableCommit { sha } => {
+                        !state.reachable_commits.contains(sha)
+                    }
+                })
+            {
+                finish_apply(state, seq);
+                return;
+            }
+            let unique: BTreeSet<_> = recipients.iter().map(|r| &r.conversation_id).collect();
+            if unique.len() != recipients.len()
+                || recipients.iter().any(|r| {
+                    !state
+                        .conversations
+                        .get(&r.conversation_id)
+                        .is_some_and(|c| {
+                            c.role == r.role
+                                && c.namespace == r.namespace
+                                && c.task_id == r.task_id
+                                && c.assignment_epoch == r.assignment_epoch
+                                && c.lifecycle != super::state::ConversationLifecycle::Completed
+                        })
+                })
+            {
+                finish_apply(state, seq);
+                return;
+            }
+            let mut resumed = Vec::new();
+            for recipient in recipients {
+                let conversation = state
+                    .conversations
+                    .get_mut(&recipient.conversation_id)
+                    .expect("validated above");
+                conversation.queued.push(super::state::QueuedMessage {
+                    sequence_no: seq,
+                    body: body.clone(),
+                    references: references.clone(),
+                    marker: super::state::DeliveryMarker::Queued,
+                });
+                if conversation.lifecycle == super::state::ConversationLifecycle::AwaitingLead
+                    || conversation.lifecycle
+                        == super::state::ConversationLifecycle::ReworkingInvalidHandoff
+                {
+                    conversation.lifecycle = super::state::ConversationLifecycle::Ready;
+                    resumed.push((conversation.namespace, conversation.task_id.clone()));
+                }
+            }
+            for (namespace, task_id) in resumed {
+                if let Some(task) = state.tasks_in_mut(namespace).get_mut(&task_id) {
+                    task.status = TaskStatus::Pending;
+                }
+            }
         }
         MissionEvent::TaskWorkspacePrepared {
             task_id,
@@ -266,25 +367,38 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             clear_cleanup_failure(state, effect_id);
             match outcome {
                 Ok(success) => {
-                    let contract_error = expected_contract.as_ref().map_or(
-                        Some("role outcome has no active request"),
-                        |(output, base_sha)| {
-                            super::event::role_success_contract_error(
-                                *output,
-                                &success.handoff,
-                                success.artifact.as_ref(),
-                                base_sha,
+                    let contract_error = if success.final_response.declared_len()
+                        > crate::MAX_FINAL_RESPONSE_BYTES
+                    {
+                        Some("role final response exceeds the durable bound")
+                    } else if success.handoff.is_none() && success.artifact.is_some() {
+                        Some("a checkpoint without a handoff cannot return an artifact")
+                    } else {
+                        success.handoff.as_ref().and_then(|handoff| {
+                            expected_contract.as_ref().map_or(
+                                Some("role outcome has no active request"),
+                                |(output, base_sha)| {
+                                    super::event::role_success_contract_error(
+                                        *output,
+                                        handoff,
+                                        success.artifact.as_ref(),
+                                        base_sha,
+                                    )
+                                },
                             )
-                        },
-                    );
+                        })
+                    };
                     if contract_error.is_none() {
                         if let Some(artifact) = &success.artifact {
                             state.current_sha = artifact.head_sha.clone();
+                            state.reachable_commits.insert(artifact.head_sha.clone());
                         }
                         if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
                             task.attempts = task.attempts.max(*attempt_no);
                         }
-                        apply_handoff(state, *namespace, task_id, &success.handoff);
+                        if let Some(handoff) = &success.handoff {
+                            apply_handoff(state, *namespace, task_id, handoff);
+                        }
                         if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
                             task.last_runtime_configuration =
                                 Some(success.runtime_configuration.clone());
@@ -297,6 +411,12 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                                 task.consecutive_failures = 0;
                             }
                         }
+                        settle_conversation_delivery(
+                            state,
+                            *namespace,
+                            task_id,
+                            success.handoff.is_some(),
+                        );
                     } else {
                         let mut failure = TypedFailure::invalid(
                             "role.success_contract",
@@ -316,6 +436,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     }
                 }
                 Err(failure) => {
+                    settle_failed_conversation_delivery(state, *namespace, task_id, failure);
                     apply_role_failure(
                         state,
                         TaskAddress::new(*namespace, task_id.clone()),
@@ -367,6 +488,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             clear_cleanup_failure(state, effect_id);
             match outcome {
                 Ok(success) => {
+                    state.authoritative_receipts.insert(effect_id.clone());
                     state.oracle_failures.remove(oracle);
                     let verdict = AuthoritativeVerdict::from_oracle_outcome(
                         oracle.clone(),
@@ -648,6 +770,71 @@ fn merge_runtime_configuration(
         requested_mode: current.requested_mode.clone().or(previous.requested_mode),
         applied_mode: current.applied_mode.clone().or(previous.applied_mode),
         mode_confirmation: current.mode_confirmation.or(previous.mode_confirmation),
+    }
+}
+
+fn settle_conversation_delivery(
+    state: &mut MissionState,
+    namespace: super::TaskNamespace,
+    task_id: &TaskId,
+    has_handoff: bool,
+) {
+    let Some((_, conversation)) = state.conversations.iter_mut().find(|(_, conversation)| {
+        conversation.namespace == namespace
+            && &conversation.task_id == task_id
+            && conversation.lifecycle == super::state::ConversationLifecycle::Running
+    }) else {
+        return;
+    };
+    let boundary = conversation.active_message_boundary.take().unwrap_or(0);
+    conversation.consumed_through = conversation.consumed_through.max(boundary);
+    conversation
+        .queued
+        .retain(|message| message.sequence_no > boundary);
+    conversation.lifecycle = if has_handoff {
+        super::state::ConversationLifecycle::Completed
+    } else {
+        super::state::ConversationLifecycle::AwaitingLead
+    };
+}
+
+fn settle_failed_conversation_delivery(
+    state: &mut MissionState,
+    namespace: super::TaskNamespace,
+    task_id: &TaskId,
+    failure: &TypedFailure,
+) {
+    let Some((_, conversation)) = state.conversations.iter_mut().find(|(_, conversation)| {
+        conversation.namespace == namespace
+            && &conversation.task_id == task_id
+            && conversation.lifecycle == super::state::ConversationLifecycle::Running
+    }) else {
+        return;
+    };
+    let boundary = conversation.active_message_boundary.take().unwrap_or(0);
+    if failure.evidence().code.as_deref() == Some("kernel.launch") {
+        conversation.lifecycle = super::state::ConversationLifecycle::Ready;
+        return;
+    }
+    let invalid_handoff = failure.evidence().code.as_deref() == Some("handoff.schema");
+    let marker = if invalid_handoff {
+        super::state::DeliveryMarker::PreviouslyDelivered
+    } else {
+        super::state::DeliveryMarker::PossiblyDelivered
+    };
+    for message in conversation
+        .queued
+        .iter_mut()
+        .filter(|message| message.sequence_no <= boundary)
+    {
+        message.marker = marker;
+    }
+    if invalid_handoff && conversation.invalid_handoff_reworks < state.config.recovery.max_attempts
+    {
+        conversation.invalid_handoff_reworks += 1;
+        conversation.lifecycle = super::state::ConversationLifecycle::ReworkingInvalidHandoff;
+    } else {
+        conversation.lifecycle = super::state::ConversationLifecycle::Ready;
     }
 }
 
@@ -1835,7 +2022,7 @@ mod tests {
                 if known_tasks.contains(&TaskAddress::new(*namespace, task_id.clone()))
                     && requested_effects.insert(effect_id.clone())
                 {
-                    let (role, output) = match &success.handoff {
+                    let (role, output) = match success.handoff.as_ref().expect("test log handoff") {
                         Handoff::Work { .. } if *namespace == crate::TaskNamespace::Planning => (
                             RoleName::new("planner").expect("role name"),
                             OutputSemantics::ProducesReport,
@@ -2328,7 +2515,7 @@ mod tests {
             attempt_no,
             effect_id: role_effect(namespace, task, attempt_no, 1),
             outcome: Ok(RoleRunSuccess {
-                handoff,
+                handoff: Some(handoff),
                 artifact,
                 final_response: PayloadRef::inline("final response"),
                 runtime_configuration: RuntimeConfigurationEvidence::default(),
@@ -3594,12 +3781,12 @@ mod tests {
                 attempt_no: 1,
                 effect_id: role_effect(crate::TaskNamespace::Execution, "work", 1, 1),
                 outcome: Ok(RoleRunSuccess {
-                    handoff: Handoff::Plan {
+                    handoff: Some(Handoff::Plan {
                         done: true,
                         report: PayloadRef::inline("plan"),
                         proposal: Some(proposal),
                         request_attention: false,
-                    },
+                    }),
                     artifact: Some(ArtifactOutcome {
                         base_sha: "base".into(),
                         head_sha: "must-not-promote".into(),
@@ -3702,7 +3889,7 @@ mod tests {
                 attempt_no: 2,
                 effect_id: forged_effect,
                 outcome: Ok(RoleRunSuccess {
-                    handoff: work_handoff(true, false),
+                    handoff: Some(work_handoff(true, false)),
                     artifact: Some(ArtifactOutcome {
                         base_sha: "h1".into(),
                         head_sha: "forged-head".into(),
@@ -3757,7 +3944,7 @@ mod tests {
                 attempt_no,
                 effect_id: role_effect(crate::TaskNamespace::Execution, "original", 1, 1),
                 outcome: Ok(RoleRunSuccess {
-                    handoff: work_handoff(true, false),
+                    handoff: Some(work_handoff(true, false)),
                     artifact: None,
                     final_response: PayloadRef::inline("wrong completion"),
                     runtime_configuration: RuntimeConfigurationEvidence::default(),
@@ -3875,7 +4062,7 @@ mod tests {
                 attempt_no: 1,
                 effect_id: validator_effect,
                 outcome: Ok(RoleRunSuccess {
-                    handoff: validate_handoff(&[]),
+                    handoff: Some(validate_handoff(&[])),
                     artifact: Some(ArtifactOutcome {
                         base_sha: "base".into(),
                         head_sha: "must-not-promote".into(),
@@ -3924,7 +4111,7 @@ mod tests {
                 attempt_no: 1,
                 effect_id: effect_id.clone(),
                 outcome: Ok(RoleRunSuccess {
-                    handoff: work_handoff(false, false),
+                    handoff: Some(work_handoff(false, false)),
                     artifact: Some(ArtifactOutcome {
                         base_sha: "base".into(),
                         head_sha: "must-not-promote".into(),
@@ -5041,5 +5228,157 @@ mod tests {
         assert!(state
             .open_attention
             .contains_key("oracle_verdict_failed:cargo-test"));
+    }
+
+    #[test]
+    fn checkpoint_and_atomic_message_routing_are_conversation_scoped() {
+        let mut checkpoint = role_completed("w", "checkpoint", work_handoff(true, false), None);
+        let MissionEvent::RoleRunCompleted {
+            outcome: Ok(success),
+            ..
+        } = &mut checkpoint
+        else {
+            unreachable!()
+        };
+        success.handoff = None;
+        let mut events = vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "first"),
+            checkpoint,
+        ];
+        let checkpoint_state = fold_log(events.clone()).expect("checkpoint state");
+        let (conversation_id, conversation) = checkpoint_state
+            .conversations
+            .iter()
+            .next()
+            .expect("conversation");
+        assert_eq!(
+            conversation.lifecycle,
+            super::super::state::ConversationLifecycle::AwaitingLead
+        );
+        assert_eq!(
+            checkpoint_state.tasks[&tid("w")].status,
+            TaskStatus::Running
+        );
+
+        let recipient = super::super::event::ConversationRecipient {
+            conversation_id: conversation_id.clone(),
+            role: conversation.role.clone(),
+            namespace: conversation.namespace,
+            task_id: conversation.task_id.clone(),
+            assignment_epoch: conversation.assignment_epoch,
+        };
+        events.push(MissionEvent::MessageSent {
+            recipients: vec![recipient.clone()],
+            body: "continue".into(),
+            references: vec![super::super::event::MessageReference::ReachableCommit {
+                sha: "base".into(),
+            }],
+        });
+        let resumed = fold_log(events.clone()).expect("resumed state");
+        assert_eq!(resumed.tasks[&tid("w")].status, TaskStatus::Pending);
+        assert_eq!(resumed.conversations[conversation_id].queued.len(), 1);
+
+        let mut forged = recipient;
+        forged.conversation_id = crate::ConversationId::parse("f".repeat(64)).unwrap();
+        events.push(MissionEvent::MessageSent {
+            recipients: vec![forged],
+            body: "must be atomic".into(),
+            references: vec![],
+        });
+        events.push(MissionEvent::MessageSent {
+            recipients: vec![super::super::event::ConversationRecipient {
+                conversation_id: conversation_id.clone(),
+                role: conversation.role.clone(),
+                namespace: conversation.namespace,
+                task_id: conversation.task_id.clone(),
+                assignment_epoch: conversation.assignment_epoch,
+            }],
+            body: "invalid reference".into(),
+            references: vec![super::super::event::MessageReference::ReachableCommit {
+                sha: "foreign".into(),
+            }],
+        });
+        let rejected = fold_log(events).expect("rejected state");
+        assert_eq!(rejected.conversations[conversation_id].queued.len(), 1);
+    }
+
+    #[test]
+    fn request_boundary_consumes_only_prior_messages_and_mismatch_cannot_advance() {
+        let mut checkpoint = role_completed("w", "checkpoint", work_handoff(true, false), None);
+        let MissionEvent::RoleRunCompleted {
+            outcome: Ok(success),
+            ..
+        } = &mut checkpoint
+        else {
+            unreachable!()
+        };
+        success.handoff = None;
+        let seed = vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "first"),
+            checkpoint,
+        ];
+        let state = fold_log(seed.clone()).unwrap();
+        let (conversation_id, conversation) = state.conversations.iter().next().unwrap();
+        let recipient = super::super::event::ConversationRecipient {
+            conversation_id: conversation_id.clone(),
+            role: conversation.role.clone(),
+            namespace: conversation.namespace,
+            task_id: conversation.task_id.clone(),
+            assignment_epoch: 1,
+        };
+        let mut events = seed;
+        events.push(MissionEvent::MessageSent {
+            recipients: vec![recipient.clone()],
+            body: "before".into(),
+            references: vec![],
+        });
+        let mut request = role_requested("w", "second");
+        if let MissionEvent::RoleRunRequested {
+            attempt_no,
+            effect_id,
+            ..
+        } = &mut request
+        {
+            *attempt_no = 2;
+            *effect_id = role_effect(crate::TaskNamespace::Execution, "w", 2, 1);
+        }
+        events.push(request);
+        events.push(MissionEvent::MessageSent {
+            recipients: vec![recipient],
+            body: "during".into(),
+            references: vec![],
+        });
+        let mut forged = role_completed_at(
+            crate::TaskNamespace::Execution,
+            "w",
+            2,
+            "forged",
+            work_handoff(true, false),
+            None,
+        );
+        if let MissionEvent::RoleRunCompleted { task_id, .. } = &mut forged {
+            *task_id = tid("other");
+        }
+        events.push(forged);
+        let mismatched = fold_log(events.clone()).unwrap();
+        assert_eq!(mismatched.conversations[conversation_id].queued.len(), 2);
+
+        events.pop();
+        events.push(role_completed_at(
+            crate::TaskNamespace::Execution,
+            "w",
+            2,
+            "valid",
+            work_handoff(true, false),
+            None,
+        ));
+        let completed = fold_log(events).unwrap();
+        let queued = &completed.conversations[conversation_id].queued;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].body, "during");
     }
 }

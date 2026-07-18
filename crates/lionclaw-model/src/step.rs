@@ -507,11 +507,11 @@ mod tests {
             attempt_no,
             effect_id: role_effect(task, attempt_no),
             outcome: Ok(RoleRunSuccess {
-                handoff: Handoff::Work {
+                handoff: Some(Handoff::Work {
                     done: true,
                     report: PayloadRef::inline("done"),
                     request_attention: false,
-                },
+                }),
                 artifact: artifact.map(|(base_sha, head_sha)| ArtifactOutcome {
                     base_sha: base_sha.to_string(),
                     head_sha: head_sha.to_string(),

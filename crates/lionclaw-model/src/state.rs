@@ -14,6 +14,46 @@ use super::verdict::{AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationLifecycle {
+    Ready,
+    Running,
+    AwaitingLead,
+    ReworkingInvalidHandoff,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryMarker {
+    Queued,
+    PreviouslyDelivered,
+    PossiblyDelivered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedMessage {
+    pub sequence_no: u64,
+    pub body: String,
+    pub references: Vec<super::MessageReference>,
+    pub marker: DeliveryMarker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationState {
+    pub role: RoleName,
+    pub namespace: super::TaskNamespace,
+    pub task_id: TaskId,
+    pub assignment_epoch: u32,
+    pub workspace_base_sha: String,
+    pub lifecycle: ConversationLifecycle,
+    pub queued: Vec<QueuedMessage>,
+    pub consumed_through: u64,
+    pub active_message_boundary: Option<u64>,
+    pub invalid_handoff_reworks: u32,
+}
+
 /// A durable cancellation fact that dominates any later effect outcome.
 /// Event order chooses one cause; both the live engine and pure replay use
 /// this value so the shell cannot grant success that the reducer rejects.
@@ -706,6 +746,7 @@ impl InflightEffect {
             // its inflight entry here.
             MissionEvent::MissionCreated { .. }
             | MissionEvent::PlanProposed { .. }
+            | MissionEvent::MessageSent { .. }
             | MissionEvent::TaskWorkspacePrepared { .. }
             | MissionEvent::EffectRuntimeConfigured { .. }
             | MissionEvent::RoleRunCompleted { .. }
@@ -817,6 +858,15 @@ pub struct MissionState {
     /// Per-oracle dispatch counter (attempt numbering).
     pub oracle_attempts: BTreeMap<OracleName, u32>,
     pub inflight: BTreeMap<super::EffectId, InflightEffect>,
+    /// Mission-private dialogue authority, keyed by stable role-instance id.
+    #[serde(default)]
+    pub conversations: BTreeMap<super::ConversationId, ConversationState>,
+    /// Exact same-mission evidence identities eligible for message references.
+    #[serde(default)]
+    pub authoritative_receipts: BTreeSet<super::EffectId>,
+    /// Commits established by mission creation or accepted artifact outcomes.
+    #[serde(default)]
+    pub reachable_commits: BTreeSet<String>,
     #[serde(default)]
     pub stop_requests: BTreeMap<super::EffectId, String>,
     #[serde(default)]
