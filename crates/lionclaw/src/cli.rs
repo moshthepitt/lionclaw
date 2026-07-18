@@ -2610,12 +2610,13 @@ fn conversation_views(
                 .join("conversations")
                 .join(id.as_str())
                 .join("runtime");
-            let resume_mode = if lionclaw_runtime_api::runtime_session_ready_marker_exists(
+            let resume_mode = match lionclaw_runtime_api::recorded_runtime_resume_mode(
                 &runtime_root,
             )? {
-                "native_session"
-            } else {
-                "canonical_reconstruction"
+                Some(lionclaw_runtime_api::RuntimeResumeMode::Resumed) => "native_session",
+                Some(lionclaw_runtime_api::RuntimeResumeMode::Reconstructed) | None => {
+                    "canonical_reconstruction"
+                }
             };
             Ok(serde_json::json!({
                 "id": id.as_str(),

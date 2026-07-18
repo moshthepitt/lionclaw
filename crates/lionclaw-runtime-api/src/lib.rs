@@ -69,8 +69,8 @@ pub use program::{
     RuntimeProgramStdoutSender, RUNTIME_PROGRAM_STDOUT_LINE_LIMIT,
 };
 pub use state::{
-    clear_state_value, load_ready_state_value, load_state_value,
-    runtime_session_ready_marker_exists, save_state_value, RuntimeSessionReady,
-    RUNTIME_SESSION_READY_MARKER,
+    clear_state_value, load_ready_state_value, load_state_value, record_runtime_resume_mode,
+    recorded_runtime_resume_mode, runtime_session_ready_marker_exists, save_state_value,
+    RuntimeSessionReady, RUNTIME_SESSION_READY_MARKER,
 };
 pub use turn::TurnResult;

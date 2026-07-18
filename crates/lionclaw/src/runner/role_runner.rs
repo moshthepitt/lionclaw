@@ -577,6 +577,7 @@ impl OciRoleRunner {
             setup_control_failure(profile, control)
         })
         .await?;
+        let resume_mode = handle.resume_mode;
 
         let (journal_tx, journal_rx) = tokio::sync::mpsc::channel::<lionclaw_runtime_api::TurnEvent>(
             lionclaw_runtime_api::RUNTIME_TURN_JOURNAL_CAPACITY,
@@ -693,11 +694,8 @@ impl OciRoleRunner {
         // failure, interruption, or deadline. Adapters with no saved identity
         // truthfully reconstruct on the next request.
         if let Some(root) = state_root {
-            std::fs::write(
-                root.join(lionclaw_runtime_api::RUNTIME_SESSION_READY_MARKER),
-                b"ready\n",
-            )
-            .map_err(|e| launch(format!("failed to commit native session state: {e}")))?;
+            lionclaw_runtime_api::record_runtime_resume_mode(&root, resume_mode)
+                .map_err(|e| launch(format!("failed to commit native session state: {e}")))?;
         }
 
         match result {
@@ -842,7 +840,9 @@ fn uuid_from_key(key: &str) -> uuid::Uuid {
 mod tests {
     use super::*;
     use crate::mission_type::SkillPackage;
+    use crate::ports::{EffectCleaner, EffectCleanupRequest};
     use lionclaw_confinement::MountAccess;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     #[test]
@@ -862,6 +862,110 @@ mod tests {
         let config = OciRoleRunner::driver_config(&profile).expect("driver config");
 
         assert_eq!(config.mode.as_deref(), Some("autonomous"));
+    }
+
+    #[tokio::test]
+    async fn codex_profile_runner_and_cleaner_keep_only_conversation_state_for_every_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let profiles = RuntimeProfiles::built_in().unwrap();
+        let runner = OciRoleRunner::new(
+            profiles,
+            "slice4-test-image".into(),
+            AuthorityCeiling::default(),
+        );
+        let profile = runner.profile("codex").expect("resolve codex profile");
+        assert_eq!(profile.name, "codex");
+        assert_eq!(profile.driver, "codex");
+        assert!(profile.native_resume);
+        OciRoleRunner::validate_profile(&profile).expect("construct codex driver");
+
+        let mission_id = crate::model::MissionId::for_creation("/workspace", "slice4", 1);
+        let conversation_id = crate::model::ConversationId::for_role_instance(
+            &mission_id,
+            crate::model::TaskNamespace::Execution,
+            &crate::model::TaskId::new("runtime-boundary").unwrap(),
+            &crate::model::RoleName::new("implementer").unwrap(),
+            1,
+        );
+        let conversation =
+            ConversationDirs::prepare(temp.path(), mission_id.as_str(), &conversation_id).unwrap();
+        std::fs::create_dir_all(&conversation.work).unwrap();
+        std::fs::write(conversation.runtime.join("opaque-session"), b"private").unwrap();
+        std::fs::write(conversation.work.join("workspace-identity"), b"stable").unwrap();
+
+        let engine = temp.path().join("fake-oci");
+        std::fs::write(&engine, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&engine).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&engine, permissions).unwrap();
+        let cleaner =
+            crate::effect_cleanup::LocalEffectCleaner::new(engine.to_string_lossy().into_owned());
+
+        for outcome in ["success", "role-failure", "interruption", "deadline"] {
+            let effect_id = crate::model::EffectId::for_parts(&["outcome", outcome]);
+            let effect = EffectDirs::prepare(temp.path(), mission_id.as_str(), &effect_id).unwrap();
+            for relative in [
+                "handoff/handoff.json",
+                "runtime-home/credentials",
+                "runtime/authorization",
+                "scratch/privileged-projection",
+                "effect-work",
+            ] {
+                let path = effect.root.join(relative);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(path, b"effect-private").unwrap();
+            }
+            cleaner
+                .cleanup(EffectCleanupRequest {
+                    mission_id: mission_id.clone(),
+                    effect_id,
+                    workspace_dir: workspace.clone(),
+                    state_dir: temp.path().to_path_buf(),
+                    discard_artifact: false,
+                })
+                .await
+                .unwrap();
+            assert!(!effect.root.exists(), "effect leaked after {outcome}");
+            assert_eq!(
+                std::fs::read(conversation.runtime.join("opaque-session")).unwrap(),
+                b"private"
+            );
+            assert_eq!(
+                std::fs::read(conversation.work.join("workspace-identity")).unwrap(),
+                b"stable"
+            );
+        }
+
+        std::fs::write(
+            &engine,
+            "#!/bin/sh\nmarker=\"${0%/*}/failed-once\"\nif [ ! -e \"$marker\" ]; then touch \"$marker\"; exit 1; fi\nexit 0\n",
+        )
+        .unwrap();
+        let retry_cleaner =
+            crate::effect_cleanup::LocalEffectCleaner::new(engine.to_string_lossy().into_owned());
+        let retry_effect_id = crate::model::EffectId::for_parts(&["outcome", "cleanup-retry"]);
+        let retry_effect =
+            EffectDirs::prepare(temp.path(), mission_id.as_str(), &retry_effect_id).unwrap();
+        std::fs::write(retry_effect.runtime_home.join("credential"), b"private").unwrap();
+        let retry_request = EffectCleanupRequest {
+            mission_id,
+            effect_id: retry_effect_id,
+            workspace_dir: workspace,
+            state_dir: temp.path().to_path_buf(),
+            discard_artifact: false,
+        };
+        retry_cleaner
+            .cleanup(retry_request.clone())
+            .await
+            .expect_err("fault-injected container cleanup must block settlement");
+        retry_cleaner.cleanup(retry_request).await.unwrap();
+        assert!(!retry_effect.root.exists());
+        assert!(conversation.runtime.join("opaque-session").is_file());
+        assert!(conversation.work.join("workspace-identity").is_file());
     }
 
     #[test]
