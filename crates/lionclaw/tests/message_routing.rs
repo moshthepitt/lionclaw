@@ -21,8 +21,16 @@ fn send_cli(repo: &std::path::Path, mission: &str, args: &[&str]) -> Cli {
     Cli::try_parse_from(argv).expect("production send parser")
 }
 
-async fn event_count(store: &MissionStore, mission: &lionclaw::model::MissionId) -> usize {
-    store.load(mission).await.unwrap().len()
+async fn reject_without_mutation(
+    store: &MissionStore,
+    mission: &lionclaw::model::MissionId,
+    command: Cli,
+) {
+    let events = store.load(mission).await.unwrap();
+    let state = store.require_state(mission).await.unwrap();
+    assert!(cli::run(command).await.is_err());
+    assert_eq!(store.load(mission).await.unwrap(), events);
+    assert_eq!(store.require_state(mission).await.unwrap(), state);
 }
 
 #[tokio::test]
@@ -118,12 +126,27 @@ async fn production_cli_routes_atomically_to_exact_current_role_instances() {
         vec!["--to", "alpha", "--to", "missing"],
     ];
     for args in rejected {
-        let before = event_count(&store, &mission).await;
-        assert!(cli::run(send_cli(dir.path(), mission.as_str(), &args))
-            .await
-            .is_err());
-        assert_eq!(event_count(&store, &mission).await, before);
+        reject_without_mutation(
+            &store,
+            &mission,
+            send_cli(dir.path(), mission.as_str(), &args),
+        )
+        .await;
     }
+    assert!(Cli::try_parse_from([
+        "lionclaw",
+        "mission",
+        "send",
+        "--mission-id",
+        mission.as_str(),
+        "--all",
+        "--to",
+        "alpha",
+        "--repo",
+        dir.path().to_str().unwrap(),
+        "feedback",
+    ])
+    .is_err());
     for epoch in [0, 2] {
         let id = ConversationId::for_role_instance(
             &mission,
@@ -132,18 +155,19 @@ async fn production_cli_routes_atomically_to_exact_current_role_instances() {
             &role,
             epoch,
         );
-        let before = event_count(&store, &mission).await;
-        assert!(cli::run(send_cli(
-            dir.path(),
-            mission.as_str(),
-            &["--to", id.as_str()]
-        ))
-        .await
-        .is_err());
-        assert_eq!(event_count(&store, &mission).await, before);
+        reject_without_mutation(
+            &store,
+            &mission,
+            send_cli(dir.path(), mission.as_str(), &["--to", id.as_str()]),
+        )
+        .await;
     }
 
-    // Both task sugar and --all resolve through the same current-instance set.
+    // Unique task sugar, an explicit id, and --all resolve through the same
+    // current-instance snapshot.
+    cli::run(send_cli(dir.path(), mission.as_str(), &["--to", "alpha"]))
+        .await
+        .unwrap();
     cli::run(send_cli(
         dir.path(),
         mission.as_str(),
@@ -163,9 +187,10 @@ async fn production_cli_routes_atomically_to_exact_current_role_instances() {
             _ => None,
         })
         .collect();
-    assert_eq!(sent.len(), 2);
+    assert_eq!(sent.len(), 3);
     assert_eq!(sent[0].len(), 1, "routing is one atomic event");
-    assert_eq!(sent[1].len(), 1, "--all snapshots every current instance");
+    assert_eq!(sent[1].len(), 1, "explicit id routes exactly once");
+    assert_eq!(sent[2].len(), 1, "--all snapshots every current instance");
     assert!(sent
         .iter()
         .flat_map(|recipients| recipients.iter())
@@ -187,6 +212,8 @@ async fn production_cli_routes_atomically_to_exact_current_role_instances() {
     // Concurrent production CLI writers contend on MissionStore CAS. Each
     // successful command contributes exactly one whole MessageSent event;
     // conflicts contribute none, so partial routing is unrepresentable.
+    let race_before = store.load(&mission).await.unwrap();
+    let race_state_before = store.require_state(&mission).await.unwrap();
     let barrier = Arc::new(tokio::sync::Barrier::new(16));
     let mut writers = Vec::new();
     for _ in 0..16 {
@@ -211,6 +238,7 @@ async fn production_cli_routes_atomically_to_exact_current_role_instances() {
         "the race must exercise both CAS outcomes"
     );
     let after = store.load(&mission).await.unwrap();
+    assert_eq!(after.len(), race_before.len() + ok);
     let race_events: Vec<_> = after
         .iter()
         .rev()
@@ -222,4 +250,9 @@ async fn production_cli_routes_atomically_to_exact_current_role_instances() {
         event,
         MissionEvent::MessageSent { recipients, .. } if recipients.len() == 1
     )));
+    let race_state_after = store.require_state(&mission).await.unwrap();
+    let before_queued = &race_state_before.conversations[&current_conversation].queued;
+    let after_queued = &race_state_after.conversations[&current_conversation].queued;
+    assert_eq!(after_queued.len(), before_queued.len() + ok);
+    assert_eq!(race_state_after.head, race_state_before.head + ok as u64);
 }

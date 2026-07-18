@@ -145,6 +145,12 @@ async fn real_cli_views_share_one_folded_conversation_projection() {
         &["mission", "report", mission.as_str(), "--json"],
     )))
     .unwrap();
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let authoritative = store.require_state(&mission).await.unwrap();
+    let folded_conversation = &authoritative.conversations[&conversation_id];
+    assert_eq!(folded_conversation.queued.len(), 1);
+    assert_eq!(folded_conversation.queued[0].body, "queued lead message");
+    assert_eq!(folded_conversation.queued[0].marker, DeliveryMarker::Queued);
     let projections = [
         conversation(&status_json, conversation_id.as_str()),
         conversation(&report_json, conversation_id.as_str()),
@@ -237,7 +243,6 @@ async fn real_cli_views_share_one_folded_conversation_projection() {
         );
     }
 
-    let store = MissionStore::open(dir.path()).await.unwrap();
     let events = store.load(&mission).await.unwrap();
     assert!(events
         .iter()

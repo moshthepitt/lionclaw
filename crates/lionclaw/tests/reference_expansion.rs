@@ -4,8 +4,9 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
+use clap::Parser;
 use common::{approve_plan, effect_id, harness, proposal, simple_plan, BASE_SHA};
-use lionclaw::engine::{record_message, MessageCommand};
+use lionclaw::cli::{self, Cli};
 use lionclaw::model::{
     EventEnvelope, MessageReference, MissionEvent, OracleName, OracleRunSuccess, ParkedEffect,
     PayloadRef,
@@ -14,6 +15,26 @@ use lionclaw::ports::{RoleRunOutcome, RoleRunRequest, RoleRunUpdate};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 use lionclaw_runtime_api::TypedFailure;
+
+fn send_cli(
+    repo: &std::path::Path,
+    mission: &lionclaw::model::MissionId,
+    conversation: &str,
+    reference_args: &[&str],
+) -> Cli {
+    let mut args = vec![
+        "lionclaw",
+        "mission",
+        "send",
+        "--mission-id",
+        mission.as_str(),
+        "--to",
+        conversation,
+    ];
+    args.extend_from_slice(reference_args);
+    args.extend(["--repo", repo.to_str().unwrap(), "inspect the cited change"]);
+    Cli::try_parse_from(args).expect("production mission send parser")
+}
 
 fn checkpoint(request: &RoleRunRequest) -> RoleRunOutcome {
     request
@@ -55,20 +76,12 @@ async fn reachable_commit_expands_only_at_the_typed_role_request_boundary() {
     let conversation = awaiting.conversations.keys().next().unwrap().to_string();
     let store = MissionStore::open(dir.path()).await.unwrap();
 
-    record_message(
-        &store,
+    cli::run(send_cli(
         dir.path(),
         &mission,
-        MessageCommand {
-            selectors: vec![conversation],
-            all: false,
-            body: "inspect the cited change".into(),
-            references: vec![MessageReference::ReachableCommit {
-                sha: BASE_SHA.into(),
-            }],
-        },
-        10,
-    )
+        &conversation,
+        &["--commit", BASE_SHA],
+    ))
     .await
     .unwrap();
 
@@ -133,11 +146,7 @@ async fn unavailable_references_fail_before_append_or_delivery_advancement() {
     let conversation = awaiting.conversations.keys().next().unwrap().to_string();
     let store = MissionStore::open(dir.path()).await.unwrap();
     let before = store.load(&mission).await.unwrap();
-    let queued_before: usize = awaiting
-        .conversations
-        .values()
-        .map(|c| c.queued.len())
-        .sum();
+    let state_before = store.require_state(&mission).await.unwrap();
 
     let invalid = [
         MessageReference::ReachableCommit {
@@ -151,33 +160,26 @@ async fn unavailable_references_fail_before_append_or_delivery_advancement() {
         },
     ];
     for reference in invalid {
-        let error = record_message(
-            &store,
+        let (flag, identity) = match &reference {
+            MessageReference::ReachableCommit { sha } => ("--commit", sha.as_str()),
+            MessageReference::AuthoritativeReceipt { effect_id } => {
+                ("--receipt", effect_id.as_str())
+            }
+            MessageReference::ParkEvidence { effect_id } => ("--park", effect_id.as_str()),
+        };
+        let error = cli::run(send_cli(
             dir.path(),
             &mission,
-            MessageCommand {
-                selectors: vec![conversation.clone()],
-                all: false,
-                body: "must not append".into(),
-                references: vec![reference],
-            },
-            11,
-        )
+            &conversation,
+            &[flag, identity],
+        ))
         .await
         .expect_err("foreign or unreachable authority must fail closed");
         assert!(error.to_string().contains("not valid authority"));
         let after = store.load(&mission).await.unwrap();
-        assert_eq!(after.len(), before.len(), "failure appended an event");
+        assert_eq!(after, before, "failure changed the authoritative log");
         let state = store.require_state(&mission).await.unwrap();
-        assert_eq!(
-            state
-                .conversations
-                .values()
-                .map(|c| c.queued.len())
-                .sum::<usize>(),
-            queued_before,
-            "failure advanced delivery"
-        );
+        assert_eq!(state, state_before, "failure changed folded delivery state");
     }
 }
 

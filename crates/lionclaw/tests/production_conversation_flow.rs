@@ -12,9 +12,9 @@ use lionclaw::config::RuntimeProfiles;
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
 use lionclaw::mission_type::load_mission_type;
 use lionclaw::model::{
-    apply, fold, Assertion, AssertionId, DecisionAction, FinishClass, MissionEvent, MissionPhase,
-    MissionState, OracleName, Plan, PlanProposal, Requirement, RequirementDisposition,
-    RequirementId, RequirementKind, RoleName, Task, TaskId, TaskKind,
+    apply, fold, Assertion, AssertionId, FinishClass, MissionEvent, MissionPhase, MissionState,
+    OracleName, Plan, PlanProposal, Requirement, RequirementDisposition, RequirementId,
+    RequirementKind, RoleName, Task, TaskId, TaskKind,
 };
 use lionclaw::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
 use lionclaw::runner::OciRoleRunner;
@@ -315,25 +315,54 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         )
         .await
         .unwrap();
-    engine
-        .propose_plan(
-            &mission_id,
-            PlanProposal {
-                base_revision: 0,
-                plan: plan(),
-            },
-        )
-        .await
-        .unwrap();
-    engine
-        .decide(
-            &mission_id,
-            "plan_proposal:mission",
-            DecisionAction::Approve,
-            "approve production proof",
-        )
-        .await
-        .unwrap();
+    let mission_type_snapshot = repo
+        .join(".lionclaw/missions")
+        .join(mission_id.as_str())
+        .join("mission-type");
+    std::fs::create_dir_all(mission_type_snapshot.parent().unwrap()).unwrap();
+    lionclaw::mission_type::materialize_mission_type(
+        &mission_type_dir,
+        &mission_type_snapshot,
+        &AuthorityCeiling::default(),
+    )
+    .unwrap();
+    let proposal_path = temp.path().join("proposal.json");
+    std::fs::write(
+        &proposal_path,
+        serde_json::to_vec(&PlanProposal {
+            base_revision: 0,
+            plan: plan(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let propose = cli::Cli::try_parse_from([
+        "lionclaw",
+        "mission",
+        "plan",
+        "propose",
+        mission_id.as_str(),
+        "--file",
+        proposal_path.to_str().unwrap(),
+        "--repo",
+        repo.to_str().unwrap(),
+    ])
+    .unwrap();
+    cli::run(propose).await.unwrap();
+    let decide = cli::Cli::try_parse_from([
+        "lionclaw",
+        "mission",
+        "decide",
+        mission_id.as_str(),
+        "plan_proposal:mission",
+        "approve",
+        "--justification",
+        "approve production proof",
+        "--repo",
+        repo.to_str().unwrap(),
+    ])
+    .unwrap();
+    cli::run(decide).await.unwrap();
 
     let status = cli::Cli::try_parse_from([
         "lionclaw",
@@ -370,6 +399,31 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             finish: FinishClass::Verified
         }
     );
+    for args in [
+        vec![
+            "lionclaw",
+            "mission",
+            "report",
+            mission_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--json",
+        ],
+        vec![
+            "lionclaw",
+            "mission",
+            "inbox",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--json",
+        ],
+    ] {
+        let observation = cli::Cli::try_parse_from(args).unwrap();
+        assert_eq!(
+            cli::run(observation).await.unwrap(),
+            std::process::ExitCode::SUCCESS
+        );
+    }
     assert_ne!(outcome.state.current_sha, base);
     assert_eq!(calls.lock().unwrap().len(), 1);
     assert_eq!(turns.lock().unwrap().len(), 2);
