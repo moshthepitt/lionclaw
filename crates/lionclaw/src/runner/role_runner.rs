@@ -11,12 +11,10 @@ use lionclaw_confinement::WORKSPACE_MOUNT_TARGET;
 use lionclaw_runtime_acp::AcpRuntimeDriver;
 use lionclaw_runtime_api::{
     RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider,
-    RuntimeSessionReady, RuntimeSessionStartInput, TurnExecution, TurnInput, TypedFailure,
-    TypedFailureEvidence,
+    RuntimeDriverRegistry, RuntimeSessionReady, RuntimeSessionStartInput, TurnExecution, TurnInput,
+    TypedFailure, TypedFailureEvidence,
 };
-use lionclaw_runtime_codex::{
-    CodexRuntimeAuthProvider, CodexRuntimeDriver, CODEX_RUNTIME_AUTH_KIND,
-};
+use lionclaw_runtime_codex::{CodexRuntimeAuthProvider, CodexRuntimeDriver};
 use tokio::sync::Mutex;
 
 use crate::authority::{
@@ -38,6 +36,8 @@ pub struct OciRoleRunner {
     profiles: RuntimeProfiles,
     image_id: String,
     ceiling: AuthorityCeiling,
+    drivers: RuntimeDriverRegistry,
+    auth_providers: RuntimeAuthRegistry,
     /// Serializes Git checkout/capture operations inside this process. The
     /// mission driver lock provides cross-process coordination.
     repo_lock: Arc<Mutex<()>>,
@@ -45,10 +45,19 @@ pub struct OciRoleRunner {
 
 impl OciRoleRunner {
     pub fn new(profiles: RuntimeProfiles, image_id: String, ceiling: AuthorityCeiling) -> Self {
+        let drivers = RuntimeDriverRegistry::new([
+            Arc::new(CodexRuntimeDriver) as Arc<dyn RuntimeDriverProvider>,
+            Arc::new(AcpRuntimeDriver) as Arc<dyn RuntimeDriverProvider>,
+        ]);
+        let auth_providers = RuntimeAuthRegistry::new([
+            Arc::new(CodexRuntimeAuthProvider) as Arc<dyn RuntimeAuthProvider>
+        ]);
         Self {
             profiles,
             image_id,
             ceiling,
+            drivers,
+            auth_providers,
             repo_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -62,33 +71,44 @@ impl OciRoleRunner {
         Ok(profile)
     }
 
-    fn driver(profile: &MissionRuntimeProfile) -> anyhow::Result<Box<dyn RuntimeDriverProvider>> {
-        match profile.driver.as_str() {
-            "codex" => Ok(Box::new(CodexRuntimeDriver)),
-            "acp" => Ok(Box::new(AcpRuntimeDriver)),
-            other => anyhow::bail!("unknown runtime driver '{other}'"),
-        }
+    fn driver(
+        &self,
+        profile: &MissionRuntimeProfile,
+    ) -> anyhow::Result<Arc<dyn RuntimeDriverProvider>> {
+        self.drivers.get(&profile.driver).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown runtime driver '{}' (registered: {})",
+                profile.driver,
+                self.drivers.names().collect::<Vec<_>>().join(", ")
+            )
+        })
     }
 
-    fn auth_registry(profile: &MissionRuntimeProfile) -> anyhow::Result<RuntimeAuthRegistry> {
+    fn auth_registry(
+        &self,
+        profile: &MissionRuntimeProfile,
+    ) -> anyhow::Result<RuntimeAuthRegistry> {
         let Some(auth) = &profile.auth else {
             return Ok(RuntimeAuthRegistry::empty());
         };
-        let provider: Arc<dyn RuntimeAuthProvider> = match auth {
-            RuntimeAuthConfig::Provider(kind) if kind == CODEX_RUNTIME_AUTH_KIND => {
-                Arc::new(CodexRuntimeAuthProvider)
-            }
-            RuntimeAuthConfig::Provider(kind) => {
-                anyhow::bail!(
-                    "runtime '{}' configures unsupported auth provider '{kind}'",
-                    profile.name
-                )
-            }
+        match auth {
+            RuntimeAuthConfig::Provider(kind) => self
+                .auth_providers
+                .get_kind(kind)
+                .map(|provider| RuntimeAuthRegistry::new([provider]))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "runtime '{}' configures unsupported auth provider '{kind}'",
+                        profile.name
+                    )
+                }),
             RuntimeAuthConfig::NativeHome(config) => {
-                Arc::new(NativeHomeAuthProvider::new(config.clone()))
+                Ok(RuntimeAuthRegistry::new([
+                    Arc::new(NativeHomeAuthProvider::new(config.clone()))
+                        as Arc<dyn RuntimeAuthProvider>,
+                ]))
             }
-        };
-        Ok(RuntimeAuthRegistry::new([provider]))
+        }
     }
 
     fn driver_config(profile: &MissionRuntimeProfile) -> anyhow::Result<RuntimeDriverConfig> {
@@ -111,9 +131,14 @@ impl OciRoleRunner {
     }
 
     pub(crate) fn validate_profile(profile: &MissionRuntimeProfile) -> anyhow::Result<()> {
-        let driver = Self::driver(profile)?;
+        let runner = Self::new(
+            RuntimeProfiles::single(profile.clone()),
+            String::new(),
+            AuthorityCeiling::default(),
+        );
+        let driver = runner.driver(profile)?;
         let config = Self::driver_config(profile)?;
-        Self::auth_registry(profile)?;
+        runner.auth_registry(profile)?;
         driver.validate_config(&config)
     }
 }
@@ -525,11 +550,13 @@ impl OciRoleRunner {
         request: &RoleRunRequest,
         plan: lionclaw_confinement::EffectiveExecutionPlan,
     ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
-        let driver = Self::driver(profile)
+        let driver = self
+            .driver(profile)
             .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
         let config = Self::driver_config(profile)
             .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
-        let auth_registry = Self::auth_registry(profile)
+        let auth_registry = self
+            .auth_registry(profile)
             .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
         driver
             .validate_config(&config)

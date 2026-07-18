@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -38,4 +38,69 @@ pub trait RuntimeDriverProvider: Send + Sync {
     }
 
     fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter>;
+}
+
+/// Driver implementations keyed by their declared protocol identifier.
+///
+/// Runtime profiles select an entry from this registry; construction code
+/// never needs to know which product a profile names.
+#[derive(Clone, Default)]
+pub struct RuntimeDriverRegistry {
+    providers: Arc<BTreeMap<String, Arc<dyn RuntimeDriverProvider>>>,
+}
+
+impl RuntimeDriverRegistry {
+    pub fn new(providers: impl IntoIterator<Item = Arc<dyn RuntimeDriverProvider>>) -> Self {
+        let providers = providers
+            .into_iter()
+            .map(|provider| (provider.driver().to_string(), provider))
+            .collect();
+        Self {
+            providers: Arc::new(providers),
+        }
+    }
+
+    pub fn get(&self, driver: &str) -> Option<Arc<dyn RuntimeDriverProvider>> {
+        self.providers.get(driver).cloned()
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.providers.keys().map(String::as_str)
+    }
+}
+
+impl fmt::Debug for RuntimeDriverRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeDriverRegistry")
+            .field("providers", &self.providers.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DeclaredDriver;
+
+    impl RuntimeDriverProvider for DeclaredDriver {
+        fn driver(&self) -> &'static str {
+            "declared-protocol"
+        }
+
+        fn create_adapter(&self, _config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
+            unreachable!("registry selection does not instantiate the adapter")
+        }
+    }
+
+    #[test]
+    fn profile_driver_is_selected_by_declared_registry_identity() {
+        let registry =
+            RuntimeDriverRegistry::new(
+                [Arc::new(DeclaredDriver) as Arc<dyn RuntimeDriverProvider>],
+            );
+
+        assert!(registry.get("declared-protocol").is_some());
+        assert!(registry.get("unregistered-product").is_none());
+    }
 }

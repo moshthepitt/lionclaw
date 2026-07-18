@@ -52,7 +52,9 @@ pub use context::{
     safe_relative_path, RuntimeExecutionContext, RuntimeMcpServerSpec,
     RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimePathProjectionKind,
 };
-pub use driver::{RuntimeDriverConfig, RuntimeDriverProvider, RuntimeTerminalConfig};
+pub use driver::{
+    RuntimeDriverConfig, RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeTerminalConfig,
+};
 pub use event::{
     append_streamed_text_boundary, append_streamed_text_delta, canonical_events,
     observe_final_response, RuntimeArtifact, RuntimeEvent, RuntimeEventSender, RuntimeFileChange,

@@ -41,3 +41,25 @@ fn superseded_runtime_contract_has_no_source_residue() {
         }
     }
 }
+
+#[test]
+fn production_runtime_construction_does_not_branch_on_product_names() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let path = workspace.join("crates/lionclaw/src/runner/role_runner.rs");
+    let source = std::fs::read_to_string(&path).expect("read production role runner");
+    let forbidden = [
+        ["match profile.", "driver"].concat(),
+        ["driver.as_", "str()"].concat(),
+        ["CODEX_RUNTIME_", "AUTH_KIND"].concat(),
+        ["kind == ", "\"codex\""].concat(),
+        ["driver == ", "\"codex\""].concat(),
+        ["driver == ", "\"acp\""].concat(),
+    ];
+
+    for behavior_branch in forbidden {
+        assert!(
+            !source.contains(&behavior_branch),
+            "runtime construction contains product-name behavior branch {behavior_branch:?}"
+        );
+    }
+}

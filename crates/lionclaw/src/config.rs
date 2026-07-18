@@ -112,6 +112,12 @@ impl RuntimeSkillsDir {
 }
 
 impl RuntimeProfiles {
+    pub(crate) fn single(profile: MissionRuntimeProfile) -> Self {
+        Self {
+            profiles: BTreeMap::from([(profile.name.clone(), profile)]),
+        }
+    }
+
     pub fn built_in() -> Result<Self> {
         let user_home = user_home_from_env()
             .ok_or_else(|| anyhow!("HOME is required to resolve built-in runtime auth paths"))?;
