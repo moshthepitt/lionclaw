@@ -52,6 +52,21 @@ impl OciRoleRunner {
         let auth_providers = RuntimeAuthRegistry::new([
             Arc::new(CodexRuntimeAuthProvider) as Arc<dyn RuntimeAuthProvider>
         ]);
+        Self::with_registries(profiles, image_id, ceiling, drivers, auth_providers)
+    }
+
+    /// Construct the production runner with protocol registries supplied by
+    /// the caller. This is the transport seam used by production-path tests:
+    /// workspace, authority, session, handoff, and capture behavior remains
+    /// the real runner while only the external native-runtime transport is
+    /// substituted.
+    pub fn with_registries(
+        profiles: RuntimeProfiles,
+        image_id: String,
+        ceiling: AuthorityCeiling,
+        drivers: RuntimeDriverRegistry,
+        auth_providers: RuntimeAuthRegistry,
+    ) -> Self {
         Self {
             profiles,
             image_id,
