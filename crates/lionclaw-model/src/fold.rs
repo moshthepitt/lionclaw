@@ -356,12 +356,13 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }
         }
         MissionEvent::RoleRunCompleted {
-            namespace,
-            task_id,
-            attempt_no,
             effect_id,
+            request,
             outcome,
         } => {
+            let namespace = &request.namespace;
+            let task_id = &request.task_id;
+            let attempt_no = &request.attempt_no;
             let (observed_configuration, expected_contract) = state
                 .inflight
                 .get(effect_id)
@@ -2036,6 +2037,7 @@ mod tests {
     fn fold_log(events: Vec<MissionEvent>) -> Option<MissionState> {
         let mut known_tasks = BTreeSet::new();
         let mut requested_effects = BTreeSet::new();
+        let mut synthesized_role_requests = BTreeSet::new();
         let mut valid_log = Vec::new();
         for event in events {
             match &event {
@@ -2063,21 +2065,26 @@ mod tests {
                 _ => {}
             }
             if let MissionEvent::RoleRunCompleted {
-                namespace,
-                task_id,
-                attempt_no,
+                request,
                 effect_id,
                 outcome: Ok(success),
             } = &event
             {
-                if known_tasks.contains(&TaskAddress::new(*namespace, task_id.clone()))
-                    && requested_effects.insert(effect_id.clone())
+                if known_tasks.contains(&TaskAddress::new(
+                    request.namespace,
+                    request.task_id.clone(),
+                )) && requested_effects.insert(effect_id.clone())
                 {
+                    synthesized_role_requests.insert(effect_id.clone());
                     let (role, output) = match success.handoff.as_ref().expect("test log handoff") {
-                        Handoff::Work { .. } if *namespace == crate::TaskNamespace::Planning => (
-                            RoleName::new("planner").expect("role name"),
-                            OutputSemantics::ProducesReport,
-                        ),
+                        Handoff::Work { .. }
+                            if request.namespace == crate::TaskNamespace::Planning =>
+                        {
+                            (
+                                RoleName::new("planner").expect("role name"),
+                                OutputSemantics::ProducesReport,
+                            )
+                        }
                         Handoff::Work { .. } => (
                             RoleName::new("implementer").expect("role name"),
                             OutputSemantics::ProducesArtifact,
@@ -2098,14 +2105,14 @@ mod tests {
                     valid_log.push(MissionEvent::RoleRunRequested {
                         conversation_id: crate::ConversationId::for_role_instance(
                             &mission_id(),
-                            *namespace,
-                            task_id,
+                            request.namespace,
+                            &request.task_id,
                             &role,
                             1,
                         ),
-                        namespace: *namespace,
-                        task_id: task_id.clone(),
-                        attempt_no: *attempt_no,
+                        namespace: request.namespace,
+                        task_id: request.task_id.clone(),
+                        attempt_no: request.attempt_no,
                         effect_id: effect_id.clone(),
                         role,
                         output,
@@ -2183,6 +2190,7 @@ mod tests {
             std::iter::once(event).chain(approve)
         });
         let mut queued: BTreeMap<crate::ConversationId, Vec<u64>> = BTreeMap::new();
+        let mut active_roles: BTreeMap<EffectId, crate::RoleRunRequestIdentity> = BTreeMap::new();
         fold(events.enumerate().map(|(i, mut event)| {
             let sequence_no = i as u64;
             match &mut event {
@@ -2195,13 +2203,20 @@ mod tests {
                     }
                 }
                 MissionEvent::RoleRunRequested {
+                    effect_id,
                     conversation_id,
                     namespace,
                     task_id,
+                    attempt_no,
                     role,
+                    output,
+                    runtime,
+                    prompt,
+                    base_sha,
                     assignment_epoch,
                     message_boundary,
                     presented_messages,
+                    recreate_workspace,
                     ..
                 } => {
                     *conversation_id = crate::ConversationId::for_role_instance(
@@ -2213,6 +2228,41 @@ mod tests {
                     );
                     *message_boundary = sequence_no.saturating_sub(1);
                     *presented_messages = queued.get(conversation_id).cloned().unwrap_or_default();
+                    active_roles.insert(
+                        effect_id.clone(),
+                        crate::RoleRunRequestIdentity {
+                            conversation_id: conversation_id.clone(),
+                            namespace: *namespace,
+                            task_id: task_id.clone(),
+                            attempt_no: *attempt_no,
+                            assignment_epoch: *assignment_epoch,
+                            role: role.clone(),
+                            output: *output,
+                            runtime: runtime.clone(),
+                            prompt: prompt.clone(),
+                            prompt_hash: prompt.content_sha256().unwrap(),
+                            base_sha: base_sha.clone(),
+                            recreate_workspace: *recreate_workspace,
+                            message_boundary: *message_boundary,
+                            presented_messages: presented_messages.clone(),
+                        },
+                    );
+                }
+                MissionEvent::RoleRunCompleted {
+                    effect_id, request, ..
+                } => {
+                    if let Some(active) = active_roles.get(effect_id) {
+                        if synthesized_role_requests.contains(effect_id) {
+                            **request = active.clone();
+                            return envelope(sequence_no, event);
+                        }
+                        let mut normalized = (**request).clone();
+                        normalized.message_boundary = active.message_boundary;
+                        normalized.presented_messages = active.presented_messages.clone();
+                        if normalized == *active {
+                            **request = active.clone();
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -2609,11 +2659,24 @@ mod tests {
         handoff: Handoff,
         artifact: Option<ArtifactOutcome>,
     ) -> MissionEvent {
+        let role = if namespace == crate::TaskNamespace::Planning {
+            RoleName::new("planner").unwrap()
+        } else {
+            RoleName::new("implementer").unwrap()
+        };
+        let output = if namespace == crate::TaskNamespace::Planning {
+            match &handoff {
+                Handoff::Plan { .. } => OutputSemantics::ProposesPlan,
+                Handoff::Validate { .. } => OutputSemantics::EmitsVerdict,
+                Handoff::Review { .. } => OutputSemantics::EmitsGapVerdict,
+                Handoff::Work { .. } => OutputSemantics::ProducesReport,
+            }
+        } else {
+            OutputSemantics::ProducesArtifact
+        };
         MissionEvent::RoleRunCompleted {
-            namespace,
-            task_id: tid(task),
-            attempt_no,
             effect_id: role_effect(namespace, task, attempt_no, 1),
+            request: role_identity(namespace, task, attempt_no, 1, role, output, "base", true),
             outcome: Ok(RoleRunSuccess {
                 handoff: Some(handoff),
                 artifact,
@@ -2621,6 +2684,42 @@ mod tests {
                 runtime_configuration: RuntimeConfigurationEvidence::default(),
             }),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn role_identity(
+        namespace: crate::TaskNamespace,
+        task: &str,
+        attempt_no: u32,
+        assignment_epoch: u32,
+        role: RoleName,
+        output: OutputSemantics,
+        base_sha: &str,
+        recreate_workspace: bool,
+    ) -> Box<crate::RoleRunRequestIdentity> {
+        let prompt = PayloadRef::inline("prompt");
+        Box::new(crate::RoleRunRequestIdentity {
+            conversation_id: crate::ConversationId::for_role_instance(
+                &mission_id(),
+                namespace,
+                &tid(task),
+                &role,
+                assignment_epoch,
+            ),
+            namespace,
+            task_id: tid(task),
+            attempt_no,
+            assignment_epoch,
+            role,
+            output,
+            runtime: "codex".into(),
+            prompt_hash: prompt.content_sha256().unwrap(),
+            prompt,
+            base_sha: base_sha.into(),
+            recreate_workspace,
+            message_boundary: 0,
+            presented_messages: vec![],
+        })
     }
 
     fn oracle_requested(assertion_id: &str, judged: &str, _key: &str) -> MissionEvent {
@@ -2778,9 +2877,16 @@ mod tests {
                 budget_deadline_ms: 100_001,
             },
             MissionEvent::RoleRunCompleted {
-                namespace: crate::TaskNamespace::Execution,
-                task_id: tid("w"),
-                attempt_no: 2,
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "w",
+                    2,
+                    2,
+                    RoleName::new("implementer").unwrap(),
+                    OutputSemantics::ProducesArtifact,
+                    "moved",
+                    true,
+                ),
                 effect_id: second_effect,
                 outcome: Err(TypedFailure::permanent(
                     "kernel.launch",
@@ -3581,9 +3687,16 @@ mod tests {
             plan_proposed(vec![], vec![work_task("t1")]),
             role_requested("t1", "k1"),
             MissionEvent::RoleRunCompleted {
-                namespace: crate::TaskNamespace::Execution,
-                task_id: tid("t1"),
-                attempt_no: 1,
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "t1",
+                    1,
+                    1,
+                    RoleName::new("implementer").unwrap(),
+                    OutputSemantics::ProducesArtifact,
+                    "base",
+                    true,
+                ),
                 effect_id: role_effect(crate::TaskNamespace::Execution, "t1", 1, 1),
                 outcome: Err(TypedFailure::DeadlineExhausted {
                     evidence: Box::new(TypedFailureEvidence {
@@ -3660,9 +3773,16 @@ mod tests {
                 plan_proposed(vec![], vec![work_task("t1")]),
                 role_requested("t1", &format!("request-{index}")),
                 MissionEvent::RoleRunCompleted {
-                    namespace: crate::TaskNamespace::Execution,
-                    task_id: tid("t1"),
-                    attempt_no: 1,
+                    request: role_identity(
+                        crate::TaskNamespace::Execution,
+                        "t1",
+                        1,
+                        1,
+                        RoleName::new("implementer").unwrap(),
+                        OutputSemantics::ProducesArtifact,
+                        "base",
+                        true,
+                    ),
                     effect_id: role_effect(crate::TaskNamespace::Execution, "t1", 1, 1),
                     outcome: Err(failure.clone()),
                 },
@@ -3708,9 +3828,16 @@ mod tests {
             plan_proposed(vec![], vec![work_task("same-id")]),
             role_requested("same-id", "execution"),
             MissionEvent::RoleRunCompleted {
-                namespace: crate::TaskNamespace::Execution,
-                task_id: tid("same-id"),
-                attempt_no: 1,
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "same-id",
+                    1,
+                    1,
+                    RoleName::new("implementer").unwrap(),
+                    OutputSemantics::ProducesArtifact,
+                    "base",
+                    true,
+                ),
                 effect_id: role_effect(crate::TaskNamespace::Execution, "same-id", 1, 1),
                 outcome: Err(TypedFailure::DeadlineExhausted {
                     evidence: Box::new(TypedFailureEvidence::new(None, "took too long")),
@@ -3836,9 +3963,16 @@ mod tests {
                 OutputSemantics::ProducesReport,
             ),
             MissionEvent::RoleRunCompleted {
-                namespace: crate::TaskNamespace::Planning,
-                task_id: tid("same-id"),
-                attempt_no: 1,
+                request: role_identity(
+                    crate::TaskNamespace::Planning,
+                    "same-id",
+                    1,
+                    1,
+                    RoleName::new("planner").unwrap(),
+                    OutputSemantics::ProducesReport,
+                    "base",
+                    true,
+                ),
                 effect_id: parked_effect.clone(),
                 outcome: Err(TypedFailure::permanent("runtime.failed", "failed")),
             },
@@ -3885,9 +4019,16 @@ mod tests {
             plan_proposed(vec![], vec![work_task("work")]),
             role_requested("work", "wrong-namespace"),
             MissionEvent::RoleRunCompleted {
-                namespace: crate::TaskNamespace::Execution,
-                task_id: tid("work"),
-                attempt_no: 1,
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "work",
+                    1,
+                    1,
+                    RoleName::new("implementer").unwrap(),
+                    OutputSemantics::ProducesArtifact,
+                    "base",
+                    true,
+                ),
                 effect_id: role_effect(crate::TaskNamespace::Execution, "work", 1, 1),
                 outcome: Ok(RoleRunSuccess {
                     handoff: Some(Handoff::Plan {
@@ -4002,9 +4143,16 @@ mod tests {
                 budget_deadline_ms: 100_000,
             },
             MissionEvent::RoleRunCompleted {
-                namespace: crate::TaskNamespace::Execution,
-                task_id: tid("work"),
-                attempt_no: 2,
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "work",
+                    2,
+                    1,
+                    RoleName::new("implementer").unwrap(),
+                    OutputSemantics::ProducesArtifact,
+                    "base",
+                    true,
+                ),
                 effect_id: forged_effect,
                 outcome: Ok(RoleRunSuccess {
                     handoff: Some(work_handoff(true, false)),
@@ -4057,9 +4205,16 @@ mod tests {
         for (namespace, task_id, attempt_no) in mismatches {
             let mut events = base.clone();
             events.push(MissionEvent::RoleRunCompleted {
-                namespace,
-                task_id: tid(task_id),
-                attempt_no,
+                request: role_identity(
+                    namespace,
+                    task_id,
+                    attempt_no,
+                    1,
+                    RoleName::new("implementer").unwrap(),
+                    OutputSemantics::ProducesArtifact,
+                    "base",
+                    true,
+                ),
                 effect_id: role_effect(crate::TaskNamespace::Execution, "original", 1, 1),
                 outcome: Ok(RoleRunSuccess {
                     handoff: Some(work_handoff(true, false)),
@@ -4078,6 +4233,67 @@ mod tests {
                 TaskStatus::Pending
             );
             assert!(state.parked_effects.is_empty());
+        }
+
+        let baseline = fold_log(base).expect("baseline");
+        let (effect_id, effect) = baseline.inflight.iter().next().unwrap();
+        let valid = effect.role_request_identity().unwrap();
+        for dimension in 0..15 {
+            let mut request = valid.clone();
+            let mut completed_effect_id = effect_id.clone();
+            match dimension {
+                0 => request.namespace = crate::TaskNamespace::Planning,
+                1 => request.task_id = tid("claimed"),
+                2 => request.attempt_no += 1,
+                3 => request.assignment_epoch += 1,
+                4 => {
+                    request.conversation_id = crate::ConversationId::parse("f".repeat(64)).unwrap()
+                }
+                5 => request.role = RoleName::new("reviewer").unwrap(),
+                6 => request.output = OutputSemantics::EmitsVerdict,
+                7 => request.runtime = "other-profile".into(),
+                8 => request.prompt = PayloadRef::inline("other prompt"),
+                9 => request.prompt_hash = "0".repeat(64),
+                10 => request.base_sha = "other-base".into(),
+                11 => request.recreate_workspace = !request.recreate_workspace,
+                12 => request.message_boundary += 1,
+                13 => request.presented_messages.push(999),
+                14 => completed_effect_id = EffectId::for_parts(&["forged", "effect"]),
+                _ => unreachable!(),
+            }
+            let mut rejected = baseline.clone();
+            apply(
+                &mut rejected,
+                &envelope(
+                    baseline.head + 1,
+                    MissionEvent::RoleRunCompleted {
+                        effect_id: completed_effect_id,
+                        request: Box::new(request),
+                        outcome: Err(TypedFailure::permanent("forged", "forged completion")),
+                    },
+                ),
+            );
+            assert_eq!(
+                rejected.inflight, baseline.inflight,
+                "dimension {dimension}"
+            );
+            assert_eq!(
+                rejected.stop_requests, baseline.stop_requests,
+                "dimension {dimension}"
+            );
+            assert_eq!(
+                rejected.reached_deadlines, baseline.reached_deadlines,
+                "dimension {dimension}"
+            );
+            assert_eq!(
+                rejected.cleanup_failure, baseline.cleanup_failure,
+                "dimension {dimension}"
+            );
+            assert_eq!(
+                rejected.conversations, baseline.conversations,
+                "dimension {dimension}"
+            );
+            assert_eq!(rejected.tasks, baseline.tasks, "dimension {dimension}");
         }
     }
 
@@ -4159,9 +4375,16 @@ mod tests {
             role_completed("work", "work", work_handoff(true, false), None),
             validator_request,
             MissionEvent::RoleRunCompleted {
-                namespace: crate::TaskNamespace::Execution,
-                task_id: tid("validator"),
-                attempt_no: 1,
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "validator",
+                    1,
+                    1,
+                    RoleName::new("reviewer").unwrap(),
+                    OutputSemantics::EmitsVerdict,
+                    "base",
+                    true,
+                ),
                 effect_id: validator_effect,
                 outcome: Ok(RoleRunSuccess {
                     handoff: Some(validate_handoff(&[])),
@@ -4208,9 +4431,16 @@ mod tests {
             plan_proposed(vec![], vec![work_task("writer")]),
             role_requested("writer", "incomplete-writer"),
             MissionEvent::RoleRunCompleted {
-                namespace: crate::TaskNamespace::Execution,
-                task_id: tid("writer"),
-                attempt_no: 1,
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "writer",
+                    1,
+                    1,
+                    RoleName::new("implementer").unwrap(),
+                    OutputSemantics::ProducesArtifact,
+                    "base",
+                    true,
+                ),
                 effect_id: effect_id.clone(),
                 outcome: Ok(RoleRunSuccess {
                     handoff: Some(work_handoff(false, false)),
@@ -4257,9 +4487,16 @@ mod tests {
             ),
             role_requested("retired", "retired-writer"),
             MissionEvent::RoleRunCompleted {
-                namespace: crate::TaskNamespace::Execution,
-                task_id: tid("retired"),
-                attempt_no: 1,
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "retired",
+                    1,
+                    1,
+                    RoleName::new("implementer").unwrap(),
+                    OutputSemantics::ProducesArtifact,
+                    "base",
+                    true,
+                ),
                 effect_id: parked_effect.clone(),
                 outcome: Err(TypedFailure::permanent("runtime.failed", "failed")),
             },
@@ -4697,9 +4934,16 @@ mod tests {
                 None,
             ),
             MissionEvent::RoleRunCompleted {
-                namespace: crate::TaskNamespace::Execution,
-                task_id: tid("specter"),
-                attempt_no: 1,
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "specter",
+                    1,
+                    1,
+                    RoleName::new("implementer").unwrap(),
+                    OutputSemantics::ProducesArtifact,
+                    "base",
+                    true,
+                ),
                 effect_id: EffectId::for_parts(&["test", "k3"]),
                 outcome: Err(TypedFailure::permanent("runtime.gone", "gone")),
             },
@@ -5448,8 +5692,8 @@ mod tests {
             work_handoff(true, false),
             None,
         );
-        if let MissionEvent::RoleRunCompleted { task_id, .. } = &mut forged {
-            *task_id = tid("other");
+        if let MissionEvent::RoleRunCompleted { request, .. } = &mut forged {
+            request.task_id = tid("other");
         }
         events.push(forged);
         let mismatched = fold_log(events.clone()).unwrap();
@@ -5470,8 +5714,8 @@ mod tests {
                     work_handoff(true, false),
                     None,
                 );
-                if let MissionEvent::RoleRunCompleted { attempt_no, .. } = &mut event {
-                    *attempt_no = 1;
+                if let MissionEvent::RoleRunCompleted { request, .. } = &mut event {
+                    request.attempt_no = 1;
                 }
                 event
             },

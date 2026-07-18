@@ -3456,10 +3456,29 @@ mod tests {
                 budget_deadline_ms: 100_000,
             },
             MissionEvent::RoleRunCompleted {
-                namespace: crate::model::TaskNamespace::Execution,
-                task_id: TaskId::new("fix").unwrap(),
-                attempt_no: 1,
                 effect_id: review_role_effect(),
+                request: Box::new(crate::model::RoleRunRequestIdentity {
+                    conversation_id: crate::model::ConversationId::for_role_instance(
+                        &review_mission_id(),
+                        TaskNamespace::Execution,
+                        &TaskId::new("fix").unwrap(),
+                        &RoleName::new("implementer").unwrap(),
+                        1,
+                    ),
+                    namespace: TaskNamespace::Execution,
+                    task_id: TaskId::new("fix").unwrap(),
+                    attempt_no: 1,
+                    assignment_epoch: 1,
+                    role: RoleName::new("implementer").unwrap(),
+                    output: OutputSemantics::ProducesArtifact,
+                    runtime: "codex".into(),
+                    prompt_hash: REVIEW_PROMPT_HASH.into(),
+                    prompt: PayloadRef::inline("prompt"),
+                    base_sha: "base".into(),
+                    recreate_workspace: true,
+                    message_boundary: 3,
+                    presented_messages: vec![],
+                }),
                 outcome: Ok(RoleRunSuccess {
                     handoff: Some(Handoff::Work {
                         done: true,

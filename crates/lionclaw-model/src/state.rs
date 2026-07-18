@@ -607,6 +607,46 @@ pub enum InflightEffect {
 }
 
 impl InflightEffect {
+    pub fn role_request_identity(&self) -> Option<super::RoleRunRequestIdentity> {
+        let Self::RoleRun {
+            conversation_id,
+            namespace,
+            task_id,
+            attempt_no,
+            role,
+            output,
+            runtime,
+            prompt,
+            base_sha,
+            assignment_epoch,
+            message_boundary,
+            presented_messages,
+            recreate_workspace,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(super::RoleRunRequestIdentity {
+            conversation_id: conversation_id.clone(),
+            namespace: *namespace,
+            task_id: task_id.clone(),
+            attempt_no: *attempt_no,
+            assignment_epoch: *assignment_epoch,
+            role: role.clone(),
+            output: *output,
+            runtime: runtime.clone(),
+            prompt: prompt.clone(),
+            prompt_hash: prompt
+                .content_sha256()
+                .expect("accepted role requests always have content-addressed prompts"),
+            base_sha: base_sha.clone(),
+            recreate_workspace: *recreate_workspace,
+            message_boundary: *message_boundary,
+            presented_messages: presented_messages.clone(),
+        })
+    }
+
     pub fn set_deadline_ms(&mut self, new_deadline_ms: i64) {
         match self {
             Self::RoleRun { deadline_ms, .. }
@@ -782,24 +822,9 @@ impl InflightEffect {
     pub(crate) fn matches_outcome(&self, event: &super::event::MissionEvent) -> bool {
         use super::event::MissionEvent;
         match (self, event) {
-            (
-                Self::RoleRun {
-                    namespace,
-                    task_id,
-                    attempt_no,
-                    ..
-                },
-                MissionEvent::RoleRunCompleted {
-                    namespace: completed_namespace,
-                    task_id: completed_task,
-                    attempt_no: completed_attempt,
-                    ..
-                },
-            ) => {
-                namespace == completed_namespace
-                    && task_id == completed_task
-                    && attempt_no == completed_attempt
-            }
+            (Self::RoleRun { .. }, MissionEvent::RoleRunCompleted { request, .. }) => self
+                .role_request_identity()
+                .is_some_and(|active| active == **request),
             (
                 Self::OracleRun {
                     assertion_ids,

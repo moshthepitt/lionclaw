@@ -1009,12 +1009,13 @@ impl Engine {
             bail!("execute_role_run called with a non-role effect");
         };
         let attempt_no = *attempt_no;
+        let request = effect
+            .role_request_identity()
+            .expect("matched role-run effect");
         let completed = |outcome| {
             NewEvent::new(MissionEvent::RoleRunCompleted {
-                namespace: *namespace,
-                task_id: task_id.clone(),
-                attempt_no,
                 effect_id: effect_id.clone(),
+                request: Box::new(request.clone()),
                 outcome,
             })
         };
@@ -1933,16 +1934,13 @@ fn failed_outcome(
     failure: TypedFailure,
 ) -> NewEvent {
     NewEvent::new(match effect {
-        InflightEffect::RoleRun {
-            namespace,
-            task_id,
-            attempt_no,
-            ..
-        } => MissionEvent::RoleRunCompleted {
-            namespace: *namespace,
-            task_id: task_id.clone(),
-            attempt_no: *attempt_no,
+        InflightEffect::RoleRun { .. } => MissionEvent::RoleRunCompleted {
             effect_id: effect_id.clone(),
+            request: Box::new(
+                effect
+                    .role_request_identity()
+                    .expect("matched role-run effect"),
+            ),
             outcome: Err(failure),
         },
         InflightEffect::OracleRun {

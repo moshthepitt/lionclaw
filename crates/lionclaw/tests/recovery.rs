@@ -67,10 +67,29 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
         }),
     };
     let orphan = lionclaw::store::NewEvent::new(MissionEvent::RoleRunCompleted {
-        namespace: TaskNamespace::Execution,
-        task_id: task_id.clone(),
-        attempt_no: 1,
         effect_id: effect_id.clone(),
+        request: Box::new(lionclaw::model::RoleRunRequestIdentity {
+            conversation_id: lionclaw::model::ConversationId::for_role_instance(
+                &mission_id,
+                TaskNamespace::Execution,
+                &task_id,
+                &lionclaw::model::RoleName::new("implementer").unwrap(),
+                1,
+            ),
+            namespace: TaskNamespace::Execution,
+            task_id: task_id.clone(),
+            attempt_no: 1,
+            assignment_epoch: 1,
+            role: lionclaw::model::RoleName::new("implementer").unwrap(),
+            output: lionclaw::model::OutputSemantics::ProducesArtifact,
+            runtime: "codex".into(),
+            prompt: lionclaw::model::PayloadRef::inline("prompt"),
+            prompt_hash: prompt_hash.into(),
+            base_sha: BASE_SHA.into(),
+            recreate_workspace: true,
+            message_boundary: 0,
+            presented_messages: vec![],
+        }),
         outcome: Err(interrupted),
     });
     let state = h.engine.load_state(&mission_id).await.expect("state");

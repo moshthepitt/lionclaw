@@ -510,11 +510,14 @@ mod tests {
         _key: &str,
         artifact: Option<(&str, &str)>,
     ) -> MissionEvent {
-        MissionEvent::RoleRunCompleted {
-            namespace: TaskNamespace::Execution,
-            task_id: tid(task),
+        let request = role_request_identity(
+            task,
             attempt_no,
+            artifact.map_or("sha-0", |(base_sha, _)| base_sha),
+        );
+        MissionEvent::RoleRunCompleted {
             effect_id: role_effect(task, attempt_no),
+            request,
             outcome: Ok(RoleRunSuccess {
                 handoff: Some(Handoff::Work {
                     done: true,
@@ -533,14 +536,42 @@ mod tests {
 
     fn role_failed(task: &str, _key: &str) -> MissionEvent {
         MissionEvent::RoleRunCompleted {
-            namespace: TaskNamespace::Execution,
-            task_id: tid(task),
-            attempt_no: 1,
             effect_id: role_effect(task, 1),
+            request: role_request_identity(task, 1, "sha-0"),
             outcome: Err(TypedFailure::DeadlineExhausted {
                 evidence: Box::new(TypedFailureEvidence::new(None, "runner timed out")),
             }),
         }
+    }
+
+    fn role_request_identity(
+        task: &str,
+        attempt_no: u32,
+        base_sha: &str,
+    ) -> Box<crate::RoleRunRequestIdentity> {
+        let prompt = PayloadRef::inline("assembled prompt");
+        Box::new(crate::RoleRunRequestIdentity {
+            conversation_id: crate::ConversationId::for_role_instance(
+                &mission_id(),
+                TaskNamespace::Execution,
+                &tid(task),
+                &rname("implementer"),
+                1,
+            ),
+            namespace: TaskNamespace::Execution,
+            task_id: tid(task),
+            attempt_no,
+            assignment_epoch: 1,
+            role: rname("implementer"),
+            output: crate::OutputSemantics::ProducesArtifact,
+            runtime: "codex".into(),
+            prompt_hash: prompt.content_sha256().unwrap(),
+            prompt,
+            base_sha: base_sha.into(),
+            recreate_workspace: attempt_no == 1,
+            message_boundary: 0,
+            presented_messages: vec![],
+        })
     }
 
     fn oracle_requested(
@@ -600,13 +631,25 @@ mod tests {
             });
             std::iter::once(event).chain(approve)
         });
+        let mut role_boundaries = std::collections::BTreeMap::new();
         fold(events.enumerate().map(|(i, mut event)| {
             let sequence_no = i as u64 + 1;
             if let MissionEvent::RoleRunRequested {
-                message_boundary, ..
+                effect_id,
+                message_boundary,
+                ..
             } = &mut event
             {
                 *message_boundary = sequence_no - 1;
+                role_boundaries.insert(effect_id.clone(), *message_boundary);
+            }
+            if let MissionEvent::RoleRunCompleted {
+                effect_id, request, ..
+            } = &mut event
+            {
+                if let Some(boundary) = role_boundaries.get(effect_id) {
+                    request.message_boundary = *boundary;
+                }
             }
             let mut stamps = VersionStamps::default();
             if matches!(event, MissionEvent::RoleRunRequested { .. }) {

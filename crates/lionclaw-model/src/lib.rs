@@ -40,10 +40,10 @@ pub use event::{
     ControlAction, ConversationRecipient, DecisionAction, EffectEventClass, EffectResource,
     EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff, MessageReference, MissionConfig,
     MissionEvent, MissionTypeRef, OracleRunSuccess, PayloadRef, PreparedInputRef, RecoveryConfig,
-    RoleRunSuccess, RuntimeConfigurationEvidence, StopBar, TaskNamespace, TerminalReviewConfig,
-    TerminalReviewSuccess, ValidationItem, VersionStamps, MAX_EXECUTION_DURATION_SECS,
-    MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES, MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES,
-    SCHEMA_VERSION,
+    RoleRunRequestIdentity, RoleRunSuccess, RuntimeConfigurationEvidence, StopBar, TaskNamespace,
+    TerminalReviewConfig, TerminalReviewSuccess, ValidationItem, VersionStamps,
+    MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES,
+    MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES, SCHEMA_VERSION,
 };
 pub use failure::{
     bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,

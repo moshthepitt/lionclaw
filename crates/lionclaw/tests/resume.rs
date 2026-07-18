@@ -211,10 +211,29 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
             })
             .with_prompt_hash(CRASHED_PROMPT_HASH),
             NewEvent::new(MissionEvent::RoleRunCompleted {
-                namespace: lionclaw::model::TaskNamespace::Execution,
-                task_id,
-                attempt_no: 1,
                 effect_id: role_effect,
+                request: Box::new(lionclaw::model::RoleRunRequestIdentity {
+                    conversation_id: lionclaw::model::ConversationId::for_role_instance(
+                        &mission_id,
+                        lionclaw::model::TaskNamespace::Execution,
+                        &task_id,
+                        &lionclaw::model::RoleName::new("implementer").unwrap(),
+                        1,
+                    ),
+                    namespace: lionclaw::model::TaskNamespace::Execution,
+                    task_id,
+                    attempt_no: 1,
+                    assignment_epoch: 1,
+                    role: lionclaw::model::RoleName::new("implementer").unwrap(),
+                    output: OutputSemantics::ProducesArtifact,
+                    runtime: "codex".into(),
+                    prompt: PayloadRef::inline("prompt"),
+                    prompt_hash: CRASHED_PROMPT_HASH.into(),
+                    base_sha: BASE_SHA.into(),
+                    recreate_workspace: true,
+                    message_boundary: state.head,
+                    presented_messages: vec![],
+                }),
                 outcome: Ok(RoleRunSuccess {
                     handoff: Some(Handoff::Work {
                         done: true,

@@ -125,6 +125,39 @@ mod tests {
         )
     }
 
+    fn test_role_identity(
+        mission_id: &MissionId,
+        task_id: &TaskId,
+        role: &str,
+        output: crate::OutputSemantics,
+        message_boundary: u64,
+    ) -> Box<crate::RoleRunRequestIdentity> {
+        let role = RoleName::new(role).unwrap();
+        let prompt = PayloadRef::inline("p");
+        Box::new(crate::RoleRunRequestIdentity {
+            conversation_id: crate::ConversationId::for_role_instance(
+                mission_id,
+                crate::TaskNamespace::Execution,
+                task_id,
+                &role,
+                1,
+            ),
+            namespace: crate::TaskNamespace::Execution,
+            task_id: task_id.clone(),
+            attempt_no: 1,
+            assignment_epoch: 1,
+            role,
+            output,
+            runtime: "codex".into(),
+            prompt_hash: prompt.content_sha256().unwrap(),
+            prompt,
+            base_sha: "s0".into(),
+            recreate_workspace: true,
+            message_boundary,
+            presented_messages: vec![],
+        })
+    }
+
     fn aid(s: &str) -> AssertionId {
         AssertionId::new(s).unwrap()
     }
@@ -278,10 +311,14 @@ mod tests {
                 &mission_id,
                 seq,
                 MissionEvent::RoleRunCompleted {
-                    namespace: crate::TaskNamespace::Execution,
-                    task_id: task.id.clone(),
-                    attempt_no: 1,
                     effect_id,
+                    request: test_role_identity(
+                        &mission_id,
+                        &task.id,
+                        "implementer",
+                        crate::OutputSemantics::ProducesArtifact,
+                        seq - 2,
+                    ),
                     outcome: Ok(crate::RoleRunSuccess {
                         handoff: Some(Handoff::Work {
                             done: true,
@@ -332,10 +369,14 @@ mod tests {
                 &mission_id,
                 seq,
                 MissionEvent::RoleRunCompleted {
-                    namespace: crate::TaskNamespace::Execution,
-                    task_id: tid(validator),
-                    attempt_no: 1,
                     effect_id: role_effect(&mission_id, &tid(validator)),
+                    request: test_role_identity(
+                        &mission_id,
+                        &tid(validator),
+                        "reviewer",
+                        crate::OutputSemantics::EmitsVerdict,
+                        seq - 2,
+                    ),
                     outcome: Ok(crate::RoleRunSuccess {
                         handoff: Some(Handoff::Validate {
                             done: true,

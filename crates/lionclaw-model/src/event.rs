@@ -483,6 +483,28 @@ pub struct RoleRunSuccess {
     pub runtime_configuration: RuntimeConfigurationEvidence,
 }
 
+/// Immutable authority carried from a role request into its completion.
+/// The reducer accepts an outcome only when every field still matches the
+/// active request; an effect id alone is not evidence of what was executed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleRunRequestIdentity {
+    pub conversation_id: ConversationId,
+    pub namespace: TaskNamespace,
+    pub task_id: TaskId,
+    pub attempt_no: u32,
+    pub assignment_epoch: u32,
+    pub role: RoleName,
+    pub output: OutputSemantics,
+    pub runtime: String,
+    pub prompt: PayloadRef,
+    pub prompt_hash: String,
+    pub base_sha: String,
+    pub recreate_workspace: bool,
+    pub message_boundary: u64,
+    pub presented_messages: Vec<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OracleRunSuccess {
@@ -596,10 +618,8 @@ pub enum MissionEvent {
         configuration: RuntimeConfigurationEvidence,
     },
     RoleRunCompleted {
-        namespace: TaskNamespace,
-        task_id: TaskId,
-        attempt_no: u32,
         effect_id: super::EffectId,
+        request: Box<RoleRunRequestIdentity>,
         outcome: Result<RoleRunSuccess, TypedFailure>,
     },
     OracleRunRequested {
