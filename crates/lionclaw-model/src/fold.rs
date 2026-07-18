@@ -117,7 +117,6 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             return;
         };
         if !effect.matches_outcome(&envelope.event) {
-            reject_mismatched_outcome(state, effect_id, effect);
             finish_apply(state, seq);
             return;
         }
@@ -719,21 +718,6 @@ fn finish_apply(state: &mut MissionState, seq: u64) {
     derive_gates(state);
     derive_attention(state);
     derive_phase(state);
-}
-
-fn reject_mismatched_outcome(
-    state: &mut MissionState,
-    effect_id: &super::EffectId,
-    effect: InflightEffect,
-) {
-    let mut failure = TypedFailure::permanent(
-        "kernel.effect_identity",
-        "effect outcome identity does not match its request",
-    );
-    if let Some(configuration) = effect.runtime_configuration() {
-        failure.evidence_mut().configuration = configuration.clone();
-    }
-    settle_effect_failure(state, effect_id, effect, failure, None);
 }
 
 fn settle_effect_failure(
@@ -4085,31 +4069,15 @@ mod tests {
                 }),
             });
             let state = fold_log(events).expect("state");
-            assert!(state.inflight.is_empty());
-            assert_eq!(state.tasks[&tid("original")].status, TaskStatus::Failed);
-            assert!(matches!(
-                state.tasks[&tid("original")].last_failure,
-                Some(TypedFailure::PermanentRuntime { .. })
-            ));
+            assert_eq!(state.inflight.len(), 1);
+            assert_eq!(state.tasks[&tid("original")].status, TaskStatus::Running);
+            assert!(state.tasks[&tid("original")].last_failure.is_none());
             assert_eq!(state.tasks[&tid("claimed")].status, TaskStatus::Pending);
             assert_eq!(
                 state.planning.tasks[&tid("original")].status,
                 TaskStatus::Pending
             );
-            assert!(matches!(
-                state
-                    .parked_effects
-                    .get(&role_effect(
-                        crate::TaskNamespace::Execution,
-                        "original",
-                        1,
-                        1,
-                    )),
-                Some(ParkedEffect::RoleRun {
-                    namespace: crate::TaskNamespace::Execution,
-                    task_id,
-                }) if task_id == &tid("original")
-            ));
+            assert!(state.parked_effects.is_empty());
         }
     }
 
@@ -4342,19 +4310,12 @@ mod tests {
         ])
         .expect("state");
 
-        assert!(state.inflight.is_empty());
-        assert!(matches!(
-            state.oracle_failures.get(&oracle("cargo-test")),
-            Some(TypedFailure::PermanentRuntime { .. })
-        ));
+        assert_eq!(state.inflight.len(), 1);
+        assert!(!state.oracle_failures.contains_key(&oracle("cargo-test")));
         assert!(state.contract[&aid("TESTS-PASS")]
             .last_authoritative
             .is_none());
-        assert!(matches!(
-            state.parked_effects.get(&effect_id),
-            Some(ParkedEffect::OracleRun { oracle: parked })
-                if parked == &oracle("cargo-test")
-        ));
+        assert!(!state.parked_effects.contains_key(&effect_id));
     }
 
     #[test]
@@ -4489,16 +4450,9 @@ mod tests {
         ]);
         let state = fold_log(events).expect("state");
 
-        assert!(state.inflight.is_empty());
-        let Some(ReviewOutcome::Failed { failure }) = state.terminal_review.outcome else {
-            panic!("mismatched review outcome must fail");
-        };
-        assert!(matches!(failure, TypedFailure::PermanentRuntime { .. }));
-        assert_eq!(failure.evidence().configuration, observed);
-        assert!(matches!(
-            state.parked_effects.get(&effect_id),
-            Some(ParkedEffect::TerminalReview)
-        ));
+        assert_eq!(state.inflight.len(), 1);
+        assert!(state.terminal_review.outcome.is_none());
+        assert!(!state.parked_effects.contains_key(&effect_id));
     }
 
     #[test]
@@ -5500,6 +5454,46 @@ mod tests {
         events.push(forged);
         let mismatched = fold_log(events.clone()).unwrap();
         assert_eq!(mismatched.conversations[conversation_id].queued.len(), 2);
+        assert_eq!(mismatched.inflight.len(), 1);
+        assert!(mismatched.conversations[conversation_id]
+            .active_delivery
+            .is_some());
+        assert_eq!(mismatched.tasks[&tid("w")].status, TaskStatus::Running);
+
+        for forged in [
+            {
+                let mut event = role_completed_at(
+                    crate::TaskNamespace::Execution,
+                    "w",
+                    2,
+                    "forged-attempt",
+                    work_handoff(true, false),
+                    None,
+                );
+                if let MissionEvent::RoleRunCompleted { attempt_no, .. } = &mut event {
+                    *attempt_no = 1;
+                }
+                event
+            },
+            role_completed_at(
+                crate::TaskNamespace::Planning,
+                "w",
+                2,
+                "forged-namespace",
+                work_handoff(true, false),
+                None,
+            ),
+        ] {
+            let mut forged_log = events.clone();
+            forged_log.pop();
+            forged_log.push(forged);
+            let rejected = fold_log(forged_log).unwrap();
+            assert_eq!(rejected.inflight.len(), 1);
+            assert_eq!(rejected.conversations[conversation_id].queued.len(), 2);
+            assert!(rejected.conversations[conversation_id]
+                .active_delivery
+                .is_some());
+        }
 
         events.pop();
         events.push(role_completed_at(
