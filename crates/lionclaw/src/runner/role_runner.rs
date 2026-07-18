@@ -903,7 +903,25 @@ mod tests {
         let cleaner =
             crate::effect_cleanup::LocalEffectCleaner::new(engine.to_string_lossy().into_owned());
 
-        for outcome in ["success", "role-failure", "interruption", "deadline"] {
+        for outcome in [
+            "success",
+            "role-failure",
+            "retry",
+            "interruption",
+            "deadline",
+            "stop",
+            "continue",
+            "restart",
+        ] {
+            // Re-open from the durable identity on every iteration, as a new
+            // engine process does after loading the store. Effect identity is
+            // deliberately absent from this lookup.
+            let reopened =
+                ConversationDirs::prepare(temp.path(), mission_id.as_str(), &conversation_id)
+                    .unwrap();
+            assert_eq!(reopened.root, conversation.root);
+            assert_eq!(reopened.work, conversation.work);
+            assert_eq!(reopened.runtime, conversation.runtime);
             let effect_id = crate::model::EffectId::for_parts(&["outcome", outcome]);
             let effect = EffectDirs::prepare(temp.path(), mission_id.as_str(), &effect_id).unwrap();
             for relative in [
@@ -952,7 +970,7 @@ mod tests {
             EffectDirs::prepare(temp.path(), mission_id.as_str(), &retry_effect_id).unwrap();
         std::fs::write(retry_effect.runtime_home.join("credential"), b"private").unwrap();
         let retry_request = EffectCleanupRequest {
-            mission_id,
+            mission_id: mission_id.clone(),
             effect_id: retry_effect_id,
             workspace_dir: workspace,
             state_dir: temp.path().to_path_buf(),
@@ -962,10 +980,30 @@ mod tests {
             .cleanup(retry_request.clone())
             .await
             .expect_err("fault-injected container cleanup must block settlement");
+        // Local projections are removed even when container removal fails;
+        // the retry is solely for the still-unsettled external cleanup.
+        assert!(!retry_effect.root.exists());
+        assert!(!retry_effect.runtime_home.join("credential").exists());
+        assert!(conversation.runtime.join("opaque-session").is_file());
         retry_cleaner.cleanup(retry_request).await.unwrap();
         assert!(!retry_effect.root.exists());
         assert!(conversation.runtime.join("opaque-session").is_file());
         assert!(conversation.work.join("workspace-identity").is_file());
+
+        // A replacement assignment is a new role instance and therefore
+        // cannot inherit the old native identity or task checkout.
+        let replacement_id = crate::model::ConversationId::for_role_instance(
+            &mission_id,
+            crate::model::TaskNamespace::Execution,
+            &crate::model::TaskId::new("runtime-boundary").unwrap(),
+            &crate::model::RoleName::new("implementer").unwrap(),
+            2,
+        );
+        assert_ne!(replacement_id, conversation_id);
+        let replacement =
+            ConversationDirs::prepare(temp.path(), mission_id.as_str(), &replacement_id).unwrap();
+        assert!(!replacement.runtime.join("opaque-session").exists());
+        assert!(!replacement.work.join("workspace-identity").exists());
     }
 
     #[test]
