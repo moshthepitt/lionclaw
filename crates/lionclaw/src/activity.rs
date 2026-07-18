@@ -8,7 +8,10 @@ use anyhow::{Context, Result};
 use rustix::fs::{open, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{InflightEffect, MissionState, TaskId, TaskKind, TaskNamespace};
+use crate::model::{
+    ConversationLifecycle, DeliveryMarker, InflightEffect, MissionState, TaskId, TaskKind,
+    TaskNamespace,
+};
 
 const MAX_EFFECTS: usize = 32;
 const MAX_TEXT: usize = 4 * 1024;
@@ -54,6 +57,12 @@ pub struct EffectActivity {
     pub workspace: WorkspaceObservation,
     pub queued_controls: Vec<String>,
     pub queued_messages: usize,
+    #[serde(default)]
+    pub conversation_lifecycle: Option<ConversationLifecycle>,
+    #[serde(default)]
+    pub message_boundary: Option<u64>,
+    #[serde(default)]
+    pub delivery_markers: Vec<DeliveryMarker>,
     pub legal_controls: Vec<String>,
 }
 
@@ -247,11 +256,13 @@ pub async fn publish_observed(
         .iter()
         .take(MAX_EFFECTS)
         .map(|(effect_id, effect)| {
-            let (role, task, runtime, requested_at_ms) = match effect {
+            let (role, task, runtime, requested_at_ms, conversation) = match effect {
                 InflightEffect::RoleRun {
+                    namespace,
                     role,
                     task_id,
                     runtime,
+                    assignment_epoch,
                     requested_at_ms,
                     ..
                 } => (
@@ -259,6 +270,15 @@ pub async fn publish_observed(
                     Some(task_id.as_str().to_string()),
                     Some(runtime.clone()),
                     *requested_at_ms,
+                    state
+                        .conversations
+                        .get(&crate::model::ConversationId::for_role_instance(
+                            &state.mission_id,
+                            *namespace,
+                            task_id,
+                            role,
+                            *assignment_epoch,
+                        )),
                 ),
                 InflightEffect::OracleRun {
                     oracle,
@@ -269,6 +289,7 @@ pub async fn publish_observed(
                     None,
                     Some("oracle".into()),
                     *requested_at_ms,
+                    None,
                 ),
                 InflightEffect::TerminalReview {
                     role,
@@ -280,6 +301,7 @@ pub async fn publish_observed(
                     None,
                     Some(runtime.clone()),
                     *requested_at_ms,
+                    None,
                 ),
             };
             let workspace = workspace_observations
@@ -352,7 +374,27 @@ pub async fn publish_observed(
                 tool_activity: prior.and_then(|prior| prior.tool_activity.clone()),
                 workspace,
                 queued_controls,
-                queued_messages: prior.map_or(0, |prior| prior.queued_messages),
+                queued_messages: conversation.map_or(0, |conversation| {
+                    conversation
+                        .queued
+                        .iter()
+                        .filter(|message| {
+                            conversation
+                                .active_message_boundary
+                                .is_none_or(|boundary| message.sequence_no > boundary)
+                        })
+                        .count()
+                }),
+                conversation_lifecycle: conversation.map(|conversation| conversation.lifecycle),
+                message_boundary: conversation
+                    .and_then(|conversation| conversation.active_message_boundary),
+                delivery_markers: conversation.map_or_else(Vec::new, |conversation| {
+                    conversation
+                        .queued
+                        .iter()
+                        .map(|message| message.marker)
+                        .collect()
+                }),
                 legal_controls: if deadline_reached {
                     Vec::new()
                 } else {
@@ -362,7 +404,7 @@ pub async fn publish_observed(
         })
         .collect();
     let mut projection = ActivityProjection {
-        version: 2,
+        version: 3,
         mission_id: state.mission_id.as_str().to_string(),
         event_head: state.head,
         generated_at_ms: now_ms,
@@ -942,7 +984,7 @@ mod tests {
         write(
             temp.path(),
             &ActivityProjection {
-                version: 2,
+                version: 3,
                 mission_id: "mission".into(),
                 event_head: 4,
                 generated_at_ms: 10,
@@ -963,6 +1005,9 @@ mod tests {
                     workspace: WorkspaceObservation::Clean,
                     queued_controls: Vec::new(),
                     queued_messages: 0,
+                    conversation_lifecycle: None,
+                    message_boundary: None,
+                    delivery_markers: Vec::new(),
                     legal_controls: vec!["stop".into()],
                 }],
             },

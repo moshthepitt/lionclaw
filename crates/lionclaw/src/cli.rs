@@ -224,6 +224,15 @@ pub struct SendArgs {
     pub all: bool,
     /// Exact UTF-8 message body.
     pub message: String,
+    /// Reference an authoritative receipt by effect id. Repeatable.
+    #[arg(long = "receipt", action = clap::ArgAction::Append)]
+    pub receipts: Vec<String>,
+    /// Reference parked-effect evidence by effect id. Repeatable.
+    #[arg(long = "park", action = clap::ArgAction::Append)]
+    pub parks: Vec<String>,
+    /// Reference a commit reachable in this mission. Repeatable.
+    #[arg(long = "commit", action = clap::ArgAction::Append)]
+    pub commits: Vec<String>,
     #[arg(long)]
     pub repo: Option<PathBuf>,
 }
@@ -826,6 +835,7 @@ async fn cmd_inbox(args: InboxArgs) -> Result<()> {
         if matches!(
             view.disposition,
             MissionDisposition::AwaitingPlan
+                | MissionDisposition::AwaitingLead
                 | MissionDisposition::Parked
                 | MissionDisposition::CleanupBlocked
         ) {
@@ -1082,6 +1092,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
                     task_runtime_json(&store, id, task, None)
                 }).collect::<Result<Vec<_>>>()?,
+                "conversations": conversation_views(state, &store)?,
                 "assertions": rows.iter().map(|row| serde_json::json!({
                     "id": row.id,
                     "oracle": row.oracle,
@@ -1181,6 +1192,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             }
         }
     }
+    print_conversations(state, &store, "  ")?;
     print_non_task_failures(state);
     if let Some(failure) = &state.cleanup_failure {
         println!(
@@ -1407,6 +1419,21 @@ async fn cmd_send(args: SendArgs) -> Result<()> {
             assignment_epoch: conversation.assignment_epoch,
         })
         .collect();
+    let mut references =
+        Vec::with_capacity(args.receipts.len() + args.parks.len() + args.commits.len());
+    for effect_id in &args.receipts {
+        references.push(crate::model::MessageReference::AuthoritativeReceipt {
+            effect_id: EffectId::parse(effect_id)?,
+        });
+    }
+    for effect_id in &args.parks {
+        references.push(crate::model::MessageReference::ParkEvidence {
+            effect_id: EffectId::parse(effect_id)?,
+        });
+    }
+    for sha in args.commits {
+        references.push(crate::model::MessageReference::ReachableCommit { sha });
+    }
     store
         .append(
             &mission_id,
@@ -1414,7 +1441,7 @@ async fn cmd_send(args: SendArgs) -> Result<()> {
             &[NewEvent::new(MissionEvent::MessageSent {
                 recipients,
                 body: args.message,
-                references: Vec::new(),
+                references,
             })],
             SystemClock.now_ms(),
         )
@@ -1940,6 +1967,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 }
             }
         }
+        print_conversations(state, &store, "  ")?;
         print_task_workspace_observations(state, "  ", &workspace_observations);
         if view.disposition == MissionDisposition::Running {
             print_activity(&store, &mission_id)?;
@@ -2397,6 +2425,10 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
             MissionDisposition::Running => {
                 println!("mission {mission_id}: running under another driver")
             }
+            MissionDisposition::AwaitingLead => {
+                println!("mission {mission_id}: awaiting lead feedback");
+                print_conversations(state, store, "  ")?;
+            }
             MissionDisposition::CleanupBlocked => {
                 let failure = state
                     .cleanup_failure
@@ -2473,6 +2505,7 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         "revision": state.revision,
         "current_sha": state.current_sha,
         "objective": state.objective,
+        "conversations": conversation_views(state, store)?,
         "tasks": state.tasks.iter().map(|(id, task)| {
             task_runtime_json(
                 store,
@@ -2534,6 +2567,79 @@ fn task_runtime_json(
             .map(|response| store.blobs().resolve(response))
             .transpose()?,
     }))
+}
+
+fn conversation_views(
+    state: &crate::model::MissionState,
+    store: &MissionStore,
+) -> Result<Vec<serde_json::Value>> {
+    state
+        .conversations
+        .iter()
+        .map(|(id, conversation)| {
+            let runtime_root = store
+                .mission_dir(&state.mission_id)
+                .join("conversations")
+                .join(id.as_str())
+                .join("runtime");
+            let resume_mode = if lionclaw_runtime_api::runtime_session_ready_marker_exists(
+                &runtime_root,
+            )? {
+                "native_session"
+            } else {
+                "canonical_reconstruction"
+            };
+            Ok(serde_json::json!({
+                "id": id.as_str(),
+                "role": conversation.role.as_str(),
+                "namespace": conversation.namespace,
+                "task_id": conversation.task_id.as_str(),
+                "assignment_epoch": conversation.assignment_epoch,
+                "workspace_base_sha": conversation.workspace_base_sha,
+                "lifecycle": conversation.lifecycle,
+                "final_response": state.tasks_in(conversation.namespace)
+                    .get(&conversation.task_id)
+                    .and_then(|task| task.final_response.as_ref())
+                    .map(|response| store.blobs().resolve(response))
+                    .transpose()?,
+                "queued_messages": conversation.queued,
+                "consumed_through": conversation.consumed_through,
+                "active_message_boundary": conversation.active_message_boundary,
+                "invalid_handoff_reworks": conversation.invalid_handoff_reworks,
+                "runtime_resume_mode": resume_mode,
+                "legal_actions": match conversation.lifecycle {
+                    crate::model::ConversationLifecycle::AwaitingLead => vec!["mission send"],
+                    crate::model::ConversationLifecycle::Running => vec!["mission status", "mission send"],
+                    crate::model::ConversationLifecycle::Ready
+                    | crate::model::ConversationLifecycle::ReworkingInvalidHandoff => vec!["mission advance", "mission send"],
+                    crate::model::ConversationLifecycle::Completed => Vec::new(),
+                },
+            }))
+        })
+        .collect()
+}
+
+fn print_conversations(
+    state: &crate::model::MissionState,
+    store: &MissionStore,
+    indent: &str,
+) -> Result<()> {
+    for conversation in conversation_views(state, store)? {
+        println!(
+            "{indent}conversation {}: lifecycle={} queued={} delivery_through={} resume={}",
+            conversation["id"].as_str().unwrap_or("?"),
+            conversation["lifecycle"].as_str().unwrap_or("?"),
+            conversation["queued_messages"]
+                .as_array()
+                .map_or(0, Vec::len),
+            conversation["consumed_through"],
+            conversation["runtime_resume_mode"].as_str().unwrap_or("?")
+        );
+        if let Some(response) = conversation["final_response"].as_str() {
+            println!("{indent}  final response: {response}");
+        }
+    }
+    Ok(())
 }
 
 fn planning_input_json(
@@ -3489,6 +3595,35 @@ mod tests {
                 final_response: None,
             },
         );
+        let conversation_id = crate::model::ConversationId::for_role_instance(
+            &state.mission_id,
+            crate::model::TaskNamespace::Execution,
+            &TaskId::new("retained").unwrap(),
+            &crate::model::RoleName::new("implementer").unwrap(),
+            1,
+        );
+        state.conversations.insert(
+            conversation_id.clone(),
+            crate::model::ConversationState {
+                role: crate::model::RoleName::new("implementer").unwrap(),
+                namespace: crate::model::TaskNamespace::Execution,
+                task_id: TaskId::new("retained").unwrap(),
+                assignment_epoch: 1,
+                workspace_base_sha: "base".into(),
+                lifecycle: crate::model::ConversationLifecycle::AwaitingLead,
+                queued: vec![crate::model::QueuedMessage {
+                    sequence_no: 7,
+                    body: "lead context".into(),
+                    references: vec![crate::model::MessageReference::ReachableCommit {
+                        sha: "base".into(),
+                    }],
+                    marker: crate::model::DeliveryMarker::PossiblyDelivered,
+                }],
+                consumed_through: 3,
+                active_message_boundary: None,
+                invalid_handoff_reworks: 1,
+            },
+        );
         let mission_id = state.mission_id.clone();
         let mut view = MissionView {
             state,
@@ -3579,6 +3714,16 @@ mod tests {
         assert_eq!(json["phase"], "attention_needed");
         assert_eq!(json["disposition"], "parked");
         assert_eq!(json["next_actions"], serde_json::json!(["mission decide"]));
+        assert_eq!(json["conversations"][0]["id"], conversation_id.as_str());
+        assert_eq!(json["conversations"][0]["lifecycle"], "awaiting_lead");
+        assert_eq!(
+            json["conversations"][0]["queued_messages"][0]["marker"],
+            "possibly_delivered"
+        );
+        assert_eq!(
+            json["conversations"][0]["runtime_resume_mode"],
+            "canonical_reconstruction"
+        );
         assert_eq!(json["planning_input"], serde_json::Value::Null);
         assert_eq!(json["cleanup_failure"], serde_json::Value::Null);
         assert_eq!(json["attention"][0]["kind"], "oracle_verdict_failed");

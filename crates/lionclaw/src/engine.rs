@@ -144,6 +144,7 @@ impl EngineServices {
 pub enum MissionDisposition {
     Ready,
     Running,
+    AwaitingLead,
     AwaitingPlan,
     Parked,
     CleanupBlocked,
@@ -155,6 +156,7 @@ impl MissionDisposition {
         match self {
             Self::Ready => "ready",
             Self::Running => "running",
+            Self::AwaitingLead => "awaiting_lead",
             Self::AwaitingPlan => "awaiting_plan",
             Self::Parked => "parked",
             Self::CleanupBlocked => "cleanup_blocked",
@@ -181,6 +183,10 @@ impl MissionView {
             MissionDisposition::CleanupBlocked
         } else if state.phase.is_terminal() {
             MissionDisposition::Terminal
+        } else if state.conversations.values().any(|conversation| {
+            conversation.lifecycle == crate::model::ConversationLifecycle::AwaitingLead
+        }) {
+            MissionDisposition::AwaitingLead
         } else if !state.open_attention.is_empty() {
             MissionDisposition::Parked
         } else if state.phase == MissionPhase::Planning
@@ -198,6 +204,7 @@ impl MissionView {
         match self.disposition {
             MissionDisposition::Ready => vec!["mission advance"],
             MissionDisposition::Running => vec!["mission status"],
+            MissionDisposition::AwaitingLead => vec!["mission send"],
             MissionDisposition::AwaitingPlan => vec!["mission plan propose"],
             MissionDisposition::Parked if !self.state.parked_effects.is_empty() => {
                 vec!["mission continue", "mission decide"]
