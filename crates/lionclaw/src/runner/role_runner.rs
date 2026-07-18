@@ -27,7 +27,7 @@ use crate::model::OutputSemantics;
 use crate::ports::{ExecutionControl, RoleRunOutcome, RoleRunRequest, RoleRunner};
 
 use super::executor::{mission_execution_context, MissionProgramExecutor};
-use super::handoff::read_handoff;
+use super::handoff::read_optional_handoff;
 use super::native_home_auth::NativeHomeAuthProvider;
 use super::{
     await_controlled, prepare_skill_mounts, ConversationDirs, EffectDirs, SCRATCH_MOUNT_TARGET,
@@ -458,12 +458,13 @@ impl RoleRunner for OciRoleRunner {
         let cancellation_configuration = applied.clone();
         let cancellation_response = final_response.clone();
         let finish = async {
-            let handoff =
-                read_handoff(&dirs.handoff, request.role.output).map_err(|mut failure| {
+            let handoff = read_optional_handoff(&dirs.handoff, request.role.output).map_err(
+                |mut failure| {
                     failure.evidence_mut().final_response = final_response.clone();
                     failure.evidence_mut().configuration = applied.clone();
                     failure
-                })?;
+                },
+            )?;
             let artifact = if is_writer {
                 let _guard = self.repo_lock.lock().await;
                 let artifact = request

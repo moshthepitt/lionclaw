@@ -54,11 +54,11 @@ struct NoopRoleRunner;
 impl RoleRunner for NoopRoleRunner {
     async fn run(&self, _request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         Ok(RoleRunOutcome {
-            handoff: Handoff::Work {
+            handoff: Some(Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("self-test noop worker"),
                 request_attention: false,
-            },
+            }),
             artifact: None,
             runtime_configuration: Default::default(),
             final_response: "self-test noop worker".to_string(),
@@ -76,7 +76,7 @@ impl RoleRunner for ReviewParkRoleRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         if request.task_id.as_str() == crate::engine::TERMINAL_REVIEW_TASK_TAG {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Review {
+                handoff: Some(Handoff::Review {
                     done: true,
                     report: PayloadRef::inline("self-test scripted review"),
                     passed: false,
@@ -91,18 +91,18 @@ impl RoleRunner for ReviewParkRoleRunner {
                     nonce: crate::prompt::handoff_nonce(&request.prompt)
                         .expect("terminal-review prompt has a nonce")
                         .to_string(),
-                },
+                }),
                 artifact: None,
                 runtime_configuration: Default::default(),
                 final_response: "self-test scripted review".to_string(),
             })
         } else {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Work {
+                handoff: Some(Handoff::Work {
                     done: true,
                     report: PayloadRef::inline("self-test worker"),
                     request_attention: false,
-                },
+                }),
                 artifact: None,
                 runtime_configuration: Default::default(),
                 final_response: "self-test worker".to_string(),
@@ -537,11 +537,11 @@ impl ScriptedRoleRunner {
         }
         let artifact = capture.capture().await?;
         Ok(RoleRunOutcome {
-            handoff: Handoff::Work {
+            handoff: Some(Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("self-test scripted fix"),
                 request_attention: false,
-            },
+            }),
             artifact: Some(artifact),
             runtime_configuration: Default::default(),
             final_response: "self-test scripted fix".to_string(),

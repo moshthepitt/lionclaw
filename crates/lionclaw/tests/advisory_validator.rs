@@ -25,7 +25,7 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
     MockRoleRunner::new(Box::new(move |req: &RoleRunRequest| {
         let outcome = match req.role.output {
             OutputSemantics::EmitsVerdict => RoleRunOutcome {
-                handoff: Handoff::Validate {
+                handoff: Some(Handoff::Validate {
                     done: true,
                     report: PayloadRef::inline("reviewed"),
                     items: vec![ValidationItem {
@@ -34,7 +34,7 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
                     }],
                     passed: reviewer_passes,
                     request_attention: false,
-                },
+                }),
                 artifact: None,
                 runtime_configuration: Default::default(),
                 final_response: String::new(),
@@ -43,11 +43,11 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
                 lionclaw::testing::review_verdict(req, true, vec![])
             }
             OutputSemantics::ProducesArtifact => RoleRunOutcome {
-                handoff: Handoff::Work {
+                handoff: Some(Handoff::Work {
                     done: true,
                     report: PayloadRef::inline("wrote it"),
                     request_attention: false,
-                },
+                }),
                 artifact: Some(CapturedArtifact::for_testing(
                     req.base_sha.clone(),
                     HEAD_SHA,
@@ -168,7 +168,7 @@ async fn read_only_validator_artifacts_are_rejected_before_the_fold() {
             output => panic!("unexpected output contract {output:?}"),
         };
         Ok(RoleRunOutcome {
-            handoff,
+            handoff: Some(handoff),
             artifact,
             runtime_configuration: Default::default(),
             final_response: String::new(),

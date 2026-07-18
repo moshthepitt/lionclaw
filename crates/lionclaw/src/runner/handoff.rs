@@ -169,6 +169,20 @@ pub fn read_handoff(dir: &Path, output: OutputSemantics) -> Result<Handoff, Type
     parse_handoff(&raw, output)
 }
 
+/// Read an optional role handoff. Absence is a successful dialogue checkpoint;
+/// every present filesystem object is still validated fail-closed by
+/// `read_handoff`, including dangling symlinks and non-regular files.
+pub fn read_optional_handoff(
+    dir: &Path,
+    output: OutputSemantics,
+) -> Result<Option<Handoff>, TypedFailure> {
+    let path = dir.join("handoff.json");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => read_handoff(dir, output).map(Some),
+    }
+}
+
 fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, TypedFailure> {
     let invalid = |detail: String| TypedFailure::invalid("handoff.schema", detail);
     let mut value: serde_json::Value =
@@ -307,6 +321,20 @@ mod tests {
 
     use super::*;
     use crate::model::PayloadRef;
+
+    #[test]
+    fn absent_handoff_is_an_ordinary_checkpoint_but_present_invalid_data_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            read_optional_handoff(dir.path(), OutputSemantics::ProducesArtifact).unwrap(),
+            None
+        );
+
+        std::fs::write(dir.path().join("handoff.json"), "not json").expect("write invalid handoff");
+        let failure = read_optional_handoff(dir.path(), OutputSemantics::ProducesArtifact)
+            .expect_err("a present malformed handoff must enter schema rework");
+        assert_eq!(failure.evidence().code.as_deref(), Some("handoff.schema"));
+    }
 
     #[test]
     fn oversized_handoff_is_rejected() {

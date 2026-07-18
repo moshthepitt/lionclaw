@@ -222,7 +222,7 @@ fn successful_role_outcome(req: &RoleRunRequest) -> RoleRunOutcome {
     let artifact = (req.role.output == OutputSemantics::ProducesArtifact)
         .then(|| CapturedArtifact::for_testing(req.base_sha.clone(), "head-1"));
     RoleRunOutcome {
-        handoff,
+        handoff: Some(handoff),
         artifact,
         runtime_configuration: Default::default(),
         final_response: String::new(),
@@ -784,11 +784,11 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
             ));
         }
         Ok(RoleRunOutcome {
-            handoff: Handoff::Work {
+            handoff: Some(Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("report"),
                 request_attention: false,
-            },
+            }),
             artifact: None,
             runtime_configuration: Default::default(),
             final_response: String::new(),
@@ -853,7 +853,7 @@ async fn park_after_author(
             }
         };
         Ok(RoleRunOutcome {
-            handoff,
+            handoff: Some(handoff),
             artifact: None,
             runtime_configuration: Default::default(),
             final_response: String::new(),

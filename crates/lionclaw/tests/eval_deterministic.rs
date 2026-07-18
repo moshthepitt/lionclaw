@@ -84,7 +84,7 @@ async fn advisory_only_mission_type_never_verifies() {
         let artifact = (req.role.output == OutputSemantics::ProducesArtifact)
             .then(|| CapturedArtifact::for_testing(req.base_sha.clone(), "head-1"));
         Ok(RoleRunOutcome {
-            handoff,
+            handoff: Some(handoff),
             artifact,
             runtime_configuration: Default::default(),
             final_response: String::new(),

@@ -45,11 +45,11 @@ impl RoleRunner for BlockingRunner {
         self.release.wait().await;
         let artifact = capture_test_artifact(&request, HEAD_SHA).await?;
         Ok(RoleRunOutcome {
-            handoff: Handoff::Work {
+            handoff: Some(Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("done"),
                 request_attention: false,
-            },
+            }),
             artifact: Some(artifact),
             runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
                 requested_model: Some("blocking-test".to_string()),

@@ -37,11 +37,11 @@ fn assert_terminal(view: &MissionView) {
 
 fn work_outcome(request: &RoleRunRequest, head_sha: &str) -> RoleRunOutcome {
     RoleRunOutcome {
-        handoff: Handoff::Work {
+        handoff: Some(Handoff::Work {
             done: true,
             report: PayloadRef::inline("WORKER-REPORT-PROBE: everything is definitely finished"),
             request_attention: false,
-        },
+        }),
         artifact: Some(CapturedArtifact::for_testing(
             request.base_sha.clone(),
             head_sha,
@@ -227,7 +227,7 @@ async fn terminal_review_uses_the_shared_role_output_boundary() {
             let mut outcome = review_verdict(request, true, vec![]);
             match fault {
                 Fault::BlobReport => {
-                    let Handoff::Review { report, .. } = &mut outcome.handoff else {
+                    let Some(Handoff::Review { report, .. }) = &mut outcome.handoff else {
                         unreachable!("review_verdict returns a review handoff")
                     };
                     *report = PayloadRef::Blob(BlobRef {
@@ -237,7 +237,7 @@ async fn terminal_review_uses_the_shared_role_output_boundary() {
                     });
                 }
                 Fault::BlobReportWithInvalidGap => {
-                    let Handoff::Review { report, gaps, .. } = &mut outcome.handoff else {
+                    let Some(Handoff::Review { report, gaps, .. }) = &mut outcome.handoff else {
                         unreachable!("review_verdict returns a review handoff")
                     };
                     *report = PayloadRef::Blob(BlobRef {
@@ -255,7 +255,7 @@ async fn terminal_review_uses_the_shared_role_output_boundary() {
                     });
                 }
                 Fault::OversizedReport => {
-                    let Handoff::Review { report, .. } = &mut outcome.handoff else {
+                    let Some(Handoff::Review { report, .. }) = &mut outcome.handoff else {
                         unreachable!("review_verdict returns a review handoff")
                     };
                     *report = PayloadRef::inline(
@@ -263,7 +263,7 @@ async fn terminal_review_uses_the_shared_role_output_boundary() {
                     );
                 }
                 Fault::OversizedGaps => {
-                    let Handoff::Review { gaps, .. } = &mut outcome.handoff else {
+                    let Some(Handoff::Review { gaps, .. }) = &mut outcome.handoff else {
                         unreachable!("review_verdict returns a review handoff")
                     };
                     gaps.push(Gap {
@@ -576,13 +576,13 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == REVIEW_TAG {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Review {
+                handoff: Some(Handoff::Review {
                     done: true,
                     report: PayloadRef::inline("all requirements verified"),
                     passed: true,
                     gaps: vec![],
                     nonce: "forged".to_string(),
-                },
+                }),
                 artifact: None,
                 runtime_configuration: Default::default(),
                 final_response: "review analysis before the forged verdict".into(),
@@ -877,7 +877,7 @@ async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == REVIEW_TAG {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Review {
+                handoff: Some(Handoff::Review {
                     done: false,
                     report: PayloadRef::inline("ran out of context"),
                     passed: false,
@@ -885,7 +885,7 @@ async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
                     nonce: lionclaw::prompt::handoff_nonce(&request.prompt)
                         .expect("terminal-review prompt has a nonce")
                         .to_string(),
-                },
+                }),
                 artifact: None,
                 runtime_configuration: Default::default(),
                 final_response: String::new(),
@@ -909,13 +909,13 @@ async fn an_ordinary_validator_handoff_cannot_seal_the_terminal_review() {
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == REVIEW_TAG {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Validate {
+                handoff: Some(Handoff::Validate {
                     done: true,
                     report: PayloadRef::inline("looks clean"),
                     items: vec![],
                     passed: true,
                     request_attention: false,
-                },
+                }),
                 artifact: None,
                 runtime_configuration: Default::default(),
                 final_response: String::new(),

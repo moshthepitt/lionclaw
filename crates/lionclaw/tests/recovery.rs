@@ -17,11 +17,11 @@ use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 fn completed_work(base_sha: &str) -> RoleRunOutcome {
     RoleRunOutcome {
-        handoff: Handoff::Work {
+        handoff: Some(Handoff::Work {
             done: true,
             report: PayloadRef::inline("completed"),
             request_attention: false,
-        },
+        }),
         artifact: Some(CapturedArtifact::for_testing(base_sha, HEAD_SHA)),
         runtime_configuration: Default::default(),
         final_response: String::new(),
@@ -152,11 +152,11 @@ async fn invalid_handoff_is_reworked_automatically_with_exact_feedback() {
         *count += 1;
         if *count == 1 {
             return Ok(RoleRunOutcome {
-                handoff: Handoff::Work {
+                handoff: Some(Handoff::Work {
                     done: false,
                     report: PayloadRef::inline("unfinished"),
                     request_attention: false,
-                },
+                }),
                 artifact: None,
                 runtime_configuration: Default::default(),
                 final_response: String::new(),
@@ -200,13 +200,13 @@ async fn wrong_handoff_schema_is_recorded_as_invalid_and_reworked() {
         *count += 1;
         if *count == 1 {
             return Ok(RoleRunOutcome {
-                handoff: Handoff::Validate {
+                handoff: Some(Handoff::Validate {
                     done: true,
                     report: PayloadRef::inline("wrong schema"),
                     items: vec![],
                     passed: true,
                     request_attention: false,
-                },
+                }),
                 artifact: Some(CapturedArtifact::for_testing(
                     request.base_sha.clone(),
                     HEAD_SHA,

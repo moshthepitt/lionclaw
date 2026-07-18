@@ -177,11 +177,11 @@ impl RoleRunner for SleepingRunner {
         tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
         let artifact = capture_test_artifact(&request, HEAD_SHA).await?;
         Ok(RoleRunOutcome {
-            handoff: Handoff::Work {
+            handoff: Some(Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("worked beyond initial deadline"),
                 request_attention: false,
-            },
+            }),
             artifact: Some(artifact),
             runtime_configuration: Default::default(),
             final_response: String::new(),
@@ -201,11 +201,11 @@ impl RoleRunner for ArtifactlessWriter {
             .await
             .unwrap();
         Ok(RoleRunOutcome {
-            handoff: Handoff::Work {
+            handoff: Some(Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("the requested work was already satisfied"),
                 request_attention: false,
-            },
+            }),
             artifact: None,
             runtime_configuration: Default::default(),
             final_response: "no repository change was needed".into(),
@@ -249,11 +249,11 @@ impl RoleRunner for ControlledRunner {
         }
         let artifact = capture_test_artifact(&request, HEAD_SHA).await?;
         Ok(RoleRunOutcome {
-            handoff: Handoff::Work {
+            handoff: Some(Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("continued in the same task workspace"),
                 request_attention: false,
-            },
+            }),
             artifact: Some(artifact),
             runtime_configuration: Default::default(),
             final_response: "completed after continue".into(),

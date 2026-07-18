@@ -36,11 +36,11 @@ fn aid(n: &str) -> AssertionId {
 
 fn work_outcome(request: &RoleRunRequest) -> RoleRunOutcome {
     RoleRunOutcome {
-        handoff: Handoff::Work {
+        handoff: Some(Handoff::Work {
             done: true,
             report: lionclaw::model::PayloadRef::inline("done"),
             request_attention: false,
-        },
+        }),
         artifact: Some(CapturedArtifact::for_testing(
             request.base_sha.clone(),
             HEAD_SHA,
@@ -241,11 +241,11 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
 
     let runner = MockRoleRunner::new(Box::new(move |request| {
         Ok(RoleRunOutcome {
-            handoff: Handoff::Work {
+            handoff: Some(Handoff::Work {
                 done: true,
                 report: lionclaw::model::PayloadRef::inline("done"),
                 request_attention: false,
-            },
+            }),
             artifact: Some(CapturedArtifact::for_testing(
                 request.base_sha.clone(),
                 HEAD_SHA,
@@ -438,7 +438,7 @@ async fn planning_prompt_leaves_assigned_skills_to_native_loading() {
             },
         };
         Ok(RoleRunOutcome {
-            handoff,
+            handoff: Some(handoff),
             artifact: None,
             runtime_configuration: Default::default(),
             final_response: String::new(),
@@ -492,7 +492,7 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
             },
         };
         Ok(RoleRunOutcome {
-            handoff,
+            handoff: Some(handoff),
             artifact: None,
             runtime_configuration: Default::default(),
             final_response: String::new(),
@@ -552,11 +552,11 @@ async fn terminal_review_prompt_leaves_assigned_skills_to_native_loading() {
             Ok(lionclaw::testing::review_verdict(request, true, vec![]))
         } else {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Work {
+                handoff: Some(Handoff::Work {
                     done: true,
                     report: lionclaw::model::PayloadRef::inline("done"),
                     request_attention: false,
-                },
+                }),
                 artifact: Some(CapturedArtifact::for_testing(
                     request.base_sha.clone(),
                     HEAD_SHA,
@@ -603,11 +603,11 @@ async fn terminal_review_prompt_for_unassigned_role_has_no_skill_section() {
             Ok(lionclaw::testing::review_verdict(request, true, vec![]))
         } else {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Work {
+                handoff: Some(Handoff::Work {
                     done: true,
                     report: lionclaw::model::PayloadRef::inline("done"),
                     request_attention: false,
-                },
+                }),
                 artifact: Some(CapturedArtifact::for_testing(
                     request.base_sha.clone(),
                     HEAD_SHA,

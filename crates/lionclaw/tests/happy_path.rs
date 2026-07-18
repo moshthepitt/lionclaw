@@ -5,18 +5,203 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
+use clap::Parser;
 use common::{
     approve_plan, covered_requirement, harness, proposal, simple_plan, test_mission_type, BASE_SHA,
     HEAD_SHA,
 };
 use lionclaw::engine::MissionDisposition;
+use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::PreparedInput;
 use lionclaw::model::{
     Assertion, AssertionId, FinishClass, InputName, MissionPhase, OracleName, OutputSemantics,
     PlanningDag, PlanningTask, RoleName, TaskId, TaskStatus,
 };
+use lionclaw::testing::{MockClock, NoopEffectCleaner};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
+use lionclaw::{cli, store::MissionStore};
+
+#[tokio::test]
+async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_completes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let turns = Arc::new(AtomicUsize::new(0));
+    let scripted_turns = turns.clone();
+    let role_runner = MockRoleRunner::new(Box::new(move |request| {
+        request
+            .updates
+            .try_send(lionclaw::ports::RoleRunUpdate::WorkspacePrepared {
+                base_sha: request.base_sha.clone(),
+                assignment_epoch: request.assignment_epoch,
+            })
+            .expect("production runner reports prepared workspace before the turn");
+        match scripted_turns.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(lionclaw::ports::RoleRunOutcome {
+                handoff: None,
+                artifact: None,
+                runtime_configuration: Default::default(),
+                final_response: "Which behavior should I preserve?".into(),
+            }),
+            1 => {
+                let mut failure = lionclaw_runtime_api::TypedFailure::invalid(
+                    "handoff.schema",
+                    "handoff is missing the 'done' boolean",
+                );
+                failure.evidence_mut().final_response = "I attempted the requested repair".into();
+                Err(failure)
+            }
+            _ => Ok(lionclaw::ports::RoleRunOutcome {
+                handoff: Some(lionclaw::model::Handoff::Work {
+                    done: true,
+                    report: lionclaw::model::PayloadRef::inline("preserved compatibility"),
+                    request_attention: false,
+                }),
+                artifact: Some(lionclaw::ports::CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    HEAD_SHA,
+                )),
+                runtime_configuration: Default::default(),
+                final_response: "Implemented and verified.".into(),
+            }),
+        }
+    }));
+    let h = common::harness(dir.path(), role_runner, MockOracleRunner::exiting(0)).await;
+    let mission_id = h
+        .engine
+        .create_mission(dir.path().to_str().unwrap(), "preserve behavior", BASE_SHA)
+        .await
+        .unwrap();
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &mission_id).await;
+
+    let checkpoint = h.engine.advance(&mission_id).await.unwrap();
+    assert_eq!(checkpoint.disposition, MissionDisposition::AwaitingLead);
+    let (conversation_id, conversation) = checkpoint.state.conversations.iter().next().unwrap();
+    assert_eq!(
+        checkpoint
+            .state
+            .tasks
+            .values()
+            .next()
+            .unwrap()
+            .final_response,
+        Some(lionclaw::model::PayloadRef::inline(
+            "Which behavior should I preserve?"
+        ))
+    );
+    let conversation_id = conversation_id.clone();
+    let assignment_epoch = conversation.assignment_epoch;
+    assert_eq!(
+        checkpoint
+            .state
+            .tasks
+            .values()
+            .next()
+            .unwrap()
+            .assignment_epoch,
+        assignment_epoch
+    );
+
+    let send = cli::Cli::try_parse_from([
+        "lionclaw",
+        "mission",
+        "send",
+        "--mission-id",
+        mission_id.as_str(),
+        "--to",
+        "fix",
+        "--repo",
+        dir.path().to_str().unwrap(),
+        "Preserve compatibility.",
+    ])
+    .expect("real CLI parser accepts task-name recipient sugar");
+    assert_eq!(
+        cli::run(send).await.unwrap(),
+        std::process::ExitCode::SUCCESS
+    );
+
+    // Reconstruct the production engine over the durable store, as a new CLI
+    // process would. The same role runner stands in for the profile-selected
+    // native adapter and lets the test inspect continuity without provider
+    // branching.
+    let restarted = Engine::new(
+        MissionStore::open(dir.path()).await.unwrap(),
+        test_mission_type(),
+        "codex".into(),
+        "localhost/lionclaw-runtime-dev:v1".into(),
+        EngineServices::new(
+            h.role_runner.clone(),
+            h.oracle_runner.clone(),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    );
+    let outcome = restarted.advance(&mission_id).await.unwrap();
+    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
+    assert_eq!(
+        outcome.state.phase,
+        MissionPhase::Done {
+            finish: FinishClass::Verified
+        }
+    );
+    let resumed = outcome.state.conversations.get(&conversation_id).unwrap();
+    assert_eq!(resumed.assignment_epoch, assignment_epoch);
+    assert!(resumed.queued.is_empty());
+    assert_eq!(turns.load(Ordering::SeqCst), 3);
+
+    let events = MissionStore::open(dir.path())
+        .await
+        .unwrap()
+        .load(&mission_id)
+        .await
+        .unwrap();
+    let invalid = events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                lionclaw::model::MissionEvent::RoleRunCompleted { outcome: Err(failure), .. }
+                    if failure.evidence().code.as_deref() == Some("handoff.schema")
+                        && failure.detail() == "handoff is missing the 'done' boolean"
+            )
+        })
+        .expect("exact schema failure is durable");
+    let message_sequence = events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.event,
+                lionclaw::model::MissionEvent::MessageSent { .. }
+            )
+        })
+        .expect("CLI feedback is durable")
+        .sequence_no;
+    assert!(resumed.consumed_through >= message_sequence);
+    let valid = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                lionclaw::model::MissionEvent::RoleRunCompleted { outcome: Ok(_), .. }
+            ) && event.sequence_no > events[invalid].sequence_no
+        })
+        .expect("valid repair follows invalid handoff");
+    let receipt = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                lionclaw::model::MissionEvent::OracleRunCompleted { .. }
+            )
+        })
+        .expect("oracle receipt exists");
+    assert!(invalid < valid && valid < receipt);
+}
 
 #[tokio::test]
 async fn passing_oracle_yields_verified_finish() {
@@ -188,11 +373,11 @@ async fn durable_role_outcomes_bound_adapter_configuration_evidence() {
         dir.path(),
         MockRoleRunner::new(Box::new(move |request| {
             Ok(lionclaw::ports::RoleRunOutcome {
-                handoff: lionclaw::model::Handoff::Work {
+                handoff: Some(lionclaw::model::Handoff::Work {
                     done: true,
                     report: lionclaw::model::PayloadRef::inline("done"),
                     request_attention: false,
-                },
+                }),
                 artifact: Some(lionclaw::ports::CapturedArtifact::for_testing(
                     request.base_sha.clone(),
                     HEAD_SHA,
@@ -392,11 +577,11 @@ async fn worker_reporting_not_done_parks_with_attention() {
         dir.path(),
         MockRoleRunner::new(Box::new(|_| {
             Ok(lionclaw::ports::RoleRunOutcome {
-                handoff: lionclaw::model::Handoff::Work {
+                handoff: Some(lionclaw::model::Handoff::Work {
                     done: false,
                     report: lionclaw::model::PayloadRef::inline("stuck"),
                     request_attention: false,
-                },
+                }),
                 artifact: None,
                 runtime_configuration: Default::default(),
                 final_response: String::new(),
@@ -434,7 +619,7 @@ async fn role_runner_cannot_inject_a_durable_blob_reference() {
         dir.path(),
         MockRoleRunner::new(Box::new(|request| {
             Ok(lionclaw::ports::RoleRunOutcome {
-                handoff: lionclaw::model::Handoff::Work {
+                handoff: Some(lionclaw::model::Handoff::Work {
                     done: true,
                     report: lionclaw::model::PayloadRef::Blob(lionclaw::model::BlobRef {
                         algo: "sha256".into(),
@@ -442,7 +627,7 @@ async fn role_runner_cannot_inject_a_durable_blob_reference() {
                         len: 1,
                     }),
                     request_attention: false,
-                },
+                }),
                 artifact: Some(lionclaw::ports::CapturedArtifact::for_testing(
                     request.base_sha.clone(),
                     HEAD_SHA,
@@ -495,13 +680,13 @@ async fn role_runner_oversized_report_is_a_durable_invalid_output() {
         dir.path(),
         MockRoleRunner::new(Box::new(|request| {
             Ok(lionclaw::ports::RoleRunOutcome {
-                handoff: lionclaw::model::Handoff::Work {
+                handoff: Some(lionclaw::model::Handoff::Work {
                     done: true,
                     report: lionclaw::model::PayloadRef::inline(
                         "x".repeat(lionclaw::runner::MAX_HANDOFF_REPORT_BYTES + 1),
                     ),
                     request_attention: false,
-                },
+                }),
                 artifact: Some(lionclaw::ports::CapturedArtifact::for_testing(
                     request.base_sha.clone(),
                     HEAD_SHA,

@@ -30,7 +30,7 @@ impl EffectCleaner for NoopEffectCleaner {
 /// (judges are never captured, so `artifact` is always `None`).
 pub fn review_verdict(request: &RoleRunRequest, passed: bool, gaps: Vec<Gap>) -> RoleRunOutcome {
     RoleRunOutcome {
-        handoff: Handoff::Review {
+        handoff: Some(Handoff::Review {
             done: true,
             report: PayloadRef::inline("requirement map + observations"),
             passed,
@@ -38,7 +38,7 @@ pub fn review_verdict(request: &RoleRunRequest, passed: bool, gaps: Vec<Gap>) ->
             nonce: crate::prompt::handoff_nonce(&request.prompt)
                 .expect("terminal-review prompt has a nonce")
                 .to_string(),
-        },
+        }),
         artifact: None,
         runtime_configuration: crate::model::RuntimeConfigurationEvidence {
             requested_model: Some("mock-model".to_string()),
@@ -121,11 +121,11 @@ impl MockRoleRunner {
         let head_sha = head_sha.to_string();
         Self::new(Box::new(move |request| {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Work {
+                handoff: Some(Handoff::Work {
                     done: true,
                     report: PayloadRef::inline("did the work"),
                     request_attention: false,
-                },
+                }),
                 artifact: Some(CapturedArtifact::for_testing(
                     request.base_sha.clone(),
                     head_sha.clone(),

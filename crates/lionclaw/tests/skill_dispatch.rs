@@ -40,11 +40,11 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
         assert_eq!(request.skills[0].name, "engineering");
         assert_eq!(request.skills[0].root, expected_root);
         Ok(RoleRunOutcome {
-            handoff: Handoff::Work {
+            handoff: Some(Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("done"),
                 request_attention: false,
-            },
+            }),
             artifact: Some(CapturedArtifact::for_testing(
                 request.base_sha.clone(),
                 HEAD_SHA,
@@ -100,11 +100,11 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
         assert_eq!(request.runtime, "codex");
         assert!(request.skills.is_empty());
         Ok(RoleRunOutcome {
-            handoff: Handoff::Work {
+            handoff: Some(Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("done"),
                 request_attention: false,
-            },
+            }),
             artifact: Some(CapturedArtifact::for_testing(
                 request.base_sha.clone(),
                 HEAD_SHA,

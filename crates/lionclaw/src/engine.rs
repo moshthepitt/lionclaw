@@ -473,9 +473,14 @@ impl Engine {
             }
             match step(&state) {
                 StepDecision::Idle => {
-                    return match state.phase {
-                        MissionPhase::Planning => Ok(()),
-                        phase => bail!("engine idle in unexpected phase {phase:?}"),
+                    return if state.phase == MissionPhase::Planning
+                        || state.conversations.values().any(|conversation| {
+                            conversation.lifecycle
+                                == crate::model::ConversationLifecycle::AwaitingLead
+                        }) {
+                        Ok(())
+                    } else {
+                        bail!("engine idle in unexpected phase {:?}", state.phase)
                     };
                 }
                 StepDecision::Park | StepDecision::Terminal => return Ok(()),
@@ -1100,11 +1105,11 @@ impl Engine {
                 // A planning author's proposal is validated fail-closed before
                 // it is recorded, exactly like a manually proposed plan — an
                 // invalid proposal is a failed attempt, never a bad contract.
-                if let Handoff::Plan {
+                if let Some(Handoff::Plan {
                     done: true,
                     proposal,
                     ..
-                } = &outcome.handoff
+                }) = &outcome.handoff
                 {
                     let Some(proposal) = proposal else {
                         return Ok(completed(Err(invalid_role_outcome(
@@ -1121,7 +1126,12 @@ impl Engine {
                         ))));
                     }
                 }
-                let handoff = match self.externalize_handoff(&outcome.handoff) {
+                let handoff = match outcome
+                    .handoff
+                    .as_ref()
+                    .map(|handoff| self.externalize_handoff(handoff))
+                    .transpose()
+                {
                     Ok(handoff) => handoff,
                     Err(failure) => {
                         return Ok(completed(Err(with_role_outcome_evidence(
@@ -1145,7 +1155,7 @@ impl Engine {
                     ..Default::default()
                 };
                 Ok(completed(Ok(RoleRunSuccess {
-                    handoff: Some(handoff),
+                    handoff,
                     artifact: outcome
                         .artifact
                         .map(crate::ports::CapturedArtifact::into_outcome),
@@ -1346,13 +1356,13 @@ impl Engine {
                 return Ok(completed(Err(failure.projected())));
             }
         };
-        let Handoff::Review {
+        let Some(Handoff::Review {
             done,
             report,
             passed,
             gaps,
             nonce: echoed,
-        } = &outcome.handoff
+        }) = &outcome.handoff
         else {
             // Unreachable via the runner's schema check; fail closed anyway.
             return Ok(completed(Err(invalid_role_outcome(
@@ -2221,8 +2231,10 @@ fn validated_role_success(
     effect_id: &crate::model::EffectId,
 ) -> std::result::Result<crate::ports::RoleRunOutcome, TypedFailure> {
     let outcome = outcome.projected();
-    if let Err(failure) = crate::runner::validate_handoff(&outcome.handoff) {
-        return Err(with_role_outcome_evidence(failure, &outcome));
+    if let Some(handoff) = &outcome.handoff {
+        if let Err(failure) = crate::runner::validate_handoff(handoff) {
+            return Err(with_role_outcome_evidence(failure, &outcome));
+        }
     }
     if let Some(artifact) = &outcome.artifact {
         if let Err(detail) = artifact.validate_binding(mission_id, effect_id, base_sha) {
@@ -2233,18 +2245,26 @@ fn validated_role_success(
             ));
         }
     }
-    if let Some(detail) = crate::model::role_success_contract_error(
-        output,
-        &outcome.handoff,
-        outcome
-            .artifact
-            .as_ref()
-            .map(crate::ports::CapturedArtifact::as_outcome),
-        base_sha,
-    ) {
+    if let Some(handoff) = &outcome.handoff {
+        if let Some(detail) = crate::model::role_success_contract_error(
+            output,
+            handoff,
+            outcome
+                .artifact
+                .as_ref()
+                .map(crate::ports::CapturedArtifact::as_outcome),
+            base_sha,
+        ) {
+            return Err(invalid_role_outcome(
+                "role.success_contract",
+                detail,
+                &outcome,
+            ));
+        }
+    } else if outcome.artifact.is_some() {
         return Err(invalid_role_outcome(
             "role.success_contract",
-            detail,
+            "a dialogue checkpoint without a handoff cannot publish an artifact",
             &outcome,
         ));
     }

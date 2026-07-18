@@ -71,7 +71,10 @@ pub enum RoleRunUpdate {
 
 #[derive(Debug, Clone)]
 pub struct RoleRunOutcome {
-    pub handoff: Handoff,
+    /// An agent may finish a dialogue turn without declaring task completion.
+    /// That is an ordinary checkpoint whose final response is presented to the
+    /// lead; a present handoff remains subject to the role's closed contract.
+    pub handoff: Option<Handoff>,
     /// Engine-observed commits (never agent-claimed). Writers return `Some`
     /// only when a clean committed head was captured; work that was already
     /// satisfied may legitimately return `None`. Read-only roles never return

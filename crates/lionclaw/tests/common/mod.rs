@@ -355,11 +355,11 @@ pub fn review_runner(verdicts: Vec<(bool, Vec<lionclaw::model::Gap>)>) -> MockRo
             Ok(lionclaw::testing::review_verdict(request, passed, gaps))
         } else {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Work {
+                handoff: Some(Handoff::Work {
                     done: true,
                     report: PayloadRef::inline("committed the change"),
                     request_attention: false,
-                },
+                }),
                 artifact: Some(CapturedArtifact::for_testing(
                     request.base_sha.clone(),
                     HEAD_SHA,
