@@ -31,6 +31,7 @@ enum DeliveryTurn {
     Fail,
     InvalidHandoff,
     Complete,
+    CompleteWithOversizedReference,
     Review,
 }
 
@@ -123,6 +124,85 @@ async fn assert_reference_send_rejected(
         after_state.conversations[conversation].consumed_through, before_cursor,
         "rejection advanced the freshly folded delivery cursor"
     );
+}
+
+async fn capture_reference_watch(
+    repo: &Path,
+    store: &MissionStore,
+    mission: &lionclaw::model::MissionId,
+    conversation: &lionclaw::model::ConversationId,
+    transports: &cli::MissionTransports,
+    entered: &Arc<tokio::sync::Semaphore>,
+    release: &Arc<tokio::sync::Semaphore>,
+) -> String {
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission.as_str(),
+            "--to",
+            conversation.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "hold the current effect for the watch proof",
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    entered.forget_permits(entered.available_permits());
+    release.forget_permits(release.available_permits());
+    let command = cli::Cli::try_parse_from([
+        "lionclaw",
+        "mission",
+        "driver",
+        mission.as_str(),
+        "--repo",
+        repo.to_str().unwrap(),
+        "--handshake",
+        store
+            .lionclaw_dir()
+            .join("references-watch.ready")
+            .to_str()
+            .unwrap(),
+    ])
+    .unwrap();
+    let active_driver = tokio::spawn({
+        let transports = transports.clone();
+        async move { cli::run_with_transports(command, transports).await }
+    });
+    entered.acquire().await.unwrap().forget();
+    let current = store.require_state(mission).await.unwrap();
+    let mission_root = store.lionclaw_dir().join("missions").join(mission.as_str());
+    lionclaw::activity::publish_observed(
+        repo,
+        &mission_root,
+        &current,
+        lionclaw::activity::now_ms(),
+        None,
+    )
+    .await
+    .unwrap();
+    let watched = Command::new("timeout")
+        .args(["1", env!("CARGO_BIN_EXE_lionclaw"), "mission", "status"])
+        .arg(mission.as_str())
+        .args(["--watch", "--json", "--repo"])
+        .arg(repo)
+        .output()
+        .unwrap();
+    let watched = String::from_utf8(watched.stdout).unwrap();
+    assert!(
+        watched.lines().next().is_some(),
+        "watch emitted no observation"
+    );
+    release.add_permits(8);
+    assert_eq!(
+        active_driver.await.unwrap().unwrap(),
+        std::process::ExitCode::SUCCESS
+    );
+    watched
 }
 
 fn projected_conversation<'a>(value: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
@@ -232,13 +312,15 @@ impl RuntimeAdapter for DeliveryTransport {
             DeliveryTurn::InvalidHandoff => {
                 std::fs::write(Self::handoff(&execution), b"{}")?;
             }
-            DeliveryTurn::Complete => {
+            DeliveryTurn::Complete | DeliveryTurn::CompleteWithOversizedReference => {
                 let runtime = execution.context.runtime_state_root.as_ref().unwrap();
                 let work = runtime.parent().unwrap().join("work");
                 std::fs::write(work.join("delivery.txt"), "complete\n")?;
-                std::fs::write(work.join("reference-bound.txt"), "B".repeat(70 * 1024))?;
                 git(&work, &["add", "delivery.txt"])?;
-                git(&work, &["add", "reference-bound.txt"])?;
+                if matches!(turn, DeliveryTurn::CompleteWithOversizedReference) {
+                    std::fs::write(work.join("reference-bound.txt"), "B".repeat(70 * 1024))?;
+                    git(&work, &["add", "reference-bound.txt"])?;
+                }
                 git(&work, &["commit", "-q", "-m", "complete delivery proof"])?;
                 std::fs::write(
                     Self::handoff(&execution),
@@ -269,7 +351,9 @@ impl RuntimeAdapter for DeliveryTransport {
                 ),
                 DeliveryTurn::Fail => unreachable!("returned above"),
                 DeliveryTurn::InvalidHandoff => "I supplied an invalid handoff.".into(),
-                DeliveryTurn::Complete => "The requested production flow is complete.".into(),
+                DeliveryTurn::Complete | DeliveryTurn::CompleteWithOversizedReference => {
+                    "The requested production flow is complete.".into()
+                }
                 DeliveryTurn::Review => "The terminal review is clean.".into(),
             },
             ..Default::default()
@@ -1707,8 +1791,24 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert!(review_requested < review_completed);
 }
 
-#[tokio::test]
-async fn production_references_are_authoritative_bounded_and_transient() {
+#[test]
+fn production_references_are_authoritative_bounded_and_transient() {
+    std::thread::Builder::new()
+        .name("production-reference-proof".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(production_references_are_authoritative_bounded_and_transient_inner())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn production_references_are_authoritative_bounded_and_transient_inner() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -1735,7 +1835,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let mission_type_dir = temp.path().join("mission-type");
     materialize_mission_type(&mission_type_dir);
     let turns = Arc::new(Mutex::new(VecDeque::from([
-        DeliveryTurn::Complete,
+        DeliveryTurn::CompleteWithOversizedReference,
         DeliveryTurn::Fail,
         DeliveryTurn::AwaitLead,
         DeliveryTurn::AwaitLead,
@@ -1748,7 +1848,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
             turns: turns.clone(),
             entered: entered.clone(),
-            release,
+            release: release.clone(),
             sessions: Arc::new(Mutex::new(Vec::new())),
             prompts: prompts.clone(),
             launch_failures: Arc::new(Mutex::new(0)),
@@ -1966,6 +2066,18 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         assert_reference_send_rejected(&repo, &store, &mission, &conversation, args, expected)
             .await;
     }
+    let too_many = (0..=lionclaw::model::MAX_MESSAGE_REFERENCES)
+        .flat_map(|_| ["--receipt".to_string(), receipt.to_string()])
+        .collect();
+    assert_reference_send_rejected(
+        &repo,
+        &store,
+        &mission,
+        &conversation,
+        too_many,
+        "message has too many references",
+    )
+    .await;
     let aggregate = (0..lionclaw::model::MAX_MESSAGE_REFERENCES)
         .flat_map(|_| ["--receipt".to_string(), receipt.to_string()])
         .collect();
@@ -2032,6 +2144,21 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert!(prompt.contains(&format!("reachable commit {base}:")));
     assert!(prompt.contains("base.txt"));
 
+    // Keep a real production effect current while exercising the parsed,
+    // bounded watch path. The adapter is the registry-selected codex native
+    // transport; only its completion gate is scripted.
+    let mission_root = store.lionclaw_dir().join("missions").join(mission.as_str());
+    let watched = capture_reference_watch(
+        &repo,
+        &store,
+        &mission,
+        &conversation,
+        &transports,
+        &entered,
+        &release,
+    )
+    .await;
+
     let durable = serde_json::to_string(&store.load(&mission).await.unwrap()).unwrap();
     let transient_prose = [
         "authoritative receipt ",
@@ -2051,20 +2178,22 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         vec!["mission", "status", mission.as_str(), "--json"],
         vec!["mission", "inbox"],
         vec!["mission", "inbox", "--json"],
+        vec!["mission", "log", mission.as_str()],
         vec!["mission", "report", mission.as_str()],
         vec!["mission", "report", mission.as_str(), "--json"],
     ]
     .into_iter()
     .map(|args| stdout(cli_output(&repo, &args)))
     .collect::<Vec<_>>()
-    .join("\n");
+    .join("\n")
+        + "\n"
+        + &watched;
     for transient in transient_prose {
         assert!(
             !rendered_views.contains(transient),
             "parsed CLI view leaked transient expansion: {transient}"
         );
     }
-    let mission_root = store.lionclaw_dir().join("missions").join(mission.as_str());
     for path in walk_paths(&mission_root) {
         if path.is_file() {
             let bytes = std::fs::read(&path).unwrap();
@@ -2078,7 +2207,6 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             }
         }
     }
-
     // Mint foreign authority through a second real mission. Its receipt and
     // park are genuine, but mission identity keeps both out of this mission's
     // authority set.
