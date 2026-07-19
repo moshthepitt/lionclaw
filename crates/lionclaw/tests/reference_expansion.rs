@@ -5,7 +5,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
-use common::{approve_plan, effect_id, harness, proposal, simple_plan, BASE_SHA};
+use common::{approve_plan, harness, proposal, simple_plan, BASE_SHA};
 use lionclaw::cli::{self, Cli};
 use lionclaw::model::{MessageReference, MissionEvent};
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest, RoleRunUpdate};
@@ -116,66 +116,6 @@ async fn reachable_commit_expands_only_at_the_typed_role_request_boundary() {
             let bytes = std::fs::read(&entry).unwrap();
             assert!(!String::from_utf8_lossy(&bytes).contains("LionClaw test base"));
         }
-    }
-}
-
-#[tokio::test]
-async fn unavailable_references_fail_before_append_or_delivery_advancement() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness(
-        dir.path(),
-        MockRoleRunner::new(Box::new(|request| Ok(checkpoint(request)))),
-        MockOracleRunner::exiting(0),
-    )
-    .await;
-    let mission = h
-        .engine
-        .create_mission(dir.path().to_str().unwrap(), "invalid references", BASE_SHA)
-        .await
-        .unwrap();
-    h.engine
-        .propose_plan(&mission, proposal(0, simple_plan()))
-        .await
-        .unwrap();
-    approve_plan(&h.engine, &mission).await;
-    let awaiting = h.engine.advance(&mission).await.unwrap().state;
-    let conversation = awaiting.conversations.keys().next().unwrap().to_string();
-    let store = MissionStore::open(dir.path()).await.unwrap();
-    let before = store.load(&mission).await.unwrap();
-    let state_before = store.require_state(&mission).await.unwrap();
-
-    let invalid = [
-        MessageReference::ReachableCommit {
-            sha: "0".repeat(40),
-        },
-        MessageReference::AuthoritativeReceipt {
-            effect_id: effect_id("foreign-receipt"),
-        },
-        MessageReference::ParkEvidence {
-            effect_id: effect_id("foreign-park"),
-        },
-    ];
-    for reference in invalid {
-        let (flag, identity) = match &reference {
-            MessageReference::ReachableCommit { sha } => ("--commit", sha.as_str()),
-            MessageReference::AuthoritativeReceipt { effect_id } => {
-                ("--receipt", effect_id.as_str())
-            }
-            MessageReference::ParkEvidence { effect_id } => ("--park", effect_id.as_str()),
-        };
-        let error = cli::run(send_cli(
-            dir.path(),
-            &mission,
-            &conversation,
-            &[flag, identity],
-        ))
-        .await
-        .expect_err("foreign or unreachable authority must fail closed");
-        assert!(error.to_string().contains("not valid authority"));
-        let after = store.load(&mission).await.unwrap();
-        assert_eq!(after, before, "failure changed the authoritative log");
-        let state = store.require_state(&mission).await.unwrap();
-        assert_eq!(state, state_before, "failure changed folded delivery state");
     }
 }
 

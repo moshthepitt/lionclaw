@@ -13,7 +13,7 @@ use lionclaw::config::RuntimeProfiles;
 use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{
     apply, fold, Assertion, AssertionId, FinishClass, MissionEvent, MissionPhase, MissionState,
-    OracleName, Plan, PlanProposal, Requirement, RequirementDisposition, RequirementId,
+    OracleName, PayloadRef, Plan, PlanProposal, Requirement, RequirementDisposition, RequirementId,
     RequirementKind, RoleName, Task, TaskId, TaskKind,
 };
 use lionclaw::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
@@ -53,6 +53,76 @@ fn stdout(output: Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("UTF-8 CLI output")
+}
+
+fn walk_paths(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut paths = Vec::new();
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(
+                std::fs::read_dir(&path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        }
+        paths.push(path);
+    }
+    paths
+}
+
+async fn assert_reference_send_rejected(
+    repo: &Path,
+    store: &MissionStore,
+    mission: &lionclaw::model::MissionId,
+    conversation: &lionclaw::model::ConversationId,
+    reference_args: Vec<String>,
+    expected: &str,
+) {
+    let before_events = store.load(mission).await.unwrap();
+    let before_state = fold(before_events.clone()).unwrap();
+    let before_cursor = before_state.conversations[conversation].consumed_through;
+    let before_messages = before_events
+        .iter()
+        .filter(|event| matches!(event.event, MissionEvent::MessageSent { .. }))
+        .count();
+    let mut args = vec![
+        "lionclaw".to_string(),
+        "mission".into(),
+        "send".into(),
+        "--mission-id".into(),
+        mission.to_string(),
+        "--to".into(),
+        conversation.to_string(),
+    ];
+    args.extend(reference_args);
+    args.extend([
+        "--repo".into(),
+        repo.display().to_string(),
+        "REJECTED-EXPANSION-PROBE".into(),
+    ]);
+    let error = cli::run(cli::Cli::try_parse_from(args).unwrap())
+        .await
+        .expect_err("invalid production reference set must fail closed");
+    assert!(
+        format!("{error:#}").contains(expected),
+        "unexpected rejection: {error:#}"
+    );
+    let after_events = store.load(mission).await.unwrap();
+    let after_state = fold(after_events.clone()).unwrap();
+    assert_eq!(after_events, before_events, "rejection partially appended");
+    assert_eq!(
+        after_events
+            .iter()
+            .filter(|event| matches!(event.event, MissionEvent::MessageSent { .. }))
+            .count(),
+        before_messages,
+        "rejection appended MessageSent"
+    );
+    assert_eq!(
+        after_state.conversations[conversation].consumed_through, before_cursor,
+        "rejection advanced the freshly folded delivery cursor"
+    );
 }
 
 fn projected_conversation<'a>(value: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
@@ -166,7 +236,9 @@ impl RuntimeAdapter for DeliveryTransport {
                 let runtime = execution.context.runtime_state_root.as_ref().unwrap();
                 let work = runtime.parent().unwrap().join("work");
                 std::fs::write(work.join("delivery.txt"), "complete\n")?;
+                std::fs::write(work.join("reference-bound.txt"), "B".repeat(70 * 1024))?;
                 git(&work, &["add", "delivery.txt"])?;
+                git(&work, &["add", "reference-bound.txt"])?;
                 git(&work, &["commit", "-q", "-m", "complete delivery proof"])?;
                 std::fs::write(
                     Self::handoff(&execution),
@@ -380,10 +452,15 @@ struct FailingOracleTransport;
 #[async_trait]
 impl OracleRunner for FailingOracleTransport {
     async fn run(&self, _request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+        let mut stdout = b"AUTHORITATIVE-RECEIPT-CONTENT\n".to_vec();
+        stdout.extend(std::iter::repeat_n(b'R', 10 * 1024));
+        // A non-UTF-8 byte forces the production store to retain this genuine
+        // receipt payload in the content-addressed blob store.
+        stdout.push(0xff);
         Ok(OracleOutcome {
             exit_code: 1,
             exit_signal: None,
-            stdout: b"AUTHORITATIVE-RECEIPT-CONTENT\n".to_vec(),
+            stdout,
             stderr: Vec::new(),
             prepared_inputs: Vec::new(),
             duration_ms: 1,
@@ -1753,6 +1830,79 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         })
         .map(|(id, _)| id.clone())
         .expect("current production conversation");
+
+    let oversized_commit = parked
+        .reachable_commits
+        .iter()
+        .find(|sha| sha.as_str() != base)
+        .expect("production artifact commit authority")
+        .clone();
+    let tree = stdout(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", &format!("{base}^{{tree}}")])
+            .output()
+            .unwrap(),
+    )
+    .trim()
+    .to_string();
+    let unreachable = String::from_utf8(
+        Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "commit-tree",
+                tree.as_str(),
+                "-m",
+                "detached reference object",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert!(repo.join(".git/objects").exists());
+
+    for (args, expected) in [
+        (
+            vec!["--commit".into(), "0".repeat(40)],
+            "not valid authority",
+        ),
+        (
+            vec!["--commit".into(), unreachable.clone()],
+            "not valid authority",
+        ),
+        (
+            vec!["--commit".into(), oversized_commit.to_string()],
+            "per-reference expansion bound",
+        ),
+        (
+            vec![
+                "--receipt".into(),
+                receipt.to_string(),
+                "--commit".into(),
+                unreachable.clone(),
+            ],
+            "not valid authority",
+        ),
+    ] {
+        assert_reference_send_rejected(&repo, &store, &mission, &conversation, args, expected)
+            .await;
+    }
+    let aggregate = (0..lionclaw::model::MAX_MESSAGE_REFERENCES)
+        .flat_map(|_| ["--receipt".to_string(), receipt.to_string()])
+        .collect();
+    assert_reference_send_rejected(
+        &repo,
+        &store,
+        &mission,
+        &conversation,
+        aggregate,
+        "aggregate expansion bound",
+    )
+    .await;
+
     let before_send = store.load(&mission).await.unwrap();
     cli::run(
         cli::Cli::try_parse_from([
@@ -1807,15 +1957,253 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert!(prompt.contains("base.txt"));
 
     let durable = serde_json::to_string(&store.load(&mission).await.unwrap()).unwrap();
-    for transient in [
+    let transient_prose = [
         "authoritative receipt ",
         "park evidence ",
         "reachable commit ",
         "inspect all authoritative references\n[",
-    ] {
+        "REJECTED-EXPANSION-PROBE",
+    ];
+    for transient in transient_prose {
         assert!(
             !durable.contains(transient),
             "durable expansion leaked: {transient}"
         );
     }
+    let rendered_views = [
+        vec!["mission", "status", mission.as_str()],
+        vec!["mission", "status", mission.as_str(), "--json"],
+        vec!["mission", "inbox"],
+        vec!["mission", "inbox", "--json"],
+        vec!["mission", "report", mission.as_str()],
+        vec!["mission", "report", mission.as_str(), "--json"],
+    ]
+    .into_iter()
+    .map(|args| stdout(cli_output(&repo, &args)))
+    .collect::<Vec<_>>()
+    .join("\n");
+    for transient in transient_prose {
+        assert!(
+            !rendered_views.contains(transient),
+            "parsed CLI view leaked transient expansion: {transient}"
+        );
+    }
+    let mission_root = store.lionclaw_dir().join("missions").join(mission.as_str());
+    for path in walk_paths(&mission_root) {
+        if path.is_file() {
+            let bytes = std::fs::read(&path).unwrap();
+            let content = String::from_utf8_lossy(&bytes);
+            for transient in transient_prose {
+                assert!(
+                    !content.contains(transient),
+                    "mission-private file {} leaked transient expansion",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    // Mint foreign authority through a second real mission. Its receipt and
+    // park are genuine, but mission identity keeps both out of this mission's
+    // authority set.
+    {
+        let mut foreign_turns = turns.lock().unwrap();
+        foreign_turns.clear();
+        foreign_turns.extend([
+            DeliveryTurn::Complete,
+            DeliveryTurn::Fail,
+            DeliveryTurn::AwaitLead,
+        ]);
+    }
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "start",
+            "--type",
+            mission_type_dir.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--objective",
+            "mint foreign reference authority",
+            "--runtime",
+            "codex",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    let foreign = store
+        .list_missions()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate != &mission)
+        .unwrap();
+    for command in [
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "plan",
+            "propose",
+            foreign.as_str(),
+            "--file",
+            proposal_path.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            foreign.as_str(),
+            "plan_proposal:mission",
+            "approve",
+            "--justification",
+            "mint foreign authority",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    ] {
+        cli::run_with_transports(command, transports.clone())
+            .await
+            .unwrap();
+    }
+    let foreign_driver = |name: &str| {
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "driver",
+            foreign.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--handshake",
+            temp.path().join(name).to_str().unwrap(),
+        ])
+        .unwrap()
+    };
+    for attempt in 0..4 {
+        cli::run_with_transports(
+            foreign_driver(&format!("foreign-receipt-{attempt}")),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+        if !store
+            .require_state(&foreign)
+            .await
+            .unwrap()
+            .authoritative_receipts
+            .is_empty()
+        {
+            break;
+        }
+    }
+    let foreign_failed = store.require_state(&foreign).await.unwrap();
+    let foreign_receipt = foreign_failed
+        .authoritative_receipts
+        .iter()
+        .next()
+        .unwrap()
+        .clone();
+    let foreign_attention = foreign_failed.open_attention.keys().next().unwrap().clone();
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            foreign.as_str(),
+            foreign_attention.as_str(),
+            "repair",
+            "--justification",
+            "mint foreign park",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    for attempt in 0..4 {
+        cli::run_with_transports(
+            foreign_driver(&format!("foreign-park-{attempt}")),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+        if !store
+            .require_state(&foreign)
+            .await
+            .unwrap()
+            .parked_effects
+            .is_empty()
+        {
+            break;
+        }
+    }
+    let foreign_park = store
+        .require_state(&foreign)
+        .await
+        .unwrap()
+        .parked_effects
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    for (flag, identity) in [
+        ("--receipt", foreign_receipt.to_string()),
+        ("--park", foreign_park.to_string()),
+    ] {
+        assert_reference_send_rejected(
+            &repo,
+            &store,
+            &mission,
+            &conversation,
+            vec![flag.into(), identity],
+            "not valid authority",
+        )
+        .await;
+    }
+
+    let receipt_blob = store
+        .load(&mission)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|event| match event.event {
+            MissionEvent::OracleRunCompleted {
+                effect_id,
+                outcome: Ok(success),
+                ..
+            } if effect_id == receipt => match success.stdout {
+                PayloadRef::Blob(blob) => Some(blob),
+                PayloadRef::Inline { .. } => None,
+            },
+            _ => None,
+        })
+        .expect("production receipt stored as a private blob");
+    let blob_path = store
+        .lionclaw_dir()
+        .join("blobs/sha256")
+        .join(&receipt_blob.hex[..2])
+        .join(&receipt_blob.hex[2..4])
+        .join(&receipt_blob.hex);
+    let mut permissions = std::fs::metadata(&blob_path).unwrap().permissions();
+    permissions.set_mode(0o644);
+    std::fs::set_permissions(&blob_path, permissions).unwrap();
+    let mut corrupted = std::fs::read(&blob_path).unwrap();
+    corrupted[0] ^= 1;
+    std::fs::write(&blob_path, corrupted).unwrap();
+    assert_reference_send_rejected(
+        &repo,
+        &store,
+        &mission,
+        &conversation,
+        vec!["--receipt".into(), receipt.to_string()],
+        "failed content verification",
+    )
+    .await;
 }
