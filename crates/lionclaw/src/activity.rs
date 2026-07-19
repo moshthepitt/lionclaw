@@ -12,7 +12,7 @@ use crate::model::{InflightEffect, MissionState, TaskId, TaskKind, TaskNamespace
 
 const MAX_EFFECTS: usize = 32;
 const MAX_TEXT: usize = 4 * 1024;
-const MAX_PROJECTION_BYTES: u64 = 256 * 1024;
+pub const MAX_PROJECTION_BYTES: u64 = 256 * 1024;
 const MAX_DRIVER_STDERR_BYTES: u64 = 64 * 1024;
 const MAX_DRIVER_DIAGNOSTIC_BYTES: u64 = (MAX_TEXT * 4) as u64;
 const MAX_CONCURRENT_OBSERVERS: usize = 4;
@@ -53,11 +53,25 @@ pub struct EffectActivity {
 /// Load the disposable observer only when it describes this exact fresh fold.
 /// Any read, shape, bound, or authority mismatch is deliberately suppressed.
 pub fn load_validated(mission_dir: &Path, state: &MissionState) -> Option<ActivityProjection> {
-    let target = path(mission_dir);
-    if std::fs::metadata(&target).ok()?.len() > MAX_PROJECTION_BYTES {
+    let descriptor = open(
+        path(mission_dir),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .ok()?;
+    let mut file = std::fs::File::from(descriptor);
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_PROJECTION_BYTES {
         return None;
     }
-    let bytes = std::fs::read(target).ok()?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    (&mut file)
+        .take(MAX_PROJECTION_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_PROJECTION_BYTES {
+        return None;
+    }
     let projection: ActivityProjection = serde_json::from_slice(&bytes).ok()?;
     let expected = state
         .inflight

@@ -56,6 +56,32 @@ fn stdout(output: Output) -> String {
     String::from_utf8(output.stdout).expect("UTF-8 CLI output")
 }
 
+fn assert_activity_suppressed(repo: &Path, mission_id: &str, label: &str) {
+    let status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        repo,
+        &["mission", "status", mission_id, "--json"],
+    )))
+    .unwrap();
+    assert_eq!(status["activity"], serde_json::Value::Null, "{label}");
+
+    for format in [None, Some("--json")] {
+        let mut command = Command::new("timeout");
+        command
+            .args(["0.35", env!("CARGO_BIN_EXE_lionclaw"), "mission", "status"])
+            .arg(mission_id)
+            .arg("--watch");
+        if let Some(format) = format {
+            command.arg(format);
+        }
+        let output = command.arg("--repo").arg(repo).output().unwrap();
+        assert!(
+            output.stdout.is_empty(),
+            "{label} leaked through watch: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
 fn walk_paths(root: &Path) -> Vec<std::path::PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut paths = Vec::new();
@@ -1388,18 +1414,23 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         serde_json::to_value(&activity).unwrap()
     );
     let activity_path = lionclaw::activity::path(&mission_dir);
-    let assert_suppressed = |label: &str| {
-        let status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
-            &repo,
-            &["mission", "status", mission_id.as_str(), "--json"],
-        )))
-        .unwrap();
-        assert_eq!(status["activity"], serde_json::Value::Null, "{label}");
-    };
     std::fs::write(&activity_path, b"not json").unwrap();
-    assert_suppressed("malformed projection");
+    assert_activity_suppressed(&repo, mission_id.as_str(), "malformed projection");
     std::fs::remove_file(&activity_path).unwrap();
-    assert_suppressed("absent projection");
+    assert_activity_suppressed(&repo, mission_id.as_str(), "absent projection");
+    std::fs::write(
+        &activity_path,
+        vec![0; (lionclaw::activity::MAX_PROJECTION_BYTES + 1) as usize],
+    )
+    .unwrap();
+    assert_activity_suppressed(&repo, mission_id.as_str(), "oversized projection");
+    std::fs::remove_file(&activity_path).unwrap();
+    std::fs::create_dir(&activity_path).unwrap();
+    assert_activity_suppressed(&repo, mission_id.as_str(), "non-regular projection");
+    std::fs::remove_dir(&activity_path).unwrap();
+    std::os::unix::fs::symlink("missing-observer-target", &activity_path).unwrap();
+    assert_activity_suppressed(&repo, mission_id.as_str(), "symlink projection");
+    std::fs::remove_file(&activity_path).unwrap();
     for (label, field, value) in [
         ("stale version", "version", serde_json::json!(3)),
         (
@@ -1416,12 +1447,12 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         let mut candidate = serde_json::to_value(&activity).unwrap();
         candidate[field] = value;
         std::fs::write(&activity_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
-        assert_suppressed(label);
+        assert_activity_suppressed(&repo, mission_id.as_str(), label);
     }
     let mut missing = activity.clone();
     missing.effects.clear();
     std::fs::write(&activity_path, serde_json::to_vec(&missing).unwrap()).unwrap();
-    assert_suppressed("missing effect");
+    assert_activity_suppressed(&repo, mission_id.as_str(), "missing effect");
     for (label, ids) in [
         ("forged effect", vec!["forged-effect"]),
         ("wrong effect", vec!["wrong-effect"]),
@@ -1437,8 +1468,12 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             })
             .collect();
         std::fs::write(&activity_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
-        assert_suppressed(label);
+        assert_activity_suppressed(&repo, mission_id.as_str(), label);
     }
+    let mut duplicate = activity.clone();
+    duplicate.effects.push(activity.effects[0].clone());
+    std::fs::write(&activity_path, serde_json::to_vec(&duplicate).unwrap()).unwrap();
+    assert_activity_suppressed(&repo, mission_id.as_str(), "duplicate effect");
     std::fs::write(&activity_path, serde_json::to_vec(&activity).unwrap()).unwrap();
     let watched = Command::new("timeout")
         .args(["1", env!("CARGO_BIN_EXE_lionclaw"), "mission", "status"])
@@ -1450,7 +1485,33 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let watched_line = String::from_utf8(watched.stdout).unwrap();
     let watched_activity: serde_json::Value =
         serde_json::from_str(watched_line.lines().next().expect("watch observation")).unwrap();
-    assert_eq!(watched_activity, serde_json::to_value(&activity).unwrap());
+    assert_eq!(
+        watched_activity["activity"],
+        serde_json::to_value(&activity).unwrap()
+    );
+    assert_eq!(
+        watched_activity["conversations"],
+        refreshed_status["conversations"]
+    );
+    assert_eq!(watched_activity["tasks"], refreshed_status["tasks"]);
+    assert_eq!(
+        watched_activity["next_actions"],
+        refreshed_status["next_actions"]
+    );
+    let watched_human = Command::new("timeout")
+        .args(["1", env!("CARGO_BIN_EXE_lionclaw"), "mission", "status"])
+        .arg(mission_id.as_str())
+        .args(["--watch", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    let watched_human = String::from_utf8(watched_human.stdout).unwrap();
+    assert!(watched_human.contains(&format!("{} ", effect_id.as_str())));
+    assert!(watched_human.contains("lifecycle=running"));
+    assert!(watched_human.contains("resume=canonical_reconstruction"));
+    assert!(watched_human.contains("legal_actions=mission status|mission send"));
+    assert!(watched_human.contains("marker=queued"));
+    assert!(watched_human.contains(base.as_str()));
     let active_human = stdout(cli_output(
         &repo,
         &["mission", "status", mission_id.as_str()],
@@ -1520,6 +1581,19 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .require_state(&mission_id)
         .await
         .unwrap();
+    assert!(failed.inflight.is_empty());
+    let mut completed_effect_projection = activity.clone();
+    completed_effect_projection.event_head = failed.head;
+    std::fs::write(
+        &activity_path,
+        serde_json::to_vec(&completed_effect_projection).unwrap(),
+    )
+    .unwrap();
+    assert_activity_suppressed(
+        &repo,
+        mission_id.as_str(),
+        "completed effect at current head",
+    );
     assert!(failed
         .conversations
         .values()

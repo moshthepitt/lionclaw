@@ -1968,14 +1968,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
     let view = load_mission_view(&store, &mission_id).await?;
     let state = &view.state;
     if args.json {
-        let mut value = mission_view_json(&view, &store).await?;
-        let activity = running_activity(&store, state, view.disposition)
-            .and_then(|activity| serde_json::to_value(activity).ok())
-            .unwrap_or(serde_json::Value::Null);
-        value["activity"] = activity;
-        value["driver_error"] = crate::activity::driver_error(&store.mission_dir(&mission_id))
-            .map_or(serde_json::Value::Null, serde_json::Value::String);
-        println!("{value}");
+        println!("{}", status_json(&view, &store).await?);
     } else {
         let workspace_observations =
             crate::activity::task_workspace_observations(store.lionclaw_dir(), state).await;
@@ -2053,7 +2046,11 @@ async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) 
             }
             continue;
         };
-        let bytes = serde_json::to_vec(&activity)?;
+        let bytes = if json {
+            serde_json::to_vec(&status_json(&view, store).await?)?
+        } else {
+            serde_json::to_vec(&activity)?
+        };
         if bytes != previous {
             if json {
                 println!("{}", String::from_utf8_lossy(&bytes));
@@ -2073,6 +2070,7 @@ async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) 
                         workspace_observation_summary(&effect.workspace)
                     );
                 }
+                print_conversations(&view.state, store, "  ")?;
             }
             previous = bytes;
         }
@@ -2081,6 +2079,17 @@ async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) 
             () = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
     }
+}
+
+async fn status_json(view: &MissionView, store: &MissionStore) -> Result<serde_json::Value> {
+    let mut value = mission_view_json(view, store).await?;
+    value["activity"] = running_activity(store, &view.state, view.disposition)
+        .and_then(|activity| serde_json::to_value(activity).ok())
+        .unwrap_or(serde_json::Value::Null);
+    value["driver_error"] =
+        crate::activity::driver_error(&store.mission_dir(&view.state.mission_id))
+            .map_or(serde_json::Value::Null, serde_json::Value::String);
+    Ok(value)
 }
 
 fn running_activity(
