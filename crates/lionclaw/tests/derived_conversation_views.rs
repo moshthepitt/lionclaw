@@ -205,6 +205,9 @@ async fn real_cli_views_share_one_folded_conversation_projection() {
         assert!(human.contains("queued=1"));
         assert!(human.contains("resume=native_session"));
         assert!(human.contains("final response: lead checkpoint"));
+        assert!(human.contains("body=queued lead message"));
+        assert!(human.contains("marker=queued"));
+        assert!(human.contains(BASE_SHA));
     }
     assert!(human_status.contains("next: mission advance"));
 
@@ -252,6 +255,21 @@ async fn real_cli_views_share_one_folded_conversation_projection() {
                 lifecycle => panic!("unexpected retry lifecycle {lifecycle}"),
             }
         );
+    }
+    for human in [
+        stdout(cli_output(
+            dir.path(),
+            &["mission", "status", mission.as_str()],
+        )),
+        stdout(cli_output(
+            dir.path(),
+            &["mission", "report", mission.as_str()],
+        )),
+        stdout(cli_output(dir.path(), &["mission", "inbox"])),
+    ] {
+        assert!(human.contains("body=queued lead message"));
+        assert!(human.contains("marker=previously_delivered"));
+        assert!(human.contains(BASE_SHA));
     }
 
     let events = store.load(&mission).await.unwrap();

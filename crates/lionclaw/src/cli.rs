@@ -2468,6 +2468,7 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
                         }
                     }
                 }
+                print_conversations(state, store, "  ")?;
                 print_task_workspace_observations(state, "  ", &workspace_observations);
                 print_non_task_failures(state);
             }
@@ -2688,6 +2689,17 @@ fn print_conversations(
         );
         if let Some(response) = conversation["final_response"].as_str() {
             println!("{indent}  final response: {response}");
+        }
+        if let Some(messages) = conversation["queued_messages"].as_array() {
+            for message in messages {
+                println!(
+                    "{indent}  queued message {}: marker={} body={} references={}",
+                    message["sequence_no"],
+                    message["marker"].as_str().unwrap_or("?"),
+                    message["body"].as_str().unwrap_or("?"),
+                    message["references"]
+                );
+            }
         }
     }
     Ok(())
