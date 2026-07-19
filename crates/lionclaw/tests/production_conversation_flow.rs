@@ -42,6 +42,7 @@ struct DeliveryTransport {
     release: Arc<tokio::sync::Semaphore>,
     sessions: SessionObservations,
     prompts: PromptObservations,
+    launch_failures: Arc<Mutex<usize>>,
 }
 
 impl DeliveryTransport {
@@ -79,6 +80,12 @@ impl RuntimeAdapter for DeliveryTransport {
         &self,
         input: RuntimeSessionStartInput,
     ) -> anyhow::Result<RuntimeSessionHandle> {
+        let mut launch_failures = self.launch_failures.lock().unwrap();
+        if *launch_failures > 0 {
+            *launch_failures -= 1;
+            anyhow::bail!("scripted session launch failure");
+        }
+        drop(launch_failures);
         let native_ready = matches!(
             &input.resume,
             lionclaw_runtime_api::RuntimeResume::Native { ready, .. } if ready.is_ready()
@@ -186,6 +193,7 @@ struct DeliveryProvider {
     release: Arc<tokio::sync::Semaphore>,
     sessions: SessionObservations,
     prompts: PromptObservations,
+    launch_failures: Arc<Mutex<usize>>,
 }
 
 impl RuntimeDriverProvider for DeliveryProvider {
@@ -200,6 +208,7 @@ impl RuntimeDriverProvider for DeliveryProvider {
             release: self.release.clone(),
             sessions: self.sessions.clone(),
             prompts: self.prompts.clone(),
+            launch_failures: self.launch_failures.clone(),
         })
     }
 }
@@ -747,6 +756,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let turns = Arc::new(Mutex::new(VecDeque::from([
         DeliveryTurn::AwaitLead,
         DeliveryTurn::InvalidHandoff,
+        DeliveryTurn::Fail,
+        DeliveryTurn::AwaitLead,
         DeliveryTurn::Complete,
         DeliveryTurn::Review,
     ])));
@@ -754,6 +765,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let sessions = Arc::new(Mutex::new(Vec::new()));
     let prompts = Arc::new(Mutex::new(Vec::new()));
+    let launch_failures = Arc::new(Mutex::new(0));
     let transports = cli::MissionTransports::external(
         profiles,
         RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
@@ -762,6 +774,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             release: release.clone(),
             sessions: sessions.clone(),
             prompts: prompts.clone(),
+            launch_failures: launch_failures.clone(),
         }) as Arc<dyn RuntimeDriverProvider>]),
         RuntimeAuthRegistry::empty(),
         Arc::new(ExternalOracleTransport {
@@ -923,23 +936,135 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     )
     .await
     .unwrap();
+    *launch_failures.lock().unwrap() = 1;
 
+    let launch_driver = tokio::spawn({
+        let transports = transports.clone();
+        let command = driver_cli(&temp.path().join("delivery-launch-failure.ready"));
+        async move { cli::run_with_transports(command, transports).await }
+    });
+    let active_store = MissionStore::open(&repo).await.unwrap();
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let events = active_store.load(&mission_id).await.unwrap();
+            if events.iter().any(|event| {
+                matches!(
+                    &event.event,
+                    MissionEvent::RoleRunCompleted { outcome: Err(failure), .. }
+                        if failure.evidence().code.as_deref() == Some("kernel.launch")
+                )
+            }) {
+                break events;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("launch failure was not recorded");
+    if !launch_driver.is_finished() {
+        launch_driver.abort();
+    }
+    match launch_driver.await {
+        Ok(Ok(_)) => {}
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(Err(error)) => panic!("launch driver failed: {error:#}"),
+    }
+    let launch = events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                MissionEvent::RoleRunCompleted { outcome: Err(failure), .. }
+                    if failure.evidence().code.as_deref() == Some("kernel.launch")
+            )
+        })
+        .expect("production launch failure");
+    let after_launch = fold(events[..=launch].iter().cloned()).unwrap();
+    let delivery = after_launch.conversations.values().next().unwrap();
+    assert_eq!(delivery.queued.len(), 1);
+    assert_eq!(
+        delivery.queued[0].marker,
+        lionclaw::model::DeliveryMarker::Queued
+    );
+    assert!(delivery.active_delivery.is_none());
+    let parked = active_store.require_state(&mission_id).await.unwrap();
+    let parked_effect = parked.parked_effects.keys().next().unwrap().to_string();
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "continue",
+            mission_id.as_str(),
+            parked_effect.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--reason",
+            "retry the launch-class failure",
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
     let restarted_driver = tokio::spawn({
         let transports = transports.clone();
         let command = driver_cli(&temp.path().join("delivery-restarted.ready"));
         async move { cli::run_with_transports(command, transports).await }
     });
     entered.acquire().await.unwrap().forget();
-    let state = MissionStore::open(&repo)
-        .await
-        .unwrap()
-        .require_state(&mission_id)
-        .await
-        .unwrap();
+    let state = active_store.require_state(&mission_id).await.unwrap();
     let delivery = state.conversations.values().next().unwrap();
     assert_eq!(delivery.queued.len(), 1);
-    let boundary = delivery.active_delivery.as_ref().unwrap().message_boundary;
+    let active = delivery.active_delivery.as_ref().unwrap();
+    let boundary = active.message_boundary;
     assert!(delivery.queued[0].sequence_no <= boundary);
+
+    // The runner has launched with this exact immutable request. Reducer
+    // fault-injection mutates this same identity; this production path proves
+    // it actually reaches the active runner and stays stable as the log moves.
+    let effect_id = active.effect_id.clone();
+    let request = state
+        .inflight
+        .get(&effect_id)
+        .unwrap()
+        .role_request_identity()
+        .unwrap();
+    assert_eq!(request.message_boundary, boundary);
+    assert_eq!(
+        request.presented_messages,
+        vec![delivery.queued[0].sequence_no]
+    );
+
+    // This production-ingress append occurs while the request is held inside
+    // the native adapter. It is beyond that request's boundary by definition.
+    cli::run_with_transports(
+        send("This arrived during the active turn."),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    let mid_turn = active_store.require_state(&mission_id).await.unwrap();
+    let delivery = mid_turn.conversations.values().next().unwrap();
+    assert_eq!(delivery.queued.len(), 2);
+    assert!(delivery.queued[1].sequence_no > boundary);
+    assert_eq!(
+        delivery.active_delivery.as_ref().unwrap().message_boundary,
+        boundary
+    );
+    assert!(active_store
+        .load(&mission_id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|event| {
+            matches!(
+                &event.event,
+                MissionEvent::RoleRunCompleted { outcome: Err(failure), .. }
+                    if failure.evidence().code.as_deref() == Some("kernel.launch")
+            )
+        }));
+
+    // Invalid handoff proves delivered failure: only the message inside the
+    // immutable boundary becomes PreviouslyDelivered; the arrival stays queued.
     release.add_permits(1);
     entered.acquire().await.unwrap().forget();
     let reworking = MissionStore::open(&repo)
@@ -953,11 +1078,125 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         delivery.queued[0].marker,
         lionclaw::model::DeliveryMarker::PreviouslyDelivered
     );
+    assert_eq!(
+        delivery.queued[1].marker,
+        lionclaw::model::DeliveryMarker::Queued
+    );
     let retry_boundary = delivery.active_delivery.as_ref().unwrap().message_boundary;
     assert!(retry_boundary >= boundary);
-    assert!(delivery.queued[0].sequence_no <= retry_boundary);
-    release.add_permits(2);
+    assert!(delivery.queued[1].sequence_no <= retry_boundary);
+
+    // A delivered transport failure truthfully makes everything presented by
+    // its request only PossiblyDelivered.
+    release.add_permits(1);
     restarted_driver.await.unwrap().unwrap();
+    let failed = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
+    assert!(failed
+        .conversations
+        .values()
+        .next()
+        .unwrap()
+        .queued
+        .iter()
+        .all(|message| { message.marker == lionclaw::model::DeliveryMarker::PossiblyDelivered }));
+    let failed_effect = failed.parked_effects.keys().next().unwrap().to_string();
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "continue",
+            mission_id.as_str(),
+            failed_effect.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--reason",
+            "retry the delivered transport failure",
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let interrupted_driver = tokio::spawn({
+        let transports = transports.clone();
+        let command = driver_cli(&temp.path().join("delivery-interrupted.ready"));
+        async move { cli::run_with_transports(command, transports).await }
+    });
+    entered.acquire().await.unwrap().forget();
+
+    // Drop the process while the next native turn is active. Restart recovery
+    // records interruption, and the same production request path re-presents
+    // the messages with the conservative marker.
+    interrupted_driver.abort();
+    assert!(interrupted_driver.await.unwrap_err().is_cancelled());
+    let recovered_driver = tokio::spawn({
+        let transports = transports.clone();
+        let command = driver_cli(&temp.path().join("delivery-recovered.ready"));
+        async move { cli::run_with_transports(command, transports).await }
+    });
+    recovered_driver.await.unwrap().unwrap();
+    let recovered = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
+    let delivery = recovered.conversations.values().next().unwrap();
+    assert!(delivery
+        .queued
+        .iter()
+        .all(|message| { message.marker == lionclaw::model::DeliveryMarker::PossiblyDelivered }));
+    let interrupted_effect = recovered.parked_effects.keys().next().unwrap().to_string();
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "continue",
+            mission_id.as_str(),
+            interrupted_effect.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--reason",
+            "retry the interrupted delivery",
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let completion_driver = tokio::spawn({
+        let transports = transports.clone();
+        let command = driver_cli(&temp.path().join("delivery-completion.ready"));
+        async move { cli::run_with_transports(command, transports).await }
+    });
+    entered.acquire().await.unwrap().forget();
+    let completing = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
+    let delivery = completing.conversations.values().next().unwrap();
+    let completion_boundary = delivery.active_delivery.as_ref().unwrap().message_boundary;
+
+    cli::run_with_transports(send("Keep this for the next turn."), transports.clone())
+        .await
+        .unwrap();
+    let before_success = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
+    assert!(
+        before_success.conversations.values().next().unwrap().queued[2].sequence_no
+            > completion_boundary
+    );
+    release.add_permits(2);
+    completion_driver.await.unwrap().unwrap();
     let mut completed_store = MissionStore::open(&repo).await.unwrap();
     if completed_store
         .require_state(&mission_id)
@@ -978,7 +1217,13 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     }
     let completed = completed_store.require_state(&mission_id).await.unwrap();
     let delivery = completed.conversations.values().next().unwrap();
-    assert!(delivery.queued.is_empty());
+    assert_eq!(delivery.queued.len(), 1);
+    assert_eq!(delivery.queued[0].body, "Keep this for the next turn.");
+    assert_eq!(
+        delivery.queued[0].marker,
+        lionclaw::model::DeliveryMarker::Queued
+    );
+    assert!(delivery.queued[0].sequence_no > delivery.consumed_through);
     assert_eq!(
         completed.phase,
         MissionPhase::Done {
@@ -989,7 +1234,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert!(turns.lock().unwrap().is_empty());
     {
         let sessions = sessions.lock().unwrap();
-        assert_eq!(sessions.len(), 4);
+        assert_eq!(sessions.len(), 6);
         assert_eq!(sessions[0].0, sessions[1].0, "workspace changed on restart");
         assert_eq!(sessions[1].0, sessions[2].0, "workspace changed on repair");
         assert!(!sessions[0].1);
@@ -1029,10 +1274,10 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .iter()
         .position(|event| matches!(event.event, MissionEvent::TerminalReviewCompleted { .. }))
         .unwrap();
-    assert_eq!(completions.len(), 3);
-    assert!(completions[0] < completions[1] && completions[1] < completions[2]);
+    assert_eq!(completions.len(), 6);
+    assert!(completions.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(
-        completions[2] < oracle && oracle < review_requested && review_requested < review_completed
+        completions[5] < oracle && oracle < review_requested && review_requested < review_completed
     );
 }
 
@@ -1080,6 +1325,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             release,
             sessions: Arc::new(Mutex::new(Vec::new())),
             prompts: prompts.clone(),
+            launch_failures: Arc::new(Mutex::new(0)),
         }) as Arc<dyn RuntimeDriverProvider>]),
         RuntimeAuthRegistry::empty(),
         Arc::new(FailingOracleTransport),
