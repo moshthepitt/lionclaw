@@ -115,8 +115,18 @@ fn account_materialized_bytes(
     if bytes > MAX_REFERENCE_BYTES {
         bail!("{label} {identity} exceeds the per-reference expansion bound");
     }
+    // `render_conversation_message` inserts exactly this labelled wrapper in
+    // the typed request.  Budget the expansion that crosses that boundary,
+    // not merely the referenced source payload.
+    let rendered_bytes = label
+        .len()
+        .checked_add(1)
+        .and_then(|size| size.checked_add(identity.len()))
+        .and_then(|size| size.checked_add(2))
+        .and_then(|size| size.checked_add(bytes))
+        .context("reference expansion size overflow")?;
     let next = total
-        .checked_add(bytes)
+        .checked_add(rendered_bytes)
         .context("reference expansion size overflow")?;
     if next > MAX_EXPANDED_REFERENCE_BYTES {
         bail!("message references exceed the aggregate expansion bound");
@@ -160,23 +170,35 @@ mod tests {
             "a rejected item must not consume aggregate budget"
         );
 
-        for index in 0..(MAX_EXPANDED_REFERENCE_BYTES / MAX_REFERENCE_BYTES) {
-            account_materialized_bytes(
-                "authoritative receipt",
-                &index.to_string(),
-                MAX_REFERENCE_BYTES,
-                &mut total,
-            )
-            .unwrap();
+        let wrapper = "authoritative receipt".len() + 1 + "0".len() + 2;
+        let content = MAX_REFERENCE_BYTES - wrapper;
+        for _ in 0..(MAX_EXPANDED_REFERENCE_BYTES / MAX_REFERENCE_BYTES) {
+            account_materialized_bytes("authoritative receipt", "0", content, &mut total).unwrap();
         }
         assert!(account_materialized_bytes("park evidence", "overflow", 1, &mut total).is_err());
     }
 
     #[test]
     fn expansion_limits_accept_the_exact_bound() {
-        let mut total = MAX_EXPANDED_REFERENCE_BYTES - MAX_REFERENCE_BYTES;
+        let wrapper = "reachable commit".len() + 1 + "a".len() + 2;
+        let mut total = MAX_EXPANDED_REFERENCE_BYTES - MAX_REFERENCE_BYTES - wrapper;
         account_materialized_bytes("reachable commit", "a", MAX_REFERENCE_BYTES, &mut total)
             .unwrap();
         assert_eq!(total, MAX_EXPANDED_REFERENCE_BYTES);
+    }
+
+    #[test]
+    fn labelled_wrapper_cannot_escape_the_aggregate_bound() {
+        let wrapper = "park evidence".len() + 1 + "effect".len() + 2;
+        let mut total = MAX_EXPANDED_REFERENCE_BYTES - MAX_REFERENCE_BYTES;
+        let error = account_materialized_bytes(
+            "park evidence",
+            "effect",
+            MAX_REFERENCE_BYTES - wrapper + 1,
+            &mut total,
+        )
+        .expect_err("label and identity bytes are part of transient expansion");
+        assert!(error.to_string().contains("aggregate expansion bound"));
+        assert_eq!(total, MAX_EXPANDED_REFERENCE_BYTES - MAX_REFERENCE_BYTES);
     }
 }
