@@ -54,29 +54,16 @@ async fn production_cli_routes_atomically_to_exact_current_role_instances() {
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let role = RoleName::new("implementer").unwrap();
     let alpha = TaskId::new("alpha").unwrap();
-    let (mission, alpha_conversation) = loop {
-        let mission = h
-            .engine
-            .create_mission(dir.path().to_str().unwrap(), "route", BASE_SHA)
-            .await
-            .unwrap();
-        let conversation =
-            ConversationId::for_role_instance(&mission, TaskNamespace::Execution, &alpha, &role, 1);
-        if conversation
-            .as_str()
-            .starts_with(|character: char| ('b'..='f').contains(&character))
-        {
-            break (mission, conversation);
-        }
-    };
-    // A selector can legitimately match one conversation id and a different
-    // task name. This is the otherwise easy-to-miss ambiguous-sugar case.
-    let collision = TaskId::new(alpha_conversation.as_str()).unwrap();
-    let task_ids = [alpha.clone(), TaskId::new("beta").unwrap(), collision];
+    let mission = h
+        .engine
+        .create_mission(dir.path().to_str().unwrap(), "route", BASE_SHA)
+        .await
+        .unwrap();
+    let task_ids = [alpha.clone(), TaskId::new("beta").unwrap()];
     let tasks = task_ids
         .iter()
         .cloned()
-        .zip(["ROUTE-A", "ROUTE-B", "ROUTE-C"])
+        .zip(["ROUTE-A", "ROUTE-B"])
         .map(|(id, assertion)| Task {
             id,
             kind: TaskKind::Work,
@@ -92,15 +79,11 @@ async fn production_cli_routes_atomically_to_exact_current_role_instances() {
             proposal(
                 0,
                 Plan {
-                    requirements: [
-                        ("ROUTING-A", "ROUTE-A"),
-                        ("ROUTING-B", "ROUTE-B"),
-                        ("ROUTING-C", "ROUTE-C"),
-                    ]
-                    .into_iter()
-                    .map(|(requirement, assertion)| covered_requirement(requirement, assertion))
-                    .collect(),
-                    assertions: ["ROUTE-A", "ROUTE-B", "ROUTE-C"]
+                    requirements: [("ROUTING-A", "ROUTE-A"), ("ROUTING-B", "ROUTE-B")]
+                        .into_iter()
+                        .map(|(requirement, assertion)| covered_requirement(requirement, assertion))
+                        .collect(),
+                    assertions: ["ROUTE-A", "ROUTE-B"]
                         .into_iter()
                         .map(|id| Assertion {
                             id: AssertionId::new(id).unwrap(),

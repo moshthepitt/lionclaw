@@ -2259,6 +2259,53 @@ pub struct MessageCommand {
     pub references: Vec<crate::model::MessageReference>,
 }
 
+fn resolve_message_recipients(
+    current: &[crate::model::ConversationRecipient],
+    selectors: &[String],
+    all: bool,
+) -> Result<Vec<crate::model::ConversationRecipient>> {
+    if all && !selectors.is_empty() {
+        bail!("--all cannot be mixed with explicit recipients");
+    }
+    if !all && selectors.is_empty() {
+        bail!("recipient set is empty");
+    }
+    let selected = if all {
+        current.to_vec()
+    } else {
+        let mut selected = Vec::new();
+        for selector in selectors {
+            let matches: Vec<_> = current
+                .iter()
+                .filter(|recipient| {
+                    recipient.conversation_id.as_str() == selector
+                        || recipient.task_id.as_str() == selector
+                })
+                .collect();
+            match matches.as_slice() {
+                [] => bail!("recipient '{selector}' is not a current conversation or task"),
+                [one] => selected.push((*one).clone()),
+                _ => bail!("task name '{selector}' is ambiguous; use a conversation id"),
+            }
+        }
+        selected
+    };
+    if selected.is_empty() {
+        bail!("recipient set is empty");
+    }
+    if selected.len() > crate::model::MAX_MESSAGE_RECIPIENTS {
+        bail!("message has too many recipients");
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    if selected
+        .iter()
+        .any(|recipient| !ids.insert(recipient.conversation_id.clone()))
+    {
+        bail!("recipient set contains a duplicate conversation");
+    }
+    Ok(selected)
+}
+
 pub async fn record_message(
     store: &MissionStore,
     repo: &std::path::Path,
@@ -2275,12 +2322,6 @@ pub async fn record_message(
     if body.len() > crate::model::MAX_MESSAGE_BYTES {
         bail!("message exceeds {} bytes", crate::model::MAX_MESSAGE_BYTES);
     }
-    if all && !selectors.is_empty() {
-        bail!("--all cannot be mixed with explicit recipients");
-    }
-    if !all && selectors.is_empty() {
-        bail!("recipient set is empty");
-    }
     if references.len() > crate::model::MAX_MESSAGE_REFERENCES {
         bail!("message has too many references");
     }
@@ -2296,37 +2337,17 @@ pub async fn record_message(
                     .get(&conversation.task_id)
                     .is_some_and(|task| task.assignment_epoch == conversation.assignment_epoch)
         })
+        .map(
+            |(conversation_id, conversation)| crate::model::ConversationRecipient {
+                conversation_id: conversation_id.clone(),
+                role: conversation.role.clone(),
+                namespace: conversation.namespace,
+                task_id: conversation.task_id.clone(),
+                assignment_epoch: conversation.assignment_epoch,
+            },
+        )
         .collect();
-    let selected: Vec<_> = if all {
-        current
-    } else {
-        let mut selected = Vec::new();
-        for selector in &selectors {
-            let matches: Vec<_> = current
-                .iter()
-                .copied()
-                .filter(|(id, conversation)| {
-                    id.as_str() == selector || conversation.task_id.as_str() == selector
-                })
-                .collect();
-            match matches.as_slice() {
-                [] => bail!("recipient '{selector}' is not a current conversation or task"),
-                [one] => selected.push(*one),
-                _ => bail!("task name '{selector}' is ambiguous; use a conversation id"),
-            }
-        }
-        selected
-    };
-    if selected.is_empty() {
-        bail!("recipient set is empty");
-    }
-    if selected.len() > crate::model::MAX_MESSAGE_RECIPIENTS {
-        bail!("message has too many recipients");
-    }
-    let mut ids = std::collections::BTreeSet::new();
-    if selected.iter().any(|(id, _)| !ids.insert((*id).clone())) {
-        bail!("recipient set contains a duplicate conversation");
-    }
+    let recipients = resolve_message_recipients(&current, &selectors, all)?;
     for reference in &references {
         let valid = match reference {
             crate::model::MessageReference::AuthoritativeReceipt { effect_id } => {
@@ -2352,18 +2373,6 @@ pub async fn record_message(
     )
     .await
     .context("message reference validation failed")?;
-    let recipients = selected
-        .into_iter()
-        .map(
-            |(conversation_id, conversation)| crate::model::ConversationRecipient {
-                conversation_id: conversation_id.clone(),
-                role: conversation.role.clone(),
-                namespace: conversation.namespace,
-                task_id: conversation.task_id.clone(),
-                assignment_epoch: conversation.assignment_epoch,
-            },
-        )
-        .collect();
     store
         .append(
             mission_id,
@@ -2636,5 +2645,79 @@ mod assignment_tests {
             requested_at_ms + (maximum_secs * 1_000) as i64
         );
         assert!(resolved_deadline(requested_at_ms, maximum_secs + 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod message_routing_tests {
+    use super::*;
+    use crate::model::{ConversationId, ConversationRecipient, RoleName, TaskId, TaskNamespace};
+
+    fn recipient(mission: &MissionId, task: &str, epoch: u32) -> ConversationRecipient {
+        let task_id = TaskId::new(task).unwrap();
+        let role = RoleName::new("implementer").unwrap();
+        ConversationRecipient {
+            conversation_id: ConversationId::for_role_instance(
+                mission,
+                TaskNamespace::Execution,
+                &task_id,
+                &role,
+                epoch,
+            ),
+            role,
+            namespace: TaskNamespace::Execution,
+            task_id,
+            assignment_epoch: epoch,
+        }
+    }
+
+    #[test]
+    fn production_owner_resolves_one_unique_atomic_recipient_snapshot() {
+        let (mission, alpha) = (0_u64..)
+            .map(|number| {
+                let mission = MissionId::parse(format!("m{number:012x}")).unwrap();
+                let alpha = recipient(&mission, "alpha", 2);
+                (mission, alpha)
+            })
+            .find(|(_, alpha)| {
+                alpha
+                    .conversation_id
+                    .as_str()
+                    .starts_with(|character: char| character.is_ascii_alphabetic())
+            })
+            .unwrap();
+        let beta = recipient(&mission, "beta", 4);
+        let collision = recipient(&mission, alpha.conversation_id.as_str(), 1);
+        let current = vec![alpha.clone(), beta.clone(), collision];
+
+        assert_eq!(
+            resolve_message_recipients(&current, &[], true).unwrap(),
+            current
+        );
+        assert_eq!(
+            resolve_message_recipients(
+                &current,
+                &[beta.conversation_id.to_string(), "alpha".into()],
+                false,
+            )
+            .unwrap(),
+            vec![beta.clone(), alpha.clone()]
+        );
+
+        for selectors in [
+            vec!["alpha".into(), "alpha".into()],
+            vec!["beta".into(), "missing".into()],
+            vec![alpha.conversation_id.to_string()],
+        ] {
+            assert!(resolve_message_recipients(&current, &selectors, false).is_err());
+        }
+
+        let stale = recipient(&mission, "alpha", 1);
+        let future = recipient(&mission, "alpha", 3);
+        for absent in [stale.conversation_id, future.conversation_id] {
+            assert!(resolve_message_recipients(&current, &[absent.to_string()], false).is_err());
+        }
+        assert!(resolve_message_recipients(&current, &[], false).is_err());
+        assert!(resolve_message_recipients(&current, &["alpha".into()], true).is_err());
     }
 }

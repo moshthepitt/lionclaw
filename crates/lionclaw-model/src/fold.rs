@@ -5764,6 +5764,124 @@ mod tests {
     }
 
     #[test]
+    fn atomic_message_recipient_snapshot_applies_independent_conversation_queues() {
+        let question = |task: &str| {
+            let mut completed = role_completed(task, "question", work_handoff(true, false), None);
+            let MissionEvent::RoleRunCompleted {
+                outcome: Ok(success),
+                ..
+            } = &mut completed
+            else {
+                unreachable!()
+            };
+            success.handoff = None;
+            completed
+        };
+        let events = vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("alpha"), work_task("beta")]),
+            role_requested("alpha", "alpha-first"),
+            question("alpha"),
+        ];
+        let mut state = fold_log(events).expect("production-format conversation");
+        let (alpha_id, alpha_state) = state.conversations.iter().next().unwrap();
+        let alpha = super::super::event::ConversationRecipient {
+            conversation_id: alpha_id.clone(),
+            role: alpha_state.role.clone(),
+            namespace: alpha_state.namespace,
+            task_id: alpha_state.task_id.clone(),
+            assignment_epoch: alpha_state.assignment_epoch,
+        };
+        let beta_id = crate::ConversationId::for_role_instance(
+            &mission_id(),
+            crate::TaskNamespace::Execution,
+            &tid("beta"),
+            &alpha.role,
+            1,
+        );
+        let mut beta_state = alpha_state.clone();
+        beta_state.task_id = tid("beta");
+        state.conversations.insert(beta_id.clone(), beta_state);
+        let beta = super::super::event::ConversationRecipient {
+            conversation_id: beta_id,
+            role: alpha.role.clone(),
+            namespace: alpha.namespace,
+            task_id: tid("beta"),
+            assignment_epoch: 1,
+        };
+        apply(
+            &mut state,
+            &envelope(
+                5,
+                MissionEvent::MessageSent {
+                    recipients: vec![alpha.clone(), beta.clone()],
+                    body: "both".into(),
+                    references: vec![],
+                },
+            ),
+        );
+        apply(
+            &mut state,
+            &envelope(
+                6,
+                MissionEvent::MessageSent {
+                    recipients: vec![alpha.clone()],
+                    body: "alpha only".into(),
+                    references: vec![],
+                },
+            ),
+        );
+        assert_eq!(
+            state.conversations[&alpha.conversation_id]
+                .queued
+                .iter()
+                .map(|message| (message.sequence_no, message.body.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(5, "both"), (6, "alpha only")]
+        );
+        assert_eq!(
+            state.conversations[&beta.conversation_id]
+                .queued
+                .iter()
+                .map(|message| (message.sequence_no, message.body.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(5, "both")]
+        );
+
+        let future_id = crate::ConversationId::for_role_instance(
+            &mission_id(),
+            alpha.namespace,
+            &alpha.task_id,
+            &alpha.role,
+            2,
+        );
+        let mut future = state.conversations[&alpha.conversation_id].clone();
+        future.assignment_epoch = 2;
+        future.queued.clear();
+        state.conversations.insert(future_id.clone(), future);
+        assert!(
+            state.conversations[&future_id].queued.is_empty(),
+            "an immutable recipient snapshot is not inherited by a future role instance"
+        );
+
+        let mut invalid = beta.clone();
+        invalid.assignment_epoch += 1;
+        apply(
+            &mut state,
+            &envelope(
+                7,
+                MissionEvent::MessageSent {
+                    recipients: vec![alpha.clone(), invalid],
+                    body: "must not partially route".into(),
+                    references: vec![],
+                },
+            ),
+        );
+        assert_eq!(state.conversations[&alpha.conversation_id].queued.len(), 2);
+        assert_eq!(state.conversations[&beta.conversation_id].queued.len(), 1);
+    }
+
+    #[test]
     fn delivery_failure_state_machine_preserves_boundary_and_reports_retry_uncertainty() {
         let mut checkpoint = role_completed("w", "checkpoint", work_handoff(true, false), None);
         let MissionEvent::RoleRunCompleted {
