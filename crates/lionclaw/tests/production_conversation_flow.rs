@@ -27,6 +27,7 @@ use lionclaw_runtime_api::{
 #[derive(Clone, Copy)]
 enum DeliveryTurn {
     AwaitLead,
+    Fail,
     InvalidHandoff,
     Complete,
     Review,
@@ -117,8 +118,12 @@ impl RuntimeAdapter for DeliveryTransport {
         ));
         self.entered.add_permits(1);
         self.release.acquire().await.unwrap().forget();
+        if matches!(turn, DeliveryTurn::Fail) {
+            anyhow::bail!("scripted external transport failure");
+        }
         match turn {
             DeliveryTurn::AwaitLead => {}
+            DeliveryTurn::Fail => unreachable!("returned above"),
             DeliveryTurn::InvalidHandoff => {
                 std::fs::write(Self::handoff(&execution), b"{}")?;
             }
@@ -152,6 +157,7 @@ impl RuntimeAdapter for DeliveryTransport {
         Ok(TurnResult {
             final_response: match turn {
                 DeliveryTurn::AwaitLead => "Which release target should I use?",
+                DeliveryTurn::Fail => unreachable!("returned above"),
                 DeliveryTurn::InvalidHandoff => "I supplied an invalid handoff.",
                 DeliveryTurn::Complete => "The requested production flow is complete.",
                 DeliveryTurn::Review => "The terminal review is clean.",
@@ -320,6 +326,22 @@ struct ExternalOracleTransport {
     calls: Arc<Mutex<Vec<(String, String)>>>,
 }
 
+struct FailingOracleTransport;
+
+#[async_trait]
+impl OracleRunner for FailingOracleTransport {
+    async fn run(&self, _request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+        Ok(OracleOutcome {
+            exit_code: 1,
+            exit_signal: None,
+            stdout: b"AUTHORITATIVE-RECEIPT-CONTENT\n".to_vec(),
+            stderr: Vec::new(),
+            prepared_inputs: Vec::new(),
+            duration_ms: 1,
+        })
+    }
+}
+
 #[async_trait]
 impl OracleRunner for ExternalOracleTransport {
     async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
@@ -371,6 +393,33 @@ fn plan() -> Plan {
             targets: vec![assertion],
             role: Some(RoleName::new("implementer").unwrap()),
             depends_on: Vec::new(),
+        }],
+    }
+}
+
+fn reference_plan() -> Plan {
+    let first = AssertionId::new("REFERENCE-RECEIPT").unwrap();
+    Plan {
+        requirements: vec![Requirement {
+            id: RequirementId::new("REFERENCES-TRANSIENT").unwrap(),
+            kind: RequirementKind::Validation,
+            prose: "references remain transient".into(),
+            disposition: RequirementDisposition::Covered {
+                assertion_ids: vec![first.clone()],
+            },
+        }],
+        assertions: vec![Assertion {
+            id: first.clone(),
+            prose: "produce genuine receipt authority".into(),
+            oracle: Some(OracleName::new("cargo-test").unwrap()),
+        }],
+        tasks: vec![Task {
+            id: TaskId::new("mint-receipt").unwrap(),
+            kind: TaskKind::Work,
+            body: "create receipt authority then receive transient references".into(),
+            targets: vec![first],
+            role: Some(RoleName::new("implementer").unwrap()),
+            depends_on: vec![],
         }],
     }
 }
@@ -985,4 +1034,269 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert!(
         completions[2] < oracle && oracle < review_requested && review_requested < review_completed
     );
+}
+
+#[tokio::test]
+async fn production_references_are_authoritative_bounded_and_transient() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let base = initialize_repo(&repo).await;
+    let fake_oci = temp.path().join("external-oci-transport");
+    std::fs::write(
+        &fake_oci,
+        "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profiles = RuntimeProfiles::from_toml(
+        &format!(
+            r#"[runtimes.codex]
+driver = "codex"
+command = "external-codex"
+native-resume = true
+confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
+"#,
+            fake_oci.display()
+        ),
+        temp.path(),
+    )
+    .unwrap();
+    let mission_type_dir = temp.path().join("mission-type");
+    materialize_mission_type(&mission_type_dir);
+    let turns = Arc::new(Mutex::new(VecDeque::from([
+        DeliveryTurn::Complete,
+        DeliveryTurn::Fail,
+        DeliveryTurn::AwaitLead,
+        DeliveryTurn::AwaitLead,
+    ])));
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(8));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let transports = cli::MissionTransports::external(
+        profiles,
+        RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
+            turns: turns.clone(),
+            entered: entered.clone(),
+            release,
+            sessions: Arc::new(Mutex::new(Vec::new())),
+            prompts: prompts.clone(),
+        }) as Arc<dyn RuntimeDriverProvider>]),
+        RuntimeAuthRegistry::empty(),
+        Arc::new(FailingOracleTransport),
+    );
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "start",
+            "--type",
+            mission_type_dir.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--objective",
+            "prove transient references",
+            "--runtime",
+            "codex",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    let store = MissionStore::open(&repo).await.unwrap();
+    let mission = store.list_missions().await.unwrap().pop().unwrap();
+    let proposal_path = temp.path().join("reference-plan.json");
+    std::fs::write(
+        &proposal_path,
+        serde_json::to_vec(&PlanProposal {
+            base_revision: 0,
+            plan: reference_plan(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for command in [
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "plan",
+            "propose",
+            mission.as_str(),
+            "--file",
+            proposal_path.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            mission.as_str(),
+            "plan_proposal:mission",
+            "approve",
+            "--justification",
+            "approve reference proof",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    ] {
+        cli::run_with_transports(command, transports.clone())
+            .await
+            .unwrap();
+    }
+    let driver = |name: &str| {
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "driver",
+            mission.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--handshake",
+            temp.path().join(name).to_str().unwrap(),
+        ])
+        .unwrap()
+    };
+    for attempt in 0..4 {
+        cli::run_with_transports(
+            driver(&format!("references-receipt-{attempt}")),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+        if !store
+            .require_state(&mission)
+            .await
+            .unwrap()
+            .authoritative_receipts
+            .is_empty()
+        {
+            break;
+        }
+    }
+    let failed_oracle = store.require_state(&mission).await.unwrap();
+    let receipt = failed_oracle
+        .authoritative_receipts
+        .iter()
+        .next()
+        .expect("production oracle receipt")
+        .clone();
+    let attention = failed_oracle.open_attention.keys().next().unwrap().clone();
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            mission.as_str(),
+            &attention,
+            "repair",
+            "--justification",
+            "retry to create park evidence",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    for attempt in 0..4 {
+        cli::run_with_transports(
+            driver(&format!("references-parked-{attempt}")),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+        if !store
+            .require_state(&mission)
+            .await
+            .unwrap()
+            .parked_effects
+            .is_empty()
+        {
+            break;
+        }
+    }
+    let parked = store.require_state(&mission).await.unwrap();
+    let park = parked
+        .parked_effects
+        .keys()
+        .next()
+        .expect("production failed role park evidence")
+        .clone();
+    let conversation = parked
+        .conversations
+        .iter()
+        .find(|(_, conversation)| {
+            conversation.task_id.as_str() == "mint-receipt"
+                && conversation.lifecycle != lionclaw::model::ConversationLifecycle::Completed
+        })
+        .map(|(id, _)| id.clone())
+        .expect("current production conversation");
+    let before_send = store.load(&mission).await.unwrap();
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission.as_str(),
+            "--to",
+            conversation.as_str(),
+            "--receipt",
+            receipt.as_str(),
+            "--park",
+            park.as_str(),
+            "--commit",
+            base.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "inspect all authoritative references",
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let after_send = store.load(&mission).await.unwrap();
+    assert_eq!(after_send.len(), before_send.len() + 1);
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "continue",
+            mission.as_str(),
+            park.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--reason",
+            "continue reference proof",
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    cli::run_with_transports(driver("references-delivered"), transports.clone())
+        .await
+        .unwrap();
+    let prompt = prompts.lock().unwrap().last().unwrap().0.clone();
+    assert!(prompt.contains(&format!("authoritative receipt {receipt}:")));
+    assert!(prompt.contains("AUTHORITATIVE-RECEIPT-CONTENT"));
+    assert!(prompt.contains(&format!("park evidence {park}:")));
+    assert!(prompt.contains("scripted external transport failure"));
+    assert!(prompt.contains(&format!("reachable commit {base}:")));
+    assert!(prompt.contains("base.txt"));
+
+    let durable = serde_json::to_string(&store.load(&mission).await.unwrap()).unwrap();
+    for transient in [
+        "authoritative receipt ",
+        "park evidence ",
+        "reachable commit ",
+        "inspect all authoritative references\n[",
+    ] {
+        assert!(
+            !durable.contains(transient),
+            "durable expansion leaked: {transient}"
+        );
+    }
 }

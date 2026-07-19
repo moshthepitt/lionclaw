@@ -53,9 +53,10 @@ pub async fn materialize_references(
                 )
             }
             MessageReference::ParkEvidence { effect_id } => {
-                if !state.parked_effects.contains_key(effect_id) {
-                    bail!("park evidence {effect_id} is not valid in this mission");
-                }
+                // Ingress authorizes park evidence while the effect is parked.
+                // A later `continue` deliberately removes that live-state entry,
+                // but must not invalidate the immutable queued message boundary.
+                // The same-mission completed failure is the durable material.
                 let failure = events
                     .iter()
                     .rev()
