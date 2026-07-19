@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -35,6 +36,33 @@ enum DeliveryTurn {
 
 type SessionObservations = Arc<Mutex<Vec<(Option<String>, bool)>>>;
 type PromptObservations = Arc<Mutex<Vec<(String, std::path::PathBuf)>>>;
+
+fn cli_output(repo: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+        .args(args)
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("run parsed production CLI")
+}
+
+fn stdout(output: Output) -> String {
+    assert!(
+        output.status.success(),
+        "CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("UTF-8 CLI output")
+}
+
+fn projected_conversation<'a>(value: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    value["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|conversation| conversation["id"] == id)
+        .expect("conversation in projection")
+}
 
 struct DeliveryTransport {
     turns: Arc<Mutex<VecDeque<DeliveryTurn>>>,
@@ -163,13 +191,15 @@ impl RuntimeAdapter for DeliveryTransport {
         }
         Ok(TurnResult {
             final_response: match turn {
-                DeliveryTurn::AwaitLead => "Which release target should I use?",
+                DeliveryTurn::AwaitLead => format!(
+                    "Which release target should I use? {}",
+                    "x".repeat(80 * 1024)
+                ),
                 DeliveryTurn::Fail => unreachable!("returned above"),
-                DeliveryTurn::InvalidHandoff => "I supplied an invalid handoff.",
-                DeliveryTurn::Complete => "The requested production flow is complete.",
-                DeliveryTurn::Review => "The terminal review is clean.",
-            }
-            .into(),
+                DeliveryTurn::InvalidHandoff => "I supplied an invalid handoff.".into(),
+                DeliveryTurn::Complete => "The requested production flow is complete.".into(),
+                DeliveryTurn::Review => "The terminal review is clean.".into(),
+            },
             ..Default::default()
         })
     }
@@ -730,7 +760,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 async fn production_delivery_uses_one_exact_immutable_boundary() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
-    initialize_repo(&repo).await;
+    let base = initialize_repo(&repo).await;
     let fake_oci = temp.path().join("external-oci-transport");
     std::fs::write(
         &fake_oci,
@@ -906,12 +936,54 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .tasks_in(conversation.namespace)
         .get(&conversation.task_id)
         .unwrap();
-    assert!(matches!(
-        task.final_response.as_ref(),
-        Some(lionclaw::model::PayloadRef::Inline { text })
-            if text == "Which release target should I use?"
-    ));
+    let response = task.final_response.as_ref().unwrap();
+    let response = awaiting_store.blobs().resolve(response).unwrap();
+    assert!(response.starts_with("Which release target should I use?"));
+    assert!(response.len() <= lionclaw::model::MAX_FINAL_RESPONSE_BYTES as usize);
     let conversation_id = conversation_id.to_string();
+
+    // Every user-facing view is parsed and rendered by the production binary
+    // after a fresh MissionStore reload. They must agree on the one folded
+    // awaiting-lead conversation rather than carrying observer authority.
+    let status_json: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        &repo,
+        &["mission", "status", mission_id.as_str(), "--json"],
+    )))
+    .unwrap();
+    let report_json: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        &repo,
+        &["mission", "report", mission_id.as_str(), "--json"],
+    )))
+    .unwrap();
+    let inbox_json: serde_json::Value =
+        serde_json::from_str(&stdout(cli_output(&repo, &["mission", "inbox", "--json"]))).unwrap();
+    for root in [&status_json, &report_json, &inbox_json["missions"][0]] {
+        let projected = projected_conversation(root, &conversation_id);
+        assert_eq!(projected["lifecycle"], "awaiting_lead");
+        assert_eq!(
+            projected["legal_actions"],
+            serde_json::json!(["mission send"])
+        );
+        assert_eq!(projected["runtime_resume_mode"], "canonical_reconstruction");
+        let final_response = projected["final_response"].as_str().unwrap();
+        assert!(final_response.starts_with("Which release target should I use?"));
+        assert!(final_response.len() <= lionclaw::model::MAX_FINAL_RESPONSE_BYTES as usize);
+    }
+    assert_eq!(status_json["activity"], serde_json::Value::Null);
+    assert_eq!(
+        status_json["next_actions"],
+        serde_json::json!(["mission send"])
+    );
+    for args in [
+        vec!["mission", "status", mission_id.as_str()],
+        vec!["mission", "report", mission_id.as_str()],
+        vec!["mission", "inbox"],
+    ] {
+        let human = stdout(cli_output(&repo, &args));
+        assert!(human.contains("lifecycle=awaiting_lead"));
+        assert!(human.contains("legal_actions=mission send"));
+        assert!(human.contains("final response: Which release target should I use?"));
+    }
 
     // A canonically parsed lead reply is appended after reopening the store.
     // A new driver process then reconstructs the Engine from durable authority.
@@ -924,6 +996,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             mission_id.as_str(),
             "--to",
             conversation_id.as_str(),
+            "--commit",
+            base.as_str(),
             "--repo",
             repo.to_str().unwrap(),
             body,
@@ -1033,6 +1107,61 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         request.presented_messages,
         vec![delivery.queued[0].sequence_no]
     );
+    let active_status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        &repo,
+        &["mission", "status", mission_id.as_str(), "--json"],
+    )))
+    .unwrap();
+    let active_projection = projected_conversation(&active_status, &conversation_id);
+    assert_eq!(active_projection["lifecycle"], "running");
+    assert_eq!(
+        active_projection["legal_actions"],
+        serde_json::json!(["mission status", "mission send"])
+    );
+    assert_eq!(
+        active_projection["runtime_resume_mode"],
+        "canonical_reconstruction"
+    );
+    assert_eq!(active_projection["queued_messages"][0]["marker"], "queued");
+    assert_eq!(
+        active_projection["queued_messages"][0]["references"][0]["sha"],
+        base
+    );
+    // Recompute the disposable observer through its production projection from
+    // the freshly loaded fold, then require parsed status to render that exact
+    // projection without promoting it to persisted mission authority.
+    let mission_dir = repo.join(".lionclaw/missions").join(mission_id.as_str());
+    lionclaw::activity::publish_observed(
+        &repo,
+        &mission_dir,
+        &state,
+        lionclaw::activity::now_ms(),
+        None,
+    )
+    .await
+    .unwrap();
+    let activity: lionclaw::activity::ActivityProjection =
+        serde_json::from_slice(&std::fs::read(lionclaw::activity::path(&mission_dir)).unwrap())
+            .unwrap();
+    assert_eq!(activity.event_head, state.head);
+    assert_eq!(activity.effects.len(), 1);
+    assert_eq!(activity.effects[0].effect_id, effect_id.as_str());
+    assert_eq!(activity.effects[0].message_boundary, Some(boundary));
+    let refreshed_status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        &repo,
+        &["mission", "status", mission_id.as_str(), "--json"],
+    )))
+    .unwrap();
+    assert_eq!(
+        refreshed_status["activity"],
+        serde_json::to_value(&activity).unwrap()
+    );
+    let active_human = stdout(cli_output(
+        &repo,
+        &["mission", "status", mission_id.as_str()],
+    ));
+    assert!(active_human.contains("legal_actions=mission status|mission send"));
+    assert!(active_human.contains("activity "));
 
     // This production-ingress append occurs while the request is held inside
     // the native adapter. It is beyond that request's boundary by definition.
@@ -1104,6 +1233,53 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .queued
         .iter()
         .all(|message| { message.marker == lionclaw::model::DeliveryMarker::PossiblyDelivered }));
+    let uncertain_status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        &repo,
+        &["mission", "status", mission_id.as_str(), "--json"],
+    )))
+    .unwrap();
+    let uncertain_report: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        &repo,
+        &["mission", "report", mission_id.as_str(), "--json"],
+    )))
+    .unwrap();
+    let uncertain_inbox: serde_json::Value =
+        serde_json::from_str(&stdout(cli_output(&repo, &["mission", "inbox", "--json"]))).unwrap();
+    for root in [
+        &uncertain_status,
+        &uncertain_report,
+        &uncertain_inbox["missions"][0],
+    ] {
+        let projected = projected_conversation(root, &conversation_id);
+        assert!(projected["queued_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["marker"] == "possibly_delivered"));
+        assert_eq!(
+            projected["queued_messages"][0]["body"],
+            "Use the preserved release target."
+        );
+        assert_eq!(
+            projected["queued_messages"][0]["references"][0]["sha"],
+            base
+        );
+        assert_eq!(projected["runtime_resume_mode"], "native_session");
+        assert_eq!(
+            projected["legal_actions"],
+            serde_json::json!(["mission advance", "mission send"])
+        );
+    }
+    for args in [
+        vec!["mission", "status", mission_id.as_str()],
+        vec!["mission", "report", mission_id.as_str()],
+        vec!["mission", "inbox"],
+    ] {
+        let human = stdout(cli_output(&repo, &args));
+        assert!(human.contains("marker=possibly_delivered"));
+        assert!(human.contains("body=Use the preserved release target."));
+        assert!(human.contains("legal_actions=mission advance|mission send"));
+    }
     let failed_effect = failed.parked_effects.keys().next().unwrap().to_string();
     cli::run(
         cli::Cli::try_parse_from([

@@ -2678,14 +2678,22 @@ fn print_conversations(
 ) -> Result<()> {
     for conversation in conversation_views(state, store)? {
         println!(
-            "{indent}conversation {}: lifecycle={} queued={} delivery_through={} resume={}",
+            "{indent}conversation {}: lifecycle={} queued={} delivery_through={} resume={} legal_actions={}",
             conversation["id"].as_str().unwrap_or("?"),
             conversation["lifecycle"].as_str().unwrap_or("?"),
             conversation["queued_messages"]
                 .as_array()
                 .map_or(0, Vec::len),
             conversation["consumed_through"],
-            conversation["runtime_resume_mode"].as_str().unwrap_or("?")
+            conversation["runtime_resume_mode"].as_str().unwrap_or("?"),
+            conversation["legal_actions"]
+                .as_array()
+                .map(|actions| actions
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("|"))
+                .unwrap_or_default()
         );
         if let Some(response) = conversation["final_response"].as_str() {
             println!("{indent}  final response: {response}");
