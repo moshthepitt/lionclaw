@@ -32,10 +32,15 @@ enum DeliveryTurn {
     Review,
 }
 
+type SessionObservations = Arc<Mutex<Vec<(Option<String>, bool)>>>;
+type PromptObservations = Arc<Mutex<Vec<(String, std::path::PathBuf)>>>;
+
 struct DeliveryTransport {
     turns: Arc<Mutex<VecDeque<DeliveryTurn>>>,
     entered: Arc<tokio::sync::Semaphore>,
     release: Arc<tokio::sync::Semaphore>,
+    sessions: SessionObservations,
+    prompts: PromptObservations,
 }
 
 impl DeliveryTransport {
@@ -73,9 +78,21 @@ impl RuntimeAdapter for DeliveryTransport {
         &self,
         input: RuntimeSessionStartInput,
     ) -> anyhow::Result<RuntimeSessionHandle> {
+        let native_ready = matches!(
+            &input.resume,
+            lionclaw_runtime_api::RuntimeResume::Native { ready, .. } if ready.is_ready()
+        );
+        self.sessions
+            .lock()
+            .unwrap()
+            .push((input.working_dir.clone(), native_ready));
         Ok(RuntimeSessionHandle {
             runtime_session_id: input.session_id.to_string(),
-            resume_mode: RuntimeResumeMode::Reconstructed,
+            resume_mode: if native_ready {
+                RuntimeResumeMode::Resumed
+            } else {
+                RuntimeResumeMode::Reconstructed
+            },
         })
     }
 
@@ -90,6 +107,14 @@ impl RuntimeAdapter for DeliveryTransport {
             .unwrap()
             .pop_front()
             .expect("scripted turn");
+        self.prompts.lock().unwrap().push((
+            execution.input.prompt.clone(),
+            execution
+                .context
+                .runtime_state_root
+                .clone()
+                .expect("native state root"),
+        ));
         self.entered.add_permits(1);
         self.release.acquire().await.unwrap().forget();
         match turn {
@@ -125,7 +150,13 @@ impl RuntimeAdapter for DeliveryTransport {
             }
         }
         Ok(TurnResult {
-            final_response: "scripted delivery turn".into(),
+            final_response: match turn {
+                DeliveryTurn::AwaitLead => "Which release target should I use?",
+                DeliveryTurn::InvalidHandoff => "I supplied an invalid handoff.",
+                DeliveryTurn::Complete => "The requested production flow is complete.",
+                DeliveryTurn::Review => "The terminal review is clean.",
+            }
+            .into(),
             ..Default::default()
         })
     }
@@ -147,6 +178,8 @@ struct DeliveryProvider {
     turns: Arc<Mutex<VecDeque<DeliveryTurn>>>,
     entered: Arc<tokio::sync::Semaphore>,
     release: Arc<tokio::sync::Semaphore>,
+    sessions: SessionObservations,
+    prompts: PromptObservations,
 }
 
 impl RuntimeDriverProvider for DeliveryProvider {
@@ -159,6 +192,8 @@ impl RuntimeDriverProvider for DeliveryProvider {
             turns: self.turns.clone(),
             entered: self.entered.clone(),
             release: self.release.clone(),
+            sessions: self.sessions.clone(),
+            prompts: self.prompts.clone(),
         })
     }
 }
@@ -370,7 +405,7 @@ role = "gap-reviewer"
 default-timeout-secs = 60
 max-task-time-secs = 120
 extension-step-secs = 30
-auto-continue-candidate = true
+auto-continue-candidate = false
 auto-continue-proof = true
 "#,
     )
@@ -668,12 +703,16 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     ])));
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let sessions = Arc::new(Mutex::new(Vec::new()));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
     let transports = cli::MissionTransports::external(
         profiles,
         RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
             turns: turns.clone(),
             entered: entered.clone(),
             release: release.clone(),
+            sessions: sessions.clone(),
+            prompts: prompts.clone(),
         }) as Arc<dyn RuntimeDriverProvider>]),
         RuntimeAuthRegistry::empty(),
         Arc::new(ExternalOracleTransport {
@@ -754,14 +793,66 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         ])
         .unwrap()
     };
-    let driver = tokio::spawn({
+    // The first process reaches a genuine no-handoff checkpoint and exits.
+    let first_driver = tokio::spawn({
         let transports = transports.clone();
         let command = driver_cli(&temp.path().join("delivery-first.ready"));
         async move { cli::run_with_transports(command, transports).await }
     });
     entered.acquire().await.unwrap().forget();
-    let state = store.require_state(&mission_id).await.unwrap();
-    let conversation_id = state.conversations.keys().next().unwrap().to_string();
+    release.add_permits(1);
+    let reached_awaiting = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let store = MissionStore::open(&repo).await.unwrap();
+            let state = store.require_state(&mission_id).await.unwrap();
+            if state.conversations.values().any(|conversation| {
+                conversation.lifecycle == lionclaw::model::ConversationLifecycle::AwaitingLead
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if reached_awaiting.is_err() {
+        panic!(
+            "first driver did not reach awaiting lead: {:#?}",
+            MissionStore::open(&repo)
+                .await
+                .unwrap()
+                .require_state(&mission_id)
+                .await
+                .unwrap()
+        );
+    }
+    if !first_driver.is_finished() {
+        first_driver.abort();
+    }
+    match first_driver.await {
+        Ok(Ok(code)) => assert_eq!(code, std::process::ExitCode::SUCCESS),
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(Err(error)) => panic!("first driver failed: {error:#}"),
+    }
+    let awaiting_store = MissionStore::open(&repo).await.unwrap();
+    let awaiting = lionclaw::engine::load_mission_view(&awaiting_store, &mission_id)
+        .await
+        .unwrap();
+    assert_eq!(awaiting.disposition, MissionDisposition::AwaitingLead);
+    let (conversation_id, conversation) = awaiting.state.conversations.iter().next().unwrap();
+    let task = awaiting
+        .state
+        .tasks_in(conversation.namespace)
+        .get(&conversation.task_id)
+        .unwrap();
+    assert!(matches!(
+        task.final_response.as_ref(),
+        Some(lionclaw::model::PayloadRef::Inline { text })
+            if text == "Which release target should I use?"
+    ));
+    let conversation_id = conversation_id.to_string();
+
+    // A canonically parsed lead reply is appended after reopening the store.
+    // A new driver process then reconstructs the Engine from durable authority.
     let send = |body: &'static str| {
         cli::Cli::try_parse_from([
             "lionclaw",
@@ -777,46 +868,68 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         ])
         .unwrap()
     };
-    cli::run_with_transports(send("before"), transports.clone())
-        .await
-        .unwrap();
-    release.add_permits(1);
-    entered.acquire().await.unwrap().forget();
-    cli::run_with_transports(send("during"), transports.clone())
-        .await
-        .unwrap();
-    let active = store.require_state(&mission_id).await.unwrap();
-    let delivery = active.conversations.values().next().unwrap();
-    let boundary = delivery.active_delivery.as_ref().unwrap().message_boundary;
-    assert_eq!(delivery.queued.len(), 2);
-    assert!(delivery.queued[0].sequence_no <= boundary);
-    assert!(delivery.queued[1].sequence_no > boundary);
+    cli::run_with_transports(
+        send("Use the preserved release target."),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
 
+    let restarted_driver = tokio::spawn({
+        let transports = transports.clone();
+        let command = driver_cli(&temp.path().join("delivery-restarted.ready"));
+        async move { cli::run_with_transports(command, transports).await }
+    });
+    entered.acquire().await.unwrap().forget();
+    let state = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
+    let delivery = state.conversations.values().next().unwrap();
+    assert_eq!(delivery.queued.len(), 1);
+    let boundary = delivery.active_delivery.as_ref().unwrap().message_boundary;
+    assert!(delivery.queued[0].sequence_no <= boundary);
     release.add_permits(1);
     entered.acquire().await.unwrap().forget();
-    let reworking = store.require_state(&mission_id).await.unwrap();
+    let reworking = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
     let delivery = reworking.conversations.values().next().unwrap();
     assert_eq!(
         delivery.queued[0].marker,
         lionclaw::model::DeliveryMarker::PreviouslyDelivered
     );
-    assert_eq!(
-        delivery.queued[1].marker,
-        lionclaw::model::DeliveryMarker::Queued
-    );
     let retry_boundary = delivery.active_delivery.as_ref().unwrap().message_boundary;
-    assert!(delivery.queued[1].sequence_no <= retry_boundary);
-
-    cli::run_with_transports(send("after"), transports.clone())
+    assert!(retry_boundary >= boundary);
+    assert!(delivery.queued[0].sequence_no <= retry_boundary);
+    release.add_permits(2);
+    restarted_driver.await.unwrap().unwrap();
+    let mut completed_store = MissionStore::open(&repo).await.unwrap();
+    if completed_store
+        .require_state(&mission_id)
+        .await
+        .unwrap()
+        .phase
+        != (MissionPhase::Done {
+            finish: FinishClass::Verified,
+        })
+    {
+        cli::run_with_transports(
+            driver_cli(&temp.path().join("delivery-closing.ready")),
+            transports.clone(),
+        )
         .await
         .unwrap();
-    release.add_permits(2);
-    driver.await.unwrap().unwrap();
-    let completed = store.require_state(&mission_id).await.unwrap();
+        completed_store = MissionStore::open(&repo).await.unwrap();
+    }
+    let completed = completed_store.require_state(&mission_id).await.unwrap();
     let delivery = completed.conversations.values().next().unwrap();
-    assert_eq!(delivery.queued.len(), 1);
-    assert_eq!(delivery.queued[0].body, "after");
-    assert!(delivery.queued[0].sequence_no > retry_boundary);
+    assert!(delivery.queued.is_empty());
     assert_eq!(
         completed.phase,
         MissionPhase::Done {
@@ -825,4 +938,51 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     );
 
     assert!(turns.lock().unwrap().is_empty());
+    {
+        let sessions = sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 4);
+        assert_eq!(sessions[0].0, sessions[1].0, "workspace changed on restart");
+        assert_eq!(sessions[1].0, sessions[2].0, "workspace changed on repair");
+        assert!(!sessions[0].1);
+        assert!(
+            sessions[1].1,
+            "native session was not eligible after restart"
+        );
+        assert!(sessions[2].1, "native session was not eligible for repair");
+    }
+    {
+        let prompts = prompts.lock().unwrap();
+        assert!(prompts[1].0.contains("Use the preserved release target."));
+        assert!(prompts[2]
+            .0
+            .contains("handoff is missing the 'schema' string"));
+        assert_eq!(prompts[0].1, prompts[1].1);
+        assert_eq!(prompts[1].1, prompts[2].1);
+    }
+
+    let events = completed_store.load(&mission_id).await.unwrap();
+    let completions: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(event.event, MissionEvent::RoleRunCompleted { .. }).then_some(index)
+        })
+        .collect();
+    let oracle = events
+        .iter()
+        .position(|event| matches!(event.event, MissionEvent::OracleRunCompleted { .. }))
+        .unwrap();
+    let review_requested = events
+        .iter()
+        .position(|event| matches!(event.event, MissionEvent::TerminalReviewRequested { .. }))
+        .unwrap();
+    let review_completed = events
+        .iter()
+        .position(|event| matches!(event.event, MissionEvent::TerminalReviewCompleted { .. }))
+        .unwrap();
+    assert_eq!(completions.len(), 3);
+    assert!(completions[0] < completions[1] && completions[1] < completions[2]);
+    assert!(
+        completions[2] < oracle && oracle < review_requested && review_requested < review_completed
+    );
 }

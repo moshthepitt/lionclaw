@@ -523,7 +523,11 @@ impl RoleRunner for OciRoleRunner {
                     failure
                 },
             )?;
-            let artifact = if is_writer {
+            // A writer may pause for lead input without handing off. Such a
+            // dialogue checkpoint publishes neither an artifact nor capture
+            // authority; the same conversation workspace remains available
+            // for the next turn.
+            let artifact = if is_writer && handoff.is_some() {
                 let _guard = self.repo_lock.lock().await;
                 let artifact = request
                     .artifact_capture
