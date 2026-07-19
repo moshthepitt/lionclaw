@@ -343,10 +343,13 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
     assert_eq!(activity.effects[0].applied_model, None);
     assert_eq!(activity.effects[0].applied_mode, None);
     assert_eq!(activity.effects[0].last_activity, "event 9999");
-    assert_eq!(
-        activity.effects[0].legal_controls,
-        ["stop", "extend_deadline"]
-    );
+    let observer = serde_json::to_value(&activity.effects[0]).unwrap();
+    for fold_owned in ["role", "task", "runtime", "deadline_ms", "legal_controls"] {
+        assert!(
+            observer.get(fold_owned).is_none(),
+            "observer duplicated fold-owned field {fold_owned}"
+        );
+    }
     let active = store.require_state(&mission_id).await.unwrap();
     let (effect_id, effect) = active.inflight.iter().next().unwrap();
     let effect_id = effect_id.clone();

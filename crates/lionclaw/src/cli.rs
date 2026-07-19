@@ -1969,8 +1969,8 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
     let state = &view.state;
     if args.json {
         let mut value = mission_view_json(&view, &store).await?;
-        let activity = running_activity_bytes(&store, &mission_id, view.disposition)
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        let activity = running_activity(&store, state, view.disposition)
+            .and_then(|activity| serde_json::to_value(activity).ok())
             .unwrap_or(serde_json::Value::Null);
         value["activity"] = activity;
         value["driver_error"] = crate::activity::driver_error(&store.mission_dir(&mission_id))
@@ -2019,7 +2019,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
         print_conversations(state, &store, "  ")?;
         print_task_workspace_observations(state, "  ", &workspace_observations);
         if view.disposition == MissionDisposition::Running {
-            print_activity(&store, &mission_id)?;
+            print_activity(&store, state)?;
         }
         if let Some(error) = crate::activity::driver_error(&store.mission_dir(&mission_id)) {
             println!("driver error: {error}");
@@ -2042,23 +2042,34 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
 async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) -> Result<()> {
     let mut previous = Vec::new();
     loop {
-        let disposition = load_mission_view(store, mission_id).await?.disposition;
-        let Some(bytes) = running_activity_bytes(store, mission_id, disposition) else {
-            return Ok(());
+        let view = load_mission_view(store, mission_id).await?;
+        let Some(activity) = running_activity(store, &view.state, view.disposition) else {
+            if view.disposition != MissionDisposition::Running {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => return Ok(()),
+                () = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
+            continue;
         };
-        if !bytes.is_empty() && bytes != previous {
+        let bytes = serde_json::to_vec(&activity)?;
+        if bytes != previous {
             if json {
                 println!("{}", String::from_utf8_lossy(&bytes));
-            } else if let Ok(activity) =
-                serde_json::from_slice::<crate::activity::ActivityProjection>(&bytes)
-            {
+            } else {
                 for effect in activity.effects {
+                    let Some(inflight) = view.state.inflight.iter().find_map(|(id, inflight)| {
+                        (id.as_str() == effect.effect_id).then_some(inflight)
+                    }) else {
+                        continue;
+                    };
                     println!(
                         "{} {} elapsed={}ms deadline={} workspace={}",
                         effect.effect_id,
                         effect.last_activity,
                         effect.elapsed_ms,
-                        effect.deadline_ms,
+                        inflight.deadline_ms(),
                         workspace_observation_summary(&effect.workspace)
                     );
                 }
@@ -2072,30 +2083,47 @@ async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) 
     }
 }
 
-fn running_activity_bytes(
+fn running_activity(
     store: &MissionStore,
-    mission_id: &MissionId,
+    state: &crate::model::MissionState,
     disposition: MissionDisposition,
-) -> Option<Vec<u8>> {
-    (disposition == MissionDisposition::Running).then(|| {
-        std::fs::read(crate::activity::path(&store.mission_dir(mission_id))).unwrap_or_default()
-    })
+) -> Option<crate::activity::ActivityProjection> {
+    (disposition == MissionDisposition::Running)
+        .then(|| crate::activity::load_validated(&store.mission_dir(&state.mission_id), state))
+        .flatten()
 }
 
-fn print_activity(store: &MissionStore, mission_id: &MissionId) -> Result<()> {
-    let path = crate::activity::path(&store.mission_dir(mission_id));
-    let Ok(bytes) = std::fs::read(path) else {
+fn print_activity(store: &MissionStore, state: &crate::model::MissionState) -> Result<()> {
+    let Some(activity) =
+        crate::activity::load_validated(&store.mission_dir(&state.mission_id), state)
+    else {
         return Ok(());
     };
-    let activity: crate::activity::ActivityProjection = serde_json::from_slice(&bytes)?;
     for effect in activity.effects {
+        let Some(inflight) = state
+            .inflight
+            .iter()
+            .find_map(|(id, inflight)| (id.as_str() == effect.effect_id).then_some(inflight))
+        else {
+            return Ok(());
+        };
         println!(
             "activity {}: {} elapsed={}ms deadline={} controls={}",
             effect.effect_id,
             effect.last_activity,
             effect.elapsed_ms,
-            effect.deadline_ms,
-            effect.legal_controls.join("|")
+            inflight.deadline_ms(),
+            if state.reached_deadlines.contains_key(
+                state
+                    .inflight
+                    .keys()
+                    .find(|id| id.as_str() == effect.effect_id)
+                    .unwrap()
+            ) {
+                ""
+            } else {
+                "stop|extend_deadline"
+            }
         );
     }
     Ok(())
@@ -3832,17 +3860,10 @@ mod tests {
             b"stale",
         )
         .unwrap();
-        assert!(running_activity_bytes(&store, &mission_id, MissionDisposition::Parked).is_none());
-        assert_eq!(
-            running_activity_bytes(&store, &mission_id, MissionDisposition::Running).as_deref(),
-            Some(b"stale".as_slice())
-        );
+        assert!(running_activity(&store, &view.state, MissionDisposition::Parked).is_none());
+        assert!(running_activity(&store, &view.state, MissionDisposition::Running).is_none());
         std::fs::remove_file(crate::activity::path(&store.mission_dir(&mission_id))).unwrap();
-        assert_eq!(
-            running_activity_bytes(&store, &mission_id, MissionDisposition::Running),
-            Some(Vec::new()),
-            "a running watch waits through the pre-projection startup window"
-        );
+        assert!(running_activity(&store, &view.state, MissionDisposition::Running).is_none());
         let json = mission_view_json(&view, &store).await.unwrap();
 
         assert_eq!(json["phase"], "attention_needed");

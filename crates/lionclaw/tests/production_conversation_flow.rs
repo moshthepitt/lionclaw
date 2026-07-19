@@ -1294,7 +1294,6 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert_eq!(activity.event_head, state.head);
     assert_eq!(activity.effects.len(), 1);
     assert_eq!(activity.effects[0].effect_id, effect_id.as_str());
-    assert_eq!(activity.effects[0].message_boundary, Some(boundary));
     let refreshed_status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
         &repo,
         &["mission", "status", mission_id.as_str(), "--json"],
@@ -1304,6 +1303,70 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         refreshed_status["activity"],
         serde_json::to_value(&activity).unwrap()
     );
+    let activity_path = lionclaw::activity::path(&mission_dir);
+    let assert_suppressed = |label: &str| {
+        let status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+            &repo,
+            &["mission", "status", mission_id.as_str(), "--json"],
+        )))
+        .unwrap();
+        assert_eq!(status["activity"], serde_json::Value::Null, "{label}");
+    };
+    std::fs::write(&activity_path, b"not json").unwrap();
+    assert_suppressed("malformed projection");
+    std::fs::remove_file(&activity_path).unwrap();
+    assert_suppressed("absent projection");
+    for (label, field, value) in [
+        ("stale version", "version", serde_json::json!(3)),
+        (
+            "mission mismatch",
+            "mission_id",
+            serde_json::json!("foreign"),
+        ),
+        (
+            "head mismatch",
+            "event_head",
+            serde_json::json!(state.head - 1),
+        ),
+    ] {
+        let mut candidate = serde_json::to_value(&activity).unwrap();
+        candidate[field] = value;
+        std::fs::write(&activity_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
+        assert_suppressed(label);
+    }
+    let mut missing = activity.clone();
+    missing.effects.clear();
+    std::fs::write(&activity_path, serde_json::to_vec(&missing).unwrap()).unwrap();
+    assert_suppressed("missing effect");
+    for (label, ids) in [
+        ("forged effect", vec!["forged-effect"]),
+        ("wrong effect", vec!["wrong-effect"]),
+        ("extra effect", vec![effect_id.as_str(), "extra-effect"]),
+    ] {
+        let mut candidate = activity.clone();
+        candidate.effects = ids
+            .into_iter()
+            .map(|id| {
+                let mut effect = activity.effects[0].clone();
+                effect.effect_id = id.into();
+                effect
+            })
+            .collect();
+        std::fs::write(&activity_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
+        assert_suppressed(label);
+    }
+    std::fs::write(&activity_path, serde_json::to_vec(&activity).unwrap()).unwrap();
+    let watched = Command::new("timeout")
+        .args(["1", env!("CARGO_BIN_EXE_lionclaw"), "mission", "status"])
+        .arg(mission_id.as_str())
+        .args(["--watch", "--json", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    let watched_line = String::from_utf8(watched.stdout).unwrap();
+    let watched_activity: serde_json::Value =
+        serde_json::from_str(watched_line.lines().next().expect("watch observation")).unwrap();
+    assert_eq!(watched_activity, serde_json::to_value(&activity).unwrap());
     let active_human = stdout(cli_output(
         &repo,
         &["mission", "status", mission_id.as_str()],
@@ -1554,6 +1617,19 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             finish: FinishClass::Verified
         }
     );
+    let mut completed_effect = activity.clone();
+    completed_effect.event_head = completed.head;
+    std::fs::write(
+        &activity_path,
+        serde_json::to_vec(&completed_effect).unwrap(),
+    )
+    .unwrap();
+    let completed_status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        &repo,
+        &["mission", "status", mission_id.as_str(), "--json"],
+    )))
+    .unwrap();
+    assert_eq!(completed_status["activity"], serde_json::Value::Null);
 
     assert!(turns.lock().unwrap().is_empty());
     {

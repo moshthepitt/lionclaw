@@ -8,13 +8,11 @@ use anyhow::{Context, Result};
 use rustix::fs::{open, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{
-    ConversationLifecycle, DeliveryMarker, InflightEffect, MissionState, TaskId, TaskKind,
-    TaskNamespace,
-};
+use crate::model::{InflightEffect, MissionState, TaskId, TaskKind, TaskNamespace};
 
 const MAX_EFFECTS: usize = 32;
 const MAX_TEXT: usize = 4 * 1024;
+const MAX_PROJECTION_BYTES: u64 = 256 * 1024;
 const MAX_DRIVER_STDERR_BYTES: u64 = 64 * 1024;
 const MAX_DRIVER_DIAGNOSTIC_BYTES: u64 = (MAX_TEXT * 4) as u64;
 const MAX_CONCURRENT_OBSERVERS: usize = 4;
@@ -42,28 +40,56 @@ pub struct ActivityProjection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EffectActivity {
     pub effect_id: String,
-    pub role: Option<String>,
-    pub task: Option<String>,
-    pub runtime: Option<String>,
     pub applied_model: Option<String>,
     pub model_confirmation: Option<lionclaw_runtime_api::RuntimeConfigurationConfirmation>,
     pub applied_mode: Option<String>,
     pub mode_confirmation: Option<lionclaw_runtime_api::RuntimeConfigurationConfirmation>,
-    pub environment: String,
     pub elapsed_ms: i64,
-    pub deadline_ms: i64,
     pub last_activity: String,
     pub tool_activity: Option<String>,
     pub workspace: WorkspaceObservation,
-    pub queued_controls: Vec<String>,
-    pub queued_messages: usize,
-    #[serde(default)]
-    pub conversation_lifecycle: Option<ConversationLifecycle>,
-    #[serde(default)]
-    pub message_boundary: Option<u64>,
-    #[serde(default)]
-    pub delivery_markers: Vec<DeliveryMarker>,
-    pub legal_controls: Vec<String>,
+}
+
+/// Load the disposable observer only when it describes this exact fresh fold.
+/// Any read, shape, bound, or authority mismatch is deliberately suppressed.
+pub fn load_validated(mission_dir: &Path, state: &MissionState) -> Option<ActivityProjection> {
+    let target = path(mission_dir);
+    if std::fs::metadata(&target).ok()?.len() > MAX_PROJECTION_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(target).ok()?;
+    let projection: ActivityProjection = serde_json::from_slice(&bytes).ok()?;
+    let expected = state
+        .inflight
+        .keys()
+        .map(|id| id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let observed = projection
+        .effects
+        .iter()
+        .map(|effect| effect.effect_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let bounded_effect = |effect: &EffectActivity| {
+        effect.effect_id.len() <= MAX_TEXT
+            && effect.last_activity.len() <= MAX_TEXT
+            && effect
+                .tool_activity
+                .as_ref()
+                .is_none_or(|text| text.len() <= MAX_TEXT)
+            && match &effect.workspace {
+                WorkspaceObservation::Changed { diffstat } => diffstat.len() <= MAX_TEXT,
+                WorkspaceObservation::Unavailable { reason } => reason.len() <= MAX_TEXT,
+                _ => true,
+            }
+    };
+    (projection.version == 4
+        && projection.mission_id == state.mission_id.as_str()
+        && projection.event_head == state.head
+        && projection.effects.len() <= MAX_EFFECTS
+        && observed.len() == projection.effects.len()
+        && observed == expected
+        && projection.effects.iter().all(bounded_effect))
+    .then_some(projection)
 }
 
 pub fn path(mission_dir: &Path) -> PathBuf {
@@ -221,7 +247,7 @@ pub async fn publish_observed(
     tokio::fs::create_dir_all(mission_dir)
         .await
         .with_context(|| format!("creating mission directory '{}'", mission_dir.display()))?;
-    let previous = read(mission_dir).await.ok();
+    let previous = load_validated(mission_dir, state);
     let workspace_requests = state
         .inflight
         .iter()
@@ -256,53 +282,16 @@ pub async fn publish_observed(
         .iter()
         .take(MAX_EFFECTS)
         .map(|(effect_id, effect)| {
-            let (role, task, runtime, requested_at_ms, conversation) = match effect {
+            let requested_at_ms = match effect {
                 InflightEffect::RoleRun {
-                    namespace,
-                    role,
-                    task_id,
-                    runtime,
-                    assignment_epoch,
-                    requested_at_ms,
-                    ..
-                } => (
-                    Some(role.as_str().to_string()),
-                    Some(task_id.as_str().to_string()),
-                    Some(runtime.clone()),
-                    *requested_at_ms,
-                    state
-                        .conversations
-                        .get(&crate::model::ConversationId::for_role_instance(
-                            &state.mission_id,
-                            *namespace,
-                            task_id,
-                            role,
-                            *assignment_epoch,
-                        )),
-                ),
+                    requested_at_ms, ..
+                } => *requested_at_ms,
                 InflightEffect::OracleRun {
-                    oracle,
-                    requested_at_ms,
-                    ..
-                } => (
-                    Some(oracle.as_str().to_string()),
-                    None,
-                    Some("oracle".into()),
-                    *requested_at_ms,
-                    None,
-                ),
+                    requested_at_ms, ..
+                } => *requested_at_ms,
                 InflightEffect::TerminalReview {
-                    role,
-                    runtime,
-                    requested_at_ms,
-                    ..
-                } => (
-                    Some(role.as_str().to_string()),
-                    None,
-                    Some(runtime.clone()),
-                    *requested_at_ms,
-                    None,
-                ),
+                    requested_at_ms, ..
+                } => *requested_at_ms,
             };
             let workspace = workspace_observations
                 .get(effect_id)
@@ -327,20 +316,8 @@ pub async fn publish_observed(
             };
             let not_before_ms = effect.not_before_ms();
             let scheduled = now_ms < not_before_ms;
-            let deadline_reached = state.reached_deadlines.contains_key(effect_id);
-            let mut queued_controls = state
-                .stop_requests
-                .get(effect_id)
-                .map(|reason| vec![format!("stop: {}", bounded(reason))])
-                .unwrap_or_default();
-            if deadline_reached {
-                queued_controls.push("deadline cancellation".into());
-            }
             EffectActivity {
                 effect_id: effect_id.as_str().to_string(),
-                role,
-                task,
-                runtime,
                 // Prefer the adapter confirmation folded for this exact
                 // effect; the prior file supplies only same-effect live data.
                 applied_model: configuration
@@ -355,14 +332,9 @@ pub async fn publish_observed(
                 mode_confirmation: configuration
                     .and_then(|configuration| configuration.mode_confirmation)
                     .or_else(|| prior.and_then(|prior| prior.mode_confirmation)),
-                environment: format!(
-                    "confinement-image:{}",
-                    crate::model::short_hex(&state.image_id)
-                ),
                 elapsed_ms: now_ms
                     .saturating_sub(not_before_ms.max(requested_at_ms))
                     .max(0),
-                deadline_ms: effect.deadline_ms(),
                 last_activity: if scheduled {
                     format!("retry scheduled for {not_before_ms}")
                 } else {
@@ -373,44 +345,11 @@ pub async fn publish_observed(
                 },
                 tool_activity: prior.and_then(|prior| prior.tool_activity.clone()),
                 workspace,
-                queued_controls,
-                queued_messages: conversation.map_or(0, |conversation| {
-                    conversation
-                        .queued
-                        .iter()
-                        .filter(|message| {
-                            conversation
-                                .active_delivery
-                                .as_ref()
-                                .map(|delivery| delivery.message_boundary)
-                                .is_none_or(|boundary| message.sequence_no > boundary)
-                        })
-                        .count()
-                }),
-                conversation_lifecycle: conversation.map(|conversation| conversation.lifecycle),
-                message_boundary: conversation.and_then(|conversation| {
-                    conversation
-                        .active_delivery
-                        .as_ref()
-                        .map(|delivery| delivery.message_boundary)
-                }),
-                delivery_markers: conversation.map_or_else(Vec::new, |conversation| {
-                    conversation
-                        .queued
-                        .iter()
-                        .map(|message| message.marker)
-                        .collect()
-                }),
-                legal_controls: if deadline_reached {
-                    Vec::new()
-                } else {
-                    vec!["stop".into(), "extend_deadline".into()]
-                },
             }
         })
         .collect();
     let mut projection = ActivityProjection {
-        version: 3,
+        version: 4,
         mission_id: state.mission_id.as_str().to_string(),
         event_head: state.head,
         generated_at_ms: now_ms,
@@ -480,6 +419,7 @@ fn apply_runtime_event(
     projection.generated_at_ms = now_ms;
 }
 
+#[cfg(test)]
 async fn read(mission_dir: &Path) -> Result<ActivityProjection> {
     let bytes = tokio::fs::read(path(mission_dir)).await?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -990,31 +930,20 @@ mod tests {
         write(
             temp.path(),
             &ActivityProjection {
-                version: 3,
+                version: 4,
                 mission_id: "mission".into(),
                 event_head: 4,
                 generated_at_ms: 10,
                 effects: vec![EffectActivity {
                     effect_id: effect_id.as_str().into(),
-                    role: Some("worker".into()),
-                    task: Some("task".into()),
-                    runtime: Some("acp".into()),
                     applied_model: None,
                     model_confirmation: None,
                     applied_mode: None,
                     mode_confirmation: None,
-                    environment: "image:test".into(),
                     elapsed_ms: 0,
-                    deadline_ms: 100,
                     last_activity: "effect running".into(),
                     tool_activity: None,
                     workspace: WorkspaceObservation::Clean,
-                    queued_controls: Vec::new(),
-                    queued_messages: 0,
-                    conversation_lifecycle: None,
-                    message_boundary: None,
-                    delivery_markers: Vec::new(),
-                    legal_controls: vec!["stop".into()],
                 }],
             },
         )
