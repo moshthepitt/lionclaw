@@ -2275,12 +2275,16 @@ fn resolve_message_recipients(
     } else {
         let mut selected = Vec::new();
         for selector in selectors {
+            if let Some(exact) = current
+                .iter()
+                .find(|recipient| recipient.conversation_id.as_str() == selector)
+            {
+                selected.push(exact.clone());
+                continue;
+            }
             let matches: Vec<_> = current
                 .iter()
-                .filter(|recipient| {
-                    recipient.conversation_id.as_str() == selector
-                        || recipient.task_id.as_str() == selector
-                })
+                .filter(|recipient| recipient.task_id.as_str() == selector)
                 .collect();
             match matches.as_slice() {
                 [] => bail!("recipient '{selector}' is not a current conversation or task"),
@@ -2703,14 +2707,22 @@ mod message_routing_tests {
             .unwrap(),
             vec![beta.clone(), alpha.clone()]
         );
+        assert_eq!(
+            resolve_message_recipients(&current, &[alpha.conversation_id.to_string()], false)
+                .unwrap(),
+            vec![alpha.clone()],
+            "an exact conversation id wins over colliding task-name sugar"
+        );
 
         for selectors in [
             vec!["alpha".into(), "alpha".into()],
             vec!["beta".into(), "missing".into()],
-            vec![alpha.conversation_id.to_string()],
         ] {
             assert!(resolve_message_recipients(&current, &selectors, false).is_err());
         }
+        let mut ambiguous = current.clone();
+        ambiguous.push(recipient(&mission, "alpha", 5));
+        assert!(resolve_message_recipients(&ambiguous, &["alpha".into()], false).is_err());
 
         let stale = recipient(&mission, "alpha", 1);
         let future = recipient(&mission, "alpha", 3);
