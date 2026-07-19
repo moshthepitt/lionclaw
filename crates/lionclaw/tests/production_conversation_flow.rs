@@ -1,6 +1,7 @@
 //! The Slice 4 production conversation proof.  Only the native agent and
 //! oracle transports are scripted; every boundary around them is production.
 
+use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,145 @@ use lionclaw_runtime_api::{
     RuntimeDriverConfig, RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeResumeMode,
     RuntimeSessionHandle, RuntimeSessionStartInput, TurnExecution, TurnResult, TypedFailure,
 };
+
+#[derive(Clone, Copy)]
+enum DeliveryTurn {
+    AwaitLead,
+    InvalidHandoff,
+    Complete,
+    Review,
+}
+
+struct DeliveryTransport {
+    turns: Arc<Mutex<VecDeque<DeliveryTurn>>>,
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl DeliveryTransport {
+    fn handoff(execution: &TurnExecution) -> std::path::PathBuf {
+        let runtime = execution
+            .context
+            .runtime_state_root
+            .as_ref()
+            .expect("native state root");
+        let mission = runtime
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("mission state root");
+        std::fs::read_dir(mission.join("effects"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("handoff/handoff.json"))
+            .find(|path| path.parent().is_some_and(Path::exists))
+            .expect("current effect handoff mount")
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for DeliveryTransport {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "delivery-native".into(),
+            version: "1".into(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> anyhow::Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: input.session_id.to_string(),
+            resume_mode: RuntimeResumeMode::Reconstructed,
+        })
+    }
+
+    async fn turn(
+        &self,
+        execution: TurnExecution,
+        _journal: lionclaw_runtime_api::RuntimeTurnJournalSender,
+    ) -> anyhow::Result<TurnResult> {
+        let turn = self
+            .turns
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted turn");
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        match turn {
+            DeliveryTurn::AwaitLead => {}
+            DeliveryTurn::InvalidHandoff => {
+                std::fs::write(Self::handoff(&execution), b"{}")?;
+            }
+            DeliveryTurn::Complete => {
+                let runtime = execution.context.runtime_state_root.as_ref().unwrap();
+                let work = runtime.parent().unwrap().join("work");
+                std::fs::write(work.join("delivery.txt"), "complete\n")?;
+                git(&work, &["add", "delivery.txt"])?;
+                git(&work, &["commit", "-q", "-m", "complete delivery proof"])?;
+                std::fs::write(
+                    Self::handoff(&execution),
+                    r#"{"schema":"lionclaw.mission.work-handoff.v2","type":"work","done":true,"report":"delivery complete","request_attention":false}"#,
+                )?;
+            }
+            DeliveryTurn::Review => {
+                let nonce = execution
+                    .input
+                    .prompt
+                    .rsplit_once("## Handoff nonce")
+                    .expect("terminal review nonce")
+                    .1
+                    .trim();
+                std::fs::write(
+                    Self::handoff(&execution),
+                    format!(
+                        r#"{{"schema":"lionclaw.mission.review-handoff.v2","type":"review","done":true,"report":"delivery state clean","passed":true,"nonce":"{nonce}","gaps":[]}}"#
+                    ),
+                )?;
+            }
+        }
+        Ok(TurnResult {
+            final_response: "scripted delivery turn".into(),
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> anyhow::Result<RuntimeCancellation> {
+        Ok(RuntimeCancellation::Acknowledged)
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct DeliveryProvider {
+    turns: Arc<Mutex<VecDeque<DeliveryTurn>>>,
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl RuntimeDriverProvider for DeliveryProvider {
+    fn driver(&self) -> &'static str {
+        "codex"
+    }
+
+    fn create_adapter(&self, _config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
+        Arc::new(DeliveryTransport {
+            turns: self.turns.clone(),
+            entered: self.entered.clone(),
+            release: self.release.clone(),
+        })
+    }
+}
 
 struct NativeTransport {
     turns: Arc<Mutex<Vec<String>>>,
@@ -491,4 +631,198 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
                 .read_dir()
                 .is_ok_and(|mut entries| entries.next().is_some())
         }));
+}
+
+#[tokio::test]
+async fn production_delivery_uses_one_exact_immutable_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    initialize_repo(&repo).await;
+    let fake_oci = temp.path().join("external-oci-transport");
+    std::fs::write(
+        &fake_oci,
+        "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profiles = RuntimeProfiles::from_toml(
+        &format!(
+            r#"[runtimes.codex]
+driver = "codex"
+command = "external-codex"
+native-resume = true
+confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
+"#,
+            fake_oci.display()
+        ),
+        temp.path(),
+    )
+    .unwrap();
+    let mission_type_dir = temp.path().join("mission-type");
+    materialize_mission_type(&mission_type_dir);
+    let turns = Arc::new(Mutex::new(VecDeque::from([
+        DeliveryTurn::AwaitLead,
+        DeliveryTurn::InvalidHandoff,
+        DeliveryTurn::Complete,
+        DeliveryTurn::Review,
+    ])));
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let transports = cli::MissionTransports::external(
+        profiles,
+        RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
+            turns: turns.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        }) as Arc<dyn RuntimeDriverProvider>]),
+        RuntimeAuthRegistry::empty(),
+        Arc::new(ExternalOracleTransport {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    let start = cli::Cli::try_parse_from([
+        "lionclaw",
+        "mission",
+        "start",
+        "--type",
+        mission_type_dir.to_str().unwrap(),
+        "--repo",
+        repo.to_str().unwrap(),
+        "--objective",
+        "prove exact delivery",
+        "--runtime",
+        "codex",
+    ])
+    .unwrap();
+    cli::run_with_transports(start, transports.clone())
+        .await
+        .unwrap();
+    let store = MissionStore::open(&repo).await.unwrap();
+    let mission_id = store.list_missions().await.unwrap().pop().unwrap();
+    let proposal_path = temp.path().join("delivery-plan.json");
+    std::fs::write(
+        &proposal_path,
+        serde_json::to_vec(&PlanProposal {
+            base_revision: 0,
+            plan: plan(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for cli in [
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "plan",
+            "propose",
+            mission_id.as_str(),
+            "--file",
+            proposal_path.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            mission_id.as_str(),
+            "plan_proposal:mission",
+            "approve",
+            "--justification",
+            "approve delivery proof",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    ] {
+        cli::run_with_transports(cli, transports.clone())
+            .await
+            .unwrap();
+    }
+
+    let driver_cli = |handshake: &Path| {
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "driver",
+            mission_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--handshake",
+            handshake.to_str().unwrap(),
+        ])
+        .unwrap()
+    };
+    let driver = tokio::spawn({
+        let transports = transports.clone();
+        let command = driver_cli(&temp.path().join("delivery-first.ready"));
+        async move { cli::run_with_transports(command, transports).await }
+    });
+    entered.acquire().await.unwrap().forget();
+    let state = store.require_state(&mission_id).await.unwrap();
+    let conversation_id = state.conversations.keys().next().unwrap().to_string();
+    let send = |body: &'static str| {
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission_id.as_str(),
+            "--to",
+            conversation_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            body,
+        ])
+        .unwrap()
+    };
+    cli::run_with_transports(send("before"), transports.clone())
+        .await
+        .unwrap();
+    release.add_permits(1);
+    entered.acquire().await.unwrap().forget();
+    cli::run_with_transports(send("during"), transports.clone())
+        .await
+        .unwrap();
+    let active = store.require_state(&mission_id).await.unwrap();
+    let delivery = active.conversations.values().next().unwrap();
+    let boundary = delivery.active_delivery.as_ref().unwrap().message_boundary;
+    assert_eq!(delivery.queued.len(), 2);
+    assert!(delivery.queued[0].sequence_no <= boundary);
+    assert!(delivery.queued[1].sequence_no > boundary);
+
+    release.add_permits(1);
+    entered.acquire().await.unwrap().forget();
+    let reworking = store.require_state(&mission_id).await.unwrap();
+    let delivery = reworking.conversations.values().next().unwrap();
+    assert_eq!(
+        delivery.queued[0].marker,
+        lionclaw::model::DeliveryMarker::PreviouslyDelivered
+    );
+    assert_eq!(
+        delivery.queued[1].marker,
+        lionclaw::model::DeliveryMarker::Queued
+    );
+    let retry_boundary = delivery.active_delivery.as_ref().unwrap().message_boundary;
+    assert!(delivery.queued[1].sequence_no <= retry_boundary);
+
+    cli::run_with_transports(send("after"), transports.clone())
+        .await
+        .unwrap();
+    release.add_permits(2);
+    driver.await.unwrap().unwrap();
+    let completed = store.require_state(&mission_id).await.unwrap();
+    let delivery = completed.conversations.values().next().unwrap();
+    assert_eq!(delivery.queued.len(), 1);
+    assert_eq!(delivery.queued[0].body, "after");
+    assert!(delivery.queued[0].sequence_no > retry_boundary);
+    assert_eq!(
+        completed.phase,
+        MissionPhase::Done {
+            finish: FinishClass::Verified
+        }
+    );
+
+    assert!(turns.lock().unwrap().is_empty());
 }
