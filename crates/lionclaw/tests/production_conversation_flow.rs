@@ -365,6 +365,16 @@ struct ExternalOracleTransport {
     calls: Arc<Mutex<Vec<(String, String)>>>,
 }
 
+fn scripted_oracle_outcome(oracle: &str) -> (i32, &'static [u8], u64) {
+    match oracle {
+        "build-release" => (0, b"release build passed\n", 11),
+        "cargo-clippy" => (0, b"clippy passed\n", 12),
+        "cargo-test" => (0, b"tests passed\n", 13),
+        "fmt-check" => (0, b"format check passed\n", 14),
+        other => panic!("unexpected external oracle request: {other}"),
+    }
+}
+
 struct FailingOracleTransport;
 
 #[async_trait]
@@ -385,17 +395,18 @@ impl OracleRunner for FailingOracleTransport {
 impl OracleRunner for ExternalOracleTransport {
     async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
         assert!(request.workspace_dir.join(".git").exists());
+        let (exit_code, stdout, duration_ms) = scripted_oracle_outcome(request.oracle.as_str());
         self.calls
             .lock()
             .unwrap()
             .push((request.oracle.to_string(), request.judged_sha));
         Ok(OracleOutcome {
-            exit_code: 0,
+            exit_code,
             exit_signal: None,
-            stdout: b"authoritative external oracle passed\n".to_vec(),
+            stdout: stdout.to_vec(),
             stderr: Vec::new(),
             prepared_inputs: Vec::new(),
-            duration_ms: 1,
+            duration_ms,
         })
     }
 }
@@ -410,26 +421,38 @@ fn git(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
 }
 
 fn plan() -> Plan {
-    let assertion = AssertionId::new("PRODUCTION-FLOW").unwrap();
+    let assertions = [
+        ("FORMAT-CLEAN", "fmt-check"),
+        ("BUILD-CLEAN", "build-release"),
+        ("CLIPPY-CLEAN", "cargo-clippy"),
+        ("TESTS-CLEAN", "cargo-test"),
+    ]
+    .map(|(id, oracle)| Assertion {
+        id: AssertionId::new(id).unwrap(),
+        prose: format!("the captured production artifact passes {oracle}"),
+        oracle: Some(OracleName::new(oracle).unwrap()),
+    });
     Plan {
         requirements: vec![Requirement {
             id: RequirementId::new("PRODUCTION-CONVERSATION").unwrap(),
             kind: RequirementKind::Validation,
             prose: "production conversation flow works".into(),
             disposition: RequirementDisposition::Covered {
-                assertion_ids: vec![assertion.clone()],
+                assertion_ids: assertions
+                    .iter()
+                    .map(|assertion| assertion.id.clone())
+                    .collect(),
             },
         }],
-        assertions: vec![Assertion {
-            id: assertion.clone(),
-            prose: "the captured production artifact passes its oracle".into(),
-            oracle: Some(OracleName::new("cargo-test").unwrap()),
-        }],
+        assertions: assertions.to_vec(),
         tasks: vec![Task {
             id: TaskId::new("integrate").unwrap(),
             kind: TaskKind::Work,
             body: "exercise production workspace and artifact capture".into(),
-            targets: vec![assertion],
+            targets: assertions
+                .iter()
+                .map(|assertion| assertion.id.clone())
+                .collect(),
             role: Some(RoleName::new("implementer").unwrap()),
             depends_on: Vec::new(),
         }],
@@ -508,9 +531,11 @@ auto-continue-proof = true
         "---\noutput: emits-gap-verdict\nruntime: codex\n---\nReview the production flow.\n",
     )
     .unwrap();
-    let oracle = root.join("oracles/cargo-test");
-    std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for name in ["build-release", "cargo-clippy", "cargo-test", "fmt-check"] {
+        let oracle = root.join("oracles").join(name);
+        std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -696,7 +721,19 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         );
     }
     assert_ne!(outcome.state.current_sha, base);
-    assert_eq!(calls.lock().unwrap().len(), 1);
+    let oracle_calls = calls.lock().unwrap().clone();
+    let mut called_names = oracle_calls
+        .iter()
+        .map(|(oracle, _)| oracle.as_str())
+        .collect::<Vec<_>>();
+    called_names.sort_unstable();
+    assert_eq!(
+        called_names,
+        ["build-release", "cargo-clippy", "cargo-test", "fmt-check"]
+    );
+    assert!(oracle_calls
+        .iter()
+        .all(|(_, judged_sha)| judged_sha == &outcome.state.current_sha));
     assert_eq!(turns.lock().unwrap().len(), 2);
     let restarted = MissionStore::open(&repo).await.unwrap();
     let events = restarted.load(&mission_id).await.unwrap();
@@ -729,10 +766,37 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .iter()
         .position(|event| matches!(event.event, MissionEvent::RoleRunCompleted { .. }))
         .unwrap();
-    let oracle = events
+    let oracle_completions = events
         .iter()
-        .position(|event| matches!(event.event, MissionEvent::OracleRunCompleted { .. }))
-        .unwrap();
+        .enumerate()
+        .filter_map(|(index, event)| match &event.event {
+            MissionEvent::OracleRunCompleted {
+                oracle,
+                judged_sha,
+                outcome: Ok(outcome),
+                ..
+            } => Some((index, oracle.as_str(), judged_sha.as_str(), outcome)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(oracle_completions.len(), 4);
+    assert_eq!(
+        oracle_completions
+            .iter()
+            .map(|(_, oracle, ..)| *oracle)
+            .collect::<Vec<_>>(),
+        oracle_calls
+            .iter()
+            .map(|(oracle, _)| oracle.as_str())
+            .collect::<Vec<_>>(),
+        "completion receipts must retain the serial external transport order"
+    );
+    for (_, oracle, judged_sha, actual) in &oracle_completions {
+        let (exit_code, _, duration_ms) = scripted_oracle_outcome(oracle);
+        assert_eq!(*judged_sha, outcome.state.current_sha);
+        assert_eq!(actual.exit_code, exit_code);
+        assert_eq!(actual.duration_ms, duration_ms);
+    }
     let gate = events
         .iter()
         .position(|event| matches!(event.event, MissionEvent::TerminalReviewRequested { .. }))
@@ -741,7 +805,13 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .iter()
         .position(|event| matches!(event.event, MissionEvent::TerminalReviewCompleted { .. }))
         .unwrap();
-    assert!(role < oracle && oracle < gate && gate < review);
+    assert!(oracle_completions
+        .iter()
+        .all(|(oracle, ..)| role < *oracle && *oracle < gate));
+    assert!(oracle_completions
+        .windows(2)
+        .all(|pair| pair[0].0 < pair[1].0));
+    assert!(gate < review);
     assert!(repo
         .join(".lionclaw/missions")
         .read_dir()
@@ -796,6 +866,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let sessions = Arc::new(Mutex::new(Vec::new()));
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let launch_failures = Arc::new(Mutex::new(0));
+    let oracle_calls = Arc::new(Mutex::new(Vec::new()));
     let transports = cli::MissionTransports::external(
         profiles,
         RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
@@ -808,7 +879,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         }) as Arc<dyn RuntimeDriverProvider>]),
         RuntimeAuthRegistry::empty(),
         Arc::new(ExternalOracleTransport {
-            calls: Arc::new(Mutex::new(Vec::new())),
+            calls: oracle_calls.clone(),
         }),
     );
     let start = cli::Cli::try_parse_from([
@@ -1438,10 +1509,19 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             matches!(event.event, MissionEvent::RoleRunCompleted { .. }).then_some(index)
         })
         .collect();
-    let oracle = events
+    let oracle_completions = events
         .iter()
-        .position(|event| matches!(event.event, MissionEvent::OracleRunCompleted { .. }))
-        .unwrap();
+        .enumerate()
+        .filter_map(|(index, event)| match &event.event {
+            MissionEvent::OracleRunCompleted {
+                oracle,
+                judged_sha,
+                outcome: Ok(outcome),
+                ..
+            } => Some((index, oracle.as_str(), judged_sha.as_str(), outcome)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let review_requested = events
         .iter()
         .position(|event| matches!(event.event, MissionEvent::TerminalReviewRequested { .. }))
@@ -1452,9 +1532,26 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .unwrap();
     assert_eq!(completions.len(), 6);
     assert!(completions.windows(2).all(|pair| pair[0] < pair[1]));
-    assert!(
-        completions[5] < oracle && oracle < review_requested && review_requested < review_completed
+    assert_eq!(oracle_completions.len(), 4);
+    let calls = oracle_calls.lock().unwrap();
+    assert_eq!(
+        oracle_completions
+            .iter()
+            .map(|(_, oracle, ..)| *oracle)
+            .collect::<Vec<_>>(),
+        calls
+            .iter()
+            .map(|(oracle, _)| oracle.as_str())
+            .collect::<Vec<_>>()
     );
+    for (index, oracle, judged_sha, actual) in oracle_completions {
+        let (exit_code, _, duration_ms) = scripted_oracle_outcome(oracle);
+        assert_eq!(judged_sha, completed.current_sha);
+        assert_eq!(actual.exit_code, exit_code);
+        assert_eq!(actual.duration_ms, duration_ms);
+        assert!(completions[5] < index && index < review_requested);
+    }
+    assert!(review_requested < review_completed);
 }
 
 #[tokio::test]
