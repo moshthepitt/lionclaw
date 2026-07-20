@@ -1734,9 +1734,12 @@ impl Engine {
             intent.namespace,
             &intent.task_id,
             &intent.role,
-            state.tasks_in(intent.namespace).get(&intent.task_id),
-            &intent.base_sha,
-            state.config.recovery.max_attempts,
+            crate::model::RoleAssignmentContext {
+                previous: state.tasks_in(intent.namespace).get(&intent.task_id),
+                required_base: &intent.base_sha,
+                lifecycle_generation: state.role_lifecycle_generation(intent.namespace),
+                max_attempts: state.config.recovery.max_attempts,
+            },
         );
         let conversation_id = assignment.conversation_id.clone();
         let message_boundary = state.head;
@@ -2671,16 +2674,16 @@ mod assignment_tests {
     #[test]
     fn fresh_assignment_rebases_only_when_the_required_deliverable_moved() {
         assert_eq!(
-            resolve_task_assignment(None, "h1", 3),
+            resolve_task_assignment(None, "h1", 1, 3),
             ("h1".into(), 1, true)
         );
         let pending = task(TaskStatus::Pending, "h1", 1);
         assert_eq!(
-            resolve_task_assignment(Some(&pending), "h2", 3),
+            resolve_task_assignment(Some(&pending), "h2", 1, 3),
             ("h2".into(), 2, true)
         );
         assert_eq!(
-            resolve_task_assignment(Some(&pending), "h1", 3),
+            resolve_task_assignment(Some(&pending), "h1", 1, 3),
             ("h1".into(), 1, false)
         );
     }
@@ -2695,7 +2698,7 @@ mod assignment_tests {
             None,
         ));
         assert_eq!(
-            resolve_task_assignment(Some(&failed), "h2", 3),
+            resolve_task_assignment(Some(&failed), "h2", 1, 3),
             ("h1".into(), 4, false)
         );
     }

@@ -70,8 +70,8 @@ pub use state::{
     DurableCancellation, EffectCleanupFailure, FailureEvidence, FailureFeedback, InflightEffect,
     MissionPhase, MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState,
     QueuedMessage, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, RoleAssignment,
-    SupersededAssertion, TaskAddress, TaskRuntimeState, TaskStatus, TerminalReviewState,
-    TerminalReviewVerdict,
+    RoleAssignmentContext, SupersededAssertion, TaskAddress, TaskRuntimeState, TaskStatus,
+    TerminalReviewState, TerminalReviewVerdict,
 };
 pub use step::{
     step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,

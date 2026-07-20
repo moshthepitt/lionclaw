@@ -214,9 +214,12 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 *namespace,
                 task_id,
                 role,
-                state.tasks_in(*namespace).get(task_id),
-                base_sha,
-                state.config.recovery.max_attempts,
+                super::state::RoleAssignmentContext {
+                    previous: state.tasks_in(*namespace).get(task_id),
+                    required_base: base_sha,
+                    lifecycle_generation: state.role_lifecycle_generation(*namespace),
+                    max_attempts: state.config.recovery.max_attempts,
+                },
             );
             let expected_conversation_id = assignment.conversation_id;
             for (id, prior) in &mut state.conversations {
@@ -1097,9 +1100,12 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         *namespace,
         task_id,
         role,
-        state.tasks_in(*namespace).get(task_id),
-        &intent.base_sha,
-        state.config.recovery.max_attempts,
+        super::state::RoleAssignmentContext {
+            previous: state.tasks_in(*namespace).get(task_id),
+            required_base: &intent.base_sha,
+            lifecycle_generation: state.role_lifecycle_generation(*namespace),
+            max_attempts: state.config.recovery.max_attempts,
+        },
     );
     if envelope.stamps.prompt_hash.as_deref() != Some(prompt_hash.as_str()) {
         return false;
@@ -1662,6 +1668,13 @@ fn apply_decision(
 }
 
 fn start_replanning(state: &mut MissionState) {
+    let replaced = state
+        .conversations
+        .iter()
+        .filter(|(_, conversation)| conversation.namespace == crate::TaskNamespace::Planning)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    retire_conversations(state, replaced);
     state.planning_base_revision = Some(state.revision);
     state.planning_generation = state.planning_generation.saturating_add(1);
     for (id, task) in &mut state.planning.tasks {
@@ -2353,7 +2366,7 @@ mod tests {
                             request.namespace,
                             &request.task_id,
                             &role,
-                            1,
+                            request.assignment_epoch,
                         ),
                         namespace: request.namespace,
                         task_id: request.task_id.clone(),
@@ -2368,7 +2381,7 @@ mod tests {
                             .artifact
                             .as_ref()
                             .map_or_else(|| "base".into(), |artifact| artifact.base_sha.clone()),
-                        assignment_epoch: 1,
+                        assignment_epoch: request.assignment_epoch,
                         message_boundary: 0,
                         presented_messages: vec![],
                         recreate_workspace: true,
@@ -2826,13 +2839,41 @@ mod tests {
     }
 
     fn planning_role_requested(task: &str, key: &str, output: OutputSemantics) -> MissionEvent {
-        role_requested_in(
+        planning_role_requested_at(task, key, output, 1)
+    }
+
+    fn planning_role_requested_at(
+        task: &str,
+        key: &str,
+        output: OutputSemantics,
+        assignment_epoch: u32,
+    ) -> MissionEvent {
+        let mut event = role_requested_in(
             crate::TaskNamespace::Planning,
             task,
             key,
             RoleName::new("planner").expect("role name"),
             output,
-        )
+        );
+        let MissionEvent::RoleRunRequested {
+            conversation_id,
+            effect_id,
+            assignment_epoch: epoch,
+            ..
+        } = &mut event
+        else {
+            unreachable!()
+        };
+        *conversation_id = crate::ConversationId::for_role_instance(
+            &mission_id(),
+            crate::TaskNamespace::Planning,
+            &tid(task),
+            &RoleName::new("planner").unwrap(),
+            assignment_epoch,
+        );
+        *effect_id = role_effect(crate::TaskNamespace::Planning, task, 1, assignment_epoch);
+        *epoch = assignment_epoch;
+        event
     }
 
     fn role_requested_in(
@@ -2901,6 +2942,65 @@ mod tests {
             handoff,
             artifact,
         )
+    }
+
+    fn planning_role_completed_at_generation(
+        task: &str,
+        handoff: Handoff,
+        assignment_epoch: u32,
+    ) -> MissionEvent {
+        let role = RoleName::new("planner").unwrap();
+        let output = match &handoff {
+            Handoff::Plan { .. } => OutputSemantics::ProposesPlan,
+            Handoff::Validate { .. } => OutputSemantics::EmitsVerdict,
+            Handoff::Review { .. } => OutputSemantics::EmitsGapVerdict,
+            Handoff::Work { .. } => OutputSemantics::ProducesReport,
+        };
+        MissionEvent::RoleRunCompleted {
+            effect_id: role_effect(crate::TaskNamespace::Planning, task, 1, assignment_epoch),
+            request: role_identity(
+                crate::TaskNamespace::Planning,
+                task,
+                1,
+                assignment_epoch,
+                role,
+                output,
+                "base",
+                true,
+            ),
+            outcome: Ok(RoleRunSuccess {
+                handoff: Some(handoff),
+                artifact: None,
+                final_response: PayloadRef::inline("final response"),
+                runtime_configuration: RuntimeConfigurationEvidence::default(),
+            }),
+        }
+    }
+
+    fn execution_role_completed_at_generation(
+        task: &str,
+        handoff: Handoff,
+        assignment_epoch: u32,
+    ) -> MissionEvent {
+        MissionEvent::RoleRunCompleted {
+            effect_id: role_effect(crate::TaskNamespace::Execution, task, 1, assignment_epoch),
+            request: role_identity(
+                crate::TaskNamespace::Execution,
+                task,
+                1,
+                assignment_epoch,
+                RoleName::new("implementer").unwrap(),
+                OutputSemantics::ProducesArtifact,
+                "base",
+                true,
+            ),
+            outcome: Ok(RoleRunSuccess {
+                handoff: Some(handoff),
+                artifact: None,
+                final_response: PayloadRef::inline("final response"),
+                runtime_configuration: RuntimeConfigurationEvidence::default(),
+            }),
+        }
     }
 
     fn role_completed_at(
@@ -4162,17 +4262,16 @@ mod tests {
             ),
             role_completed("v", "validation", validate_handoff(&[("AA", false)]), None),
             decision("gate_failed:g", super::super::event::DecisionAction::Revise),
-            planning_role_requested("same-id", "planning", OutputSemantics::ProposesPlan),
-            planning_role_completed(
+            planning_role_requested_at("same-id", "planning", OutputSemantics::ProposesPlan, 2),
+            planning_role_completed_at_generation(
                 "same-id",
-                "planning",
                 Handoff::Plan {
                     done: true,
                     report: PayloadRef::inline("replacement plan"),
                     proposal: Some(replacement),
                     request_attention: false,
                 },
-                None,
+                2,
             ),
         ])
         .expect("state");
@@ -4215,13 +4314,13 @@ mod tests {
             unreachable!("plan_proposed() builds PlanProposed");
         };
         replacement.base_revision = 1;
-        let parked_effect = role_effect(crate::TaskNamespace::Planning, "same-id", 1, 1);
+        let parked_effect = role_effect(crate::TaskNamespace::Planning, "same-id", 1, 2);
         let parked_conversation = crate::ConversationId::for_role_instance(
             &crate::MissionId::from_digest_prefix("abcdef0123456789"),
             crate::TaskNamespace::Planning,
             &tid("same-id"),
             &RoleName::new("planner").unwrap(),
-            1,
+            2,
         );
         let state = fold_log(vec![
             mission_created,
@@ -4236,17 +4335,18 @@ mod tests {
             role_completed("seed", "seed", work_handoff(true, false), None),
             role_completed("v", "validation", validate_handoff(&[("AA", false)]), None),
             decision("gate_failed:g", super::super::event::DecisionAction::Revise),
-            planning_role_requested(
+            planning_role_requested_at(
                 "same-id",
                 "planning-failure",
                 OutputSemantics::ProducesReport,
+                2,
             ),
             MissionEvent::RoleRunCompleted {
                 request: role_identity(
                     crate::TaskNamespace::Planning,
                     "same-id",
                     1,
-                    1,
+                    2,
                     RoleName::new("planner").unwrap(),
                     OutputSemantics::ProducesReport,
                     "base",
@@ -4261,7 +4361,7 @@ mod tests {
                     role: RoleName::new("planner").unwrap(),
                     namespace: crate::TaskNamespace::Planning,
                     task_id: tid("same-id"),
-                    assignment_epoch: 1,
+                    assignment_epoch: 2,
                 }],
                 body: "do not leak into the replacement".into(),
                 references: vec![],
@@ -4270,7 +4370,7 @@ mod tests {
                 proposal: replacement,
                 plan_hash: "replacement".into(),
             },
-            role_completed("same-id", "execution", work_handoff(true, false), None),
+            execution_role_completed_at_generation("same-id", work_handoff(true, false), 2),
             MissionEvent::ControlRequested {
                 effect_id: parked_effect,
                 action: super::super::event::ControlAction::Continue { automatic: false },

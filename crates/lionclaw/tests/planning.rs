@@ -14,9 +14,9 @@ use common::{covered_requirement, BASE_SHA};
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::{MissionType, MissionTypeDefinition, RoleDefinition, SkillPackage};
 use lionclaw::model::{
-    Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionEvent, MissionPhase,
-    OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, PlanningDag, PlanningRefinement,
-    PlanningTask, RoleName, StopBar, Task, TaskKind, TaskStatus,
+    Assertion, AssertionId, AttentionKind, ConversationLifecycle, DecisionAction, Handoff,
+    MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal,
+    PlanningDag, PlanningRefinement, PlanningTask, RoleName, StopBar, Task, TaskKind, TaskStatus,
 };
 use lionclaw::ports::{CapturedArtifact, RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -418,9 +418,27 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
         .collect();
     assert_eq!(strategist_effects.len(), 2);
     assert_eq!(strategist_effects[0].0, 1);
-    assert_eq!(strategist_effects[1].0, 1);
+    assert_eq!(strategist_effects[1].0, 2);
     assert_ne!(strategist_effects[0].1, strategist_effects[1].1);
     assert_eq!(replanned.state.planning_generation, 2);
+    let strategist_conversations: Vec<_> = replanned
+        .state
+        .conversations
+        .iter()
+        .filter(|(_, conversation)| conversation.task_id == tid("strategist"))
+        .collect();
+    assert_eq!(strategist_conversations.len(), 2);
+    assert_ne!(strategist_conversations[0].0, strategist_conversations[1].0);
+    let old = strategist_conversations
+        .iter()
+        .find(|(_, conversation)| conversation.assignment_epoch == 1)
+        .expect("first planning generation");
+    let replacement = strategist_conversations
+        .iter()
+        .find(|(_, conversation)| conversation.assignment_epoch == 2)
+        .expect("replacement planning generation");
+    assert_eq!(old.1.lifecycle, ConversationLifecycle::Retired);
+    assert_ne!(old.0, replacement.0);
     let second_strategist_effect = strategist_effects[1].1;
     let prompt = engine
         .reconstruct_role_prompt_for_testing(&id, second_strategist_effect)

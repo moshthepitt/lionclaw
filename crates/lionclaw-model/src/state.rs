@@ -232,6 +232,7 @@ pub struct TaskRuntimeState {
 pub fn resolve_task_assignment(
     previous: Option<&TaskRuntimeState>,
     required_base: &str,
+    lifecycle_generation: u32,
     max_attempts: u32,
 ) -> (String, u32, bool) {
     let retrying_failure =
@@ -248,9 +249,9 @@ pub fn resolve_task_assignment(
         != Some(base_sha.as_str())
         && !retrying_failure;
     let epoch = match (previous_epoch, recreate) {
-        (0, _) => 1,
-        (epoch, true) => epoch.saturating_add(1),
-        (epoch, false) => epoch,
+        (0, _) => lifecycle_generation.max(1),
+        (epoch, true) => epoch.saturating_add(1).max(lifecycle_generation),
+        (epoch, false) => epoch.max(lifecycle_generation),
     };
     (base_sha, epoch, recreate)
 }
@@ -266,17 +267,27 @@ pub struct RoleAssignment {
     pub conversation_id: super::ConversationId,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RoleAssignmentContext<'a> {
+    pub previous: Option<&'a TaskRuntimeState>,
+    pub required_base: &'a str,
+    pub lifecycle_generation: u32,
+    pub max_attempts: u32,
+}
+
 pub fn resolve_role_assignment(
     mission_id: &MissionId,
     namespace: super::TaskNamespace,
     task_id: &TaskId,
     role: &RoleName,
-    previous: Option<&TaskRuntimeState>,
-    required_base: &str,
-    max_attempts: u32,
+    context: RoleAssignmentContext<'_>,
 ) -> RoleAssignment {
-    let (base_sha, generation, recreate_workspace) =
-        resolve_task_assignment(previous, required_base, max_attempts);
+    let (base_sha, generation, recreate_workspace) = resolve_task_assignment(
+        context.previous,
+        context.required_base,
+        context.lifecycle_generation,
+        context.max_attempts,
+    );
     RoleAssignment {
         conversation_id: super::ConversationId::for_role_instance(
             mission_id, namespace, task_id, role, generation,
@@ -1011,6 +1022,17 @@ pub struct MissionState {
 }
 
 impl MissionState {
+    /// Fold-authoritative generation floor for role assignments in each
+    /// namespace. Planning replacements advance `planning_generation`; plan
+    /// promotions advance `revision`. Workspace recreation remains an
+    /// independent decision and may advance a task beyond this floor.
+    pub fn role_lifecycle_generation(&self, namespace: super::TaskNamespace) -> u32 {
+        match namespace {
+            super::TaskNamespace::Planning => self.planning_generation,
+            super::TaskNamespace::Execution => self.revision,
+        }
+    }
+
     /// Whether lead messaging is executable for this exact durable dialogue.
     /// Conversation identity, rather than mutable task state, is the authority.
     pub fn conversation_is_messageable(&self, conversation_id: &super::ConversationId) -> bool {
