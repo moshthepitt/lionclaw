@@ -22,6 +22,8 @@ pub enum ConversationLifecycle {
     AwaitingLead,
     ReworkingInvalidHandoff,
     Completed,
+    /// This generation was permanently replaced or its owning work ended.
+    Retired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +32,8 @@ pub enum DeliveryMarker {
     Queued,
     PreviouslyDelivered,
     PossiblyDelivered,
+    /// The conversation lost delivery authority before this message settled.
+    Undeliverable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,8 +224,6 @@ pub struct TaskRuntimeState {
     pub workspace_base_sha: Option<String>,
     #[serde(default)]
     pub assignment_epoch: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_response: Option<PayloadRef>,
 }
 
 /// Resolve one fresh or retry assignment from durable task state. Both the
@@ -985,7 +987,10 @@ impl MissionState {
                 .conversations
                 .get(conversation_id)
                 .is_some_and(|conversation| {
-                    conversation.lifecycle != ConversationLifecycle::Completed
+                    !matches!(
+                        conversation.lifecycle,
+                        ConversationLifecycle::Completed | ConversationLifecycle::Retired
+                    )
                 })
     }
 
@@ -1002,7 +1007,7 @@ impl MissionState {
             ConversationLifecycle::Ready | ConversationLifecycle::ReworkingInvalidHandoff => {
                 vec!["mission advance", "mission send"]
             }
-            ConversationLifecycle::Completed => Vec::new(),
+            ConversationLifecycle::Completed | ConversationLifecycle::Retired => Vec::new(),
         }
     }
 

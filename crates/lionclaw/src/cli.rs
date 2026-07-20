@@ -1194,14 +1194,13 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "next_actions": view.next_actions(),
                 "tasks": state.tasks.iter().map(|(id, task)| {
                     task_runtime_json(
-                        &store,
                         id,
                         task,
                         workspace_observations.get(id),
                     )
                 }).collect::<Result<Vec<_>>>()?,
                 "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
-                    task_runtime_json(&store, id, task, None)
+                    task_runtime_json(id, task, None)
                 }).collect::<Result<Vec<_>>>()?,
                 "conversations": conversation_views(state, &store)?,
                 "assertions": rows.iter().map(|row| serde_json::json!({
@@ -1275,12 +1274,6 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 configuration.applied_mode,
             );
         }
-        if let Some(response) = &task.final_response {
-            println!("  task {task_id} final response:");
-            for line in store.blobs().resolve(response)?.lines() {
-                println!("    {line}");
-            }
-        }
     }
     print_task_workspace_observations(state, "  ", &workspace_observations);
     for (task_id, task) in &state.planning.tasks {
@@ -1295,12 +1288,6 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 configuration.requested_mode,
                 configuration.applied_mode,
             );
-        }
-        if let Some(response) = &task.final_response {
-            println!("  planning task {task_id} final response:");
-            for line in store.blobs().resolve(response)?.lines() {
-                println!("    {line}");
-            }
         }
     }
     print_conversations(state, &store, "  ")?;
@@ -2030,9 +2017,6 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                     "  planning {id}: status={:?} runtime={:?}",
                     task.status, task.last_runtime_configuration
                 );
-                if let Some(response) = &task.final_response {
-                    println!("    final response: {}", store.blobs().resolve(response)?);
-                }
             }
         }
         print_conversations(state, &store, "  ")?;
@@ -2524,12 +2508,6 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
                     if let Some(failure) = &task.last_failure {
                         print_typed_failure(failure, &format!("  task {task_id} failure: "));
                     }
-                    if let Some(response) = &task.final_response {
-                        println!("  task {task_id} final response:");
-                        for line in blobs.resolve(response)?.lines() {
-                            println!("    {line}");
-                        }
-                    }
                 }
                 print_conversations(state, store, "  ")?;
                 print_task_workspace_observations(state, "  ", &workspace_observations);
@@ -2637,7 +2615,6 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         "conversations": conversation_views(state, store)?,
         "tasks": state.tasks.iter().map(|(id, task)| {
             task_runtime_json(
-                store,
                 id,
                 task,
                 workspace_observations.get(id),
@@ -2645,7 +2622,6 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         }).collect::<Result<Vec<_>>>()?,
         "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
             task_runtime_json(
-                store,
                 id,
                 task,
                 Some(&crate::activity::WorkspaceObservation::NotApplicable),
@@ -2692,7 +2668,6 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
 }
 
 fn task_runtime_json(
-    store: &MissionStore,
     id: &crate::model::TaskId,
     task: &crate::model::TaskRuntimeState,
     workspace_observation: Option<&crate::activity::WorkspaceObservation>,
@@ -2705,9 +2680,6 @@ fn task_runtime_json(
         "workspace_observation": workspace_observation,
         "runtime_configuration": task.last_runtime_configuration,
         "failure": task.last_failure,
-        "final_response": task.final_response.as_ref()
-            .map(|response| store.blobs().resolve(response))
-            .transpose()?,
     }))
 }
 
@@ -3793,7 +3765,6 @@ mod tests {
                 }),
                 workspace_base_sha: Some("base".into()),
                 assignment_epoch: 1,
-                final_response: Some(PayloadRef::inline("planning stopped here")),
             },
         );
         state.tasks.insert(
@@ -3808,7 +3779,6 @@ mod tests {
                 last_runtime_configuration: None,
                 workspace_base_sha: Some("base".into()),
                 assignment_epoch: 1,
-                final_response: None,
             },
         );
         state.tasks.insert(
@@ -3823,7 +3793,6 @@ mod tests {
                 last_runtime_configuration: None,
                 workspace_base_sha: Some("base".into()),
                 assignment_epoch: 1,
-                final_response: None,
             },
         );
         let conversation_id = crate::model::ConversationId::for_role_instance(
@@ -3852,7 +3821,7 @@ mod tests {
                 }],
                 consumed_through: 3,
                 active_delivery: None,
-                final_response: None,
+                final_response: Some(PayloadRef::inline("conversation owns this response")),
                 invalid_handoff_reworks: 1,
             },
         );
@@ -3989,9 +3958,10 @@ mod tests {
             json["planning_tasks"][0]["runtime_configuration"]["applied_model"],
             "applied"
         );
+        assert!(json["planning_tasks"][0].get("final_response").is_none());
         assert_eq!(
-            json["planning_tasks"][0]["final_response"],
-            "planning stopped here"
+            json["conversations"][0]["final_response"],
+            "conversation owns this response"
         );
     }
 

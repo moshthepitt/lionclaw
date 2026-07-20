@@ -1193,12 +1193,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .unwrap();
     assert_eq!(awaiting.disposition, MissionDisposition::AwaitingLead);
     let (conversation_id, conversation) = awaiting.state.conversations.iter().next().unwrap();
-    let task = awaiting
-        .state
-        .tasks_in(conversation.namespace)
-        .get(&conversation.task_id)
-        .unwrap();
-    let response = task.final_response.as_ref().unwrap();
+    let response = conversation.final_response.as_ref().unwrap();
     let response = awaiting_store.blobs().resolve(response).unwrap();
     assert!(response.starts_with("Which release target should I use?"));
     assert!(response.len() <= lionclaw::model::MAX_FINAL_RESPONSE_BYTES as usize);
@@ -2080,9 +2075,9 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let conversation = parked
         .conversations
         .iter()
-        .find(|(_, conversation)| {
+        .find(|(id, conversation)| {
             conversation.task_id.as_str() == "mint-receipt"
-                && conversation.lifecycle != lionclaw::model::ConversationLifecycle::Completed
+                && parked.conversation_is_messageable(id)
         })
         .map(|(id, _)| id.clone())
         .expect("current production conversation");

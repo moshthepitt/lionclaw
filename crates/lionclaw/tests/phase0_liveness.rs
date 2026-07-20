@@ -125,10 +125,37 @@ fn assert_abort_preserves_authority(state: &lionclaw::model::MissionState) {
     assert_eq!(aborted.superseded_assertions, state.superseded_assertions);
     assert_eq!(aborted.tasks, state.tasks);
     assert_eq!(aborted.planning, state.planning);
-    assert_eq!(aborted.conversations, state.conversations);
+    assert_eq!(aborted.conversations.len(), state.conversations.len());
+    for (id, before) in &state.conversations {
+        let after = &aborted.conversations[id];
+        assert_eq!(after.role, before.role);
+        assert_eq!(after.namespace, before.namespace);
+        assert_eq!(after.task_id, before.task_id);
+        assert_eq!(after.assignment_epoch, before.assignment_epoch);
+        assert_eq!(after.final_response, before.final_response);
+        assert_eq!(after.queued.len(), before.queued.len());
+        let expected_lifecycle =
+            if before.lifecycle == lionclaw::model::ConversationLifecycle::Completed {
+                lionclaw::model::ConversationLifecycle::Completed
+            } else {
+                lionclaw::model::ConversationLifecycle::Retired
+            };
+        assert_eq!(after.lifecycle, expected_lifecycle);
+        assert!(after.active_delivery.is_none());
+        if expected_lifecycle == lionclaw::model::ConversationLifecycle::Retired {
+            assert!(after
+                .queued
+                .iter()
+                .all(|message| message.marker == lionclaw::model::DeliveryMarker::Undeliverable));
+        }
+    }
     assert_eq!(aborted.authoritative_receipts, state.authoritative_receipts);
     assert_eq!(aborted.reachable_commits, state.reachable_commits);
     assert_eq!(aborted.parked_effects, state.parked_effects);
+    assert!(aborted
+        .parked_effects
+        .keys()
+        .all(|effect| !aborted.parked_effect_is_continuable(effect)));
     for driver_running in [false, true] {
         let view = MissionView::from_state(aborted.clone(), driver_running);
         assert_eq!(view.disposition, MissionDisposition::Terminal);

@@ -83,13 +83,7 @@ async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_complet
     assert_eq!(checkpoint.disposition, MissionDisposition::AwaitingLead);
     let (conversation_id, conversation) = checkpoint.state.conversations.iter().next().unwrap();
     assert_eq!(
-        checkpoint
-            .state
-            .tasks
-            .values()
-            .next()
-            .unwrap()
-            .final_response,
+        conversation.final_response,
         Some(lionclaw::model::PayloadRef::inline(
             "Which behavior should I preserve?"
         ))

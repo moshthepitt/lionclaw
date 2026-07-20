@@ -26,8 +26,9 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-/// Bumped for planning generations, typed failure replanning, assertion
-/// supersession history, and the universal-abort projection rules.
+/// Version 27 rebuilds snapshots from sequence zero because conversation
+/// identity, response ownership, retirement, and delivery disposition are all
+/// derived folded state. The durable MissionEvent contract is unchanged.
 pub const REDUCER_VERSION: u32 = 27;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
@@ -191,6 +192,15 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 role,
                 *assignment_epoch,
             );
+            for (id, prior) in &mut state.conversations {
+                if id != &expected_conversation_id
+                    && prior.namespace == *namespace
+                    && prior.task_id == *task_id
+                    && prior.role == *role
+                {
+                    retire_conversation(prior);
+                }
+            }
             let conversation = state
                 .conversations
                 .entry(expected_conversation_id.clone())
@@ -266,7 +276,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                                 && c.namespace == r.namespace
                                 && c.task_id == r.task_id
                                 && c.assignment_epoch == r.assignment_epoch
-                                && c.lifecycle != super::state::ConversationLifecycle::Completed
+                                && state.conversation_is_messageable(&r.conversation_id)
                         })
                 })
             {
@@ -430,7 +440,6 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
                             task.last_runtime_configuration =
                                 Some(success.runtime_configuration.clone());
-                            task.final_response = Some(success.final_response.clone());
                             if task.status == TaskStatus::Failed {
                                 task.consecutive_failures =
                                     task.consecutive_failures.saturating_add(1);
@@ -454,6 +463,14 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         );
                         failure.evidence_mut().configuration =
                             success.runtime_configuration.clone();
+                        settle_failed_conversation_delivery(
+                            state,
+                            &request.conversation_id,
+                            request.assignment_epoch,
+                            effect_id,
+                            &failure,
+                            Some(&success.final_response),
+                        );
                         apply_role_failure(
                             state,
                             TaskAddress::new(*namespace, task_id.clone()),
@@ -472,6 +489,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         request.assignment_epoch,
                         effect_id,
                         failure,
+                        None,
                     );
                     apply_role_failure(
                         state,
@@ -738,6 +756,39 @@ fn finish_apply(state: &mut MissionState, seq: u64) {
     derive_gates(state);
     derive_attention(state);
     derive_phase(state);
+    retire_illegal_conversations(state);
+}
+
+/// Retire conversations from the same authoritative state predicates used by
+/// ingress. Retirement is monotonic and preserves queued messages as explicit
+/// evidence that they can no longer be delivered.
+fn retire_illegal_conversations(state: &mut MissionState) {
+    let terminal = state.phase.is_terminal();
+    for conversation in state.conversations.values_mut() {
+        if matches!(
+            conversation.lifecycle,
+            super::state::ConversationLifecycle::Completed
+                | super::state::ConversationLifecycle::Retired
+        ) {
+            continue;
+        }
+        let task = match conversation.namespace {
+            crate::TaskNamespace::Planning => state.planning.tasks.get(&conversation.task_id),
+            crate::TaskNamespace::Execution => state.tasks.get(&conversation.task_id),
+        };
+        let generation_is_live = task.is_some_and(|task| task.status != TaskStatus::Superseded);
+        if terminal || !generation_is_live {
+            retire_conversation(conversation);
+        }
+    }
+}
+
+fn retire_conversation(conversation: &mut super::state::ConversationState) {
+    conversation.lifecycle = super::state::ConversationLifecycle::Retired;
+    conversation.active_delivery = None;
+    for message in &mut conversation.queued {
+        message.marker = super::state::DeliveryMarker::Undeliverable;
+    }
 }
 
 fn settle_effect_failure(
@@ -755,19 +806,31 @@ fn settle_effect_failure(
     let failure = merge_failure_configuration(&failure, observed_configuration.as_ref());
     match effect {
         InflightEffect::RoleRun {
+            conversation_id,
             namespace,
             task_id,
             attempt_no,
+            assignment_epoch,
             ..
-        } => apply_role_failure(
-            state,
-            TaskAddress::new(namespace, task_id),
-            attempt_no,
-            effect_id,
-            failure,
-            None,
-            final_response,
-        ),
+        } => {
+            settle_failed_conversation_delivery(
+                state,
+                &conversation_id,
+                assignment_epoch,
+                effect_id,
+                &failure,
+                final_response,
+            );
+            apply_role_failure(
+                state,
+                TaskAddress::new(namespace, task_id),
+                attempt_no,
+                effect_id,
+                failure,
+                None,
+                final_response,
+            );
+        }
         InflightEffect::OracleRun { oracle, .. } => {
             state.oracle_failures.insert(oracle.clone(), failure);
             state
@@ -846,6 +909,7 @@ fn settle_failed_conversation_delivery(
     assignment_epoch: u32,
     effect_id: &crate::EffectId,
     failure: &TypedFailure,
+    final_response: Option<&PayloadRef>,
 ) {
     let Some(conversation) = state
         .conversations
@@ -866,6 +930,10 @@ fn settle_failed_conversation_delivery(
         .take()
         .expect("matched above")
         .message_boundary;
+    conversation.final_response = final_response.cloned().or_else(|| {
+        (!failure.evidence().final_response.is_empty())
+            .then(|| PayloadRef::inline(failure.evidence().final_response.clone()))
+    });
     if failure.evidence().code.as_deref() == Some("kernel.launch") {
         conversation.lifecycle = super::state::ConversationLifecycle::Ready;
         return;
@@ -1077,7 +1145,7 @@ fn apply_role_failure(
     effect_id: &super::EffectId,
     failure: TypedFailure,
     observed_configuration: Option<&RuntimeConfigurationEvidence>,
-    final_response: Option<&PayloadRef>,
+    _final_response: Option<&PayloadRef>,
 ) {
     let failure = merge_failure_configuration(&failure, observed_configuration);
     let max_attempts = state.config.recovery.max_attempts;
@@ -1087,10 +1155,6 @@ fn apply_role_failure(
             runtime.status = TaskStatus::Failed;
             runtime.last_failure = Some(failure.clone());
             let evidence = failure.evidence();
-            runtime.final_response = final_response.cloned().or_else(|| {
-                (!evidence.final_response.is_empty())
-                    .then(|| PayloadRef::inline(evidence.final_response.clone()))
-            });
             runtime.last_runtime_configuration = Some(merge_runtime_configuration(
                 runtime.last_runtime_configuration.as_ref(),
                 &evidence.configuration,
@@ -1143,6 +1207,13 @@ fn derive_promotion(state: &mut MissionState) {
         .proposal
         .take()
         .expect("proposal present (checked above)");
+    if state.plan.is_some() {
+        for conversation in state.conversations.values_mut() {
+            if conversation.lifecycle != super::state::ConversationLifecycle::Completed {
+                retire_conversation(conversation);
+            }
+        }
+    }
     let supersessions: BTreeMap<_, _> = proposal
         .assertion_supersessions
         .iter()
@@ -1238,7 +1309,6 @@ fn pending_task() -> TaskRuntimeState {
         last_runtime_configuration: None,
         workspace_base_sha: None,
         assignment_epoch: 0,
-        final_response: None,
     }
 }
 
@@ -3839,8 +3909,13 @@ mod tests {
         .expect("state");
         let task = &state.tasks[&tid("t1")];
         assert_eq!(task.status, TaskStatus::Failed);
+        let conversation = state
+            .conversations
+            .values()
+            .find(|conversation| conversation.task_id == tid("t1"))
+            .expect("conversation");
         assert_eq!(
-            task.final_response,
+            conversation.final_response,
             Some(PayloadRef::inline("partial but useful response"))
         );
         assert_eq!(task.attempts, 1);
@@ -4041,11 +4116,18 @@ mod tests {
         ])
         .expect("state");
 
+        let planning_response = state
+            .conversations
+            .values()
+            .find(|conversation| {
+                conversation.namespace == crate::TaskNamespace::Planning
+                    && conversation.task_id == tid("same-id")
+            })
+            .and_then(|conversation| conversation.final_response.as_ref());
         assert_eq!(
-            state.planning.tasks[&tid("same-id")].final_response,
-            Some(PayloadRef::inline("final response"))
+            planning_response,
+            Some(&PayloadRef::inline("final response"))
         );
-        assert_eq!(state.tasks[&tid("same-id")].final_response, None);
     }
 
     #[test]
@@ -4073,6 +4155,13 @@ mod tests {
         };
         replacement.base_revision = 1;
         let parked_effect = role_effect(crate::TaskNamespace::Planning, "same-id", 1, 1);
+        let parked_conversation = crate::ConversationId::for_role_instance(
+            &crate::MissionId::from_digest_prefix("abcdef0123456789"),
+            crate::TaskNamespace::Planning,
+            &tid("same-id"),
+            &RoleName::new("planner").unwrap(),
+            1,
+        );
         let state = fold_log(vec![
             mission_created,
             plan_proposed(
@@ -4105,6 +4194,17 @@ mod tests {
                 effect_id: parked_effect.clone(),
                 outcome: Err(TypedFailure::permanent("runtime.failed", "failed")),
             },
+            MissionEvent::MessageSent {
+                recipients: vec![super::super::event::ConversationRecipient {
+                    conversation_id: parked_conversation.clone(),
+                    role: RoleName::new("planner").unwrap(),
+                    namespace: crate::TaskNamespace::Planning,
+                    task_id: tid("same-id"),
+                    assignment_epoch: 1,
+                }],
+                body: "do not leak into the replacement".into(),
+                references: vec![],
+            },
             MissionEvent::PlanProposed {
                 proposal: replacement,
                 plan_hash: "replacement".into(),
@@ -4123,6 +4223,19 @@ mod tests {
             TaskStatus::Pending
         );
         assert_eq!(state.tasks[&tid("same-id")].status, TaskStatus::Cleared);
+        let retired = &state.conversations[&parked_conversation];
+        assert_eq!(
+            retired.lifecycle,
+            super::super::state::ConversationLifecycle::Retired
+        );
+        assert_eq!(
+            retired.queued[0].marker,
+            super::super::state::DeliveryMarker::Undeliverable
+        );
+        assert!(retired.active_delivery.is_none());
+        assert!(state
+            .conversation_legal_actions(&parked_conversation)
+            .is_empty());
     }
 
     #[test]

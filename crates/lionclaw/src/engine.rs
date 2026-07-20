@@ -2629,6 +2629,7 @@ fn render_conversation_message(
         crate::model::DeliveryMarker::Queued => "queued",
         crate::model::DeliveryMarker::PreviouslyDelivered => "previously delivered",
         crate::model::DeliveryMarker::PossiblyDelivered => "possibly delivered",
+        crate::model::DeliveryMarker::Undeliverable => "undeliverable",
     };
     let references = expanded
         .iter()
@@ -2669,7 +2670,6 @@ mod assignment_tests {
             last_runtime_configuration: None,
             workspace_base_sha: Some(base.to_string()),
             assignment_epoch: epoch,
-            final_response: None,
         }
     }
 
