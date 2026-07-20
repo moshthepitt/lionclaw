@@ -1235,6 +1235,407 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert!(turns.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn production_park_then_base_move_replaces_and_isolates_stale_conversation() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let base = initialize_repo(&repo).await;
+    let fake_oci = temp.path().join("external-oci-transport");
+    std::fs::write(
+        &fake_oci,
+        "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profiles = RuntimeProfiles::from_toml(
+        &format!(
+            r#"[runtimes.codex]
+driver = "codex"
+command = "external-codex"
+native-resume = true
+confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
+"#,
+            fake_oci.display()
+        ),
+        temp.path(),
+    )
+    .unwrap();
+    let mission_type_dir = temp.path().join("mission-type");
+    materialize_mission_type(&mission_type_dir);
+    let turns = Arc::new(Mutex::new(VecDeque::from([
+        DeliveryTurn::Fail,
+        DeliveryTurn::Complete,
+        DeliveryTurn::AwaitLead,
+    ])));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(1));
+    let transports = cli::MissionTransports::external(
+        profiles,
+        RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
+            turns: turns.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+            sessions: Arc::new(Mutex::new(Vec::new())),
+            prompts: prompts.clone(),
+            launch_failures: Arc::new(Mutex::new(0)),
+        }) as Arc<dyn RuntimeDriverProvider>]),
+        RuntimeAuthRegistry::empty(),
+        Arc::new(FailingOracleTransport),
+    );
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "start",
+            "--type",
+            mission_type_dir.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--objective",
+            "prove parked work isolation across an ordinary base move",
+            "--runtime",
+            "codex",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    let store = MissionStore::open(&repo).await.unwrap();
+    let mission = store.list_missions().await.unwrap().pop().unwrap();
+    let proposal_path = temp.path().join("parked-base-move-plan.json");
+    std::fs::write(
+        &proposal_path,
+        serde_json::to_vec(&PlanProposal {
+            base_revision: 0,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
+            plan: reference_plan(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for command in [
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "plan",
+            "propose",
+            mission.as_str(),
+            "--file",
+            proposal_path.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            mission.as_str(),
+            "plan_proposal:mission",
+            "approve",
+            "--justification",
+            "exercise ordinary production promotion",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    ] {
+        cli::run_with_transports(command, transports.clone())
+            .await
+            .unwrap();
+    }
+    let driver = |label: &str| {
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "driver",
+            mission.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--handshake",
+            temp.path().join(label).to_str().unwrap(),
+        ])
+        .unwrap()
+    };
+    cli::run_with_transports(driver("park-old.ready"), transports.clone())
+        .await
+        .unwrap();
+    entered.acquire().await.unwrap().forget();
+    let parked = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission)
+        .await
+        .unwrap();
+    let (old_id, old) = parked
+        .conversations
+        .iter()
+        .find(|(_, conversation)| conversation.task_id.as_str() == "mint-receipt")
+        .expect("parked production conversation");
+    assert_eq!(old.lifecycle, lionclaw::model::ConversationLifecycle::Ready);
+    assert_eq!(old.workspace_base_sha, base);
+    let old_id = old_id.clone();
+    let old_generation = old.assignment_epoch;
+    let old_park = parked
+        .parked_effects
+        .iter()
+        .find(|(_, effect)| {
+            matches!(
+                effect,
+                lionclaw::model::ParkedEffect::RoleRun { task_id, .. }
+                    if task_id.as_str() == "mint-receipt"
+            )
+        })
+        .map(|(id, _)| id.clone())
+        .expect("exact parked production effect");
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission.as_str(),
+            "--to",
+            old_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "this message must become explicitly undeliverable",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "continue",
+            mission.as_str(),
+            old_park.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--reason",
+            "complete ordinary work from the unchanged assignment",
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let continued = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission)
+        .await
+        .unwrap();
+    let continued_conversation = &continued.conversations[&old_id];
+    assert_eq!(continued_conversation.assignment_epoch, old_generation);
+    assert_eq!(continued_conversation.workspace_base_sha, base);
+
+    let move_driver = tokio::spawn({
+        let transports = transports.clone();
+        let command = driver("move-base.ready");
+        async move { cli::run_with_transports(command, transports).await }
+    });
+    entered.acquire().await.unwrap().forget();
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission.as_str(),
+            "--to",
+            old_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "this late message must remain beyond the active boundary",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    release.add_permits(1);
+    move_driver.await.unwrap().unwrap();
+    let reloaded_store = MissionStore::open(&repo).await.unwrap();
+    assert_ne!(
+        reloaded_store
+            .require_state(&mission)
+            .await
+            .unwrap()
+            .current_sha,
+        base,
+        "ordinary work did not move Git base"
+    );
+    for attempt in 0..4 {
+        if !reloaded_store
+            .require_state(&mission)
+            .await
+            .unwrap()
+            .open_attention
+            .is_empty()
+        {
+            break;
+        }
+        cli::run_with_transports(
+            driver(&format!("fail-oracle-{attempt}.ready")),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+    }
+    let moved = reloaded_store.require_state(&mission).await.unwrap();
+    let old_response = moved.conversations[&old_id].final_response.clone();
+    assert!(old_response.is_some());
+    let attention = moved.open_attention.keys().next().unwrap().clone();
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            mission.as_str(),
+            attention.as_str(),
+            "repair",
+            "--justification",
+            "request the moved-base replacement after ordinary oracle failure",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    release.add_permits(1);
+    cli::run_with_transports(driver("replacement.ready"), transports.clone())
+        .await
+        .unwrap();
+    let moved = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission)
+        .await
+        .unwrap();
+    let retired = &moved.conversations[&old_id];
+    assert_eq!(
+        retired.lifecycle,
+        lionclaw::model::ConversationLifecycle::Retired
+    );
+    assert_eq!(retired.assignment_epoch, old_generation);
+    assert_eq!(retired.final_response, old_response);
+    assert!(retired.active_delivery.is_none());
+    assert_eq!(retired.queued.len(), 1);
+    assert!(retired.queued[0].sequence_no > retired.consumed_through);
+    assert!(retired
+        .queued
+        .iter()
+        .all(|message| message.marker == lionclaw::model::DeliveryMarker::Undeliverable));
+    assert!(moved.conversation_legal_actions(&old_id).is_empty());
+    assert!(!moved.parked_effect_is_continuable(&old_park));
+    let (replacement_id, replacement) = moved
+        .conversations
+        .iter()
+        .find(|(id, conversation)| {
+            *id != &old_id
+                && conversation.task_id.as_str() == "mint-receipt"
+                && moved.conversation_is_messageable(id)
+        })
+        .expect("same-task moved-base replacement conversation");
+    assert_ne!(replacement_id, &old_id);
+    assert_eq!(replacement.workspace_base_sha, moved.current_sha);
+    assert!(replacement.assignment_epoch > old_generation);
+    assert!(replacement.queued.is_empty());
+    assert!(replacement.active_delivery.is_none());
+    assert_ne!(replacement.final_response, old_response);
+
+    let before_stale = reloaded_store.load(&mission).await.unwrap();
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "continue",
+            mission.as_str(),
+            old_park.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--reason",
+            "stale continuation must fail closed",
+        ])
+        .unwrap(),
+    )
+    .await
+    .expect_err("retired parked effect must not continue");
+    assert_eq!(reloaded_store.load(&mission).await.unwrap(), before_stale);
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission.as_str(),
+            "--to",
+            old_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "stale targeted send must fail closed",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .expect_err("retired conversation must reject targeted send");
+    assert_eq!(reloaded_store.load(&mission).await.unwrap(), before_stale);
+
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission.as_str(),
+            "--all",
+            "--repo",
+            repo.to_str().unwrap(),
+            "broadcast only to the replacement generation",
+        ])
+        .unwrap(),
+        transports,
+    )
+    .await
+    .unwrap();
+    let final_events = reloaded_store.load(&mission).await.unwrap();
+    let MissionEvent::MessageSent { recipients, .. } = &final_events.last().unwrap().event else {
+        panic!("--all must append one atomic message event")
+    };
+    assert!(recipients
+        .iter()
+        .all(|recipient| recipient.conversation_id != old_id));
+    assert!(recipients
+        .iter()
+        .any(|recipient| recipient.conversation_id == *replacement_id));
+    let replayed = fold(final_events).unwrap();
+    let snapshotted = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .load_state_snapshotted(&mission)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshotted, replayed);
+    assert_eq!(replayed.conversations[&old_id].final_response, old_response);
+    assert!(replayed.conversations[&old_id].active_delivery.is_none());
+    assert!(turns.lock().unwrap().is_empty());
+    assert!(prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, runtime)| runtime.to_string_lossy().contains(replacement_id.as_str())));
+}
+
 fn materialize_mission_type(root: &Path) {
     std::fs::create_dir_all(root.join("roles")).unwrap();
     std::fs::create_dir_all(root.join("oracles")).unwrap();
@@ -1769,6 +2170,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let response = awaiting_store.blobs().resolve(response).unwrap();
     assert!(response.starts_with("Which release target should I use?"));
     assert!(response.len() <= lionclaw::model::MAX_FINAL_RESPONSE_BYTES as usize);
+    let exact_conversation_id = conversation_id.clone();
+    let assignment_generation = conversation.assignment_epoch;
     let conversation_id = conversation_id.to_string();
 
     // Every user-facing view is parsed and rendered by the production binary
@@ -1883,7 +2286,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         })
         .expect("production launch failure");
     let after_launch = fold(events[..=launch].iter().cloned()).unwrap();
-    let delivery = after_launch.conversations.values().next().unwrap();
+    let delivery = &after_launch.conversations[&exact_conversation_id];
+    assert_eq!(delivery.assignment_epoch, assignment_generation);
     assert_eq!(delivery.queued.len(), 1);
     assert_eq!(
         delivery.queued[0].marker,
@@ -2129,7 +2533,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .require_state(&mission_id)
         .await
         .unwrap();
-    let delivery = reworking.conversations.values().next().unwrap();
+    let delivery = &reworking.conversations[&exact_conversation_id];
+    assert_eq!(delivery.assignment_epoch, assignment_generation);
     assert_eq!(
         delivery.queued[0].marker,
         lionclaw::model::DeliveryMarker::PreviouslyDelivered
@@ -2152,6 +2557,10 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .require_state(&mission_id)
         .await
         .unwrap();
+    assert_eq!(
+        failed.conversations[&exact_conversation_id].assignment_epoch,
+        assignment_generation
+    );
     assert!(failed.inflight.is_empty());
     let mut completed_effect_projection = activity.clone();
     completed_effect_projection.event_head = failed.head;
@@ -2261,7 +2670,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .require_state(&mission_id)
         .await
         .unwrap();
-    let delivery = recovered.conversations.values().next().unwrap();
+    let delivery = &recovered.conversations[&exact_conversation_id];
+    assert_eq!(delivery.assignment_epoch, assignment_generation);
     assert!(delivery
         .queued
         .iter()
