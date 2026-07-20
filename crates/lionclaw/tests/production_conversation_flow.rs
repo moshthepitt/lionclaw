@@ -33,6 +33,8 @@ enum DeliveryTurn {
     Complete,
     CompleteWithOversizedReference,
     Review,
+    Plan,
+    Validate,
 }
 
 type SessionObservations = Arc<Mutex<Vec<(Option<String>, bool)>>>;
@@ -368,6 +370,18 @@ impl RuntimeAdapter for DeliveryTransport {
                     ),
                 )?;
             }
+            DeliveryTurn::Plan => {
+                std::fs::write(
+                    Self::handoff(&execution),
+                    r#"{"schema":"lionclaw.mission.plan-handoff.v2","type":"plan","done":true,"report":"planned after lead response","proposal":{"base_revision":0,"requirement_changes":[],"assertion_supersessions":[],"plan":{"requirements":[{"id":"PRODUCTION-CONVERSATION","kind":"validation","prose":"production conversation flow works","disposition":{"type":"covered","assertion_ids":["TESTS-CLEAN"]}}],"assertions":[{"id":"TESTS-CLEAN","prose":"the production flow passes tests","oracle":"cargo-test"}],"tasks":[{"id":"integrate","kind":"work","body":"exercise the production flow","targets":["TESTS-CLEAN"],"role":"implementer","depends_on":[]},{"id":"validate","kind":"validate","body":"validate the production flow","targets":["TESTS-CLEAN"],"role":"validator","depends_on":["integrate"]}]}},"request_attention":false}"#,
+                )?;
+            }
+            DeliveryTurn::Validate => {
+                std::fs::write(
+                    Self::handoff(&execution),
+                    r#"{"schema":"lionclaw.mission.validate-handoff.v2","type":"validate","done":true,"report":"validated after lead response","items":[{"item_id":"TESTS-CLEAN","passed":true}],"passed":true,"request_attention":false}"#,
+                )?;
+            }
         }
         Ok(TurnResult {
             final_response: match turn {
@@ -381,6 +395,10 @@ impl RuntimeAdapter for DeliveryTransport {
                     "The requested production flow is complete.".into()
                 }
                 DeliveryTurn::Review => "The terminal review is clean.".into(),
+                DeliveryTurn::Plan => "The lead response resolved the planning question.".into(),
+                DeliveryTurn::Validate => {
+                    "The lead response resolved the validation question.".into()
+                }
             },
             ..Default::default()
         })
@@ -685,6 +703,243 @@ async fn initialize_repo(repo: &Path) -> String {
     workspace::head_sha(repo).await.unwrap()
 }
 
+#[tokio::test]
+async fn production_planner_and_validator_resume_exact_live_conversations() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    initialize_repo(&repo).await;
+    let fake_oci = temp.path().join("external-oci-transport");
+    std::fs::write(
+        &fake_oci,
+        "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profiles = RuntimeProfiles::from_toml(
+        &format!(
+            r#"[runtimes.codex]
+driver = "codex"
+command = "external-codex"
+native-resume = true
+confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
+"#,
+            fake_oci.display()
+        ),
+        temp.path(),
+    )
+    .unwrap();
+    let mission_type_dir = temp.path().join("mission-type");
+    materialize_planning_validation_mission_type(&mission_type_dir);
+    let turns = Arc::new(Mutex::new(VecDeque::from([
+        DeliveryTurn::AwaitLead,
+        DeliveryTurn::Plan,
+        DeliveryTurn::Complete,
+        DeliveryTurn::AwaitLead,
+        DeliveryTurn::Validate,
+        DeliveryTurn::Review,
+    ])));
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(32));
+    let sessions = Arc::new(Mutex::new(Vec::new()));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let transports = cli::MissionTransports::external(
+        profiles,
+        RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
+            turns: turns.clone(),
+            entered,
+            release,
+            sessions: sessions.clone(),
+            prompts: prompts.clone(),
+            launch_failures: Arc::new(Mutex::new(0)),
+        }) as Arc<dyn RuntimeDriverProvider>]),
+        RuntimeAuthRegistry::empty(),
+        Arc::new(ExternalOracleTransport {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "start",
+            "--type",
+            mission_type_dir.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--objective",
+            "prove planner and validator conversation identity",
+            "--runtime",
+            "codex",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    let store = MissionStore::open(&repo).await.unwrap();
+    let mission_id = store.list_missions().await.unwrap().pop().unwrap();
+    let run_driver = |label: &str| {
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "driver",
+            mission_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--handshake",
+            temp.path().join(label).to_str().unwrap(),
+        ])
+        .unwrap()
+    };
+    cli::run_with_transports(run_driver("planner-await.ready"), transports.clone())
+        .await
+        .unwrap();
+
+    let planner_state = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
+    let (planner_id, planner) = planner_state
+        .conversations
+        .iter()
+        .find(|(_, conversation)| conversation.task_id.as_str() == "planner")
+        .expect("production planner conversation");
+    assert_eq!(
+        planner.lifecycle,
+        lionclaw::model::ConversationLifecycle::AwaitingLead
+    );
+    let planner_id = planner_id.clone();
+    let planner_generation = planner.assignment_epoch;
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission_id.as_str(),
+            "--to",
+            planner_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "Use the exact proposed production contract.",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    cli::run_with_transports(run_driver("planner-resume.ready"), transports.clone())
+        .await
+        .unwrap();
+    let after_planner = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
+    let planner = &after_planner.conversations[&planner_id];
+    assert_eq!(planner.assignment_epoch, planner_generation);
+    assert!(planner.queued.is_empty());
+    assert!(planner.consumed_through > 0);
+    assert!(after_planner.proposal.is_some());
+
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            mission_id.as_str(),
+            "plan_proposal:mission",
+            "approve",
+            "--justification",
+            "exercise validator production routing",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    cli::run_with_transports(run_driver("validator-await.ready"), transports.clone())
+        .await
+        .unwrap();
+    // Promotion of the implementer's commit closes that driver pass. A fresh
+    // production driver reload dispatches the dependent validator.
+    cli::run_with_transports(run_driver("validator-dispatch.ready"), transports.clone())
+        .await
+        .unwrap();
+    let validator_state = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
+    let (validator_id, validator) = validator_state
+        .conversations
+        .iter()
+        .find(|(_, conversation)| conversation.task_id.as_str() == "validate")
+        .unwrap_or_else(|| panic!("production validator conversation: {validator_state:#?}"));
+    assert_eq!(
+        validator.lifecycle,
+        lionclaw::model::ConversationLifecycle::AwaitingLead
+    );
+    let validator_id = validator_id.clone();
+    let validator_generation = validator.assignment_epoch;
+    assert_ne!(planner_id, validator_id);
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission_id.as_str(),
+            "--to",
+            validator_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "Validate the exact TESTS-CLEAN assertion.",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    cli::run_with_transports(run_driver("validator-resume.ready"), transports.clone())
+        .await
+        .unwrap();
+    let final_events = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .load(&mission_id)
+        .await
+        .unwrap();
+    let final_state = fold(final_events.clone()).unwrap();
+    let validator = &final_state.conversations[&validator_id];
+    assert_eq!(validator.assignment_epoch, validator_generation);
+    assert!(validator.queued.is_empty());
+    assert!(validator.consumed_through > 0);
+    assert_eq!(fold(final_events).unwrap(), final_state);
+    assert!(turns.lock().unwrap().is_empty());
+    let sessions = sessions.lock().unwrap();
+    assert!(sessions.iter().any(|(_, resumed)| *resumed));
+    let prompts = prompts.lock().unwrap();
+    assert!(prompts
+        .iter()
+        .any(|(prompt, _)| { prompt.contains("Use the exact proposed production contract.") }));
+    assert!(prompts
+        .iter()
+        .any(|(prompt, _)| prompt.contains("Validate the exact TESTS-CLEAN assertion.")));
+    assert!(prompts
+        .iter()
+        .any(|(_, runtime)| runtime.to_string_lossy().contains(planner_id.as_str())));
+    assert!(prompts
+        .iter()
+        .any(|(_, runtime)| runtime.to_string_lossy().contains(validator_id.as_str())));
+}
+
 fn materialize_mission_type(root: &Path) {
     std::fs::create_dir_all(root.join("roles")).unwrap();
     std::fs::create_dir_all(root.join("oracles")).unwrap();
@@ -723,6 +978,28 @@ auto-continue-proof = true
         std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+fn materialize_planning_validation_mission_type(root: &Path) {
+    materialize_mission_type(root);
+    let manifest = std::fs::read_to_string(root.join("mission.toml")).unwrap();
+    std::fs::write(
+        root.join("mission.toml"),
+        format!(
+            "{manifest}\n[[planning.tasks]]\nid = \"planner\"\nrole = \"planner\"\nbody = \"plan the production conversation proof\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("roles/planner.md"),
+        "---\noutput: proposes-plan\nruntime: codex\n---\nPlan the production flow.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("roles/validator.md"),
+        "---\noutput: emits-verdict\nruntime: codex\n---\nValidate the production flow.\n",
+    )
+    .unwrap();
 }
 
 #[tokio::test]
