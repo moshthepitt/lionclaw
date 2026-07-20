@@ -146,11 +146,7 @@ fn assert_abort_preserves_authority(state: &lionclaw::model::MissionState) {
     }
     assert_eq!(aborted.authoritative_receipts, state.authoritative_receipts);
     assert_eq!(aborted.reachable_commits, state.reachable_commits);
-    assert_eq!(aborted.parked_effects, state.parked_effects);
-    assert!(aborted
-        .parked_effects
-        .keys()
-        .all(|effect| !aborted.parked_effect_is_continuable(effect)));
+    assert!(aborted.parked_effects.is_empty());
     for driver_running in [false, true] {
         let view = MissionView::from_state(aborted.clone(), driver_running);
         assert_eq!(view.disposition, MissionDisposition::Terminal);

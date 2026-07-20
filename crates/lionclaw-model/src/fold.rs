@@ -146,11 +146,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                                     && delivery.presented_messages == request.presented_messages
                             })
                 });
-            let live_generation = state
-                .tasks_in(request.namespace)
-                .get(&request.task_id)
-                .is_some_and(|task| task.status == TaskStatus::Running);
-            if !live_delivery || !live_generation {
+            if !live_delivery {
                 finish_apply(state, seq);
                 return;
             }
@@ -213,13 +209,16 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 .or_insert_with(pending_task);
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
-            let expected_conversation_id = crate::ConversationId::for_role_instance(
+            let assignment = super::state::resolve_role_assignment(
                 &state.mission_id,
                 *namespace,
                 task_id,
                 role,
-                *assignment_epoch,
+                state.tasks_in(*namespace).get(task_id),
+                base_sha,
+                state.config.recovery.max_attempts,
             );
+            let expected_conversation_id = assignment.conversation_id;
             for (id, prior) in &mut state.conversations {
                 if id != &expected_conversation_id
                     && prior.namespace == *namespace
@@ -785,6 +784,7 @@ fn finish_apply(state: &mut MissionState, seq: u64) {
     derive_attention(state);
     derive_phase(state);
     retire_illegal_conversations(state);
+    prune_uncontinuable_parked_effects(state);
 }
 
 /// Retire conversations from the same authoritative state predicates used by
@@ -792,19 +792,61 @@ fn finish_apply(state: &mut MissionState, seq: u64) {
 /// evidence that they can no longer be delivered.
 fn retire_illegal_conversations(state: &mut MissionState) {
     let terminal = state.phase.is_terminal();
-    for conversation in state.conversations.values_mut() {
-        if conversation.lifecycle == super::state::ConversationLifecycle::Retired {
-            continue;
-        }
-        let task = match conversation.namespace {
-            crate::TaskNamespace::Planning => state.planning.tasks.get(&conversation.task_id),
-            crate::TaskNamespace::Execution => state.tasks.get(&conversation.task_id),
-        };
-        let generation_is_live = task.is_some_and(|task| task.status != TaskStatus::Superseded);
-        if terminal || !generation_is_live {
+    let retired: Vec<_> = state
+        .conversations
+        .iter()
+        .filter_map(|(id, conversation)| {
+            if conversation.lifecycle == super::state::ConversationLifecycle::Retired {
+                return None;
+            }
+            let task = match conversation.namespace {
+                crate::TaskNamespace::Planning => state.planning.tasks.get(&conversation.task_id),
+                crate::TaskNamespace::Execution => state.tasks.get(&conversation.task_id),
+            };
+            let generation_is_live = task.is_some_and(|task| task.status != TaskStatus::Superseded);
+            (terminal || !generation_is_live).then(|| id.clone())
+        })
+        .collect();
+    retire_conversations(state, retired);
+}
+
+fn retire_conversations(
+    state: &mut MissionState,
+    conversation_ids: impl IntoIterator<Item = crate::ConversationId>,
+) {
+    let conversation_ids: BTreeSet<_> = conversation_ids.into_iter().collect();
+    for id in &conversation_ids {
+        if let Some(conversation) = state.conversations.get_mut(id) {
             retire_conversation(conversation);
         }
     }
+    let effects: Vec<_> = state
+        .inflight
+        .iter()
+        .filter_map(|(effect_id, effect)| match effect {
+            InflightEffect::RoleRun {
+                conversation_id, ..
+            } if conversation_ids.contains(conversation_id) => Some(effect_id.clone()),
+            _ => None,
+        })
+        .collect();
+    for effect_id in effects {
+        state.inflight.remove(&effect_id);
+        state.stop_requests.remove(&effect_id);
+        state.reached_deadlines.remove(&effect_id);
+        clear_cleanup_failure(state, &effect_id);
+    }
+    let retired_tasks: BTreeSet<_> = conversation_ids
+        .iter()
+        .filter_map(|id| state.conversations.get(id))
+        .map(|conversation| (conversation.namespace, conversation.task_id.clone()))
+        .collect();
+    state.parked_effects.retain(|_, effect| match effect {
+        ParkedEffect::RoleRun { namespace, task_id } => {
+            !retired_tasks.contains(&(*namespace, task_id.clone()))
+        }
+        ParkedEffect::OracleRun { .. } | ParkedEffect::TerminalReview => true,
+    });
 }
 
 fn retire_conversation(conversation: &mut super::state::ConversationState) {
@@ -1050,7 +1092,11 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
     let super::step::StepDecision::DispatchRole(intent) = super::step::step(state) else {
         return false;
     };
-    let (expected_base, expected_epoch, expected_recreate) = super::state::resolve_task_assignment(
+    let expected_assignment = super::state::resolve_role_assignment(
+        &state.mission_id,
+        *namespace,
+        task_id,
+        role,
         state.tasks_in(*namespace).get(task_id),
         &intent.base_sha,
         state.config.recovery.max_attempts,
@@ -1066,13 +1112,7 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         *assignment_epoch,
         prompt_hash,
     );
-    let expected_conversation = crate::ConversationId::for_role_instance(
-        &state.mission_id,
-        *namespace,
-        task_id,
-        role,
-        *assignment_epoch,
-    );
+    let expected_conversation = expected_assignment.conversation_id;
     let expected_presented: Vec<_> =
         state
             .conversations
@@ -1090,9 +1130,9 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         && &intent.task_id == task_id
         && intent.attempt_no == *attempt_no
         && &intent.role == role
-        && expected_base.as_str() == base_sha
-        && expected_epoch == *assignment_epoch
-        && expected_recreate == *recreate_workspace
+        && expected_assignment.base_sha == *base_sha
+        && expected_assignment.generation == *assignment_epoch
+        && expected_assignment.recreate_workspace == *recreate_workspace
         && expected_effect == *effect_id
         && expected_conversation == *conversation_id
         && *message_boundary == envelope.sequence_no.saturating_sub(1)
@@ -1231,11 +1271,10 @@ fn derive_promotion(state: &mut MissionState) {
         .proposal
         .take()
         .expect("proposal present (checked above)");
-    if state.plan.is_some() {
-        for conversation in state.conversations.values_mut() {
-            retire_conversation(conversation);
-        }
-    }
+    retire_conversations(
+        state,
+        state.conversations.keys().cloned().collect::<Vec<_>>(),
+    );
     let supersessions: BTreeMap<_, _> = proposal
         .assertion_supersessions
         .iter()
@@ -4242,7 +4281,7 @@ mod tests {
 
         assert_eq!(
             state.planning.tasks[&tid("same-id")].status,
-            TaskStatus::Pending
+            TaskStatus::Failed
         );
         assert_eq!(state.tasks[&tid("same-id")].status, TaskStatus::Cleared);
         let retired = &state.conversations[&parked_conversation];
@@ -4628,68 +4667,83 @@ mod tests {
     }
 
     #[test]
-    fn retired_generation_exact_completion_cannot_mutate_replacement_authority() {
-        let mut state = fold_log(vec![
-            created(),
-            plan_proposed(vec![], vec![work_task("work")]),
-            role_requested("work", "old"),
-        ])
-        .expect("old request inflight");
-        let old_effect = role_effect(crate::TaskNamespace::Execution, "work", 1, 1);
-        let old_request = state.inflight[&old_effect].role_request_identity().unwrap();
+    fn promotion_revokes_a_real_old_request_before_replacement_and_late_completion() {
+        let mut mission_created = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.planning.tasks.push(PlanningTask {
+            id: tid("planner"),
+            role: RoleName::new("planner").unwrap(),
+            output: OutputSemantics::ProducesReport,
+            body: "prepare the plan".into(),
+            depends_on: vec![],
+        });
+        let old_effect = role_effect(crate::TaskNamespace::Planning, "planner", 1, 1);
+        let old_request = role_identity(
+            crate::TaskNamespace::Planning,
+            "planner",
+            1,
+            1,
+            RoleName::new("planner").unwrap(),
+            OutputSemantics::ProducesReport,
+            "base",
+            true,
+        );
         let old_conversation = old_request.conversation_id.clone();
-        retire_conversation(state.conversations.get_mut(&old_conversation).unwrap());
-
-        let replacement_id = crate::ConversationId::for_role_instance(
-            &mission_id(),
-            crate::TaskNamespace::Execution,
-            &tid("work"),
-            &RoleName::new("implementer").unwrap(),
-            2,
-        );
-        state.conversations.insert(
-            replacement_id,
-            super::super::state::ConversationState {
-                role: RoleName::new("implementer").unwrap(),
-                namespace: crate::TaskNamespace::Execution,
-                task_id: tid("work"),
-                assignment_epoch: 2,
-                workspace_base_sha: "replacement-base".into(),
-                lifecycle: super::super::state::ConversationLifecycle::Ready,
-                queued: vec![],
-                consumed_through: 0,
-                active_delivery: None,
-                final_response: None,
-                invalid_handoff_reworks: 0,
+        let replacement_effect = role_effect(crate::TaskNamespace::Execution, "work", 1, 1);
+        let prefix = vec![
+            mission_created,
+            planning_role_requested("planner", "old", OutputSemantics::ProducesReport),
+            MissionEvent::MessageSent {
+                recipients: vec![super::super::event::ConversationRecipient {
+                    conversation_id: old_conversation.clone(),
+                    role: RoleName::new("planner").unwrap(),
+                    namespace: crate::TaskNamespace::Planning,
+                    task_id: tid("planner"),
+                    assignment_epoch: 1,
+                }],
+                body: "old queued guidance".into(),
+                references: vec![],
             },
+            plan_proposed(vec![], vec![work_task("work")]),
+            role_requested("work", "replacement"),
+        ];
+        let before = fold_log(prefix.clone()).expect("replacement request inflight");
+        let retired = &before.conversations[&old_conversation];
+        assert_eq!(
+            retired.lifecycle,
+            super::super::state::ConversationLifecycle::Retired
         );
-        state.tasks.get_mut(&tid("work")).unwrap().assignment_epoch = 2;
-        state.tasks.get_mut(&tid("work")).unwrap().status = TaskStatus::Pending;
-        let before = state.clone();
-
-        apply(
-            &mut state,
-            &envelope(
-                before.head + 1,
-                MissionEvent::RoleRunCompleted {
-                    effect_id: old_effect,
-                    request: Box::new(old_request),
-                    outcome: Ok(RoleRunSuccess {
-                        handoff: Some(work_handoff(true, false)),
-                        artifact: Some(ArtifactOutcome {
-                            base_sha: "base".into(),
-                            head_sha: "stale-head".into(),
-                        }),
-                        final_response: PayloadRef::inline("stale response"),
-                        runtime_configuration: RuntimeConfigurationEvidence::default(),
-                    }),
-                },
-            ),
+        assert_eq!(
+            retired.queued[0].marker,
+            super::super::state::DeliveryMarker::Undeliverable
         );
+        assert!(retired.active_delivery.is_none());
+        assert!(!before.inflight.contains_key(&old_effect));
+        assert!(before.inflight.contains_key(&replacement_effect));
+        assert!(before
+            .conversation_legal_actions(&old_conversation)
+            .is_empty());
 
+        let mut log = prefix;
+        log.push(MissionEvent::RoleRunCompleted {
+            effect_id: old_effect,
+            request: old_request,
+            outcome: Ok(RoleRunSuccess {
+                handoff: Some(work_handoff(true, false)),
+                artifact: Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "stale-head".into(),
+                }),
+                final_response: PayloadRef::inline("stale response"),
+                runtime_configuration: RuntimeConfigurationEvidence::default(),
+            }),
+        });
+        let after = fold_log(log).expect("late completion folded");
         let mut expected = before;
-        expected.head = state.head;
-        assert_eq!(state, expected);
+        expected.head = after.head;
+        assert_eq!(after, expected);
     }
 
     #[test]

@@ -65,12 +65,13 @@ pub use plan_validation::{
     ProposalError, MAX_TASK_DEPENDENCIES,
 };
 pub use state::{
-    resolve_task_assignment, AdvisoryStatus, AssertionState, AttentionItem, AttentionKind,
-    ConversationLifecycle, ConversationState, DeliveryMarker, DurableCancellation,
-    EffectCleanupFailure, FailureEvidence, FailureFeedback, InflightEffect, MissionPhase,
-    MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState, QueuedMessage,
-    ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, SupersededAssertion, TaskAddress,
-    TaskRuntimeState, TaskStatus, TerminalReviewState, TerminalReviewVerdict,
+    resolve_role_assignment, resolve_task_assignment, AdvisoryStatus, AssertionState,
+    AttentionItem, AttentionKind, ConversationLifecycle, ConversationState, DeliveryMarker,
+    DurableCancellation, EffectCleanupFailure, FailureEvidence, FailureFeedback, InflightEffect,
+    MissionPhase, MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState,
+    QueuedMessage, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, RoleAssignment,
+    SupersededAssertion, TaskAddress, TaskRuntimeState, TaskStatus, TerminalReviewState,
+    TerminalReviewVerdict,
 };
 pub use step::{
     step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,

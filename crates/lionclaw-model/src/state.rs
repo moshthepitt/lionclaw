@@ -255,6 +255,38 @@ pub fn resolve_task_assignment(
     (base_sha, epoch, recreate)
 }
 
+/// The single authoritative identity derivation for a role assignment.
+/// Dispatch, prompt materialization, and replay all consume this value rather
+/// than independently inferring a current conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAssignment {
+    pub base_sha: String,
+    pub generation: u32,
+    pub recreate_workspace: bool,
+    pub conversation_id: super::ConversationId,
+}
+
+pub fn resolve_role_assignment(
+    mission_id: &MissionId,
+    namespace: super::TaskNamespace,
+    task_id: &TaskId,
+    role: &RoleName,
+    previous: Option<&TaskRuntimeState>,
+    required_base: &str,
+    max_attempts: u32,
+) -> RoleAssignment {
+    let (base_sha, generation, recreate_workspace) =
+        resolve_task_assignment(previous, required_base, max_attempts);
+    RoleAssignment {
+        conversation_id: super::ConversationId::for_role_instance(
+            mission_id, namespace, task_id, role, generation,
+        ),
+        base_sha,
+        generation,
+        recreate_workspace,
+    }
+}
+
 impl TaskRuntimeState {
     pub fn automatic_retry_remaining(&self, max_attempts: u32) -> bool {
         self.status == TaskStatus::Failed

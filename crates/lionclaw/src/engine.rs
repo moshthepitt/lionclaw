@@ -1729,18 +1729,16 @@ impl Engine {
         // Planning and execution assemble prompts and namespace effect IDs
         // separately, so a planning report can never reach an execution judge and
         // a planning effect can never collide with an execution one.
-        let conversation_id = crate::model::ConversationId::for_role_instance(
+        let assignment = crate::model::resolve_role_assignment(
             &state.mission_id,
             intent.namespace,
             &intent.task_id,
             &intent.role,
-            crate::model::resolve_task_assignment(
-                state.tasks_in(intent.namespace).get(&intent.task_id),
-                &intent.base_sha,
-                state.config.recovery.max_attempts,
-            )
-            .1,
+            state.tasks_in(intent.namespace).get(&intent.task_id),
+            &intent.base_sha,
+            state.config.recovery.max_attempts,
         );
+        let conversation_id = assignment.conversation_id.clone();
         let message_boundary = state.head;
         let presented_messages =
             state
@@ -1764,12 +1762,9 @@ impl Engine {
             }
         };
         let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));
-        let (base_sha, assignment_epoch, recreate_workspace) =
-            crate::model::resolve_task_assignment(
-                state.tasks_in(intent.namespace).get(&intent.task_id),
-                &intent.base_sha,
-                state.config.recovery.max_attempts,
-            );
+        let base_sha = assignment.base_sha;
+        let assignment_epoch = assignment.generation;
+        let recreate_workspace = assignment.recreate_workspace;
         let effect_id = EffectId::for_role_request(
             intent.namespace,
             &state.mission_id,
