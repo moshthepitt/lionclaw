@@ -517,12 +517,7 @@ async fn iterative_ratification_and_abort_survive_every_prefix_and_snapshot_gene
         .await
         .expect("propose abort candidate");
     h.engine
-        .decide(
-            &aborted_id,
-            "plan_proposal:mission",
-            DecisionAction::Abort,
-            "stop here",
-        )
+        .abort(&aborted_id, "stop here")
         .await
         .expect("abort");
     let aborted_events = h

@@ -6,8 +6,9 @@ mod common;
 use common::{approve_plan, harness, proposal, simple_plan, ParseTask, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::ProposeError;
 use lionclaw::model::{
-    Assertion, AssertionId, DecisionAction, OracleName, PlanProposal, ProposalError, Requirement,
-    RequirementDisposition, RequirementId, RequirementKind, RoleName, Task, TaskKind, TaskStatus,
+    Assertion, AssertionId, AssertionSupersession, DecisionAction, MissionEvent, PlanProposal,
+    ProposalError, Requirement, RequirementDisposition, RequirementId, RequirementKind, RoleName,
+    Task, TaskKind, TaskStatus,
 };
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
@@ -41,7 +42,7 @@ async fn started() -> (
     let (dir, h) = test_harness().await;
     let id = h
         .engine
-        .create_mission("/repo", "revise", BASE_SHA)
+        .create_mission(dir.path().to_str().unwrap(), "revise", BASE_SHA)
         .await
         .unwrap();
     h.engine
@@ -101,9 +102,10 @@ async fn stale_and_immaterial_proposals_append_nothing() {
 }
 
 #[tokio::test]
-async fn requirements_cannot_disappear_or_weaken() {
+async fn covered_requirement_weakening_requires_an_exact_recorded_decision() {
     let (_dir, h, id) = started().await;
     let mut removed = simple_plan();
+    let changed_requirement = removed.requirements[0].id.clone();
     removed.requirements = vec![Requirement {
         id: RequirementId::new("NEW-SCOPE").unwrap(),
         kind: RequirementKind::Capability,
@@ -113,22 +115,32 @@ async fn requirements_cannot_disappear_or_weaken() {
         },
     }];
     assert!(matches!(
-        h.engine.propose_plan(&id, proposal(1, removed)).await,
+        h.engine
+            .propose_plan(&id, proposal(1, removed.clone()))
+            .await,
         Err(ProposeError::Rejected(
-            ProposalError::RequirementWeakened { .. }
+            ProposalError::RequirementChangesMismatch { .. }
         ))
     ));
 
-    let mut limited = simple_plan();
-    limited.requirements[0].disposition = RequirementDisposition::Limitation {
-        rationale: "too hard".into(),
+    let declared = PlanProposal {
+        base_revision: 1,
+        requirement_changes: vec![changed_requirement.clone()],
+        assertion_supersessions: vec![],
+        plan: removed,
     };
-    assert!(matches!(
-        h.engine.propose_plan(&id, proposal(1, limited)).await,
-        Err(ProposeError::Rejected(
-            ProposalError::RequirementWeakened { .. }
-        ))
-    ));
+    h.engine.propose_plan(&id, declared).await.unwrap();
+    approve_plan(&h.engine, &id).await;
+
+    let events = h.engine.store().load(&id).await.unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        MissionEvent::DecisionRecorded {
+            action: DecisionAction::Approve,
+            requirement_changes,
+            ..
+        } if requirement_changes == std::slice::from_ref(&changed_requirement)
+    )));
 }
 
 #[tokio::test]
@@ -166,25 +178,53 @@ async fn a_limitation_may_become_covered_but_not_the_reverse() {
 }
 
 #[tokio::test]
-async fn assertions_are_preserved_and_oracle_binding_only_strengthens() {
+async fn corrected_assertions_visibly_supersede_and_stale_prior_receipts() {
     let (_dir, h, id) = started().await;
+    for _ in 0..3 {
+        h.engine.advance(&id).await.unwrap();
+    }
+    let state = h.engine.load_state(&id).await.unwrap();
+    assert!(state.contract[&AssertionId::new("TESTS-PASS").unwrap()]
+        .last_authoritative
+        .is_some());
+
     let mut changed = simple_plan();
     changed.assertions[0].prose = "different claim".into();
     assert!(matches!(
-        h.engine.propose_plan(&id, proposal(1, changed)).await,
+        h.engine
+            .propose_plan(&id, proposal(1, changed.clone()))
+            .await,
         Err(ProposeError::Rejected(
-            ProposalError::AssertionWeakened { .. }
+            ProposalError::AssertionSupersessionsMismatch { .. }
         ))
     ));
 
-    let mut rebound = simple_plan();
-    rebound.assertions[0].oracle = Some(OracleName::new("other-oracle").unwrap());
-    assert!(matches!(
-        h.engine.propose_plan(&id, proposal(1, rebound)).await,
-        Err(ProposeError::Rejected(
-            ProposalError::AssertionWeakened { .. }
-        ))
-    ));
+    let assertion_id = changed.assertions[0].id.clone();
+    h.engine
+        .propose_plan(
+            &id,
+            PlanProposal {
+                base_revision: 1,
+                requirement_changes: vec![],
+                assertion_supersessions: vec![AssertionSupersession {
+                    assertion_id: assertion_id.clone(),
+                    replacement_ids: vec![assertion_id.clone()],
+                }],
+                plan: changed,
+            },
+        )
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &id).await;
+
+    let state = h.engine.load_state(&id).await.unwrap();
+    let active = &state.contract[&assertion_id];
+    assert!(active.last_authoritative.is_none());
+    let retired = state.superseded_assertions.last().unwrap();
+    assert_eq!(retired.assertion.prose, "cargo test exits 0");
+    assert!(retired.state.last_authoritative.is_some());
+    assert_eq!(retired.replacement_ids, vec![assertion_id]);
+    assert_eq!(retired.superseded_at_revision, 2);
 }
 
 #[tokio::test]
@@ -259,6 +299,8 @@ async fn initial_proposal_must_target_revision_zero() {
             &id,
             PlanProposal {
                 base_revision: 1,
+                requirement_changes: vec![],
+                assertion_supersessions: vec![],
                 plan: simple_plan(),
             },
         )

@@ -26,9 +26,9 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-/// Bumped because durable request ingress now verifies model-derived effect
-/// identity and task-assignment generation before reserving an effect.
-pub const REDUCER_VERSION: u32 = 25;
+/// Bumped for planning generations, typed failure replanning, assertion
+/// supersession history, and the universal-abort projection rules.
+pub const REDUCER_VERSION: u32 = 26;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -74,9 +74,15 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         phase: MissionPhase::Planning,
         plan: None,
         contract: Default::default(),
+        superseded_assertions: Default::default(),
         tasks: Default::default(),
         planning: PlanningState {
             tasks: planning_tasks,
+        },
+        planning_generation: if config.planning.tasks.is_empty() {
+            0
+        } else {
+            1
         },
         planning_base_revision: (!config.planning.tasks.is_empty()).then_some(0),
         planning_input: PlanningInput {
@@ -691,8 +697,15 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             attention_id,
             action,
             justification,
+            requirement_changes,
         } => {
-            apply_decision(state, attention_id, action, justification);
+            apply_decision(
+                state,
+                attention_id,
+                action,
+                justification,
+                requirement_changes,
+            );
         }
         MissionEvent::EffectCleanupFailed {
             effect_id,
@@ -1116,6 +1129,28 @@ fn derive_promotion(state: &mut MissionState) {
         .proposal
         .take()
         .expect("proposal present (checked above)");
+    let supersessions: BTreeMap<_, _> = proposal
+        .assertion_supersessions
+        .iter()
+        .map(|entry| (entry.assertion_id.clone(), entry.replacement_ids.clone()))
+        .collect();
+    if let Some(current) = &state.plan {
+        for assertion in &current.assertions {
+            let Some(replacement_ids) = supersessions.get(&assertion.id) else {
+                continue;
+            };
+            if let Some(assertion_state) = state.contract.remove(&assertion.id) {
+                state
+                    .superseded_assertions
+                    .push(super::SupersededAssertion {
+                        assertion: assertion.clone(),
+                        state: assertion_state,
+                        replacement_ids: replacement_ids.clone(),
+                        superseded_at_revision: state.revision.saturating_add(1),
+                    });
+            }
+        }
+    }
     let next = proposal.plan;
     let live: BTreeSet<_> = next.tasks.iter().map(|task| &task.id).collect();
     let retired: Vec<_> = state
@@ -1146,6 +1181,14 @@ fn derive_promotion(state: &mut MissionState) {
             existing.oracle = assertion.oracle.clone();
         }
     }
+    let live_assertions: BTreeSet<_> = next
+        .assertions
+        .iter()
+        .map(|assertion| &assertion.id)
+        .collect();
+    state
+        .contract
+        .retain(|assertion_id, _| live_assertions.contains(assertion_id));
     for task in &next.tasks {
         seed_task(&mut state.tasks, &task.id);
     }
@@ -1245,6 +1288,7 @@ fn apply_decision(
     attention_id: &str,
     action: &super::event::DecisionAction,
     justification: &str,
+    requirement_changes: &[super::RequirementId],
 ) {
     use super::event::DecisionAction;
     let Some(item) = state.open_attention.get(attention_id).cloned() else {
@@ -1260,6 +1304,13 @@ fn apply_decision(
     };
     match (action, item.kind) {
         (DecisionAction::Approve, AttentionKind::PlanProposal) => {
+            if state
+                .proposal
+                .as_ref()
+                .is_none_or(|proposal| proposal.requirement_changes != requirement_changes)
+            {
+                return;
+            }
             state.proposal_approved = true;
             state.planning_input.latest_rejected_proposal = None;
             state.planning_input.refinement = None;
@@ -1324,6 +1375,7 @@ fn apply_decision(
         (DecisionAction::Repair, AttentionKind::OracleVerdictFailed) => {
             let feedback = super::state::FailureFeedback {
                 summary: item.report.clone(),
+                failure: item.failure.clone(),
                 evidence: item.evidence.clone(),
                 details: item.details.clone(),
                 justification: justification.to_string(),
@@ -1405,16 +1457,54 @@ fn apply_decision(
         }
         (
             DecisionAction::Revise,
-            AttentionKind::OracleVerdictFailed
+            AttentionKind::NodeFailed
+            | AttentionKind::OracleFailed
+            | AttentionKind::OracleVerdictFailed
             | AttentionKind::GateFailed
-            | AttentionKind::TerminalReviewGaps,
+            | AttentionKind::TerminalReviewGaps
+            | AttentionKind::TerminalReviewFailed,
         ) => {
+            if item.kind == AttentionKind::NodeFailed {
+                if let Some(task_id) = &item.task_id {
+                    if active_namespace == crate::TaskNamespace::Execution {
+                        if let Some(task) = state.tasks.get_mut(task_id) {
+                            task.status = TaskStatus::Superseded;
+                        }
+                    }
+                }
+            }
+            if item.kind == AttentionKind::GateFailed {
+                if let Some(task_id) = &item.task_id {
+                    if let Some(task) = state.tasks.get_mut(task_id) {
+                        task.status = TaskStatus::Superseded;
+                    }
+                }
+            }
+            if item.kind == AttentionKind::OracleFailed {
+                if let Some(oracle) = &item.oracle {
+                    state.oracle_failures.remove(oracle);
+                }
+            }
+            if item.kind == AttentionKind::OracleVerdictFailed {
+                for assertion_id in &item.assertion_ids {
+                    if let Some(assertion) = state.contract.get_mut(assertion_id) {
+                        assertion.last_authoritative = None;
+                    }
+                }
+            }
+            if matches!(
+                item.kind,
+                AttentionKind::TerminalReviewGaps | AttentionKind::TerminalReviewFailed
+            ) {
+                state.terminal_review.outcome = None;
+            }
             state.terminal_review.accepted = None;
             state.proposal = None;
             state.proposal_approved = false;
             state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(Box::new(
                 super::state::FailureFeedback {
                     summary: item.report,
+                    failure: item.failure,
                     evidence: item.evidence,
                     details: item.details,
                     justification: justification.to_string(),
@@ -1422,23 +1512,17 @@ fn apply_decision(
             )));
             start_replanning(state);
         }
-        (DecisionAction::Abort, _) => {
-            state.phase = MissionPhase::Aborted {
-                reason: justification.to_string(),
-            };
-        }
         _ => {}
     }
 }
 
 fn start_replanning(state: &mut MissionState) {
     state.planning_base_revision = Some(state.revision);
+    state.planning_generation = state.planning_generation.saturating_add(1);
     for (id, task) in &mut state.planning.tasks {
-        task.status = TaskStatus::Pending;
-        task.last_report = None;
-        task.last_failure = None;
-        task.consecutive_failures = 0;
-        task.feedback.clear();
+        let assignment_epoch = task.assignment_epoch;
+        *task = pending_task();
+        task.assignment_epoch = assignment_epoch;
         state.flagged_tasks.remove(&TaskAddress::new(
             crate::TaskNamespace::Planning,
             id.clone(),
@@ -1463,6 +1547,7 @@ fn derive_attention(state: &mut MissionState) {
                      task_id: Option<TaskId>,
                      oracle: Option<super::ids::OracleName>,
                      assertion_ids: Vec<AssertionId>,
+                     failure: Option<TypedFailure>,
                      evidence: Option<super::state::FailureEvidence>,
                      report: String| {
         let anchor = task_id
@@ -1482,6 +1567,7 @@ fn derive_attention(state: &mut MissionState) {
                 task_id,
                 oracle,
                 assertion_ids,
+                failure,
                 evidence,
                 details: None,
                 report,
@@ -1508,6 +1594,7 @@ fn derive_attention(state: &mut MissionState) {
             None,
             Vec::new(),
             None,
+            None,
             format!(
                 "approve the complete plan proposed against revision {}",
                 state.revision
@@ -1530,6 +1617,7 @@ fn derive_attention(state: &mut MissionState) {
                     Some(task_id.clone()),
                     None,
                     Vec::new(),
+                    rt.last_failure.clone(),
                     None,
                     failure_report("planning task", task_id, rt),
                 );
@@ -1542,6 +1630,7 @@ fn derive_attention(state: &mut MissionState) {
                     Some(task_id.clone()),
                     None,
                     Vec::new(),
+                    None,
                     None,
                     format!("planning task '{task_id}' asks for a look"),
                 );
@@ -1565,6 +1654,7 @@ fn derive_attention(state: &mut MissionState) {
             None,
             Some(oracle.clone()),
             Vec::new(),
+            Some(failure.clone()),
             None,
             format!("oracle '{oracle}' failed to run: {}", failure.detail()),
         );
@@ -1614,6 +1704,7 @@ fn derive_attention(state: &mut MissionState) {
             None,
             Some(oracle),
             assertion_ids,
+            None,
             Some(evidence.clone()),
             format!(
                 "authoritative oracle failed assertions [{targets}] with exit {}",
@@ -1636,19 +1727,26 @@ fn derive_attention(state: &mut MissionState) {
                     None,
                     Vec::new(),
                     None,
+                    None,
                     format!("gate '{}' cleared; confirm to proceed", task.id),
                 ),
-                Some(TaskStatus::Failed) if !state.acknowledged_gates.contains(&task.id) => raise(
-                    AttentionKind::GateFailed,
-                    Some(task.id.clone()),
-                    None,
-                    Vec::new(),
-                    None,
-                    format!(
-                        "gate '{}' is blocked by dissenting or missing verdicts",
-                        task.id
-                    ),
-                ),
+                Some(TaskStatus::Failed) if !state.acknowledged_gates.contains(&task.id) => {
+                    let reason = match super::gate::evaluate_gate(state, &plan, &task.id) {
+                        super::gate::GateResult::Blocked { reason } => reason,
+                        super::gate::GateResult::Cleared => {
+                            "gate state changed while deriving attention".to_string()
+                        }
+                    };
+                    raise(
+                        AttentionKind::GateFailed,
+                        Some(task.id.clone()),
+                        None,
+                        task.targets.clone(),
+                        None,
+                        None,
+                        format!("gate '{}' is blocked: {reason}", task.id),
+                    )
+                }
                 _ => {}
             },
             super::plan::TaskKind::Work | super::plan::TaskKind::Validate => {
@@ -1661,6 +1759,7 @@ fn derive_attention(state: &mut MissionState) {
                         Some(task.id.clone()),
                         None,
                         Vec::new(),
+                        state.tasks[&task.id].last_failure.clone(),
                         None,
                         failure_report("task", &task.id, &state.tasks[&task.id]),
                     );
@@ -1673,6 +1772,7 @@ fn derive_attention(state: &mut MissionState) {
                         Some(task.id.clone()),
                         None,
                         Vec::new(),
+                        None,
                         None,
                         format!("task '{}' asked for a human look", task.id),
                     );
@@ -1696,6 +1796,7 @@ fn derive_attention(state: &mut MissionState) {
                     None,
                     None,
                     Vec::new(),
+                    Some(failure.clone()),
                     None,
                     format!(
                         "terminal review failed to run: {}; retry to re-run \
@@ -1741,6 +1842,7 @@ fn derive_attention(state: &mut MissionState) {
                         None,
                         None,
                         Vec::new(),
+                        None,
                         None,
                         format!(
                             "{finding} at {} (attempt {}); revise the plan to \
@@ -2348,6 +2450,8 @@ mod tests {
         MissionEvent::PlanProposed {
             proposal: PlanProposal {
                 base_revision: 0,
+                requirement_changes: vec![],
+                assertion_supersessions: vec![],
                 plan: Plan {
                     requirements,
                     assertions,
@@ -2776,6 +2880,7 @@ mod tests {
             attention_id: item.into(),
             action,
             justification: "j".into(),
+            requirement_changes: vec![],
         }
     }
 
@@ -3197,7 +3302,7 @@ mod tests {
 
         assert_eq!(state.phase, MissionPhase::Planning);
         assert!(state.open_attention.is_empty());
-        assert_eq!(state.tasks[&tid("g")].status, TaskStatus::Failed);
+        assert_eq!(state.tasks[&tid("g")].status, TaskStatus::Superseded);
         let Some(PlanningRefinement::FailureEvidence(feedback)) =
             state.planning_input.refinement.as_ref()
         else {
@@ -3329,6 +3434,8 @@ mod tests {
             MissionEvent::PlanProposed {
                 proposal: PlanProposal {
                     base_revision: 0,
+                    requirement_changes: vec![],
+                    assertion_supersessions: vec![],
                     plan: Plan {
                         requirements: Vec::new(),
                         assertions: vec![assertion("UNSUPPORTED", Some("cargo-test"))],
@@ -3360,6 +3467,8 @@ mod tests {
         });
         let malformed = PlanProposal {
             base_revision: 0,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
             plan: Plan {
                 requirements: Vec::new(),
                 assertions: vec![assertion("UNSUPPORTED", Some("cargo-test"))],
@@ -4844,7 +4953,7 @@ mod tests {
 
     #[test]
     fn oracle_run_failed_raises_attention_without_verdict() {
-        let state = fold_log(vec![
+        let events = vec![
             created(),
             plan_proposed(
                 vec![assertion("TESTS-PASS", Some("cargo-test"))],
@@ -4860,8 +4969,8 @@ mod tests {
                 effect_id: oracle_effect("base", 1),
                 outcome: Err(TypedFailure::permanent("oracle.spawn", "spawn failed")),
             },
-        ])
-        .expect("state");
+        ];
+        let state = fold_log(events.clone()).expect("state");
         assert!(state.inflight.is_empty());
         assert!(state.contract[&aid("TESTS-PASS")]
             .last_authoritative
@@ -4874,7 +4983,28 @@ mod tests {
         assert_eq!(item.kind, AttentionKind::OracleFailed);
         assert_eq!(item.task_id, None);
         assert_eq!(item.oracle, Some(oracle("cargo-test")));
+        assert!(matches!(
+            item.failure,
+            Some(TypedFailure::PermanentRuntime { .. })
+        ));
         assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+
+        let mut replanning = events;
+        replanning.push(decision(
+            "oracle_failed:cargo-test",
+            super::super::event::DecisionAction::Revise,
+        ));
+        let state = fold_log(replanning).expect("replanning state");
+        assert!(state.oracle_failures.is_empty());
+        let Some(PlanningRefinement::FailureEvidence(feedback)) =
+            state.planning_input.refinement.as_ref()
+        else {
+            panic!("oracle failure must feed replanning");
+        };
+        assert!(matches!(
+            feedback.failure,
+            Some(TypedFailure::PermanentRuntime { .. })
+        ));
     }
 
     #[test]
@@ -5360,6 +5490,21 @@ mod tests {
         let item = &parked.open_attention["terminal_review_failed:mission"];
         assert_eq!(item.kind, AttentionKind::TerminalReviewFailed);
         assert!(item.report.contains("agent timed out"));
+        assert!(item.failure.is_some());
+
+        let mut revised_events = events.clone();
+        revised_events.push(decision(
+            "terminal_review_failed:mission",
+            super::super::event::DecisionAction::Revise,
+        ));
+        let revised = fold_log(revised_events).expect("replanning state");
+        assert!(revised.terminal_review.outcome.is_none());
+        let Some(PlanningRefinement::FailureEvidence(feedback)) =
+            revised.planning_input.refinement.as_ref()
+        else {
+            panic!("terminal review failure must feed replanning");
+        };
+        assert!(feedback.failure.is_some());
 
         events.push(decision(
             "terminal_review_failed:mission",
@@ -5526,7 +5671,6 @@ mod tests {
                     DecisionAction::Retry,
                     DecisionAction::Revise,
                     DecisionAction::Accept,
-                    DecisionAction::Abort,
                 ][..],
             ),
             (
@@ -5534,8 +5678,8 @@ mod tests {
                 "terminal_review_failed:mission",
                 &[
                     DecisionAction::Retry,
+                    DecisionAction::Revise,
                     DecisionAction::Accept,
-                    DecisionAction::Abort,
                 ][..],
             ),
         ] {

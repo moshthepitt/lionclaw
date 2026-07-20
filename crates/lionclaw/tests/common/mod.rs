@@ -267,6 +267,8 @@ pub fn covered_requirement(id: &str, assertion: &str) -> Requirement {
 pub fn proposal(base_revision: u32, plan: Plan) -> PlanProposal {
     PlanProposal {
         base_revision,
+        requirement_changes: vec![],
+        assertion_supersessions: vec![],
         plan,
     }
 }

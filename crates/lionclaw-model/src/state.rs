@@ -9,7 +9,7 @@ use super::event::{
     RuntimeConfigurationEvidence,
 };
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
-use super::plan::{Plan, PlanProposal};
+use super::plan::{Assertion, Plan, PlanProposal};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
@@ -273,6 +273,8 @@ pub struct FailureEvidence {
 pub struct FailureFeedback {
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TypedFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<FailureEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<PayloadRef>,
@@ -339,6 +341,16 @@ pub struct AssertionState {
     pub last_advisory: BTreeMap<TaskId, bool>,
     /// Only the fold can mint this, and only from `OracleRunCompleted`.
     pub last_authoritative: Option<AuthoritativeVerdict>,
+}
+
+/// An assertion receipt retired by an explicit correction. It remains
+/// inspectable evidence but cannot satisfy the active contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupersededAssertion {
+    pub assertion: Assertion,
+    pub state: AssertionState,
+    pub replacement_ids: Vec<AssertionId>,
+    pub superseded_at_revision: u32,
 }
 
 /// The terminal-review ledger: fold-owned, advisory-only (never read by
@@ -545,6 +557,8 @@ pub struct AttentionItem {
     pub oracle: Option<OracleName>,
     #[serde(default)]
     pub assertion_ids: Vec<AssertionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TypedFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<FailureEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -882,11 +896,16 @@ pub struct MissionState {
     pub phase: MissionPhase,
     pub plan: Option<Plan>,
     pub contract: BTreeMap<AssertionId, AssertionState>,
+    #[serde(default)]
+    pub superseded_assertions: Vec<SupersededAssertion>,
     pub tasks: BTreeMap<TaskId, TaskRuntimeState>,
     /// The contract-free planning phase: the runtime status of the mission
     /// type's planning DAG. Disjoint from `tasks` (execution); the active era
     /// decides which map receives role events and operator decisions.
     pub planning: PlanningState,
+    /// Monotonic identity of the active planning assignment generation.
+    #[serde(default)]
+    pub planning_generation: u32,
     /// Revision the active planning DAG is authoring against. `None` means the
     /// planning DAG is idle; this is independent of whether an accepted plan
     /// already exists, so the same DAG can author repairs.

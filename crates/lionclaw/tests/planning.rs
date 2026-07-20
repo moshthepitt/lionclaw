@@ -6,7 +6,7 @@
 mod common;
 
 use lionclaw_runtime_api::TypedFailure;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -131,6 +131,8 @@ fn planning_dag() -> PlanningDag {
 fn proposed_plan() -> PlanProposal {
     PlanProposal {
         base_revision: 0,
+        requirement_changes: vec![],
+        assertion_supersessions: vec![],
         plan: Plan {
             requirements: vec![covered_requirement("GREEN-TESTS", "TESTS-PASS")],
             assertions: vec![Assertion {
@@ -394,20 +396,32 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
         assert!(runtime.feedback.is_empty());
     }
 
-    advance_through_checkpoints(&engine, &id).await;
+    let replanned = advance_through_checkpoints(&engine, &id).await;
+    assert_eq!(
+        replanned.disposition,
+        lionclaw::engine::MissionDisposition::Parked,
+        "unexpected replanning conversations: {:?}",
+        replanned.state.conversations
+    );
     let events = engine.store().load(&id).await.unwrap();
-    let second_strategist_effect = events
+    let strategist_effects: Vec<_> = events
         .iter()
-        .find_map(|envelope| match &envelope.event {
+        .filter_map(|envelope| match &envelope.event {
             MissionEvent::RoleRunRequested {
                 task_id,
-                attempt_no: 2,
+                assignment_epoch,
                 effect_id,
                 ..
-            } if task_id == &tid("strategist") => Some(effect_id),
+            } if task_id == &tid("strategist") => Some((*assignment_epoch, effect_id)),
             _ => None,
         })
-        .expect("second strategist prompt");
+        .collect();
+    assert_eq!(strategist_effects.len(), 2);
+    assert_eq!(strategist_effects[0].0, 1);
+    assert_eq!(strategist_effects[1].0, 1);
+    assert_ne!(strategist_effects[0].1, strategist_effects[1].1);
+    assert_eq!(replanned.state.planning_generation, 2);
+    let second_strategist_effect = strategist_effects[1].1;
     let prompt = engine
         .reconstruct_role_prompt_for_testing(&id, second_strategist_effect)
         .await
@@ -662,14 +676,14 @@ async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
         .await
         .unwrap();
 
-    for cycle in 0..3 {
+    for _ in 0..3 {
         advance_through_checkpoints(&engine, &id).await;
         engine
             .decide(
                 &id,
                 "plan_proposal:mission",
                 DecisionAction::Revise,
-                &format!("refine cycle {cycle}"),
+                "repeat the same refinement",
             )
             .await
             .unwrap();
@@ -679,10 +693,33 @@ async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
     assert_eq!(view.state.phase, MissionPhase::AttentionNeeded);
     assert!(view.state.proposal.is_some());
     assert_eq!(*strategist_calls.lock().unwrap(), 5);
-    assert_eq!(view.state.planning.tasks[&tid("strategist")].attempts, 5);
+    assert_eq!(view.state.planning_generation, 4);
+    assert_eq!(view.state.planning.tasks[&tid("strategist")].attempts, 2);
     assert_eq!(
         view.state.planning.tasks[&tid("strategist")].consecutive_failures,
         0
+    );
+    let strategist_effects: Vec<_> = engine
+        .store()
+        .load(&id)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|event| match &event.event {
+            MissionEvent::RoleRunRequested {
+                task_id, effect_id, ..
+            } if task_id == &tid("strategist") => Some(effect_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        strategist_effects
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        strategist_effects.len(),
+        "even identical feedback produces a fresh generation identity"
     );
 }
 
@@ -721,7 +758,7 @@ async fn revise_guidance_preserves_whitespace_verbatim() {
 }
 
 #[tokio::test]
-async fn aborting_a_plan_proposal_records_the_generic_decision_atomically() {
+async fn aborting_a_plan_proposal_uses_the_universal_abort_fact() {
     let dir = tempfile::tempdir().unwrap();
     let engine = planning_engine(dir.path()).await;
     let id = engine
@@ -737,15 +774,7 @@ async fn aborting_a_plan_proposal_records_the_generic_decision_atomically() {
         .await
         .unwrap();
 
-    engine
-        .decide(
-            &id,
-            "plan_proposal:mission",
-            DecisionAction::Abort,
-            "stop exactly here",
-        )
-        .await
-        .unwrap();
+    engine.abort(&id, "stop exactly here").await.unwrap();
     let state = engine.load_state(&id).await.unwrap();
     assert!(matches!(
         state.phase,
@@ -754,20 +783,14 @@ async fn aborting_a_plan_proposal_records_the_generic_decision_atomically() {
     assert!(state.open_attention.is_empty());
 
     let events = engine.store().load(&id).await.unwrap();
-    let tail: Vec<_> = events.iter().rev().take(2).collect();
+    let tail = events.last().expect("abort event");
     assert!(matches!(
-        &tail[1].event,
-        MissionEvent::DecisionRecorded {
-            action: DecisionAction::Abort,
-            justification,
-            ..
-        } if justification == "stop exactly here"
-    ));
-    assert!(matches!(
-        &tail[0].event,
+        &tail.event,
         MissionEvent::MissionAborted { reason } if reason == "stop exactly here"
     ));
-    assert_eq!(tail[0].sequence_no, tail[1].sequence_no + 1);
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event.event, MissionEvent::DecisionRecorded { .. })));
 }
 
 /// A failed planning node must raise a *retryable* NodeFailed, never wedge the
@@ -822,6 +845,11 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
         .find(|a| a.kind == AttentionKind::NodeFailed)
         .expect("a failed planning node raises NodeFailed, not a wedge");
     assert_eq!(node_failed.task_id.as_ref(), Some(&tid("strategist")));
+    assert!(
+        node_failed.failure.is_some(),
+        "typed failure evidence is exact"
+    );
+    let failed_generation = state.planning_generation;
 
     // Retry re-pends the planning node (a fresh attempt would re-dispatch it).
     engine
@@ -835,6 +863,38 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
         "retry re-opens planning"
     );
     assert!(state.plan.is_none());
+    advance_through_checkpoints(&engine, &id).await;
+    let state = engine.load_state(&id).await.unwrap();
+
+    // Replanning retires the failed assignment generation. The next planning
+    // pass receives the exact failure plus lead feedback, and cannot dispatch
+    // the failed assignment again under its old epoch.
+    let node_failed = state
+        .open_attention
+        .values()
+        .find(|a| a.kind == AttentionKind::NodeFailed)
+        .expect("retrying the deterministic fixture fails again");
+    engine
+        .decide(
+            &id,
+            &node_failed.id,
+            DecisionAction::Revise,
+            "replace the failed planning approach",
+        )
+        .await
+        .unwrap();
+    let state = engine.load_state(&id).await.unwrap();
+    assert_eq!(state.planning_generation, failed_generation + 1);
+    assert_eq!(
+        state.planning.tasks[&tid("strategist")].status,
+        TaskStatus::Pending
+    );
+    assert!(matches!(
+        state.planning_input.refinement.as_ref(),
+        Some(PlanningRefinement::FailureEvidence(feedback))
+            if feedback.failure.is_some()
+                && feedback.justification == "replace the failed planning approach"
+    ));
 }
 
 /// Drive planning where the author hands back `author_handoff`, returning the
@@ -940,6 +1000,8 @@ async fn a_bad_author_proposal_fails_the_node_and_seeds_nothing() {
             report: PayloadRef::inline("bad plan"),
             proposal: Some(PlanProposal {
                 base_revision: 0,
+                requirement_changes: vec![],
+                assertion_supersessions: vec![],
                 plan: invalid,
             }),
             request_attention: false,

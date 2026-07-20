@@ -9,8 +9,7 @@ use common::{
 };
 use lionclaw::engine::{record_control, Engine, EngineServices, MissionDisposition};
 use lionclaw::model::{
-    Assertion, AssertionId, ControlAction, DecisionAction, Handoff, OracleName, PayloadRef,
-    TaskStatus,
+    Assertion, AssertionId, ControlAction, Handoff, OracleName, PayloadRef, TaskStatus,
 };
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, OracleOutcome,
@@ -420,7 +419,7 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
     assert!(parked.state.parked_effects.contains_key(&effect_id));
     assert_eq!(
         parked.next_actions(),
-        ["mission continue", "mission decide"]
+        ["mission continue", "mission decide", "mission abort"]
     );
     assert_eq!(
         parked
@@ -552,22 +551,8 @@ async fn abort_cancels_an_active_oracle_while_the_driver_drains_its_batch() {
         async move { engine.advance(&mission_id).await }
     });
     blocked_started.notified().await;
-    let attention_id = engine
-        .load_state(&mission_id)
-        .await
-        .unwrap()
-        .open_attention
-        .keys()
-        .find(|id| id.starts_with("oracle_verdict_failed:"))
-        .cloned()
-        .expect("the first oracle failure is durable before its sibling starts");
     engine
-        .decide(
-            &mission_id,
-            &attention_id,
-            DecisionAction::Abort,
-            "operator aborted the mission",
-        )
+        .abort(&mission_id, "operator aborted the mission")
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), driver)
@@ -583,14 +568,33 @@ async fn abort_cancels_an_active_oracle_while_the_driver_drains_its_batch() {
         lionclaw::model::MissionPhase::Aborted { .. }
     ));
     assert!(state.inflight.is_empty());
+    assert_eq!(state.current_sha, HEAD_SHA);
+    assert!(state.reachable_commits.contains(HEAD_SHA));
     let events = store.load(&mission_id).await.unwrap();
-    assert!(events.iter().any(|event| matches!(
-        &event.event,
-        lionclaw::model::MissionEvent::OracleRunCompleted {
-            outcome: Err(failure @ TypedFailure::OperatorAborted { .. }),
-            ..
-        } if failure.evidence().code.as_deref() == Some("test.aborted")
-    )));
+    let abort_sequence = events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.event,
+                lionclaw::model::MissionEvent::MissionAborted { .. }
+            )
+        })
+        .expect("durable abort fact")
+        .sequence_no;
+    let cancelled_sequence = events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.event,
+                lionclaw::model::MissionEvent::OracleRunCompleted {
+                    outcome: Err(failure @ TypedFailure::OperatorAborted { .. }),
+                    ..
+                } if failure.evidence().code.as_deref() == Some("test.aborted")
+            )
+        })
+        .expect("cancelled oracle outcome")
+        .sequence_no;
+    assert!(abort_sequence < cancelled_sequence);
 }
 
 #[tokio::test]

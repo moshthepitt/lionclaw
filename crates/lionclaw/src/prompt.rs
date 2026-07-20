@@ -108,6 +108,8 @@ fn render_judgment(role: &RoleDefinition, ctx: &JudgmentContext<'_>) -> String {
 /// and execution judges are only ever built by `assemble_role_prompt`.
 pub struct PlanningPromptContext<'a> {
     pub objective: &'a str,
+    /// Durable identity of this planning generation.
+    pub generation: u32,
     /// Accepted revision this planning run must propose against.
     pub base_revision: u32,
     /// The complete accepted/rejected/refinement input for this planning run.
@@ -147,6 +149,7 @@ fn render_planning(role: &RoleDefinition, ctx: &PlanningPromptContext<'_>) -> St
     prompt.push_str(&role.prompt_body);
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
+    prompt.push_str(&format!("\n\n## Planning generation\n\n{}", ctx.generation));
     prompt.push_str(&format!(
         "\n\n## Proposal base revision\n\n{}",
         ctx.base_revision
@@ -563,6 +566,7 @@ mod tests {
             &role,
             PlanningPromptContext {
                 objective: "revise the novel",
+                generation: 1,
                 base_revision: 0,
                 input: PlanningPromptInput {
                     accepted_plan: None,
@@ -602,6 +606,8 @@ mod tests {
         };
         let rejected = PlanProposal {
             base_revision: 7,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
             plan: Plan {
                 requirements: Vec::new(),
                 assertions: Vec::new(),
@@ -614,6 +620,7 @@ mod tests {
             &role,
             PlanningPromptContext {
                 objective: "obj",
+                generation: 8,
                 base_revision: 7,
                 input: PlanningPromptInput {
                     accepted_plan: Some(&accepted),
@@ -633,6 +640,7 @@ mod tests {
         ));
 
         assert_eq!(prompt.matches("## Current accepted plan").count(), 1);
+        assert!(prompt.contains("## Planning generation\n\n8"));
         assert_eq!(
             prompt.matches("## Latest rejected plan candidate").count(),
             1

@@ -172,7 +172,22 @@ impl Plan {
 #[serde(deny_unknown_fields)]
 pub struct PlanProposal {
     pub base_revision: u32,
+    /// Covered requirements intentionally removed or weakened by this
+    /// revision. Approval records this exact set as an explicit decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirement_changes: Vec<RequirementId>,
+    /// Prior assertions corrected or retired by this revision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertion_supersessions: Vec<AssertionSupersession>,
     pub plan: Plan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssertionSupersession {
+    pub assertion_id: AssertionId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replacement_ids: Vec<AssertionId>,
 }
 
 /// A node in the contract-free planning DAG. Unlike a `Task` it has no `kind`

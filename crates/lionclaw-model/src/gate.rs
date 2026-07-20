@@ -258,6 +258,8 @@ mod tests {
                 MissionEvent::PlanProposed {
                     proposal: crate::PlanProposal {
                         base_revision: 0,
+                        requirement_changes: vec![],
+                        assertion_supersessions: vec![],
                         plan: plan.clone(),
                     },
                     plan_hash: "h".into(),
@@ -270,6 +272,7 @@ mod tests {
                     attention_id: "plan_proposal:mission".into(),
                     action: crate::DecisionAction::Approve,
                     justification: "test fixture approves the plan".into(),
+                    requirement_changes: vec![],
                 },
             ),
         ];

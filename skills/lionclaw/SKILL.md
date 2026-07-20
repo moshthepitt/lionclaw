@@ -36,7 +36,8 @@ binary separately from its skill instructions.
    ready. Otherwise submit exact, actionable feedback with `mission decide ...
    revise --feedback-file <path>` or `--feedback-stdin`, then return to the
    advance/status loop. Revision is iterative and unbounded: review every new
-   complete proposal until the ratifier approves or aborts. LionClaw has no
+   complete proposal until the ratifier approves it or ends the mission with
+   `mission abort --reason <reason>`. LionClaw has no
    `--yes` approval bypass; do not invent one.
 7. Use `mission decide` only for an action listed on an open attention item.
    Non-revise actions require `--justification`. Preserve acceptance below the
@@ -44,6 +45,8 @@ binary separately from its skill instructions.
    delegates that decision. Routine retry, repair, and evidence-led replanning
    may be driven autonomously when the listed action is supported by the
    evidence.
+   `mission abort --reason <reason>` is independently legal for every
+   nonterminal mission and never accepts or verifies work.
 8. A concurrent observer may use `mission status --watch` and can target the
    projected effect id with `mission extend`, `mission stop`, or, after it
    parks, `mission continue`. Every control needs a reason and applies only to

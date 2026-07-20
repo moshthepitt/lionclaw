@@ -172,8 +172,11 @@ pub struct MissionView {
 }
 
 impl MissionView {
-    fn from_state(state: MissionState, driver_running: bool) -> Self {
-        let disposition = if driver_running {
+    /// Project one replayed state into its operator disposition and actions.
+    pub fn from_state(state: MissionState, driver_running: bool) -> Self {
+        let disposition = if state.phase.is_terminal() {
+            MissionDisposition::Terminal
+        } else if driver_running {
             MissionDisposition::Running
         } else if state
             .cleanup_failure
@@ -181,10 +184,12 @@ impl MissionView {
             .is_some_and(|failure| state.inflight.contains_key(&failure.effect_id))
         {
             MissionDisposition::CleanupBlocked
-        } else if state.phase.is_terminal() {
-            MissionDisposition::Terminal
         } else if state.conversations.values().any(|conversation| {
             conversation.lifecycle == crate::model::ConversationLifecycle::AwaitingLead
+                && state
+                    .tasks_in(conversation.namespace)
+                    .get(&conversation.task_id)
+                    .is_some_and(|task| task.assignment_epoch == conversation.assignment_epoch)
         }) {
             MissionDisposition::AwaitingLead
         } else if !state.open_attention.is_empty() {
@@ -202,16 +207,28 @@ impl MissionView {
 
     pub fn next_actions(&self) -> Vec<&'static str> {
         match self.disposition {
-            MissionDisposition::Ready => vec!["mission advance"],
-            MissionDisposition::Running => vec!["mission status"],
-            MissionDisposition::AwaitingLead => vec!["mission send"],
-            MissionDisposition::AwaitingPlan => vec!["mission plan propose"],
-            MissionDisposition::Parked if !self.state.parked_effects.is_empty() => {
-                vec!["mission continue", "mission decide"]
+            MissionDisposition::Ready => vec!["mission advance", "mission abort"],
+            MissionDisposition::Running => vec!["mission status", "mission abort"],
+            MissionDisposition::AwaitingLead => vec!["mission send", "mission abort"],
+            MissionDisposition::AwaitingPlan => {
+                vec!["mission plan propose", "mission abort"]
             }
-            MissionDisposition::Parked => vec!["mission decide"],
-            MissionDisposition::CleanupBlocked => vec!["mission advance", "mission log"],
-            MissionDisposition::Terminal => vec!["mission report", "mission apply"],
+            MissionDisposition::Parked if !self.state.parked_effects.is_empty() => {
+                vec!["mission continue", "mission decide", "mission abort"]
+            }
+            MissionDisposition::Parked => vec!["mission decide", "mission abort"],
+            MissionDisposition::CleanupBlocked => {
+                vec!["mission advance", "mission log", "mission abort"]
+            }
+            MissionDisposition::Terminal => {
+                let mut actions = vec!["mission report"];
+                if matches!(self.state.phase, MissionPhase::Done { .. })
+                    && self.state.deliverable_head() != self.state.base_sha
+                {
+                    actions.push("mission apply");
+                }
+                actions
+            }
         }
     }
 }
@@ -443,6 +460,12 @@ impl Engine {
             justification,
         )
         .await
+    }
+
+    /// Abort any nonterminal mission. The closure fact is appended before an
+    /// active driver observes it and begins cancellation.
+    pub async fn abort(&self, mission_id: &MissionId, reason: &str) -> Result<()> {
+        record_abort(&self.store, self.clock.now_ms(), mission_id, reason).await
     }
 
     pub async fn load_state(&self, mission_id: &MissionId) -> Result<MissionState> {
@@ -1630,6 +1653,7 @@ impl Engine {
             role,
             PlanningPromptContext {
                 objective: &state.objective,
+                generation: state.planning_generation,
                 base_revision: state.planning_base_revision.unwrap_or(state.revision),
                 input: planning_input,
                 playbook: self.mission_type.playbook.as_deref(),
@@ -2131,19 +2155,53 @@ pub async fn record_decision(
     // already specific: unknown item vs illegal action for the item's kind), so
     // a JSON caller sees the real reason, not a flattened string.
     crate::model::validate_decision(&state, attention_id, &action, justification)?;
+    let requirement_changes = if action == crate::model::DecisionAction::Approve {
+        state
+            .open_attention
+            .get(attention_id)
+            .filter(|item| item.kind == crate::model::AttentionKind::PlanProposal)
+            .and(state.proposal.as_ref())
+            .map(|proposal| proposal.requirement_changes.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let event = NewEvent::new(MissionEvent::DecisionRecorded {
         attention_id: attention_id.to_string(),
         action: action.clone(),
         justification: justification.to_string(),
+        requirement_changes,
     });
-    let mut events = vec![event];
-    if action == crate::model::DecisionAction::Abort {
-        events.push(NewEvent::new(MissionEvent::MissionAborted {
-            reason: justification.to_string(),
-        }));
+    store
+        .append(mission_id, state.head, &[event], now_ms)
+        .await?;
+    Ok(())
+}
+
+/// Record mission closure without requiring or resolving an attention item.
+/// Abort never approves, accepts, verifies, or deletes mission-owned evidence.
+pub async fn record_abort(
+    store: &MissionStore,
+    now_ms: i64,
+    mission_id: &MissionId,
+    reason: &str,
+) -> Result<()> {
+    if reason.trim().is_empty() {
+        bail!("abort requires a non-empty reason");
+    }
+    let state = store.require_state(mission_id).await?;
+    if state.phase.is_terminal() {
+        bail!("mission '{mission_id}' is terminal; abort is not legal");
     }
     store
-        .append(mission_id, state.head, &events, now_ms)
+        .append(
+            mission_id,
+            state.head,
+            &[NewEvent::new(MissionEvent::MissionAborted {
+                reason: reason.to_string(),
+            })],
+            now_ms,
+        )
         .await?;
     Ok(())
 }

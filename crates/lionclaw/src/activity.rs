@@ -814,6 +814,8 @@ mod tests {
             MissionEvent::PlanProposed {
                 proposal: PlanProposal {
                     base_revision: 0,
+                    requirement_changes: vec![],
+                    assertion_supersessions: vec![],
                     plan: Plan {
                         requirements: vec![Requirement {
                             id: RequirementId::new("REQ-1").unwrap(),
@@ -856,6 +858,7 @@ mod tests {
                 attention_id: "plan_proposal:mission".into(),
                 action: DecisionAction::Approve,
                 justification: "approve".into(),
+                requirement_changes: vec![],
             },
         ];
         let state = crate::model::fold(events.into_iter().enumerate().map(|(index, event)| {

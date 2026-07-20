@@ -328,6 +328,7 @@ mod sink_tests {
             attention_id: "x".into(),
             action: DecisionAction::Accept,
             justification: String::new(),
+            requirement_changes: vec![],
         })
     }
 

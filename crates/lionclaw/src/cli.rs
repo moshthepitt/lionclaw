@@ -168,6 +168,8 @@ pub enum MissionCommand {
     Plan(PlanCommand),
     /// Resolve an open attention item.
     Decide(DecideArgs),
+    /// Abort any nonterminal mission while preserving its evidence.
+    Abort(AbortArgs),
     /// Request cancellation of one exact active effect.
     Stop(ControlArgs),
     /// Extend one exact active effect's deadline.
@@ -295,7 +297,7 @@ pub struct DecideArgs {
     pub mission_id: String,
     /// The attention item id (see `mission status`/`inbox`).
     pub item: String,
-    /// One of: approve | retry | repair | revise | accept | abort.
+    /// One of: approve | retry | repair | revise | accept.
     pub action: String,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -309,6 +311,18 @@ pub struct DecideArgs {
     /// Read exact revise feedback from stdin.
     #[arg(long, conflicts_with_all = ["justification", "feedback_file"])]
     pub feedback_stdin: bool,
+}
+
+#[derive(Args)]
+pub struct AbortArgs {
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    /// Why the mission is ending. Recorded verbatim in the event log.
+    #[arg(long)]
+    pub reason: String,
 }
 
 #[derive(Args)]
@@ -497,6 +511,7 @@ impl MissionCommand {
             | Self::Log(_)
             | Self::Send(_)
             | Self::Decide(_)
+            | Self::Abort(_)
             | Self::Stop(_)
             | Self::Extend(_)
             | Self::Continue(_) => false,
@@ -543,6 +558,7 @@ async fn dispatch_mission(
         MissionCommand::Send(args) => cmd_send(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Plan(cmd) => cmd_plan(cmd, transports).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Abort(args) => cmd_abort(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Stop(args) => cmd_control(args, false).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Extend(args) => cmd_extend(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Continue(args) => cmd_control(args, true).await.map(|()| ExitCode::SUCCESS),
@@ -1048,6 +1064,9 @@ async fn cmd_apply(args: ApplyArgs) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let state = store.require_state(&mission_id).await?;
+    if !matches!(state.phase, MissionPhase::Done { .. }) {
+        bail!("mission {mission_id} did not complete; retained work is not accepted for apply");
+    }
     let branch = apply_target(&mission_id, &state.base_sha, state.deliverable_head())?;
     workspace::create_branch(&repo, &branch, state.deliverable_head(), args.force)
         .await
@@ -1458,6 +1477,14 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_abort(args: AbortArgs) -> Result<()> {
+    let (_repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    crate::engine::record_abort(&store, SystemClock.now_ms(), &mission_id, &args.reason).await?;
+    println!("aborted mission {mission_id}");
+    Ok(())
+}
+
 async fn cmd_send(args: SendArgs) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
@@ -1564,8 +1591,7 @@ fn parse_decision_action(action: &str) -> Result<DecisionAction> {
         "repair" => DecisionAction::Repair,
         "revise" => DecisionAction::Revise,
         "accept" => DecisionAction::Accept,
-        "abort" => DecisionAction::Abort,
-        other => bail!("unknown action '{other}' (approve|retry|repair|revise|accept|abort)"),
+        other => bail!("unknown action '{other}' (approve|retry|repair|revise|accept)"),
     })
 }
 
@@ -2535,6 +2561,21 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
             }
             MissionDisposition::Ready => println!("mission {mission_id}: ready to advance"),
         }
+        if !state.superseded_assertions.is_empty() {
+            println!("  superseded assertions:");
+            for superseded in &state.superseded_assertions {
+                let replacements = superseded
+                    .replacement_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "    {} at revision {} -> [{}]",
+                    superseded.assertion.id, superseded.superseded_at_revision, replacements
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -2590,6 +2631,7 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         "disposition": view.disposition.slug(),
         "next_actions": view.next_actions(),
         "revision": state.revision,
+        "planning_generation": state.planning_generation,
         "current_sha": state.current_sha,
         "objective": state.objective,
         "conversations": conversation_views(state, store)?,
@@ -2617,6 +2659,17 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
                 "authoritative_pass": assertion
                     .last_authoritative
                     .as_ref()
+                    .map(|verdict| verdict.passed()),
+            })
+        }).collect::<Vec<_>>(),
+        "superseded_assertions": state.superseded_assertions.iter().map(|entry| {
+            serde_json::json!({
+                "id": entry.assertion.id.as_str(),
+                "prose": entry.assertion.prose,
+                "replacement_ids": entry.replacement_ids.iter()
+                    .map(|id| id.as_str()).collect::<Vec<_>>(),
+                "superseded_at_revision": entry.superseded_at_revision,
+                "authoritative_pass": entry.state.last_authoritative.as_ref()
                     .map(|verdict| verdict.passed()),
             })
         }).collect::<Vec<_>>(),
@@ -2768,6 +2821,11 @@ fn planning_input_json(
             "kind": "failure_evidence",
             "summary": feedback.summary,
             "justification": feedback.justification,
+            "failure": feedback.failure.as_ref().map(|failure| serde_json::json!({
+                "kind": failure.category(),
+                "code": failure.evidence().code,
+                "detail": failure.detail(),
+            })),
             "evidence": feedback.evidence.as_ref()
                 .map(|evidence| crate::evidence::evidence_json(blobs, evidence))
                 .transpose()?,
@@ -2885,6 +2943,11 @@ fn attention_json(
         "kind": item.kind.slug(),
         "report": item.report,
         "assertion_ids": item.assertion_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+        "failure": item.failure.as_ref().map(|failure| serde_json::json!({
+            "kind": failure.category(),
+            "code": failure.evidence().code,
+            "detail": failure.detail(),
+        })),
         "actions": crate::model::decision::allowed_actions(item.kind)
             .iter()
             .map(crate::model::DecisionAction::slug)
@@ -3484,6 +3547,8 @@ mod tests {
             MissionEvent::PlanProposed {
                 proposal: PlanProposal {
                     base_revision: 0,
+                    requirement_changes: vec![],
+                    assertion_supersessions: vec![],
                     plan: Plan {
                         requirements: vec![Requirement {
                             id: RequirementId::new("REQ-1").unwrap(),
@@ -3514,6 +3579,7 @@ mod tests {
                 attention_id: "plan_proposal:mission".into(),
                 action: DecisionAction::Approve,
                 justification: "test fixture approves the plan".into(),
+                requirement_changes: vec![],
             },
             MissionEvent::RoleRunRequested {
                 conversation_id: crate::model::ConversationId::for_role_instance(
@@ -3877,7 +3943,10 @@ mod tests {
 
         assert_eq!(json["phase"], "attention_needed");
         assert_eq!(json["disposition"], "parked");
-        assert_eq!(json["next_actions"], serde_json::json!(["mission decide"]));
+        assert_eq!(
+            json["next_actions"],
+            serde_json::json!(["mission decide", "mission abort"])
+        );
         assert_eq!(json["conversations"][0]["id"], conversation_id.as_str());
         assert_eq!(json["conversations"][0]["lifecycle"], "awaiting_lead");
         assert_eq!(
@@ -4119,6 +4188,8 @@ mod tests {
         state.planning_base_revision = Some(1);
         state.planning_input.latest_rejected_proposal = Some(crate::model::PlanProposal {
             base_revision: 1,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
             plan: state.plan.clone().expect("accepted plan"),
         });
         state.planning_input.refinement = Some(PlanningRefinement::Guidance(
@@ -4147,6 +4218,7 @@ mod tests {
         state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(Box::new(
             FailureFeedback {
                 summary: "oracle failed".to_string(),
+                failure: None,
                 evidence: Some(FailureEvidence {
                     exit_code: 1,
                     exit_signal: None,
@@ -4219,10 +4291,8 @@ mod tests {
                     evidence: Box::new(TypedFailureEvidence::new(None, "boom")),
                 }),
             },
-            MissionEvent::DecisionRecorded {
-                attention_id: "terminal_review_failed:mission".into(),
-                action: crate::model::DecisionAction::Abort,
-                justification: "give up".into(),
+            MissionEvent::MissionAborted {
+                reason: "give up".into(),
             },
         ]);
         assert!(matches!(state.phase, MissionPhase::Aborted { .. }));

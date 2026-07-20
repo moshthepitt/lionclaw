@@ -18,10 +18,13 @@ fn delegated_ratification_uses_the_same_unbounded_revision_loop() {
         "If\n   ratification was explicitly delegated, review the complete proposal against\n   the objective and mission-type method yourself."
     ));
     assert!(SKILL.contains(
-        "Revision is iterative and unbounded: review every new\n   complete proposal until the ratifier approves or aborts."
+        "Revision is iterative and unbounded: review every new\n   complete proposal until the ratifier approves it or ends the mission with\n   `mission abort --reason <reason>`."
     ));
     assert!(SKILL.contains("revise --feedback-file <path>` or `--feedback-stdin"));
     assert!(SKILL.contains("Non-revise actions require `--justification`."));
+    assert!(SKILL.contains(
+        "`mission abort --reason <reason>` is independently legal for every\n   nonterminal mission and never accepts or verifies work."
+    ));
 }
 
 #[test]

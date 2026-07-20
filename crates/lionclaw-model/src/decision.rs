@@ -11,45 +11,35 @@ use crate::prelude::*;
 use super::event::DecisionAction;
 use super::state::{AttentionKind, MissionState};
 
-const PLAN_PROPOSAL: &[DecisionAction] = &[
-    DecisionAction::Approve,
-    DecisionAction::Revise,
-    DecisionAction::Abort,
-];
+const PLAN_PROPOSAL: &[DecisionAction] = &[DecisionAction::Approve, DecisionAction::Revise];
 const NODE_FAILED: &[DecisionAction] = &[
     DecisionAction::Retry,
+    DecisionAction::Revise,
     DecisionAction::Accept,
-    DecisionAction::Abort,
 ];
-const NODE_ATTENTION: &[DecisionAction] = &[DecisionAction::Accept, DecisionAction::Abort];
+const NODE_ATTENTION: &[DecisionAction] = &[DecisionAction::Accept];
 const ORACLE_FAILED: &[DecisionAction] = &[
     DecisionAction::Retry,
+    DecisionAction::Revise,
     DecisionAction::Accept,
-    DecisionAction::Abort,
 ];
 const ORACLE_VERDICT_FAILED: &[DecisionAction] = &[
     DecisionAction::Retry,
     DecisionAction::Repair,
     DecisionAction::Revise,
     DecisionAction::Accept,
-    DecisionAction::Abort,
 ];
-const GATE_FAILED: &[DecisionAction] = &[
-    DecisionAction::Revise,
-    DecisionAction::Accept,
-    DecisionAction::Abort,
-];
-const GATE_CHECKPOINT: &[DecisionAction] = &[DecisionAction::Approve, DecisionAction::Abort];
+const GATE_FAILED: &[DecisionAction] = &[DecisionAction::Revise, DecisionAction::Accept];
+const GATE_CHECKPOINT: &[DecisionAction] = &[DecisionAction::Approve];
 const TERMINAL_REVIEW_GAPS: &[DecisionAction] = &[
     DecisionAction::Retry,
     DecisionAction::Revise,
     DecisionAction::Accept,
-    DecisionAction::Abort,
 ];
 const TERMINAL_REVIEW_FAILED: &[DecisionAction] = &[
     DecisionAction::Retry,
+    DecisionAction::Revise,
     DecisionAction::Accept,
-    DecisionAction::Abort,
 ];
 
 pub fn allowed_actions(kind: AttentionKind) -> &'static [DecisionAction] {

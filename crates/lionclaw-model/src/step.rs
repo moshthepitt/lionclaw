@@ -443,6 +443,8 @@ mod tests {
         MissionEvent::PlanProposed {
             proposal: crate::PlanProposal {
                 base_revision: 0,
+                requirement_changes: vec![],
+                assertion_supersessions: vec![],
                 plan: Plan {
                     requirements,
                     assertions,
@@ -630,6 +632,7 @@ mod tests {
                     attention_id: "plan_proposal:mission".into(),
                     action: crate::DecisionAction::Approve,
                     justification: "test fixture approves the plan".into(),
+                    requirement_changes: vec![],
                 }
             });
             std::iter::once(event).chain(approve)
@@ -1193,6 +1196,7 @@ mod tests {
             attention_id: "terminal_review_gaps:mission".to_string(),
             action: DecisionAction::Retry,
             justification: "re-roll".to_string(),
+            requirement_changes: vec![],
         });
         let state = fold_log(events);
         // Attempts are preserved: the re-roll runs under attempt 2 (⇒ a

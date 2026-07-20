@@ -33,6 +33,17 @@ pub fn evidence_json(blobs: &BlobStore, evidence: &FailureEvidence) -> Result<se
 
 pub fn render_feedback(blobs: &BlobStore, feedback: &FailureFeedback) -> Result<String> {
     let mut rendered = feedback.summary.clone();
+    if let Some(failure) = &feedback.failure {
+        let evidence = failure.evidence();
+        rendered.push_str("\nFailure kind: ");
+        rendered.push_str(failure.category());
+        if let Some(code) = &evidence.code {
+            rendered.push_str("\nFailure code: ");
+            rendered.push_str(code);
+        }
+        rendered.push_str("\nFailure detail: ");
+        rendered.push_str(&evidence.detail);
+    }
     if !feedback.justification.trim().is_empty() {
         rendered.push_str("\nDecision guidance: ");
         rendered.push_str(&feedback.justification);

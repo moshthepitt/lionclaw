@@ -20,9 +20,9 @@ use super::plan::{OutputSemantics, PlanInventory, PlanProposal, PlanningDag};
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
 
-/// Bumped for durable conversations, sender-free messages, and checkpoint
-/// role outcomes. Unreleased older logs intentionally fail loudly.
-pub const SCHEMA_VERSION: u32 = 19;
+/// Bumped for explicit requirement-change decisions and assertion
+/// supersessions. Unreleased older logs intentionally fail loudly.
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -717,6 +717,9 @@ pub enum MissionEvent {
         attention_id: String,
         action: DecisionAction,
         justification: String,
+        /// Covered requirements explicitly changed by plan approval.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        requirement_changes: Vec<super::RequirementId>,
     },
 }
 
@@ -750,8 +753,6 @@ pub enum DecisionAction {
     Revise,
     /// Accept a below-bar outcome and proceed, with explicit justification.
     Accept,
-    /// Abort the mission.
-    Abort,
 }
 
 impl DecisionAction {
@@ -762,7 +763,6 @@ impl DecisionAction {
             Self::Repair => "repair",
             Self::Revise => "revise",
             Self::Accept => "accept",
-            Self::Abort => "abort",
         }
     }
 }
@@ -957,6 +957,8 @@ mod compat_tests {
         let event = MissionEvent::PlanProposed {
             proposal: PlanProposal {
                 base_revision: 0,
+                requirement_changes: vec![],
+                assertion_supersessions: vec![],
                 plan: Plan {
                     requirements: vec![Requirement {
                         id: RequirementId::new("OBJECTIVE-MET").unwrap(),
@@ -984,6 +986,8 @@ mod compat_tests {
     fn empty_plan_proposal() -> PlanProposal {
         PlanProposal {
             base_revision: 0,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
             plan: crate::Plan {
                 requirements: vec![],
                 assertions: vec![],
@@ -1110,7 +1114,6 @@ mod compat_tests {
             DecisionAction::Retry,
             DecisionAction::Repair,
             DecisionAction::Accept,
-            DecisionAction::Abort,
         ];
 
         for action in cases {
@@ -1118,6 +1121,7 @@ mod compat_tests {
                 attention_id: format!("attn-{}", action.slug()),
                 action: action.clone(),
                 justification: format!("because {}", action.slug()),
+                requirement_changes: vec![],
             };
 
             let json = serde_json::to_value(&event).unwrap();

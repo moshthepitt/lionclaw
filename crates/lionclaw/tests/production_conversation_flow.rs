@@ -792,6 +792,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         &proposal_path,
         serde_json::to_vec(&PlanProposal {
             base_revision: 0,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
             plan: plan(),
         })
         .unwrap(),
@@ -1093,6 +1095,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         &proposal_path,
         serde_json::to_vec(&PlanProposal {
             base_revision: 0,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
             plan: plan(),
         })
         .unwrap(),
@@ -1230,7 +1234,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert_eq!(status_json["activity"], serde_json::Value::Null);
     assert_eq!(
         status_json["next_actions"],
-        serde_json::json!(["mission send"])
+        serde_json::json!(["mission send", "mission abort"])
     );
     for args in [
         vec!["mission", "status", mission_id.as_str()],
@@ -1956,6 +1960,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         &proposal_path,
         serde_json::to_vec(&PlanProposal {
             base_revision: 0,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
             plan: reference_plan(),
         })
         .unwrap(),

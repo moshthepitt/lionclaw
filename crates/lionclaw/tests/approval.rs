@@ -1,6 +1,6 @@
 //! Slice 4: plan approval parks the mission before any work; an approve
 //! decision lets it proceed; an unrelated/invalid decision is
-//! refused; abort terminates.
+//! refused; universal abort terminates without accepting work.
 
 mod common;
 
@@ -98,28 +98,15 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
 }
 
 #[tokio::test]
-async fn abort_decision_terminates_the_mission() {
+async fn universal_abort_needs_no_attention_and_records_only_the_abort_fact() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = gated_engine(dir.path()).await;
     let mission_id = engine
         .create_mission(dir.path().to_str().unwrap(), "gated", BASE_SHA)
         .await
         .expect("create");
-    engine
-        .propose_plan(&mission_id, proposal(0, simple_plan()))
-        .await
-        .expect("propose");
-    engine.advance(&mission_id).await.expect("advance");
 
-    engine
-        .decide(
-            &mission_id,
-            "plan_proposal:mission",
-            DecisionAction::Abort,
-            "stop",
-        )
-        .await
-        .expect("abort");
+    engine.abort(&mission_id, "stop").await.expect("abort");
     let state = engine.load_state(&mission_id).await.expect("state");
     assert!(matches!(
         state.phase,
@@ -127,17 +114,13 @@ async fn abort_decision_terminates_the_mission() {
     ));
     let events = engine.store().load(&mission_id).await.expect("events");
     assert!(matches!(
-        &events[events.len() - 2].event,
-        MissionEvent::DecisionRecorded {
-            attention_id,
-            action,
-            justification,
-        } if attention_id == "plan_proposal:mission"
-            && action == &DecisionAction::Abort
-            && justification == "stop"
-    ));
-    assert!(matches!(
         &events[events.len() - 1].event,
         MissionEvent::MissionAborted { reason } if reason == "stop"
     ));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event.event, MissionEvent::DecisionRecorded { .. })));
+
+    assert!(engine.abort(&mission_id, "again").await.is_err());
+    assert!(engine.abort(&mission_id, "").await.is_err());
 }

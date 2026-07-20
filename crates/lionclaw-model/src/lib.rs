@@ -56,8 +56,9 @@ pub use ids::{
     RequirementId, RoleName, TaskId, TERMINAL_REVIEW_TASK_TAG,
 };
 pub use plan::{
-    Assertion, OutputSemantics, Plan, PlanInventory, PlanProposal, PlanningDag, PlanningTask,
-    Requirement, RequirementDisposition, RequirementKind, Task, TaskKind,
+    Assertion, AssertionSupersession, OutputSemantics, Plan, PlanInventory, PlanProposal,
+    PlanningDag, PlanningTask, Requirement, RequirementDisposition, RequirementKind, Task,
+    TaskKind,
 };
 pub use plan_validation::{
     validate_plan, validate_plan_proposal, validate_planning_dag, PlanValidationError,
@@ -68,8 +69,8 @@ pub use state::{
     ConversationLifecycle, ConversationState, DeliveryMarker, DurableCancellation,
     EffectCleanupFailure, FailureEvidence, FailureFeedback, InflightEffect, MissionPhase,
     MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState, QueuedMessage,
-    ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, TaskAddress, TaskRuntimeState,
-    TaskStatus, TerminalReviewState, TerminalReviewVerdict,
+    ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, SupersededAssertion, TaskAddress,
+    TaskRuntimeState, TaskStatus, TerminalReviewState, TerminalReviewVerdict,
 };
 pub use step::{
     step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,

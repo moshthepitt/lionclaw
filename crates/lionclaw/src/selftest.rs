@@ -468,6 +468,8 @@ fn oracle_plan() -> Plan {
 fn proposal(base_revision: u32, plan: Plan) -> PlanProposal {
     PlanProposal {
         base_revision,
+        requirement_changes: vec![],
+        assertion_supersessions: vec![],
         plan,
     }
 }
@@ -885,12 +887,12 @@ async fn check_replanning() -> Result<()> {
         anyhow::bail!("superseded task still in the live plan");
     }
 
-    // A complete revision still cannot weaken the contract by rebinding an
+    // A complete revision cannot silently weaken the contract by rebinding an
     // existing assertion to a different oracle.
     let mut weaken = state.plan.clone().expect("accepted plan");
     weaken.assertions[0].oracle = Some(OracleName::new("cargo-clippy").expect("oracle name"));
     match engine.propose_plan(&mission_id, proposal(2, weaken)).await {
-        Err(ProposeError::Rejected(ProposalError::AssertionWeakened { .. })) => Ok(()),
+        Err(ProposeError::Rejected(ProposalError::AssertionSupersessionsMismatch { .. })) => Ok(()),
         Ok(()) => anyhow::bail!("contract-weakening revision was accepted"),
         Err(other) => anyhow::bail!("weakening refused for the wrong reason: {other}"),
     }

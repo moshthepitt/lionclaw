@@ -406,6 +406,8 @@ fn planning_mission_type(skill_dir: &std::path::Path) -> MissionType {
 fn proposed_plan() -> PlanProposal {
     PlanProposal {
         base_revision: 0,
+        requirement_changes: vec![],
+        assertion_supersessions: vec![],
         plan: Plan {
             requirements: vec![covered_requirement("GREEN-TESTS", "TESTS-PASS")],
             assertions: vec![Assertion {

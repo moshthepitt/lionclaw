@@ -280,10 +280,25 @@ pub enum ProposalError {
     TaskChanged { task: String },
     #[error("new task '{task}' reuses a retired task id")]
     TaskIdReused { task: String },
-    #[error("requirement '{requirement}' was removed or weakened")]
-    RequirementWeakened { requirement: String },
-    #[error("assertion '{assertion}' was removed or weakened")]
-    AssertionWeakened { assertion: String },
+    #[error("retired task '{task}' cannot be retained in a replacement plan")]
+    RetiredTaskRetained { task: String },
+    #[error("covered requirement change declarations do not match; expected {expected:?}, got {actual:?}")]
+    RequirementChangesMismatch {
+        expected: Vec<String>,
+        actual: Vec<String>,
+    },
+    #[error(
+        "assertion supersession declarations do not match; expected {expected:?}, got {actual:?}"
+    )]
+    AssertionSupersessionsMismatch {
+        expected: Vec<String>,
+        actual: Vec<String>,
+    },
+    #[error("assertion '{assertion}' names unknown replacement '{replacement}'")]
+    UnknownAssertionReplacement {
+        assertion: String,
+        replacement: String,
+    },
     #[error("the resulting plan is invalid:\n{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))]
     Invalid(Vec<PlanValidationError>),
 }
@@ -321,6 +336,26 @@ fn validate_plan_transition(
         });
     }
     let Some(current) = state.plan.as_ref() else {
+        if !proposal.requirement_changes.is_empty() {
+            return Err(ProposalError::RequirementChangesMismatch {
+                expected: vec![],
+                actual: proposal
+                    .requirement_changes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            });
+        }
+        if !proposal.assertion_supersessions.is_empty() {
+            return Err(ProposalError::AssertionSupersessionsMismatch {
+                expected: vec![],
+                actual: proposal
+                    .assertion_supersessions
+                    .iter()
+                    .map(|entry| entry.assertion_id.to_string())
+                    .collect(),
+            });
+        }
         return Ok(());
     };
     if proposal.plan == *current {
@@ -333,11 +368,13 @@ fn validate_plan_transition(
         .iter()
         .map(|r| (&r.id, r))
         .collect();
+    let mut required_requirement_changes = BTreeSet::new();
     for old in &current.requirements {
         let Some(new) = next_requirements.get(&old.id) else {
-            return Err(ProposalError::RequirementWeakened {
-                requirement: old.id.to_string(),
-            });
+            if matches!(old.disposition, RequirementDisposition::Covered { .. }) {
+                required_requirement_changes.insert(old.id.clone());
+            }
+            continue;
         };
         let disposition_strengthens = match (&old.disposition, &new.disposition) {
             (
@@ -363,11 +400,28 @@ fn validate_plan_transition(
                 false
             }
         };
-        if old.kind != new.kind || old.prose != new.prose || !disposition_strengthens {
-            return Err(ProposalError::RequirementWeakened {
-                requirement: old.id.to_string(),
-            });
+        if matches!(old.disposition, RequirementDisposition::Covered { .. })
+            && (old.kind != new.kind || old.prose != new.prose || !disposition_strengthens)
+        {
+            required_requirement_changes.insert(old.id.clone());
         }
+    }
+    let declared_requirement_changes: BTreeSet<_> =
+        proposal.requirement_changes.iter().cloned().collect();
+    if declared_requirement_changes.len() != proposal.requirement_changes.len()
+        || declared_requirement_changes != required_requirement_changes
+    {
+        return Err(ProposalError::RequirementChangesMismatch {
+            expected: required_requirement_changes
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            actual: proposal
+                .requirement_changes
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        });
     }
 
     let next_assertions: BTreeMap<_, _> = proposal
@@ -376,21 +430,59 @@ fn validate_plan_transition(
         .iter()
         .map(|a| (&a.id, a))
         .collect();
+    let mut required_supersessions = BTreeSet::new();
     for old in &current.assertions {
         let strengthens = next_assertions.get(&old.id).is_some_and(|new| {
             old.prose == new.prose
                 && (old.oracle == new.oracle || (old.oracle.is_none() && new.oracle.is_some()))
         });
         if !strengthens {
-            return Err(ProposalError::AssertionWeakened {
-                assertion: old.id.to_string(),
-            });
+            required_supersessions.insert(old.id.clone());
+        }
+    }
+    let declared_supersessions: BTreeSet<_> = proposal
+        .assertion_supersessions
+        .iter()
+        .map(|entry| entry.assertion_id.clone())
+        .collect();
+    if declared_supersessions.len() != proposal.assertion_supersessions.len()
+        || declared_supersessions != required_supersessions
+    {
+        return Err(ProposalError::AssertionSupersessionsMismatch {
+            expected: required_supersessions
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            actual: proposal
+                .assertion_supersessions
+                .iter()
+                .map(|entry| entry.assertion_id.to_string())
+                .collect(),
+        });
+    }
+    for supersession in &proposal.assertion_supersessions {
+        for replacement in &supersession.replacement_ids {
+            if !next_assertions.contains_key(replacement) {
+                return Err(ProposalError::UnknownAssertionReplacement {
+                    assertion: supersession.assertion_id.to_string(),
+                    replacement: replacement.to_string(),
+                });
+            }
         }
     }
 
     let current_tasks: BTreeMap<_, _> = current.tasks.iter().map(|t| (&t.id, t)).collect();
     for task in &proposal.plan.tasks {
         match current_tasks.get(&task.id) {
+            Some(_)
+                if state.tasks.get(&task.id).is_some_and(|runtime| {
+                    runtime.status == super::state::TaskStatus::Superseded
+                }) =>
+            {
+                return Err(ProposalError::RetiredTaskRetained {
+                    task: task.id.to_string(),
+                });
+            }
             Some(old) if *old != task => {
                 return Err(ProposalError::TaskChanged {
                     task: task.id.to_string(),
