@@ -8,8 +8,8 @@ use clap::Parser;
 use common::{approve_plan, covered_requirement, harness, proposal, BASE_SHA};
 use lionclaw::cli::{self, Cli};
 use lionclaw::model::{
-    Assertion, AssertionId, ConversationId, MissionEvent, OracleName, Plan, RoleName, Task, TaskId,
-    TaskKind, TaskNamespace,
+    fold, Assertion, AssertionId, ConversationId, ConversationLifecycle, DeliveryMarker,
+    MissionEvent, OracleName, Plan, RoleName, Task, TaskId, TaskKind, TaskNamespace,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -34,7 +34,7 @@ async fn reject_without_mutation(
 }
 
 #[tokio::test]
-async fn production_cli_routes_atomically_to_exact_current_role_instances() {
+async fn production_cli_routes_atomically_only_to_explicit_live_conversations() {
     let dir = tempfile::tempdir().unwrap();
     let runner = MockRoleRunner::new(Box::new(|request| {
         request
@@ -147,7 +147,7 @@ async fn production_cli_routes_atomically_to_exact_current_role_instances() {
     }
 
     // Unique task sugar, an explicit id, and --all resolve through the same
-    // current-instance snapshot.
+    // explicit live-conversation snapshot.
     cli::run(send_cli(dir.path(), mission.as_str(), &["--to", "alpha"]))
         .await
         .unwrap();
@@ -238,4 +238,103 @@ async fn production_cli_routes_atomically_to_exact_current_role_instances() {
     let after_queued = &race_state_after.conversations[&current_conversation].queued;
     assert_eq!(after_queued.len(), before_queued.len() + ok);
     assert_eq!(race_state_after.head, race_state_before.head + ok as u64);
+
+    // Accepting a real replacement plan retires the old AwaitingLead
+    // conversation before the next role is dispatched. Its queued messages
+    // become explicit tombstones and neither an exact stale target nor --all
+    // may route back into it.
+    let replacement = TaskId::new("replacement").unwrap();
+    h.engine
+        .propose_plan(
+            &mission,
+            proposal(
+                1,
+                Plan {
+                    requirements: [("ROUTING-A", "ROUTE-A"), ("ROUTING-B", "ROUTE-B")]
+                        .into_iter()
+                        .map(|(requirement, assertion)| covered_requirement(requirement, assertion))
+                        .collect(),
+                    assertions: ["ROUTE-A", "ROUTE-B"]
+                        .into_iter()
+                        .map(|id| Assertion {
+                            id: AssertionId::new(id).unwrap(),
+                            prose: "routes".into(),
+                            oracle: Some(OracleName::new("cargo-test").unwrap()),
+                        })
+                        .collect(),
+                    tasks: vec![Task {
+                        id: replacement.clone(),
+                        kind: TaskKind::Work,
+                        body: "ask replacement".into(),
+                        targets: vec![
+                            AssertionId::new("ROUTE-A").unwrap(),
+                            AssertionId::new("ROUTE-B").unwrap(),
+                        ],
+                        role: Some(role.clone()),
+                        depends_on: vec![],
+                    }],
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &mission).await;
+
+    let retired = store.require_state(&mission).await.unwrap();
+    let old = &retired.conversations[&current_conversation];
+    assert_eq!(old.lifecycle, ConversationLifecycle::Retired);
+    assert!(old.active_delivery.is_none());
+    assert!(old
+        .queued
+        .iter()
+        .all(|message| message.marker == DeliveryMarker::Undeliverable));
+    assert!(retired
+        .conversation_legal_actions(&current_conversation)
+        .is_empty());
+    reject_without_mutation(
+        &store,
+        &mission,
+        send_cli(
+            dir.path(),
+            mission.as_str(),
+            &["--to", current_conversation.as_str()],
+        ),
+    )
+    .await;
+
+    let replacement_checkpoint = h.engine.advance(&mission).await.unwrap().state;
+    let replacement_conversation = replacement_checkpoint
+        .conversations
+        .iter()
+        .find(|(id, conversation)| {
+            conversation.task_id == replacement
+                && replacement_checkpoint.conversation_is_messageable(id)
+        })
+        .map(|(id, _)| id.clone())
+        .expect("distinct live replacement conversation");
+    assert_ne!(replacement_conversation, current_conversation);
+
+    let before_all = store.load(&mission).await.unwrap();
+    cli::run(send_cli(dir.path(), mission.as_str(), &["--all"]))
+        .await
+        .unwrap();
+    let after_all = store.load(&mission).await.unwrap();
+    assert_eq!(after_all.len(), before_all.len() + 1);
+    let MissionEvent::MessageSent { recipients, .. } = &after_all.last().unwrap().event else {
+        panic!("--all must append one atomic MessageSent event")
+    };
+    assert_eq!(recipients.len(), 1);
+    assert_eq!(recipients[0].conversation_id, replacement_conversation);
+    assert_eq!(recipients[0].task_id, replacement);
+    assert!(recipients
+        .iter()
+        .all(|recipient| recipient.conversation_id != current_conversation));
+
+    let full = fold(after_all).expect("full replay after replacement send");
+    let snapshotted = store
+        .load_state_snapshotted(&mission)
+        .await
+        .expect("snapshot replay")
+        .expect("mission state");
+    assert_eq!(snapshotted, full);
 }
