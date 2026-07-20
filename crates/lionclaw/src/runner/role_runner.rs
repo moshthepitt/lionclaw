@@ -589,6 +589,20 @@ impl OciRoleRunner {
         request: &RoleRunRequest,
         plan: lionclaw_confinement::EffectiveExecutionPlan,
     ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
+        self.run_turn_with_context(profile, request, plan, mission_execution_context)
+            .await
+    }
+
+    async fn run_turn_with_context(
+        &self,
+        profile: &MissionRuntimeProfile,
+        request: &RoleRunRequest,
+        plan: lionclaw_confinement::EffectiveExecutionPlan,
+        context_builder: impl Fn(
+            &lionclaw_confinement::EffectiveExecutionPlan,
+        )
+            -> anyhow::Result<lionclaw_runtime_api::RuntimeExecutionContext>,
+    ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
         let driver = self
             .driver(profile)
             .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
@@ -604,8 +618,8 @@ impl OciRoleRunner {
 
         // Compute the fallible execution context *before* opening a session,
         // so a failure here cannot leak a started session.
-        let context = mission_execution_context(&plan)
-            .map_err(|e| launch(format!("execution context failed: {e}")))?;
+        let context =
+            context_builder(&plan).map_err(|e| launch(format!("execution context failed: {e}")))?;
 
         let state_root = profile
             .native_resume
@@ -697,7 +711,7 @@ impl OciRoleRunner {
                     recovery_failure(&reopen_failure, "reconstruction_start", &error.to_string())
                 })?;
             resume_mode = reconstruction.resume_mode;
-            let reconstruction_context = match mission_execution_context(&plan) {
+            let reconstruction_context = match context_builder(&plan) {
                 Ok(context) => context,
                 Err(error) => {
                     let _ = adapter.close(&reconstruction).await;
@@ -1046,18 +1060,29 @@ mod tests {
         Failure,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FallbackFailurePoint {
+        None,
+        ReconstructionStart,
+        ReconstructionContext,
+    }
+
     #[derive(Debug, Default)]
     struct FallbackObservations {
         starts: Vec<(bool, bool)>,
         prompts: Vec<String>,
         events: Vec<String>,
         closed: Vec<String>,
+        drained: Vec<String>,
+        native_identity: Option<String>,
+        identity_before_reconstructed_success: Option<String>,
     }
 
     struct FallbackAdapter {
         turns: StdMutex<VecDeque<FallbackTurn>>,
         observations: Arc<StdMutex<FallbackObservations>>,
-        fail_reconstruction_start: bool,
+        reopen_outcome: RuntimeNativeReopenOutcome,
+        failure_point: FallbackFailurePoint,
     }
 
     #[async_trait]
@@ -1076,22 +1101,16 @@ mod tests {
 
         fn native_reopen_outcome(
             &self,
-            handle: &RuntimeSessionHandle,
-            failure: &TypedFailure,
+            _handle: &RuntimeSessionHandle,
+            _failure: &TypedFailure,
         ) -> RuntimeNativeReopenOutcome {
-            if handle.resume_mode == RuntimeResumeMode::Resumed
-                && failure.evidence().code.as_deref() == Some("codex.thread_rollout")
-            {
-                RuntimeNativeReopenOutcome::Recoverable
-            } else {
-                RuntimeNativeReopenOutcome::NotReopenFailure
-            }
+            self.reopen_outcome
         }
 
         async fn forget_native_reopen(&self, handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
-            self.observations
-                .lock()
-                .unwrap()
+            let mut observations = self.observations.lock().unwrap();
+            observations.native_identity = None;
+            observations
                 .events
                 .push(format!("forget:{}", handle.runtime_session_id));
             Ok(())
@@ -1109,7 +1128,7 @@ mod tests {
             let ordinal = observations.starts.len() + 1;
             observations.starts.push((ready, !ready));
             observations.events.push(format!("start:{ordinal}"));
-            if ordinal == 2 && self.fail_reconstruction_start {
+            if ordinal == 2 && self.failure_point == FallbackFailurePoint::ReconstructionStart {
                 anyhow::bail!("scripted reconstruction session start failure");
             }
             Ok(RuntimeSessionHandle {
@@ -1135,6 +1154,13 @@ mod tests {
                 .expect("no third turn");
             {
                 let mut observations = self.observations.lock().unwrap();
+                if matches!(turn, FallbackTurn::Success)
+                    && execution.input.runtime_session_id == "session-2"
+                {
+                    observations.identity_before_reconstructed_success =
+                        observations.native_identity.clone();
+                    observations.native_identity = Some("native-thread-2".into());
+                }
                 observations.prompts.push(execution.input.prompt);
                 observations
                     .events
@@ -1146,6 +1172,15 @@ mod tests {
                         lane: lionclaw_runtime_api::RuntimeMessageLane::Answer,
                         text: format!("journal-{turn:?}"),
                     },
+                ))
+                .await?;
+            let configuration = lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                requested_model: Some(format!("journal-{turn:?}")),
+                ..Default::default()
+            };
+            journal
+                .send(lionclaw_runtime_api::TurnEvent::canonical(
+                    lionclaw_runtime_api::RuntimeEvent::Configuration { configuration },
                 ))
                 .await?;
             match turn {
@@ -1186,7 +1221,8 @@ mod tests {
     struct FallbackProvider {
         turns: Vec<FallbackTurn>,
         observations: Arc<StdMutex<FallbackObservations>>,
-        fail_reconstruction_start: bool,
+        reopen_outcome: RuntimeNativeReopenOutcome,
+        failure_point: FallbackFailurePoint,
     }
 
     impl RuntimeDriverProvider for FallbackProvider {
@@ -1198,7 +1234,8 @@ mod tests {
             Arc::new(FallbackAdapter {
                 turns: StdMutex::new(self.turns.iter().copied().collect()),
                 observations: self.observations.clone(),
-                fail_reconstruction_start: self.fail_reconstruction_start,
+                reopen_outcome: self.reopen_outcome,
+                failure_point: self.failure_point,
             })
         }
     }
@@ -1273,7 +1310,8 @@ mod tests {
 
     async fn run_fallback_boundary(
         turns: Vec<FallbackTurn>,
-        fail_reconstruction_start: bool,
+        reopen_outcome: RuntimeNativeReopenOutcome,
+        failure_point: FallbackFailurePoint,
     ) -> (
         Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure>,
         Arc<StdMutex<FallbackObservations>>,
@@ -1287,7 +1325,10 @@ mod tests {
             RuntimeResumeMode::Resumed,
         )
         .unwrap();
-        let observations = Arc::new(StdMutex::new(FallbackObservations::default()));
+        let observations = Arc::new(StdMutex::new(FallbackObservations {
+            native_identity: Some("stale-native-thread-1".into()),
+            ..FallbackObservations::default()
+        }));
         let profiles = RuntimeProfiles::from_toml(
             "[runtimes.codex]\ndriver = \"codex\"\ncommand = \"codex\"\nnative-resume = true\n",
             temp.path(),
@@ -1300,22 +1341,54 @@ mod tests {
             RuntimeDriverRegistry::new([Arc::new(FallbackProvider {
                 turns,
                 observations: observations.clone(),
-                fail_reconstruction_start,
+                reopen_outcome,
+                failure_point,
             }) as Arc<dyn RuntimeDriverProvider>]),
             RuntimeAuthRegistry::empty(),
         );
         let profile = runner.profile("codex").unwrap();
-        let request = fallback_request(temp.path());
+        let mut request = fallback_request(temp.path());
+        let (updates, mut updates_rx) = tokio::sync::mpsc::channel(8);
+        request.updates = updates;
+        let drain_observations = observations.clone();
+        let drain_observer = tokio::spawn(async move {
+            while let Some(update) = updates_rx.recv().await {
+                if let crate::ports::RoleRunUpdate::RuntimeConfigured(configuration) = update {
+                    if let Some(observation) = configuration.requested_model {
+                        drain_observations.lock().unwrap().drained.push(observation);
+                    }
+                }
+            }
+        });
+        let context_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = context_calls.clone();
         let result = runner
-            .run_turn(&profile, &request, fallback_plan(temp.path()))
+            .run_turn_with_context(
+                &profile,
+                &request,
+                fallback_plan(temp.path()),
+                move |plan| {
+                    let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if failure_point == FallbackFailurePoint::ReconstructionContext && call == 1 {
+                        anyhow::bail!("scripted reconstruction context failure");
+                    }
+                    mission_execution_context(plan)
+                },
+            )
             .await;
+        drop(request);
+        drain_observer.await.unwrap();
         (result, observations, temp)
     }
 
     #[tokio::test]
     async fn production_runner_recovers_one_stale_reopen_with_canonical_reconstruction() {
-        let (result, observations, temp) =
-            run_fallback_boundary(vec![FallbackTurn::Stale, FallbackTurn::Success], false).await;
+        let (result, observations, temp) = run_fallback_boundary(
+            vec![FallbackTurn::Stale, FallbackTurn::Success],
+            RuntimeNativeReopenOutcome::Recoverable,
+            FallbackFailurePoint::None,
+        )
+        .await;
         assert_eq!(result.unwrap().1, "authoritative reconstructed completion");
         let observations = observations.lock().unwrap();
         assert_eq!(observations.starts, vec![(true, false), (false, true)]);
@@ -1336,6 +1409,15 @@ mod tests {
             ]
         );
         assert_eq!(observations.closed, vec!["session-1", "session-2"]);
+        assert_eq!(
+            observations.drained,
+            vec!["journal-Stale", "journal-Success"]
+        );
+        assert_eq!(observations.identity_before_reconstructed_success, None);
+        assert_eq!(
+            observations.native_identity.as_deref(),
+            Some("native-thread-2")
+        );
         drop(observations);
         assert!(
             lionclaw_runtime_api::RuntimeSessionReady::from_runtime_state_root(
@@ -1349,8 +1431,12 @@ mod tests {
 
     #[tokio::test]
     async fn production_runner_bounds_failed_reconstruction_and_settles_both_attempts() {
-        let (result, observations, _temp) =
-            run_fallback_boundary(vec![FallbackTurn::Stale, FallbackTurn::Failure], false).await;
+        let (result, observations, _temp) = run_fallback_boundary(
+            vec![FallbackTurn::Stale, FallbackTurn::Failure],
+            RuntimeNativeReopenOutcome::Recoverable,
+            FallbackFailurePoint::None,
+        )
+        .await;
         let failure = result.unwrap_err();
         assert_eq!(
             failure.evidence().code.as_deref(),
@@ -1367,12 +1453,20 @@ mod tests {
         assert_eq!(observations.starts.len(), 2, "no third session attempt");
         assert_eq!(observations.prompts.len(), 2, "no third turn attempt");
         assert_eq!(observations.closed, vec!["session-1", "session-2"]);
+        assert_eq!(
+            observations.drained,
+            vec!["journal-Stale", "journal-Failure"]
+        );
     }
 
     #[tokio::test]
     async fn production_runner_settles_original_handle_when_reconstruction_start_fails() {
-        let (result, observations, _temp) =
-            run_fallback_boundary(vec![FallbackTurn::Stale], true).await;
+        let (result, observations, _temp) = run_fallback_boundary(
+            vec![FallbackTurn::Stale],
+            RuntimeNativeReopenOutcome::Recoverable,
+            FallbackFailurePoint::ReconstructionStart,
+        )
+        .await;
         let failure = result.unwrap_err();
         assert_eq!(
             failure.evidence().code.as_deref(),
@@ -1387,6 +1481,39 @@ mod tests {
             "failed start cannot launch a turn"
         );
         assert_eq!(observations.closed, vec!["session-1"]);
+        assert_eq!(observations.drained, vec!["journal-Stale"]);
+    }
+
+    #[tokio::test]
+    async fn production_runner_closes_reconstruction_when_context_setup_fails() {
+        let (result, observations, _temp) = run_fallback_boundary(
+            vec![FallbackTurn::Stale],
+            RuntimeNativeReopenOutcome::Recoverable,
+            FallbackFailurePoint::ReconstructionContext,
+        )
+        .await;
+        let failure = result.unwrap_err();
+        assert!(failure.detail().contains("reconstruction_context="));
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.starts.len(), 2);
+        assert_eq!(observations.prompts.len(), 1);
+        assert_eq!(observations.closed, vec!["session-1", "session-2"]);
+        assert_eq!(observations.drained, vec!["journal-Stale"]);
+    }
+
+    #[tokio::test]
+    async fn production_runner_settles_non_recoverable_original_turn_failure() {
+        let (result, observations, _temp) = run_fallback_boundary(
+            vec![FallbackTurn::Failure],
+            RuntimeNativeReopenOutcome::NotReopenFailure,
+            FallbackFailurePoint::None,
+        )
+        .await;
+        assert!(result.is_err());
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.starts.len(), 1);
+        assert_eq!(observations.closed, vec!["session-1"]);
+        assert_eq!(observations.drained, vec!["journal-Failure"]);
     }
 
     #[test]
