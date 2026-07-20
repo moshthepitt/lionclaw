@@ -697,13 +697,17 @@ impl OciRoleRunner {
                     recovery_failure(&reopen_failure, "reconstruction_start", &error.to_string())
                 })?;
             resume_mode = reconstruction.resume_mode;
-            let reconstruction_context = mission_execution_context(&plan).map_err(|error| {
-                recovery_failure(
-                    &reopen_failure,
-                    "reconstruction_context",
-                    &error.to_string(),
-                )
-            })?;
+            let reconstruction_context = match mission_execution_context(&plan) {
+                Ok(context) => context,
+                Err(error) => {
+                    let _ = adapter.close(&reconstruction).await;
+                    return Err(recovery_failure(
+                        &reopen_failure,
+                        "reconstruction_context",
+                        &error.to_string(),
+                    ));
+                }
+            };
             let (reconstructed, reconstructed_response) = execute_turn_attempt(
                 Arc::clone(&adapter),
                 &reconstruction,
@@ -1021,9 +1025,369 @@ mod tests {
     use super::*;
     use crate::mission_type::SkillPackage;
     use crate::ports::{EffectCleaner, EffectCleanupRequest};
-    use lionclaw_confinement::MountAccess;
+    use lionclaw_confinement::{
+        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, InstallPolicy, MountAccess,
+        MountSpec, NetworkMode, OciConfinementConfig, WorkspaceAccess,
+    };
+    use lionclaw_runtime_api::{
+        RuntimeAdapterInfo, RuntimeCancellation, RuntimeDriverProvider, RuntimeTurnJournalSender,
+        TurnResult,
+    };
+    use std::collections::BTreeSet;
+    use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Debug, Clone, Copy)]
+    enum FallbackTurn {
+        Stale,
+        Success,
+        Failure,
+    }
+
+    #[derive(Debug, Default)]
+    struct FallbackObservations {
+        starts: Vec<(bool, bool)>,
+        prompts: Vec<String>,
+        events: Vec<String>,
+        closed: Vec<String>,
+    }
+
+    struct FallbackAdapter {
+        turns: StdMutex<VecDeque<FallbackTurn>>,
+        observations: Arc<StdMutex<FallbackObservations>>,
+        fail_reconstruction_start: bool,
+    }
+
+    #[async_trait]
+    impl RuntimeAdapter for FallbackAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: "fallback-boundary".into(),
+                version: "1".into(),
+                healthy: true,
+            }
+        }
+
+        fn native_reopen_recovery(&self) -> RuntimeNativeReopenRecovery {
+            RuntimeNativeReopenRecovery::ForgetAndReconstruct
+        }
+
+        fn native_reopen_outcome(
+            &self,
+            handle: &RuntimeSessionHandle,
+            failure: &TypedFailure,
+        ) -> RuntimeNativeReopenOutcome {
+            if handle.resume_mode == RuntimeResumeMode::Resumed
+                && failure.evidence().code.as_deref() == Some("codex.thread_rollout")
+            {
+                RuntimeNativeReopenOutcome::Recoverable
+            } else {
+                RuntimeNativeReopenOutcome::NotReopenFailure
+            }
+        }
+
+        async fn forget_native_reopen(&self, handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            self.observations
+                .lock()
+                .unwrap()
+                .events
+                .push(format!("forget:{}", handle.runtime_session_id));
+            Ok(())
+        }
+
+        async fn session_start(
+            &self,
+            input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            let ready = matches!(
+                &input.resume,
+                RuntimeResume::Native { ready, .. } if ready.is_ready()
+            );
+            let mut observations = self.observations.lock().unwrap();
+            let ordinal = observations.starts.len() + 1;
+            observations.starts.push((ready, !ready));
+            observations.events.push(format!("start:{ordinal}"));
+            if ordinal == 2 && self.fail_reconstruction_start {
+                anyhow::bail!("scripted reconstruction session start failure");
+            }
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("session-{ordinal}"),
+                resume_mode: if ready {
+                    RuntimeResumeMode::Resumed
+                } else {
+                    RuntimeResumeMode::Reconstructed
+                },
+            })
+        }
+
+        async fn turn(
+            &self,
+            execution: TurnExecution,
+            journal: RuntimeTurnJournalSender,
+        ) -> anyhow::Result<TurnResult> {
+            let turn = self
+                .turns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("no third turn");
+            {
+                let mut observations = self.observations.lock().unwrap();
+                observations.prompts.push(execution.input.prompt);
+                observations
+                    .events
+                    .push(format!("turn:{}", execution.input.runtime_session_id));
+            }
+            journal
+                .send(lionclaw_runtime_api::TurnEvent::canonical(
+                    lionclaw_runtime_api::RuntimeEvent::MessageDelta {
+                        lane: lionclaw_runtime_api::RuntimeMessageLane::Answer,
+                        text: format!("journal-{turn:?}"),
+                    },
+                ))
+                .await?;
+            match turn {
+                FallbackTurn::Stale => Err(anyhow::Error::new(TypedFailure::transient(
+                    "codex.thread_rollout",
+                    "stale native thread",
+                    None,
+                ))),
+                FallbackTurn::Success => Ok(TurnResult {
+                    final_response: "authoritative reconstructed completion".into(),
+                    ..Default::default()
+                }),
+                FallbackTurn::Failure => Err(anyhow::Error::new(TypedFailure::permanent(
+                    "codex.process_exit",
+                    "reconstruction failed ".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT),
+                ))),
+            }
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<RuntimeCancellation> {
+            Ok(RuntimeCancellation::Acknowledged)
+        }
+
+        async fn close(&self, handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            self.observations
+                .lock()
+                .unwrap()
+                .closed
+                .push(handle.runtime_session_id.clone());
+            Ok(())
+        }
+    }
+
+    struct FallbackProvider {
+        turns: Vec<FallbackTurn>,
+        observations: Arc<StdMutex<FallbackObservations>>,
+        fail_reconstruction_start: bool,
+    }
+
+    impl RuntimeDriverProvider for FallbackProvider {
+        fn driver(&self) -> &'static str {
+            "codex"
+        }
+
+        fn create_adapter(&self, _config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
+            Arc::new(FallbackAdapter {
+                turns: StdMutex::new(self.turns.iter().copied().collect()),
+                observations: self.observations.clone(),
+                fail_reconstruction_start: self.fail_reconstruction_start,
+            })
+        }
+    }
+
+    fn fallback_plan(temp: &Path) -> EffectiveExecutionPlan {
+        EffectiveExecutionPlan {
+            runtime_id: "codex".into(),
+            preset_name: "test".into(),
+            confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+            workspace_access: WorkspaceAccess::ReadOnly,
+            network_mode: NetworkMode::None,
+            install_policy: InstallPolicy::None,
+            root_in_userns: false,
+            working_dir: Some(temp.join("workspace").to_string_lossy().into_owned()),
+            environment: vec![("CANONICAL_DIALOGUE".into(), "folded-message-1".into())],
+            mcp_servers: Vec::new(),
+            mounts: vec![
+                MountSpec {
+                    source: temp.join("workspace"),
+                    target: WORKSPACE_MOUNT_TARGET.into(),
+                    access: MountAccess::ReadOnly,
+                },
+                MountSpec {
+                    source: temp.join("runtime"),
+                    target: lionclaw_confinement::RUNTIME_MOUNT_TARGET.into(),
+                    access: MountAccess::ReadWrite,
+                },
+            ],
+            mount_runtime_secrets: false,
+            escape_classes: BTreeSet::new(),
+            limits: ExecutionLimits::default(),
+        }
+    }
+
+    fn fallback_request(temp: &Path) -> RoleRunRequest {
+        let (control_tx, control) =
+            tokio::sync::watch::channel(ExecutionControl::RunUntil(i64::MAX));
+        let _control_tx = Box::leak(Box::new(control_tx));
+        let (updates, _updates_rx) = tokio::sync::mpsc::channel(8);
+        let (activity, _activity_rx) = tokio::sync::watch::channel(None);
+        RoleRunRequest {
+            mission_id: crate::model::MissionId::for_creation("/workspace", "fallback", 1),
+            task_id: crate::model::TaskId::new("fallback-boundary").unwrap(),
+            attempt_no: 1,
+            effect_id: crate::model::EffectId::for_parts(&["fallback-boundary"]),
+            role: crate::mission_type::RoleDefinition {
+                name: crate::model::RoleName::new("implementer").unwrap(),
+                output: OutputSemantics::ProducesArtifact,
+                runtime: Some("codex".into()),
+                timeout_secs: None,
+                network: false,
+                secrets: false,
+                skills: Vec::new(),
+                prompt_body: String::new(),
+            },
+            runtime: "codex".into(),
+            skills: Vec::new(),
+            prompt: "canonical current prompt\nfolded user message\nfolded assistant message"
+                .into(),
+            base_sha: "unused".into(),
+            assignment_epoch: 1,
+            recreate_workspace: false,
+            deadline_ms: i64::MAX,
+            control,
+            updates,
+            activity,
+            workspace_dir: temp.join("workspace"),
+            state_dir: temp.join("state"),
+            artifact_capture: None,
+        }
+    }
+
+    async fn run_fallback_boundary(
+        turns: Vec<FallbackTurn>,
+        fail_reconstruction_start: bool,
+    ) -> (
+        Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure>,
+        Arc<StdMutex<FallbackObservations>>,
+        tempfile::TempDir,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        std::fs::create_dir_all(temp.path().join("runtime")).unwrap();
+        lionclaw_runtime_api::record_runtime_resume_mode(
+            &temp.path().join("runtime"),
+            RuntimeResumeMode::Resumed,
+        )
+        .unwrap();
+        let observations = Arc::new(StdMutex::new(FallbackObservations::default()));
+        let profiles = RuntimeProfiles::from_toml(
+            "[runtimes.codex]\ndriver = \"codex\"\ncommand = \"codex\"\nnative-resume = true\n",
+            temp.path(),
+        )
+        .unwrap();
+        let runner = OciRoleRunner::with_registries(
+            profiles,
+            "unused-test-image".into(),
+            AuthorityCeiling::default(),
+            RuntimeDriverRegistry::new([Arc::new(FallbackProvider {
+                turns,
+                observations: observations.clone(),
+                fail_reconstruction_start,
+            }) as Arc<dyn RuntimeDriverProvider>]),
+            RuntimeAuthRegistry::empty(),
+        );
+        let profile = runner.profile("codex").unwrap();
+        let request = fallback_request(temp.path());
+        let result = runner
+            .run_turn(&profile, &request, fallback_plan(temp.path()))
+            .await;
+        (result, observations, temp)
+    }
+
+    #[tokio::test]
+    async fn production_runner_recovers_one_stale_reopen_with_canonical_reconstruction() {
+        let (result, observations, temp) =
+            run_fallback_boundary(vec![FallbackTurn::Stale, FallbackTurn::Success], false).await;
+        assert_eq!(result.unwrap().1, "authoritative reconstructed completion");
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.starts, vec![(true, false), (false, true)]);
+        assert_eq!(observations.prompts.len(), 2);
+        assert_eq!(observations.prompts[0], observations.prompts[1]);
+        assert_eq!(
+            observations.prompts[0],
+            "canonical current prompt\nfolded user message\nfolded assistant message"
+        );
+        assert_eq!(
+            observations.events,
+            vec![
+                "start:1",
+                "turn:session-1",
+                "forget:session-1",
+                "start:2",
+                "turn:session-2"
+            ]
+        );
+        assert_eq!(observations.closed, vec!["session-1", "session-2"]);
+        drop(observations);
+        assert!(
+            lionclaw_runtime_api::RuntimeSessionReady::from_runtime_state_root(
+                &temp.path().join("runtime")
+            )
+            .unwrap()
+            .is_ready(),
+            "the reconstructed observation must be eligible for native resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_runner_bounds_failed_reconstruction_and_settles_both_attempts() {
+        let (result, observations, _temp) =
+            run_fallback_boundary(vec![FallbackTurn::Stale, FallbackTurn::Failure], false).await;
+        let failure = result.unwrap_err();
+        assert_eq!(
+            failure.evidence().code.as_deref(),
+            Some("runtime.native_reopen_reconstruction_failed")
+        );
+        assert!(failure
+            .detail()
+            .contains("native_reopen[transient_runtime]="));
+        assert!(failure
+            .detail()
+            .contains("canonical_reconstruction[permanent_runtime]="));
+        assert!(failure.detail().len() <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.starts.len(), 2, "no third session attempt");
+        assert_eq!(observations.prompts.len(), 2, "no third turn attempt");
+        assert_eq!(observations.closed, vec!["session-1", "session-2"]);
+    }
+
+    #[tokio::test]
+    async fn production_runner_settles_original_handle_when_reconstruction_start_fails() {
+        let (result, observations, _temp) =
+            run_fallback_boundary(vec![FallbackTurn::Stale], true).await;
+        let failure = result.unwrap_err();
+        assert_eq!(
+            failure.evidence().code.as_deref(),
+            Some("runtime.native_reopen_recovery")
+        );
+        assert!(failure.detail().contains("reconstruction_start="));
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.starts.len(), 2);
+        assert_eq!(
+            observations.prompts.len(),
+            1,
+            "failed start cannot launch a turn"
+        );
+        assert_eq!(observations.closed, vec!["session-1"]);
+    }
 
     #[test]
     fn double_reopen_failure_evidence_is_exact_and_bounded() {
