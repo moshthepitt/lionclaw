@@ -134,20 +134,15 @@ fn assert_abort_preserves_authority(state: &lionclaw::model::MissionState) {
         assert_eq!(after.assignment_epoch, before.assignment_epoch);
         assert_eq!(after.final_response, before.final_response);
         assert_eq!(after.queued.len(), before.queued.len());
-        let expected_lifecycle =
-            if before.lifecycle == lionclaw::model::ConversationLifecycle::Completed {
-                lionclaw::model::ConversationLifecycle::Completed
-            } else {
-                lionclaw::model::ConversationLifecycle::Retired
-            };
-        assert_eq!(after.lifecycle, expected_lifecycle);
+        assert_eq!(
+            after.lifecycle,
+            lionclaw::model::ConversationLifecycle::Retired
+        );
         assert!(after.active_delivery.is_none());
-        if expected_lifecycle == lionclaw::model::ConversationLifecycle::Retired {
-            assert!(after
-                .queued
-                .iter()
-                .all(|message| message.marker == lionclaw::model::DeliveryMarker::Undeliverable));
-        }
+        assert!(after
+            .queued
+            .iter()
+            .all(|message| message.marker == lionclaw::model::DeliveryMarker::Undeliverable));
     }
     assert_eq!(aborted.authoritative_receipts, state.authoritative_receipts);
     assert_eq!(aborted.reachable_commits, state.reachable_commits);

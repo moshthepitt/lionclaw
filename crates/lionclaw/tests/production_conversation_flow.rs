@@ -1765,9 +1765,23 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert_eq!(delivery.queued[0].body, "Keep this for the next turn.");
     assert_eq!(
         delivery.queued[0].marker,
-        lionclaw::model::DeliveryMarker::Queued
+        lionclaw::model::DeliveryMarker::Undeliverable
     );
     assert!(delivery.queued[0].sequence_no > delivery.consumed_through);
+    assert_eq!(
+        delivery.lifecycle,
+        lionclaw::model::ConversationLifecycle::Retired
+    );
+    assert!(delivery.active_delivery.is_none());
+    assert!(completed
+        .conversation_legal_actions(
+            completed
+                .conversations
+                .keys()
+                .next()
+                .expect("completed conversation")
+        )
+        .is_empty());
     assert_eq!(
         completed.phase,
         MissionPhase::Done {
