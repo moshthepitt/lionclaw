@@ -32,8 +32,8 @@ use crate::model::{
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
-    OracleOutcome, OracleRunRequest, OracleRunner, RoleRunOutcome, RoleRunRequest, RoleRunner,
-    SystemClock,
+    EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, OracleOutcome, OracleRunRequest,
+    OracleRunner, RoleRunOutcome, RoleRunRequest, RoleRunner, SystemClock,
 };
 use crate::runner::MissionProgramExecutor;
 use crate::store::MissionStore;
@@ -70,6 +70,17 @@ impl RoleRunner for NoopRoleRunner {
 /// blocking gap (echoing the prompt's nonce, as a real agent must). Drives
 /// check (6) without a model or a container.
 struct ReviewParkRoleRunner;
+
+/// The pure review check executes scripted in-process services and therefore
+/// creates no external effect resources to clean up.
+struct ScriptedEffectCleaner;
+
+#[async_trait]
+impl EffectCleaner for ScriptedEffectCleaner {
+    async fn cleanup(&self, _request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl RoleRunner for ReviewParkRoleRunner {
@@ -949,9 +960,7 @@ async fn check_terminal_review() -> Result<()> {
         EngineServices::new(
             Arc::new(ReviewParkRoleRunner),
             Arc::new(FixedOracleRunner(0)),
-            Arc::new(crate::effect_cleanup::LocalEffectCleaner::new(
-                "podman".to_string(),
-            )),
+            Arc::new(ScriptedEffectCleaner),
             Arc::new(SystemClock),
         ),
     );
@@ -973,7 +982,7 @@ async fn check_terminal_review() -> Result<()> {
     if !matches!(parked.phase, MissionPhase::AttentionNeeded) {
         anyhow::bail!(
             "a blocking review verdict did not park the mission (phase {:?})",
-            parked.phase
+            parked.phase,
         );
     }
     if !parked
