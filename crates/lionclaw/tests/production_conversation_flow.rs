@@ -940,6 +940,301 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .any(|(_, runtime)| runtime.to_string_lossy().contains(validator_id.as_str())));
 }
 
+#[tokio::test]
+async fn production_same_base_revision_retires_awaiting_planner_before_broadcast() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let base = initialize_repo(&repo).await;
+    let fake_oci = temp.path().join("external-oci-transport");
+    std::fs::write(
+        &fake_oci,
+        "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profiles = RuntimeProfiles::from_toml(
+        &format!(
+            r#"[runtimes.codex]
+driver = "codex"
+command = "external-codex"
+native-resume = true
+confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
+"#,
+            fake_oci.display()
+        ),
+        temp.path(),
+    )
+    .unwrap();
+    let mission_type_dir = temp.path().join("mission-type");
+    materialize_planning_validation_mission_type(&mission_type_dir);
+    let turns = Arc::new(Mutex::new(VecDeque::from([
+        DeliveryTurn::AwaitLead,
+        DeliveryTurn::AwaitLead,
+    ])));
+    let transports = cli::MissionTransports::external(
+        profiles,
+        RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
+            turns: turns.clone(),
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(8)),
+            sessions: Arc::new(Mutex::new(Vec::new())),
+            prompts: Arc::new(Mutex::new(Vec::new())),
+            launch_failures: Arc::new(Mutex::new(0)),
+        }) as Arc<dyn RuntimeDriverProvider>]),
+        RuntimeAuthRegistry::empty(),
+        Arc::new(ExternalOracleTransport {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "start",
+            "--type",
+            mission_type_dir.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--objective",
+            "prove same-base planner replacement routing",
+            "--runtime",
+            "codex",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    let store = MissionStore::open(&repo).await.unwrap();
+    let mission_id = store.list_missions().await.unwrap().pop().unwrap();
+    let driver = |label: &str| {
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "driver",
+            mission_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--handshake",
+            temp.path().join(label).to_str().unwrap(),
+        ])
+        .unwrap()
+    };
+    cli::run_with_transports(driver("original-planner.ready"), transports.clone())
+        .await
+        .unwrap();
+
+    let awaiting = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
+    assert_eq!(awaiting.current_sha, base);
+    let (retired_id, original) = awaiting
+        .conversations
+        .iter()
+        .find(|(_, conversation)| conversation.task_id.as_str() == "planner")
+        .expect("real planner conversation");
+    assert_eq!(
+        original.lifecycle,
+        lionclaw::model::ConversationLifecycle::AwaitingLead
+    );
+    assert!(original.final_response.is_some());
+    let retired_id = retired_id.clone();
+    let original_generation = original.assignment_epoch;
+
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission_id.as_str(),
+            "--to",
+            retired_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "Retain this queued message only as retired conversation history.",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+
+    let proposal_path = temp.path().join("same-base-plan.json");
+    std::fs::write(
+        &proposal_path,
+        serde_json::to_vec(&PlanProposal {
+            base_revision: 0,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
+            plan: plan(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "plan",
+            "propose",
+            mission_id.as_str(),
+            "--file",
+            proposal_path.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    let feedback = temp.path().join("revision-feedback.txt");
+    std::fs::write(&feedback, "replace the awaiting planner generation\n").unwrap();
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            mission_id.as_str(),
+            "plan_proposal:mission",
+            "revise",
+            "--feedback-file",
+            feedback.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+
+    let retired_events = store.load(&mission_id).await.unwrap();
+    let retired = fold(retired_events.clone()).unwrap();
+    assert_eq!(retired.current_sha, base, "revision must not move Git base");
+    let original = &retired.conversations[&retired_id];
+    assert_eq!(
+        original.lifecycle,
+        lionclaw::model::ConversationLifecycle::Retired
+    );
+    assert_eq!(original.assignment_epoch, original_generation);
+    assert!(original.final_response.is_some());
+    assert!(original.active_delivery.is_none());
+    assert_eq!(original.queued.len(), 1);
+    assert!(original
+        .queued
+        .iter()
+        .all(|message| { message.marker == lionclaw::model::DeliveryMarker::Undeliverable }));
+    assert!(retired.planning.tasks[&TaskId::new("planner").unwrap()]
+        .last_report
+        .is_none());
+    assert!(retired.conversation_legal_actions(&retired_id).is_empty());
+    assert!(retired
+        .parked_effects
+        .keys()
+        .all(|effect_id| !retired.parked_effect_is_continuable(effect_id)));
+    let superseded_tombstones: Vec<_> = retired
+        .tasks
+        .iter()
+        .filter(|(_, task)| task.status == lionclaw::model::TaskStatus::Superseded)
+        .map(|(task_id, _)| task_id.clone())
+        .collect();
+
+    let before_stale = store.load(&mission_id).await.unwrap();
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission_id.as_str(),
+            "--to",
+            retired_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "stale targeted send",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .expect_err("retired planner must reject targeted send");
+    assert_eq!(store.load(&mission_id).await.unwrap(), before_stale);
+
+    cli::run_with_transports(driver("replacement-planner.ready"), transports.clone())
+        .await
+        .unwrap();
+    let replacement_state = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
+    let (replacement_id, replacement) = replacement_state
+        .conversations
+        .iter()
+        .find(|(id, conversation)| {
+            *id != &retired_id
+                && conversation.task_id.as_str() == "planner"
+                && replacement_state.conversation_is_messageable(id)
+        })
+        .expect("distinct live replacement planner conversation");
+    assert_ne!(replacement_id, &retired_id);
+    assert!(replacement.assignment_epoch > original_generation);
+    assert!(replacement.queued.is_empty());
+    assert!(superseded_tombstones.iter().all(|task_id| {
+        replacement_state.tasks[task_id].status == lionclaw::model::TaskStatus::Superseded
+    }));
+
+    let before_all = store.load(&mission_id).await.unwrap();
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission_id.as_str(),
+            "--all",
+            "--repo",
+            repo.to_str().unwrap(),
+            "broadcast only to live replacement conversations",
+        ])
+        .unwrap(),
+        transports,
+    )
+    .await
+    .unwrap();
+    let after_all = store.load(&mission_id).await.unwrap();
+    assert_eq!(after_all.len(), before_all.len() + 1);
+    let MissionEvent::MessageSent { recipients, .. } = &after_all.last().unwrap().event else {
+        panic!("--all must append one atomic MessageSent event")
+    };
+    assert_eq!(recipients.len(), 1);
+    assert_eq!(recipients[0].conversation_id, *replacement_id);
+    assert!(recipients
+        .iter()
+        .all(|recipient| recipient.conversation_id != retired_id));
+
+    let full = fold(after_all).expect("full replay after replacement broadcast");
+    let fresh = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .load_state_snapshotted(&mission_id)
+        .await
+        .unwrap()
+        .expect("fresh snapshotted replay");
+    assert_eq!(fresh, full);
+    assert_eq!(
+        full.conversations[&retired_id].final_response,
+        original.final_response
+    );
+    assert!(turns.lock().unwrap().is_empty());
+}
+
 fn materialize_mission_type(root: &Path) {
     std::fs::create_dir_all(root.join("roles")).unwrap();
     std::fs::create_dir_all(root.join("oracles")).unwrap();
