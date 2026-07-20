@@ -2678,7 +2678,9 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         }).collect::<Result<Vec<_>>>()?,
         "cleanup_failure": cleanup_failure_json(state),
         "oracle_failures": state.oracle_failures,
-        "parked_effects": state.parked_effects.iter().map(|(effect_id, parked)| {
+        "parked_effects": state.parked_effects.iter().filter(|(effect_id, _)| {
+            state.parked_effect_is_continuable(effect_id)
+        }).map(|(effect_id, parked)| {
             serde_json::json!({
                 "effect_id": effect_id.as_str(),
                 "kind": parked,
@@ -2738,9 +2740,7 @@ fn conversation_views(
                 "assignment_epoch": conversation.assignment_epoch,
                 "workspace_base_sha": conversation.workspace_base_sha,
                 "lifecycle": conversation.lifecycle,
-                "final_response": state.tasks_in(conversation.namespace)
-                    .get(&conversation.task_id)
-                    .and_then(|task| task.final_response.as_ref())
+                "final_response": conversation.final_response.as_ref()
                     .map(|response| store.blobs().resolve(response))
                     .transpose()?,
                 "queued_messages": conversation.queued,
@@ -2749,13 +2749,7 @@ fn conversation_views(
                 "presented_messages": conversation.active_delivery.as_ref().map(|delivery| &delivery.presented_messages),
                 "invalid_handoff_reworks": conversation.invalid_handoff_reworks,
                 "runtime_resume_mode": resume_mode,
-                "legal_actions": match conversation.lifecycle {
-                    crate::model::ConversationLifecycle::AwaitingLead => vec!["mission send"],
-                    crate::model::ConversationLifecycle::Running => vec!["mission status", "mission send"],
-                    crate::model::ConversationLifecycle::Ready
-                    | crate::model::ConversationLifecycle::ReworkingInvalidHandoff => vec!["mission advance", "mission send"],
-                    crate::model::ConversationLifecycle::Completed => Vec::new(),
-                },
+                "legal_actions": state.conversation_legal_actions(id),
             }))
         })
         .collect()
@@ -3858,6 +3852,7 @@ mod tests {
                 }],
                 consumed_through: 3,
                 active_delivery: None,
+                final_response: None,
                 invalid_handoff_reworks: 1,
             },
         );
@@ -3945,7 +3940,7 @@ mod tests {
         assert_eq!(json["disposition"], "parked");
         assert_eq!(
             json["next_actions"],
-            serde_json::json!(["mission decide", "mission abort"])
+            serde_json::json!(["mission decide", "mission send", "mission abort"])
         );
         assert_eq!(json["conversations"][0]["id"], conversation_id.as_str());
         assert_eq!(json["conversations"][0]["lifecycle"], "awaiting_lead");

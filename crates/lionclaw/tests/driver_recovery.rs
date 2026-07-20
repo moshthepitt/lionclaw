@@ -152,7 +152,7 @@ async fn concurrent_advance_reports_running_and_never_double_dispatches() {
     assert_eq!(concurrent.disposition, MissionDisposition::Running);
     assert_eq!(
         concurrent.next_actions(),
-        vec!["mission status", "mission abort"]
+        vec!["mission status", "mission send", "mission abort"]
     );
     assert_eq!(concurrent.state.inflight.len(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -242,7 +242,12 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
     assert_eq!(blocked.disposition, MissionDisposition::CleanupBlocked);
     assert_eq!(
         blocked.next_actions(),
-        vec!["mission advance", "mission log", "mission abort"]
+        vec![
+            "mission advance",
+            "mission log",
+            "mission send",
+            "mission abort"
+        ]
     );
     let failure = blocked.state.cleanup_failure.as_ref().unwrap();
     assert_eq!(failure.resource, EffectResource::EffectDirectory);

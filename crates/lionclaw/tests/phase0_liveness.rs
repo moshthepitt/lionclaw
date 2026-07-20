@@ -34,13 +34,10 @@ fn envelope(state: &lionclaw::model::MissionState, event: MissionEvent) -> Event
 }
 
 fn has_current_recipient(state: &lionclaw::model::MissionState) -> bool {
-    state.conversations.values().any(|conversation| {
-        conversation.lifecycle != lionclaw::model::ConversationLifecycle::Completed
-            && state
-                .tasks_in(conversation.namespace)
-                .get(&conversation.task_id)
-                .is_some_and(|task| task.assignment_epoch == conversation.assignment_epoch)
-    })
+    state
+        .conversations
+        .keys()
+        .any(|conversation_id| state.conversation_is_messageable(conversation_id))
 }
 
 fn assert_advertised_actions_are_legal(view: &MissionView) {
@@ -52,7 +49,11 @@ fn assert_advertised_actions_are_legal(view: &MissionView) {
             "mission plan propose" => {
                 assert_eq!(view.disposition, MissionDisposition::AwaitingPlan)
             }
-            "mission continue" => assert!(!view.state.parked_effects.is_empty()),
+            "mission continue" => assert!(view
+                .state
+                .parked_effects
+                .keys()
+                .any(|effect_id| view.state.parked_effect_is_continuable(effect_id))),
             "mission decide" => assert!(!view.state.open_attention.is_empty()),
             "mission abort" => assert!(!view.state.phase.is_terminal()),
             "mission log" => assert_eq!(view.disposition, MissionDisposition::CleanupBlocked),

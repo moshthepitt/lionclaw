@@ -28,7 +28,7 @@ use crate::{RoleName, TypedFailure};
 /// discarded and rebuilt from sequence zero.
 /// Bumped for planning generations, typed failure replanning, assertion
 /// supersession history, and the universal-abort projection rules.
-pub const REDUCER_VERSION: u32 = 26;
+pub const REDUCER_VERSION: u32 = 27;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -204,6 +204,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     queued: Vec::new(),
                     consumed_through: 0,
                     active_delivery: None,
+                    final_response: None,
                     invalid_handoff_reworks: 0,
                 });
             let expected_presented: Vec<_> = conversation
@@ -440,10 +441,11 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         }
                         settle_conversation_delivery(
                             state,
-                            *namespace,
-                            task_id,
+                            &request.conversation_id,
+                            request.assignment_epoch,
                             effect_id,
                             success.handoff.is_some(),
+                            success.final_response.clone(),
                         );
                     } else {
                         let mut failure = TypedFailure::invalid(
@@ -465,7 +467,11 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 }
                 Err(failure) => {
                     settle_failed_conversation_delivery(
-                        state, *namespace, task_id, effect_id, failure,
+                        state,
+                        &request.conversation_id,
+                        request.assignment_epoch,
+                        effect_id,
+                        failure,
                     );
                     apply_role_failure(
                         state,
@@ -797,20 +803,24 @@ fn merge_runtime_configuration(
 
 fn settle_conversation_delivery(
     state: &mut MissionState,
-    namespace: super::TaskNamespace,
-    task_id: &TaskId,
+    conversation_id: &crate::ConversationId,
+    assignment_epoch: u32,
     effect_id: &crate::EffectId,
     has_handoff: bool,
+    final_response: super::PayloadRef,
 ) {
-    let Some((_, conversation)) = state.conversations.iter_mut().find(|(_, conversation)| {
-        conversation.namespace == namespace
-            && &conversation.task_id == task_id
-            && conversation.lifecycle == super::state::ConversationLifecycle::Running
-            && conversation
-                .active_delivery
-                .as_ref()
-                .is_some_and(|delivery| &delivery.effect_id == effect_id)
-    }) else {
+    let Some(conversation) = state
+        .conversations
+        .get_mut(conversation_id)
+        .filter(|conversation| {
+            conversation.assignment_epoch == assignment_epoch
+                && conversation.lifecycle == super::state::ConversationLifecycle::Running
+                && conversation
+                    .active_delivery
+                    .as_ref()
+                    .is_some_and(|delivery| &delivery.effect_id == effect_id)
+        })
+    else {
         return;
     };
     let boundary = conversation
@@ -822,6 +832,7 @@ fn settle_conversation_delivery(
     conversation
         .queued
         .retain(|message| message.sequence_no > boundary);
+    conversation.final_response = Some(final_response);
     conversation.lifecycle = if has_handoff {
         super::state::ConversationLifecycle::Completed
     } else {
@@ -831,20 +842,23 @@ fn settle_conversation_delivery(
 
 fn settle_failed_conversation_delivery(
     state: &mut MissionState,
-    namespace: super::TaskNamespace,
-    task_id: &TaskId,
+    conversation_id: &crate::ConversationId,
+    assignment_epoch: u32,
     effect_id: &crate::EffectId,
     failure: &TypedFailure,
 ) {
-    let Some((_, conversation)) = state.conversations.iter_mut().find(|(_, conversation)| {
-        conversation.namespace == namespace
-            && &conversation.task_id == task_id
-            && conversation.lifecycle == super::state::ConversationLifecycle::Running
-            && conversation
-                .active_delivery
-                .as_ref()
-                .is_some_and(|delivery| &delivery.effect_id == effect_id)
-    }) else {
+    let Some(conversation) = state
+        .conversations
+        .get_mut(conversation_id)
+        .filter(|conversation| {
+            conversation.assignment_epoch == assignment_epoch
+                && conversation.lifecycle == super::state::ConversationLifecycle::Running
+                && conversation
+                    .active_delivery
+                    .as_ref()
+                    .is_some_and(|delivery| &delivery.effect_id == effect_id)
+        })
+    else {
         return;
     };
     let boundary = conversation

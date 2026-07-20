@@ -419,7 +419,12 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
     assert!(parked.state.parked_effects.contains_key(&effect_id));
     assert_eq!(
         parked.next_actions(),
-        ["mission continue", "mission decide", "mission abort"]
+        [
+            "mission continue",
+            "mission decide",
+            "mission send",
+            "mission abort"
+        ]
     );
     assert_eq!(
         parked

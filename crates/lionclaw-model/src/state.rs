@@ -51,6 +51,9 @@ pub struct ConversationState {
     pub queued: Vec<QueuedMessage>,
     pub consumed_through: u64,
     pub active_delivery: Option<ActiveDelivery>,
+    /// Latest response produced by this exact conversation identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_response: Option<super::PayloadRef>,
     pub invalid_handoff_reworks: u32,
 }
 
@@ -974,6 +977,35 @@ pub struct MissionState {
 }
 
 impl MissionState {
+    /// Whether lead messaging is executable for this exact durable dialogue.
+    /// Conversation identity, rather than mutable task state, is the authority.
+    pub fn conversation_is_messageable(&self, conversation_id: &super::ConversationId) -> bool {
+        !self.phase.is_terminal()
+            && self
+                .conversations
+                .get(conversation_id)
+                .is_some_and(|conversation| {
+                    conversation.lifecycle != ConversationLifecycle::Completed
+                })
+    }
+
+    pub fn conversation_legal_actions(
+        &self,
+        conversation_id: &super::ConversationId,
+    ) -> Vec<&'static str> {
+        if !self.conversation_is_messageable(conversation_id) {
+            return Vec::new();
+        }
+        match self.conversations[conversation_id].lifecycle {
+            ConversationLifecycle::AwaitingLead => vec!["mission send"],
+            ConversationLifecycle::Running => vec!["mission status", "mission send"],
+            ConversationLifecycle::Ready | ConversationLifecycle::ReworkingInvalidHandoff => {
+                vec!["mission advance", "mission send"]
+            }
+            ConversationLifecycle::Completed => Vec::new(),
+        }
+    }
+
     /// The authoritative serial artifact head. Later slices may change how
     /// this value is produced; proof and closure consumers use this boundary.
     pub fn deliverable_head(&self) -> &str {
@@ -1003,9 +1035,11 @@ impl MissionState {
     /// Controls and replay share this query so a stale operator view cannot
     /// reopen a task era retired by a later plan promotion.
     pub fn parked_effect_is_continuable(&self, effect_id: &super::EffectId) -> bool {
-        self.parked_effects
-            .get(effect_id)
-            .is_some_and(|effect| self.parked_effect_remains_continuable(effect))
+        !self.phase.is_terminal()
+            && self
+                .parked_effects
+                .get(effect_id)
+                .is_some_and(|effect| self.parked_effect_remains_continuable(effect))
     }
 
     pub(crate) fn parked_effect_remains_continuable(&self, effect: &ParkedEffect) -> bool {

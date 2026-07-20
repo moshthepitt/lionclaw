@@ -184,12 +184,9 @@ impl MissionView {
             .is_some_and(|failure| state.inflight.contains_key(&failure.effect_id))
         {
             MissionDisposition::CleanupBlocked
-        } else if state.conversations.values().any(|conversation| {
+        } else if state.conversations.iter().any(|(id, conversation)| {
             conversation.lifecycle == crate::model::ConversationLifecycle::AwaitingLead
-                && state
-                    .tasks_in(conversation.namespace)
-                    .get(&conversation.task_id)
-                    .is_some_and(|task| task.assignment_epoch == conversation.assignment_epoch)
+                && state.conversation_is_messageable(id)
         }) {
             MissionDisposition::AwaitingLead
         } else if !state.open_attention.is_empty() {
@@ -206,20 +203,27 @@ impl MissionView {
     }
 
     pub fn next_actions(&self) -> Vec<&'static str> {
-        match self.disposition {
-            MissionDisposition::Ready => vec!["mission advance", "mission abort"],
-            MissionDisposition::Running => vec!["mission status", "mission abort"],
-            MissionDisposition::AwaitingLead => vec!["mission send", "mission abort"],
-            MissionDisposition::AwaitingPlan => {
-                vec!["mission plan propose", "mission abort"]
+        let can_send = self
+            .state
+            .conversations
+            .keys()
+            .any(|id| self.state.conversation_is_messageable(id));
+        let mut actions = match self.disposition {
+            MissionDisposition::Ready => vec!["mission advance"],
+            MissionDisposition::Running => vec!["mission status"],
+            MissionDisposition::AwaitingLead => vec!["mission send"],
+            MissionDisposition::AwaitingPlan => vec!["mission plan propose"],
+            MissionDisposition::Parked
+                if self
+                    .state
+                    .parked_effects
+                    .keys()
+                    .any(|effect_id| self.state.parked_effect_is_continuable(effect_id)) =>
+            {
+                vec!["mission continue", "mission decide"]
             }
-            MissionDisposition::Parked if !self.state.parked_effects.is_empty() => {
-                vec!["mission continue", "mission decide", "mission abort"]
-            }
-            MissionDisposition::Parked => vec!["mission decide", "mission abort"],
-            MissionDisposition::CleanupBlocked => {
-                vec!["mission advance", "mission log", "mission abort"]
-            }
+            MissionDisposition::Parked => vec!["mission decide"],
+            MissionDisposition::CleanupBlocked => vec!["mission advance", "mission log"],
             MissionDisposition::Terminal => {
                 let mut actions = vec!["mission report"];
                 if matches!(self.state.phase, MissionPhase::Done { .. })
@@ -229,7 +233,17 @@ impl MissionView {
                 }
                 actions
             }
+        };
+        if can_send
+            && !actions.contains(&"mission send")
+            && self.disposition != MissionDisposition::Terminal
+        {
+            actions.push("mission send");
         }
+        if self.disposition != MissionDisposition::Terminal {
+            actions.push("mission abort");
+        }
+        actions
     }
 }
 
@@ -271,13 +285,19 @@ impl Engine {
             matches!(&envelope.event, MissionEvent::RoleRunRequested { effect_id: id, .. } if id == effect_id)
         }).context("role request not found")?;
         let request_seq = request.sequence_no;
-        let (template, expected_hash, role_name) = match &request.event {
+        let (conversation_id, template, expected_hash, role_name) = match &request.event {
             MissionEvent::RoleRunRequested {
+                conversation_id,
                 prompt_template,
                 prompt_hash,
                 role,
                 ..
-            } => (*prompt_template, prompt_hash.clone(), role.clone()),
+            } => (
+                conversation_id.clone(),
+                *prompt_template,
+                prompt_hash.clone(),
+                role.clone(),
+            ),
             _ => unreachable!(),
         };
         let prefix: Vec<_> = events
@@ -294,7 +314,7 @@ impl Engine {
             .roles
             .get(&role_name)
             .context("role missing from mission type")?;
-        let dialogue = materialize_conversation_messages(self, &state, &intent).await?;
+        let dialogue = materialize_conversation_messages(self, &state, &conversation_id).await?;
         let prompt = match intent.namespace {
             TaskNamespace::Planning => {
                 self.assemble_planning_request(&state, role, &intent, &dialogue)?
@@ -1084,6 +1104,7 @@ impl Engine {
         activity: tokio::sync::watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
     ) -> Result<NewEvent> {
         let InflightEffect::RoleRun {
+            conversation_id,
             namespace,
             task_id,
             attempt_no,
@@ -1145,13 +1166,6 @@ impl Engine {
         let (updates, update_rx) = tokio::sync::mpsc::channel(8);
         let artifact_capture =
             (*output == crate::model::OutputSemantics::ProducesArtifact).then(|| {
-                let conversation_id = crate::model::ConversationId::for_role_instance(
-                    &state.mission_id,
-                    *namespace,
-                    task_id,
-                    role_name,
-                    *assignment_epoch,
-                );
                 let checkout = self
                     .store
                     .lionclaw_dir()
@@ -1170,6 +1184,8 @@ impl Engine {
             });
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
+            conversation_id: conversation_id.clone(),
+            namespace: *namespace,
             task_id: task_id.clone(),
             attempt_no,
             effect_id: effect_id.clone(),
@@ -1413,6 +1429,14 @@ impl Engine {
         let (updates, update_rx) = tokio::sync::mpsc::channel(8);
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
+            conversation_id: crate::model::ConversationId::for_role_instance(
+                &state.mission_id,
+                TaskNamespace::Execution,
+                &TaskId::new(TERMINAL_REVIEW_TASK_TAG).expect("valid literal task id"),
+                role_name,
+                attempt_no,
+            ),
+            namespace: TaskNamespace::Execution,
             task_id: TaskId::new(TERMINAL_REVIEW_TASK_TAG).expect("valid literal task id"),
             attempt_no,
             effect_id: effect_id.clone(),
@@ -1730,7 +1754,7 @@ impl Engine {
                         .map(|message| message.sequence_no)
                         .collect()
                 });
-        let dialogue = materialize_conversation_messages(self, state, &intent).await?;
+        let dialogue = materialize_conversation_messages(self, state, &conversation_id).await?;
         let prompt_text = match intent.namespace {
             TaskNamespace::Planning => {
                 self.assemble_planning_request(state, role, &intent, &dialogue)?
@@ -2209,13 +2233,9 @@ pub async fn record_abort(
 async fn materialize_conversation_messages(
     engine: &Engine,
     state: &MissionState,
-    intent: &RoleDispatchIntent,
+    conversation_id: &crate::model::ConversationId,
 ) -> Result<Vec<String>> {
-    let Some((_, conversation)) = state.conversations.iter().find(|(_, conversation)| {
-        conversation.namespace == intent.namespace
-            && conversation.task_id == intent.task_id
-            && conversation.lifecycle != crate::model::ConversationLifecycle::Completed
-    }) else {
+    let Some(conversation) = state.conversations.get(conversation_id) else {
         return Ok(Vec::new());
     };
     let events = engine.store.load(&state.mission_id).await?;
@@ -2392,13 +2412,7 @@ pub async fn record_message(
     let current: Vec<_> = state
         .conversations
         .iter()
-        .filter(|(_, conversation)| {
-            conversation.lifecycle != crate::model::ConversationLifecycle::Completed
-                && state
-                    .tasks_in(conversation.namespace)
-                    .get(&conversation.task_id)
-                    .is_some_and(|task| task.assignment_epoch == conversation.assignment_epoch)
-        })
+        .filter(|(conversation_id, _)| state.conversation_is_messageable(conversation_id))
         .map(
             |(conversation_id, conversation)| crate::model::ConversationRecipient {
                 conversation_id: conversation_id.clone(),

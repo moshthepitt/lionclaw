@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
 use crate::model::{
-    EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
-    RuntimeConfigurationEvidence, TaskId,
+    ConversationId, EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
+    RuntimeConfigurationEvidence, TaskId, TaskNamespace,
 };
 pub use crate::workspace::{ArtifactCapture, CapturedArtifact};
 
@@ -30,6 +30,9 @@ pub trait RoleRunner: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct RoleRunRequest {
     pub mission_id: MissionId,
+    /// Exact immutable dialogue identity recorded by `RoleRunRequested`.
+    pub conversation_id: ConversationId,
+    pub namespace: TaskNamespace,
     pub task_id: TaskId,
     pub attempt_no: u32,
     pub effect_id: EffectId,

@@ -376,6 +376,19 @@ async fn prepare_writer_checkout(
 #[async_trait]
 impl RoleRunner for OciRoleRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        let expected_conversation = crate::model::ConversationId::for_role_instance(
+            &request.mission_id,
+            request.namespace,
+            &request.task_id,
+            &request.role.name,
+            request.assignment_epoch,
+        );
+        if request.conversation_id != expected_conversation {
+            return Err(launch(
+                "role request conversation identity does not match its immutable coordinates"
+                    .into(),
+            ));
+        }
         if let Some(declared) = &request.role.runtime {
             if declared != &request.runtime {
                 return Err(launch(format!(
@@ -385,25 +398,10 @@ impl RoleRunner for OciRoleRunner {
             }
         }
         let profile = self.profile(&request.runtime)?;
-        let namespace = match request.role.output {
-            OutputSemantics::ProposesPlan | OutputSemantics::ProducesReport => {
-                crate::model::TaskNamespace::Planning
-            }
-            OutputSemantics::ProducesArtifact
-            | OutputSemantics::EmitsVerdict
-            | OutputSemantics::EmitsGapVerdict => crate::model::TaskNamespace::Execution,
-        };
-        let conversation_id = crate::model::ConversationId::for_role_instance(
-            &request.mission_id,
-            namespace,
-            &request.task_id,
-            &request.role.name,
-            request.assignment_epoch,
-        );
         let conversation_dirs = ConversationDirs::prepare(
             &request.state_dir,
             request.mission_id.as_str(),
-            &conversation_id,
+            &request.conversation_id,
         )
         .map_err(|e| launch(format!("failed to prepare conversation dirs: {e}")))?;
 
@@ -1278,6 +1276,14 @@ mod tests {
         let (activity, _activity_rx) = tokio::sync::watch::channel(None);
         RoleRunRequest {
             mission_id: crate::model::MissionId::for_creation("/workspace", "fallback", 1),
+            conversation_id: crate::model::ConversationId::for_role_instance(
+                &crate::model::MissionId::for_creation("/workspace", "fallback", 1),
+                crate::model::TaskNamespace::Execution,
+                &crate::model::TaskId::new("fallback-boundary").unwrap(),
+                &crate::model::RoleName::new("implementer").unwrap(),
+                1,
+            ),
+            namespace: crate::model::TaskNamespace::Execution,
             task_id: crate::model::TaskId::new("fallback-boundary").unwrap(),
             attempt_no: 1,
             effect_id: crate::model::EffectId::for_parts(&["fallback-boundary"]),
@@ -1306,6 +1312,29 @@ mod tests {
             state_dir: temp.join("state"),
             artifact_capture: None,
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_a_conversation_identity_from_another_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = OciRoleRunner::new(
+            RuntimeProfiles::built_in().unwrap(),
+            "identity-test-image".into(),
+            AuthorityCeiling::default(),
+        );
+        let mut request = fallback_request(temp.path());
+        request.conversation_id = crate::model::ConversationId::for_role_instance(
+            &request.mission_id,
+            request.namespace,
+            &request.task_id,
+            &request.role.name,
+            request.assignment_epoch + 1,
+        );
+
+        let failure = runner.run(request).await.expect_err("cross-epoch dispatch");
+        assert!(failure
+            .to_string()
+            .contains("conversation identity does not match"));
     }
 
     async fn run_fallback_boundary(
