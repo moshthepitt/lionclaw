@@ -6,8 +6,9 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use lionclaw_runtime_api::{
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeExecutionContext, RuntimeMcpServerSpec,
-    RuntimeNativeHomeArtifactDir, RuntimeProgramExecutor, RuntimeProgramSpec, RuntimeResume,
-    RuntimeResumeMode, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+    RuntimeNativeHomeArtifactDir, RuntimeNativeReopenOutcome, RuntimeNativeReopenRecovery,
+    RuntimeProgramExecutor, RuntimeProgramSpec, RuntimeResume, RuntimeResumeMode,
+    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
     RuntimeTurnJournalSender, TurnExecution, TurnInput, TurnResult, TypedFailure,
 };
 use tokio::{
@@ -73,7 +74,11 @@ impl CodexAppServerTurnRunner<'_> {
 
         let result = async {
             client.initialize(sink, &thread_state).await?;
-            let thread_id = self
+            let reopening = self
+                .adapter
+                .current_thread_id(&input.runtime_session_id)?
+                .is_some();
+            let thread_id = match self
                 .adapter
                 .ensure_app_server_thread(
                     &mut client,
@@ -81,7 +86,17 @@ impl CodexAppServerTurnRunner<'_> {
                     sink,
                     &thread_state,
                 )
-                .await?;
+                .await
+            {
+                Ok(thread_id) => thread_id,
+                Err(error) => {
+                    if reopening {
+                        self.adapter
+                            .mark_native_reopen_failed(&input.runtime_session_id)?;
+                    }
+                    return Err(error);
+                }
+            };
             let response = client
                 .request(
                     "turn/start",
@@ -179,6 +194,10 @@ impl CodexRuntimeAdapter {
             config,
             sessions: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub(crate) fn mark_native_reopen_failed(&self, runtime_session_id: &str) -> Result<()> {
+        crate::state::mark_native_reopen_failed(&self.sessions, runtime_session_id)
     }
 
     async fn run_app_server_turn(
@@ -307,6 +326,30 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         )?])
     }
 
+    fn native_reopen_recovery(&self) -> RuntimeNativeReopenRecovery {
+        RuntimeNativeReopenRecovery::ForgetAndReconstruct
+    }
+
+    fn native_reopen_outcome(
+        &self,
+        handle: &RuntimeSessionHandle,
+        _failure: &lionclaw_runtime_api::TypedFailure,
+    ) -> RuntimeNativeReopenOutcome {
+        let reopen_failed = self
+            .session_state(&handle.runtime_session_id)
+            .is_ok_and(|state| state.native_reopen_failed);
+        if handle.resume_mode == RuntimeResumeMode::Resumed && reopen_failed {
+            RuntimeNativeReopenOutcome::Recoverable
+        } else {
+            RuntimeNativeReopenOutcome::NotReopenFailure
+        }
+    }
+
+    async fn forget_native_reopen(&self, handle: &RuntimeSessionHandle) -> Result<()> {
+        crate::state::forget_thread_id(&self.sessions, &handle.runtime_session_id)?;
+        Ok(())
+    }
+
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("codex-{}", Uuid::new_v4());
         let (runtime_state_root, thread_id) = match input.resume {
@@ -326,6 +369,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
                     runtime_state_root,
                     thread_id,
                     active_turn: None,
+                    native_reopen_failed: false,
                 },
             );
 

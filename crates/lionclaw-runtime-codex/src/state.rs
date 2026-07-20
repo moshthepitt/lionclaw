@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, bail, Result};
-use lionclaw_runtime_api::{load_ready_state_value, save_state_value, RuntimeSessionReady};
+use lionclaw_runtime_api::{
+    clear_state_value, load_ready_state_value, save_state_value, RuntimeSessionReady,
+};
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const CODEX_THREAD_ID_STATE_FILE: &str = ".lionclaw-codex-thread-id";
@@ -27,6 +29,7 @@ pub(crate) struct CodexSessionState {
     pub(crate) runtime_state_root: Option<PathBuf>,
     pub(crate) thread_id: Option<String>,
     pub(crate) active_turn: Option<ActiveCodexTurn>,
+    pub(crate) native_reopen_failed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +69,47 @@ pub(crate) fn load_ready_saved_thread_id(
 pub(crate) fn save_thread_id(root: &Path, thread_id: &str) -> Result<()> {
     validate_protocol_id(thread_id)?;
     save_state_value(root, CODEX_THREAD_ID_STATE_FILE, thread_id, "codex thread")
+}
+
+pub(crate) fn forget_thread_id(
+    sessions: &RwLock<HashMap<String, CodexSessionState>>,
+    runtime_session_id: &str,
+) -> Result<()> {
+    let runtime_state_root = sessions
+        .read()
+        .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
+        .get(runtime_session_id)
+        .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))?
+        .runtime_state_root
+        .clone();
+    if let Some(root) = runtime_state_root {
+        clear_state_value(&root, CODEX_THREAD_ID_STATE_FILE, "codex thread")?;
+    }
+    let mut sessions = sessions
+        .write()
+        .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?;
+    let session = sessions
+        .get_mut(runtime_session_id)
+        .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))?;
+    session.thread_id = None;
+    session.native_reopen_failed = false;
+    drop(sessions);
+    Ok(())
+}
+
+pub(crate) fn mark_native_reopen_failed(
+    sessions: &RwLock<HashMap<String, CodexSessionState>>,
+    runtime_session_id: &str,
+) -> Result<()> {
+    let mut sessions = sessions
+        .write()
+        .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?;
+    sessions
+        .get_mut(runtime_session_id)
+        .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))?
+        .native_reopen_failed = true;
+    drop(sessions);
+    Ok(())
 }
 
 impl CodexThreadState {

@@ -40,9 +40,9 @@ mod state;
 mod turn;
 
 pub use adapter::{
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCancellation, RuntimeResume, RuntimeResumeMode,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput, TurnExecution,
-    TurnInput,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCancellation, RuntimeNativeReopenOutcome,
+    RuntimeNativeReopenRecovery, RuntimeResume, RuntimeResumeMode, RuntimeSessionHandle,
+    RuntimeSessionStartInput, RuntimeTerminalProgramInput, TurnExecution, TurnInput,
 };
 pub use auth::{
     RuntimeAuthContext, RuntimeAuthKind, RuntimeAuthPreparation, RuntimeAuthProvider,

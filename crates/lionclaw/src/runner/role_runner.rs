@@ -10,9 +10,11 @@ use async_trait::async_trait;
 use lionclaw_confinement::WORKSPACE_MOUNT_TARGET;
 use lionclaw_runtime_acp::AcpRuntimeDriver;
 use lionclaw_runtime_api::{
-    RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider,
-    RuntimeDriverRegistry, RuntimeSessionReady, RuntimeSessionStartInput, TurnExecution, TurnInput,
-    TypedFailure, TypedFailureEvidence,
+    RuntimeAdapter, RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig,
+    RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeNativeReopenOutcome,
+    RuntimeNativeReopenRecovery, RuntimeResume, RuntimeResumeMode, RuntimeSessionHandle,
+    RuntimeSessionReady, RuntimeSessionStartInput, TurnExecution, TurnInput, TypedFailure,
+    TypedFailureEvidence,
 };
 use lionclaw_runtime_codex::{CodexRuntimeAuthProvider, CodexRuntimeDriver};
 use tokio::sync::Mutex;
@@ -627,11 +629,11 @@ impl OciRoleRunner {
                     working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
                     environment: plan.environment.clone(),
                     resume: match state_root.clone() {
-                        Some(state_root) => lionclaw_runtime_api::RuntimeResume::Native {
+                        Some(state_root) => RuntimeResume::Native {
                             state_root,
                             ready: runtime_session_ready,
                         },
-                        None => lionclaw_runtime_api::RuntimeResume::Reconstruct,
+                        None => RuntimeResume::Reconstruct,
                     },
                 })
                 .await
@@ -641,116 +643,84 @@ impl OciRoleRunner {
             setup_control_failure(profile, control)
         })
         .await?;
-        let resume_mode = handle.resume_mode;
+        let mut resume_mode = handle.resume_mode;
+        let (mut result, mut fallback_final_response) = execute_turn_attempt(
+            Arc::clone(&adapter),
+            &handle,
+            profile,
+            request,
+            context,
+            plan.clone(),
+            auth_registry.clone(),
+        )
+        .await;
 
-        let (journal_tx, journal_rx) = tokio::sync::mpsc::channel::<lionclaw_runtime_api::TurnEvent>(
-            lionclaw_runtime_api::RUNTIME_TURN_JOURNAL_CAPACITY,
-        );
-        let updates = request.updates.clone();
-        let activity = request.activity.clone();
-        let activity_effect_id = request.effect_id.clone();
-        let drain = tokio::spawn(drain_runtime_journal(
-            journal_rx,
-            updates,
-            activity,
-            activity_effect_id,
-        ));
-
-        let mut turn = Box::pin(adapter.turn(
-            TurnExecution {
-                input: TurnInput {
-                    runtime_session_id: handle.runtime_session_id.clone(),
-                    prompt: request.prompt.clone(),
-                    fresh_prompt: None,
-                },
-                context,
-                executor: Box::new(MissionProgramExecutor::new(
-                    plan,
-                    auth_registry,
-                    &request.effect_id,
-                )),
-            },
-            journal_tx,
-        ));
-        let mut control = request.control.clone();
-        enum TurnEnd {
-            Completed(anyhow::Result<lionclaw_runtime_api::TurnResult>),
-            Cancel {
-                reason: String,
-                kind: CancellationKind,
-            },
-        }
-        let end = loop {
-            let current_control = control.borrow().clone();
-            match current_control {
-                ExecutionControl::RunUntil(_) => {}
-                ExecutionControl::DeadlineExhausted => {
-                    break TurnEnd::Cancel {
-                        reason: "effect deadline exhausted".into(),
-                        kind: CancellationKind::Deadline,
-                    };
-                }
-                ExecutionControl::Stop(reason) => {
-                    break TurnEnd::Cancel {
-                        reason,
-                        kind: CancellationKind::Stop,
-                    };
-                }
-                ExecutionControl::Abort(reason) => {
-                    break TurnEnd::Cancel {
-                        reason,
-                        kind: CancellationKind::Abort,
-                    };
-                }
+        let recoverable_reopen = match &result {
+            Err(failure) => {
+                adapter.native_reopen_outcome(&handle, failure)
+                    == RuntimeNativeReopenOutcome::Recoverable
             }
-            tokio::select! {
-                biased;
-                changed = control.changed() => {
-                    if changed.is_err() {
-                        continue;
-                    }
-                }
-                completed = &mut turn => break TurnEnd::Completed(completed),
-            }
+            Ok(_) => false,
         };
-        let result = match end {
-            TurnEnd::Completed(completed) => completed.map_err(|err| {
-                err.downcast_ref::<TypedFailure>()
-                    .cloned()
-                    .unwrap_or_else(|| TypedFailure::permanent("runtime.unknown", err.to_string()))
-            }),
-            TurnEnd::Cancel { reason, kind } => {
-                let (acknowledged, completed) = cancellation_acknowledged(
-                    adapter.cancel(&handle, Some(reason.clone())),
-                    turn.as_mut(),
-                    std::time::Duration::from_secs(5),
+        if recoverable_reopen
+            && resume_mode == RuntimeResumeMode::Resumed
+            && adapter.native_reopen_recovery() == RuntimeNativeReopenRecovery::ForgetAndReconstruct
+        {
+            let reopen_failure = match result {
+                Err(failure) => failure,
+                Ok(_) => unreachable!("recoverable reopen requires a failed turn"),
+            };
+            if let Err(error) = adapter.forget_native_reopen(&handle).await {
+                let _ = adapter.close(&handle).await;
+                return Err(recovery_failure(
+                    &reopen_failure,
+                    "forget",
+                    &error.to_string(),
+                ));
+            }
+            let _ = adapter.close(&handle).await;
+            let reconstruction = adapter
+                .session_start(RuntimeSessionStartInput {
+                    session_id: uuid_from_key(request.effect_id.as_str()),
+                    working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
+                    environment: plan.environment.clone(),
+                    resume: match state_root.clone() {
+                        Some(state_root) => RuntimeResume::Native {
+                            state_root,
+                            ready: RuntimeSessionReady::not_ready(),
+                        },
+                        None => RuntimeResume::Reconstruct,
+                    },
+                })
+                .await
+                .map_err(|error| {
+                    recovery_failure(&reopen_failure, "reconstruction_start", &error.to_string())
+                })?;
+            resume_mode = reconstruction.resume_mode;
+            let reconstruction_context = mission_execution_context(&plan).map_err(|error| {
+                recovery_failure(
+                    &reopen_failure,
+                    "reconstruction_context",
+                    &error.to_string(),
                 )
-                .await;
-                let mut evidence = turn_failure_evidence(
-                    profile,
-                    kind.active_detail().into(),
-                    String::new(),
-                    String::new(),
-                );
-                if let Some((configuration, final_response)) = completed_turn_evidence(completed) {
-                    evidence.configuration = configuration;
-                    evidence.final_response = final_response;
-                }
-                evidence.code = Some(
-                    if acknowledged {
-                        "runtime.cancel_acknowledged"
-                    } else {
-                        "runtime.cancel_forced"
-                    }
-                    .into(),
-                );
-                evidence.stop_reason = Some(reason);
-                Err(kind.failure(evidence))
-            }
-        };
-        drop(turn);
-        let _ = adapter.close(&handle).await;
-        let fallback_final_response = drain.await.unwrap_or_default();
+            })?;
+            let (reconstructed, reconstructed_response) = execute_turn_attempt(
+                Arc::clone(&adapter),
+                &reconstruction,
+                profile,
+                request,
+                reconstruction_context,
+                plan.clone(),
+                auth_registry,
+            )
+            .await;
+            let _ = adapter.close(&reconstruction).await;
+            fallback_final_response = reconstructed_response;
+            result =
+                reconstructed.map_err(|failure| double_recovery_failure(&reopen_failure, &failure));
+        } else {
+            let _ = adapter.close(&handle).await;
+        }
 
         // Native identity is conversation state, not successful-effect state.
         // Once a turn has launched, retain whatever opaque identity the
@@ -774,6 +744,152 @@ impl OciRoleRunner {
             }
         }
     }
+}
+
+async fn execute_turn_attempt(
+    adapter: Arc<dyn RuntimeAdapter>,
+    handle: &RuntimeSessionHandle,
+    profile: &MissionRuntimeProfile,
+    request: &RoleRunRequest,
+    context: lionclaw_runtime_api::RuntimeExecutionContext,
+    plan: lionclaw_confinement::EffectiveExecutionPlan,
+    auth_registry: RuntimeAuthRegistry,
+) -> (
+    Result<lionclaw_runtime_api::TurnResult, TypedFailure>,
+    String,
+) {
+    let (journal_tx, journal_rx) =
+        tokio::sync::mpsc::channel(lionclaw_runtime_api::RUNTIME_TURN_JOURNAL_CAPACITY);
+    let drain = tokio::spawn(drain_runtime_journal(
+        journal_rx,
+        request.updates.clone(),
+        request.activity.clone(),
+        request.effect_id.clone(),
+    ));
+    let mut turn = Box::pin(adapter.turn(
+        TurnExecution {
+            input: TurnInput {
+                runtime_session_id: handle.runtime_session_id.clone(),
+                prompt: request.prompt.clone(),
+                fresh_prompt: None,
+            },
+            context,
+            executor: Box::new(MissionProgramExecutor::new(
+                plan,
+                auth_registry,
+                &request.effect_id,
+            )),
+        },
+        journal_tx,
+    ));
+    let mut control = request.control.clone();
+    enum TurnEnd {
+        Completed(anyhow::Result<lionclaw_runtime_api::TurnResult>),
+        Cancel {
+            reason: String,
+            kind: CancellationKind,
+        },
+    }
+    let end = loop {
+        match control.borrow().clone() {
+            ExecutionControl::RunUntil(_) => {}
+            ExecutionControl::DeadlineExhausted => {
+                break TurnEnd::Cancel {
+                    reason: "effect deadline exhausted".into(),
+                    kind: CancellationKind::Deadline,
+                }
+            }
+            ExecutionControl::Stop(reason) => {
+                break TurnEnd::Cancel {
+                    reason,
+                    kind: CancellationKind::Stop,
+                }
+            }
+            ExecutionControl::Abort(reason) => {
+                break TurnEnd::Cancel {
+                    reason,
+                    kind: CancellationKind::Abort,
+                }
+            }
+        }
+        tokio::select! {
+            biased;
+            changed = control.changed() => if changed.is_err() { continue; },
+            completed = &mut turn => break TurnEnd::Completed(completed),
+        }
+    };
+    let result = match end {
+        TurnEnd::Completed(completed) => completed.map_err(|error| {
+            error
+                .downcast_ref::<TypedFailure>()
+                .cloned()
+                .unwrap_or_else(|| TypedFailure::permanent("runtime.unknown", error.to_string()))
+        }),
+        TurnEnd::Cancel { reason, kind } => {
+            let (acknowledged, completed) = cancellation_acknowledged(
+                adapter.cancel(handle, Some(reason.clone())),
+                turn.as_mut(),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            let mut evidence = turn_failure_evidence(
+                profile,
+                kind.active_detail().into(),
+                String::new(),
+                String::new(),
+            );
+            if let Some((configuration, final_response)) = completed_turn_evidence(completed) {
+                evidence.configuration = configuration;
+                evidence.final_response = final_response;
+            }
+            evidence.code = Some(
+                if acknowledged {
+                    "runtime.cancel_acknowledged"
+                } else {
+                    "runtime.cancel_forced"
+                }
+                .into(),
+            );
+            evidence.stop_reason = Some(reason);
+            Err(kind.failure(evidence))
+        }
+    };
+    drop(turn);
+    (result, drain.await.unwrap_or_default())
+}
+
+fn recovery_failure(first: &TypedFailure, stage: &str, detail: &str) -> TypedFailure {
+    TypedFailure::permanent(
+        "runtime.native_reopen_recovery",
+        format!("native_reopen={}; {stage}={detail}", first.detail()),
+    )
+    .projected()
+}
+
+fn double_recovery_failure(first: &TypedFailure, second: &TypedFailure) -> TypedFailure {
+    let first_prefix = format!("native_reopen[{}]=", first.category());
+    let second_prefix = format!("; canonical_reconstruction[{}]=", second.category());
+    let detail_budget = lionclaw_runtime_api::FAILURE_TEXT_LIMIT
+        .saturating_sub(first_prefix.len() + second_prefix.len());
+    let first_detail = bounded_stage_detail(first.detail(), detail_budget / 2);
+    let second_detail = bounded_stage_detail(second.detail(), detail_budget - first_detail.len());
+    TypedFailure::permanent(
+        "runtime.native_reopen_reconstruction_failed",
+        format!("{first_prefix}{first_detail}{second_prefix}{second_detail}"),
+    )
+    .projected()
+}
+
+fn bounded_stage_detail(detail: &str, limit: usize) -> String {
+    const MARKER: &str = "...[truncated]";
+    if detail.len() <= limit {
+        return detail.to_string();
+    }
+    let mut cut = limit.saturating_sub(MARKER.len());
+    while !detail.is_char_boundary(cut) {
+        cut = cut.saturating_sub(1);
+    }
+    format!("{}{MARKER}", &detail[..cut])
 }
 
 async fn drain_runtime_journal(
@@ -908,6 +1024,34 @@ mod tests {
     use lionclaw_confinement::MountAccess;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    #[test]
+    fn double_reopen_failure_evidence_is_exact_and_bounded() {
+        let reopen = TypedFailure::transient(
+            "codex.thread_rollout",
+            "y".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT * 2),
+            None,
+        );
+        let reconstruction = TypedFailure::permanent(
+            "codex.process_exit",
+            "x".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT * 2),
+        );
+
+        let failure = double_recovery_failure(&reopen, &reconstruction);
+
+        assert_eq!(
+            failure.evidence().code.as_deref(),
+            Some("runtime.native_reopen_reconstruction_failed")
+        );
+        assert!(failure
+            .detail()
+            .starts_with("native_reopen[transient_runtime]="));
+        assert!(failure
+            .detail()
+            .contains("; canonical_reconstruction[permanent_runtime]="));
+        assert!(failure.detail().len() <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT);
+        assert!(!failure.detail().contains("third"));
+    }
 
     #[test]
     fn acp_profile_mode_reaches_the_driver_config() {

@@ -2269,6 +2269,52 @@ async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
     adapter.close(&handle_b).await.expect("close b");
 }
 
+#[tokio::test]
+async fn native_reopen_recovery_durably_forgets_exact_stale_codex_thread() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    std::fs::write(
+        runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
+        "thread-stale\n",
+    )
+    .expect("write stale thread");
+
+    let (adapter, handle, _) = start_codex_ready_test_session(runtime_state_root.clone()).await;
+    assert_eq!(handle.resume_mode, RuntimeResumeMode::Resumed);
+    assert_eq!(
+        adapter.native_reopen_recovery(),
+        lionclaw_runtime_api::RuntimeNativeReopenRecovery::ForgetAndReconstruct
+    );
+    let failure = TypedFailure::permanent("codex.thread_rollout", "stale thread");
+    assert_eq!(
+        adapter.native_reopen_outcome(&handle, &failure),
+        lionclaw_runtime_api::RuntimeNativeReopenOutcome::NotReopenFailure
+    );
+    adapter
+        .mark_native_reopen_failed(&handle.runtime_session_id)
+        .expect("record failed thread/resume boundary");
+    assert_eq!(
+        adapter.native_reopen_outcome(&handle, &failure),
+        lionclaw_runtime_api::RuntimeNativeReopenOutcome::Recoverable
+    );
+
+    adapter
+        .forget_native_reopen(&handle)
+        .await
+        .expect("forget stale reopen identity");
+    assert_eq!(
+        adapter
+            .current_thread_id(&handle.runtime_session_id)
+            .expect("in-memory thread state"),
+        None
+    );
+    assert!(
+        !runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE).exists(),
+        "forget confirmation must follow durable removal"
+    );
+}
+
 async fn start_codex_ready_test_session(
     runtime_state_root: PathBuf,
 ) -> (

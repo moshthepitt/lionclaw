@@ -49,6 +49,23 @@ pub enum RuntimeResumeMode {
     Resumed,
 }
 
+/// Adapter-declared policy for a failed attempt to reopen native conversation
+/// state. The runner, rather than a concrete runtime branch, owns the single
+/// canonical reconstruction attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeNativeReopenRecovery {
+    Unsupported,
+    ForgetAndReconstruct,
+}
+
+/// Typed adapter observation of whether a failed turn was in fact a failed
+/// native reopen and is eligible for the declared recovery policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeNativeReopenOutcome {
+    NotReopenFailure,
+    Recoverable,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeTerminalProgramInput {
     pub session_id: Uuid,
@@ -81,6 +98,19 @@ pub trait RuntimeAdapter: Send + Sync {
     async fn info(&self) -> RuntimeAdapterInfo;
     fn native_home_artifact_dirs(&self) -> Result<Vec<RuntimeNativeHomeArtifactDir>> {
         Ok(Vec::new())
+    }
+    fn native_reopen_recovery(&self) -> RuntimeNativeReopenRecovery {
+        RuntimeNativeReopenRecovery::Unsupported
+    }
+    fn native_reopen_outcome(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _failure: &crate::TypedFailure,
+    ) -> RuntimeNativeReopenOutcome {
+        RuntimeNativeReopenOutcome::NotReopenFailure
+    }
+    async fn forget_native_reopen(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Err(anyhow!("runtime does not support native reopen recovery"))
     }
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle>;
     async fn turn(
