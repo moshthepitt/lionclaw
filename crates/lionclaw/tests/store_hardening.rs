@@ -6,9 +6,432 @@ mod common;
 use common::{
     approve_plan, fault_append_events, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA,
 };
-use lionclaw::model::{MissionEvent, OutputSemantics, RoleName, TaskId};
+use lionclaw::model::{
+    apply, fold, ConversationId, ConversationRecipient, MissionEvent, MissionState,
+    OutputSemantics, RoleName, RoleRunRequestIdentity, TaskId, TaskNamespace, TaskStatus,
+    TypedFailure,
+};
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
+
+const PROMPT_HASH: &str = "cf07194ee232eb531e15f690000d19846dea69cf05504782658afcfacb9228a2";
+
+fn role_request(state: &MissionState) -> NewEvent {
+    let task_id = TaskId::new("fix").unwrap();
+    let role = RoleName::new("implementer").unwrap();
+    let assignment = lionclaw::model::resolve_role_assignment(
+        &state.mission_id,
+        TaskNamespace::Execution,
+        &task_id,
+        &role,
+        lionclaw::model::RoleAssignmentContext {
+            previous: state.tasks.get(&task_id),
+            required_base: BASE_SHA,
+            lifecycle_generation: state.role_lifecycle_generation(TaskNamespace::Execution),
+            max_attempts: state.config.recovery.max_attempts,
+        },
+    );
+    let attempt_no = state
+        .tasks
+        .get(&task_id)
+        .map_or(1, |task| task.attempts + 1);
+    let effect_id = lionclaw::model::EffectId::for_role_request(
+        TaskNamespace::Execution,
+        &state.mission_id,
+        &task_id,
+        attempt_no,
+        assignment.generation,
+        PROMPT_HASH,
+    );
+    let presented_messages = state
+        .conversations
+        .get(&assignment.conversation_id)
+        .map_or_else(Vec::new, |conversation| {
+            conversation
+                .queued
+                .iter()
+                .map(|message| message.sequence_no)
+                .collect()
+        });
+    NewEvent::new(MissionEvent::RoleRunRequested {
+        conversation_id: assignment.conversation_id,
+        namespace: TaskNamespace::Execution,
+        task_id,
+        attempt_no,
+        effect_id,
+        role,
+        output: OutputSemantics::ProducesArtifact,
+        runtime: "codex".into(),
+        prompt_template: lionclaw::model::RolePromptTemplate::Execution,
+        prompt_hash: PROMPT_HASH.into(),
+        base_sha: assignment.base_sha,
+        assignment_epoch: assignment.generation,
+        message_boundary: state.head,
+        presented_messages,
+        recreate_workspace: assignment.recreate_workspace,
+        requested_at_ms: 0,
+        not_before_ms: 0,
+        deadline_ms: 100_000,
+        budget_deadline_ms: 100_000,
+    })
+    .with_prompt_hash(PROMPT_HASH)
+}
+
+fn assert_only_head_advanced(before: &MissionState, after: &MissionState) {
+    let mut normalized = after.clone();
+    normalized.head = before.head;
+    assert_eq!(&normalized, before);
+}
+
+fn request_identity(event: &MissionEvent) -> RoleRunRequestIdentity {
+    let MissionEvent::RoleRunRequested {
+        conversation_id,
+        namespace,
+        task_id,
+        attempt_no,
+        role,
+        output,
+        runtime,
+        prompt_template,
+        prompt_hash,
+        base_sha,
+        assignment_epoch,
+        message_boundary,
+        presented_messages,
+        recreate_workspace,
+        ..
+    } = event
+    else {
+        panic!("expected role request")
+    };
+    RoleRunRequestIdentity {
+        conversation_id: conversation_id.clone(),
+        namespace: *namespace,
+        task_id: task_id.clone(),
+        attempt_no: *attempt_no,
+        assignment_epoch: *assignment_epoch,
+        role: role.clone(),
+        output: *output,
+        runtime: runtime.clone(),
+        prompt_template: *prompt_template,
+        prompt_hash: prompt_hash.clone(),
+        base_sha: base_sha.clone(),
+        recreate_workspace: *recreate_workspace,
+        message_boundary: *message_boundary,
+        presented_messages: presented_messages.clone(),
+    }
+}
+
+#[tokio::test]
+async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA)
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+
+    for corrupt in 0..5 {
+        let before = h.engine.load_state(&mission_id).await.expect("prestate");
+        let mut request = role_request(&before);
+        let MissionEvent::RoleRunRequested {
+            conversation_id,
+            namespace,
+            task_id,
+            attempt_no,
+            effect_id,
+            prompt_hash,
+            assignment_epoch,
+            message_boundary,
+            presented_messages,
+            ..
+        } = &mut request.event
+        else {
+            unreachable!()
+        };
+        match corrupt {
+            0 => *conversation_id = ConversationId::parse("f".repeat(64)).unwrap(),
+            1 => {
+                *assignment_epoch += 1;
+                *effect_id = lionclaw::model::EffectId::for_role_request(
+                    *namespace,
+                    &before.mission_id,
+                    task_id,
+                    *attempt_no,
+                    *assignment_epoch,
+                    prompt_hash,
+                );
+            }
+            2 => *message_boundary = message_boundary.saturating_sub(1),
+            3 => *message_boundary += 1,
+            4 => presented_messages.push(before.head),
+            _ => unreachable!(),
+        }
+        fault_append_events(
+            dir.path(),
+            &mission_id,
+            before.head,
+            &[request],
+            corrupt + 10,
+        )
+        .await;
+        let after = h
+            .engine
+            .load_state(&mission_id)
+            .await
+            .expect("rejected state");
+        assert_only_head_advanced(&before, &after);
+    }
+
+    let before = h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("canonical prestate");
+    let request = role_request(&before);
+    let identity = request_identity(&request.event);
+    let MissionEvent::RoleRunRequested { effect_id, .. } = &request.event else {
+        unreachable!()
+    };
+    let effect_id = effect_id.clone();
+    fault_append_events(dir.path(), &mission_id, before.head, &[request], 20).await;
+    let accepted = h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("accepted state");
+    assert_eq!(
+        accepted.tasks[&TaskId::new("fix").unwrap()].status,
+        TaskStatus::Running
+    );
+    assert!(accepted.inflight.contains_key(&effect_id));
+    assert!(accepted
+        .conversations
+        .values()
+        .any(|conversation| conversation
+            .active_delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.effect_id == effect_id)));
+
+    let failed_head = fault_append_events(
+        dir.path(),
+        &mission_id,
+        accepted.head,
+        &[NewEvent::new(MissionEvent::RoleRunCompleted {
+            effect_id: effect_id.clone(),
+            request: Box::new(identity.clone()),
+            outcome: Err(TypedFailure::transient(
+                "runtime.busy",
+                "retry the same assignment",
+                None,
+            )),
+        })],
+        21,
+    )
+    .await;
+    let failed = h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("retry prestate");
+    assert_eq!(failed.head, failed_head);
+    assert_eq!(
+        failed.tasks[&TaskId::new("fix").unwrap()].status,
+        TaskStatus::Failed
+    );
+    let conversation = failed.conversations.values().next().unwrap();
+    let recipient = ConversationRecipient {
+        conversation_id: identity.conversation_id.clone(),
+        role: conversation.role.clone(),
+        namespace: conversation.namespace,
+        task_id: conversation.task_id.clone(),
+        assignment_epoch: conversation.assignment_epoch,
+    };
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        failed.head,
+        &[
+            NewEvent::new(MissionEvent::MessageSent {
+                recipients: vec![recipient.clone()],
+                body: "first queued message".into(),
+                references: vec![],
+            }),
+            NewEvent::new(MissionEvent::MessageSent {
+                recipients: vec![recipient],
+                body: "second queued message".into(),
+                references: vec![],
+            }),
+        ],
+        22,
+    )
+    .await;
+    for corrupt in 0..5 {
+        let before = h
+            .engine
+            .load_state(&mission_id)
+            .await
+            .expect("queued prestate");
+        let mut request = role_request(&before);
+        let MissionEvent::RoleRunRequested {
+            conversation_id,
+            namespace,
+            task_id,
+            attempt_no,
+            effect_id,
+            prompt_hash,
+            assignment_epoch,
+            presented_messages,
+            ..
+        } = &mut request.event
+        else {
+            unreachable!()
+        };
+        match corrupt {
+            0 => {
+                presented_messages.pop();
+            }
+            1 => presented_messages.push(before.head),
+            2 => presented_messages.swap(0, 1),
+            3 => {
+                *assignment_epoch = assignment_epoch.saturating_sub(1);
+                *conversation_id = ConversationId::for_role_instance(
+                    &before.mission_id,
+                    *namespace,
+                    task_id,
+                    &RoleName::new("implementer").unwrap(),
+                    *assignment_epoch,
+                );
+                *effect_id = lionclaw::model::EffectId::for_role_request(
+                    *namespace,
+                    &before.mission_id,
+                    task_id,
+                    *attempt_no,
+                    *assignment_epoch,
+                    prompt_hash,
+                );
+            }
+            4 => *conversation_id = ConversationId::parse("e".repeat(64)).unwrap(),
+            _ => unreachable!(),
+        }
+        fault_append_events(
+            dir.path(),
+            &mission_id,
+            before.head,
+            &[request],
+            23 + corrupt,
+        )
+        .await;
+        let after = h
+            .engine
+            .load_state(&mission_id)
+            .await
+            .expect("queued rejection");
+        assert_only_head_advanced(&before, &after);
+    }
+    let retry_prestate = h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("retry prestate");
+    assert_eq!(
+        h.engine
+            .store()
+            .rebuild_cursors(&mission_id, 29)
+            .await
+            .expect("seed snapshot-tail cursor"),
+        retry_prestate
+    );
+    let retry = role_request(&retry_prestate);
+    let retry_identity = request_identity(&retry.event);
+    let retry_effect = match &retry.event {
+        MissionEvent::RoleRunRequested {
+            effect_id,
+            assignment_epoch,
+            recreate_workspace,
+            ..
+        } => {
+            assert_eq!(*assignment_epoch, 1);
+            assert!(!recreate_workspace);
+            effect_id.clone()
+        }
+        _ => unreachable!(),
+    };
+    fault_append_events(dir.path(), &mission_id, retry_prestate.head, &[retry], 30).await;
+    let accepted = h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("accepted retry");
+    assert_eq!(
+        accepted.tasks[&TaskId::new("fix").unwrap()].status,
+        TaskStatus::Running
+    );
+    assert!(accepted.inflight.contains_key(&retry_effect));
+    let task = &accepted.tasks[&TaskId::new("fix").unwrap()];
+    assert_eq!(task.attempts, retry_identity.attempt_no);
+    let conversation = &accepted.conversations[&retry_identity.conversation_id];
+    assert_eq!(
+        conversation.assignment_epoch,
+        retry_identity.assignment_epoch
+    );
+    assert_eq!(conversation.workspace_base_sha, retry_identity.base_sha);
+    assert_eq!(
+        conversation.lifecycle,
+        lionclaw::model::ConversationLifecycle::Running
+    );
+    let delivery = conversation.active_delivery.as_ref().unwrap();
+    assert_eq!(delivery.effect_id, retry_effect);
+    assert_eq!(delivery.message_boundary, retry_identity.message_boundary);
+    assert_eq!(
+        delivery.presented_messages,
+        retry_identity.presented_messages
+    );
+    assert_eq!(conversation.queued.len(), 2);
+
+    let store = h.engine.store();
+    let events = store.load(&mission_id).await.expect("events");
+    let replayed = fold(events.clone()).expect("full replay");
+    assert_eq!(replayed, accepted);
+    let (snapshot_head, _) = store
+        .snapshot_meta(&mission_id)
+        .await
+        .expect("snapshot metadata")
+        .expect("live snapshot");
+    assert!(
+        snapshot_head < replayed.head,
+        "snapshot load must apply a tail"
+    );
+    let snapshotted = store
+        .load_state_snapshotted(&mission_id)
+        .await
+        .expect("snapshot-tail load")
+        .expect("state");
+    assert_eq!(snapshotted, replayed);
+    let rebuilt = store
+        .rebuild_cursors(&mission_id, 30)
+        .await
+        .expect("cursor rebuild");
+    assert_eq!(rebuilt, replayed);
+    for split in 1..events.len() {
+        let mut cursor = fold(events[..split].to_vec()).expect("prefix fold");
+        for event in &events[split..] {
+            apply(&mut cursor, event);
+        }
+        assert_eq!(cursor, replayed, "cursor split {split}");
+    }
+}
 
 #[tokio::test]
 async fn unfinished_request_is_rebuilt_from_the_log_alone() {

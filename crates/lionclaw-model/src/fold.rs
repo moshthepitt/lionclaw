@@ -184,7 +184,6 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }
         }
         MissionEvent::RoleRunRequested {
-            conversation_id,
             namespace,
             task_id,
             attempt_no,
@@ -196,10 +195,10 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             effect_id,
             ..
         } => {
-            if !role_request_matches_dispatch(state, envelope) {
+            let Some(dispatch) = validated_role_dispatch(state, envelope) else {
                 finish_apply(state, seq);
                 return;
-            }
+            };
             state.parked_effects.retain(|_, parked| {
                 !matches!(parked, ParkedEffect::RoleRun { namespace: parked_namespace, task_id: parked_task } if parked_namespace == namespace && parked_task == task_id)
             });
@@ -209,19 +208,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 .or_insert_with(pending_task);
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
-            let assignment = super::state::resolve_role_assignment(
-                &state.mission_id,
-                *namespace,
-                task_id,
-                role,
-                super::state::RoleAssignmentContext {
-                    previous: state.tasks_in(*namespace).get(task_id),
-                    required_base: base_sha,
-                    lifecycle_generation: state.role_lifecycle_generation(*namespace),
-                    max_attempts: state.config.recovery.max_attempts,
-                },
-            );
-            let expected_conversation_id = assignment.conversation_id;
+            let expected_conversation_id = dispatch.assignment.conversation_id;
             for (id, prior) in &mut state.conversations {
                 if id != &expected_conversation_id
                     && prior.namespace == *namespace
@@ -247,19 +234,6 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     final_response: None,
                     invalid_handoff_reworks: 0,
                 });
-            let expected_presented: Vec<_> = conversation
-                .queued
-                .iter()
-                .filter(|message| message.sequence_no <= *message_boundary)
-                .map(|message| message.sequence_no)
-                .collect();
-            if conversation_id != &expected_conversation_id
-                || *message_boundary != seq.saturating_sub(1)
-                || presented_messages != &expected_presented
-            {
-                finish_apply(state, seq);
-                return;
-            }
             conversation.lifecycle = super::state::ConversationLifecycle::Running;
             conversation.active_delivery = Some(super::state::ActiveDelivery {
                 effect_id: effect_id.clone(),
@@ -1055,7 +1029,14 @@ fn merge_failure_configuration(
     failure
 }
 
-fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope) -> bool {
+struct ValidatedRoleDispatch {
+    assignment: super::state::RoleAssignment,
+}
+
+fn validated_role_dispatch(
+    state: &MissionState,
+    envelope: &EventEnvelope,
+) -> Option<ValidatedRoleDispatch> {
     let MissionEvent::RoleRunRequested {
         namespace,
         task_id,
@@ -1074,7 +1055,7 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         ..
     } = &envelope.event
     else {
-        return false;
+        return None;
     };
     let output_matches = match namespace {
         super::TaskNamespace::Planning => state
@@ -1093,7 +1074,7 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
             }),
     };
     let super::step::StepDecision::DispatchRole(intent) = super::step::step(state) else {
-        return false;
+        return None;
     };
     let expected_assignment = super::state::resolve_role_assignment(
         &state.mission_id,
@@ -1108,7 +1089,7 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         },
     );
     if envelope.stamps.prompt_hash.as_deref() != Some(prompt_hash.as_str()) {
-        return false;
+        return None;
     }
     let expected_effect = super::EffectId::for_role_request(
         *namespace,
@@ -1118,11 +1099,11 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         *assignment_epoch,
         prompt_hash,
     );
-    let expected_conversation = expected_assignment.conversation_id;
+    let expected_conversation = &expected_assignment.conversation_id;
     let expected_presented: Vec<_> =
         state
             .conversations
-            .get(&expected_conversation)
+            .get(expected_conversation)
             .map_or_else(Vec::new, |conversation| {
                 conversation
                     .queued
@@ -1131,7 +1112,7 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
                     .map(|message| message.sequence_no)
                     .collect()
             });
-    output_matches
+    (output_matches
         && intent.namespace == *namespace
         && &intent.task_id == task_id
         && intent.attempt_no == *attempt_no
@@ -1140,9 +1121,12 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         && expected_assignment.generation == *assignment_epoch
         && expected_assignment.recreate_workspace == *recreate_workspace
         && expected_effect == *effect_id
-        && expected_conversation == *conversation_id
+        && expected_conversation == conversation_id
         && *message_boundary == envelope.sequence_no.saturating_sub(1)
-        && expected_presented == *presented_messages
+        && expected_presented == *presented_messages)
+        .then_some(ValidatedRoleDispatch {
+            assignment: expected_assignment,
+        })
 }
 
 fn oracle_request_matches_obligation(
