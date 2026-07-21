@@ -981,7 +981,7 @@ fn settle_failed_conversation_delivery(
         conversation.lifecycle = super::state::ConversationLifecycle::Ready;
         return;
     }
-    let invalid_handoff = failure.evidence().code.as_deref() == Some("handoff.schema");
+    let invalid_handoff = failure.is_invalid_output();
     let marker = if invalid_handoff {
         super::state::DeliveryMarker::PreviouslyDelivered
     } else {

@@ -484,7 +484,8 @@ pub struct PreparedInputRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleRunSuccess {
-    /// `None` is an ordinary dialogue checkpoint, never a failed handoff.
+    /// `None` is a dialogue checkpoint only when the pinned output semantics
+    /// makes its handoff optional; required-output absence is invalid output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<Handoff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

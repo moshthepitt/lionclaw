@@ -2591,6 +2591,12 @@ fn validated_role_success(
                 &outcome,
             ));
         }
+    } else if output.requires_handoff() {
+        return Err(invalid_role_outcome(
+            "handoff.missing",
+            "this output contract requires a typed handoff",
+            &outcome,
+        ));
     } else if outcome.artifact.is_some() {
         return Err(invalid_role_outcome(
             "role.success_contract",
@@ -2617,6 +2623,60 @@ fn with_role_outcome_evidence(
     failure.evidence_mut().configuration =
         runtime_configuration_evidence(&outcome.runtime_configuration);
     failure.projected()
+}
+
+#[cfg(test)]
+mod role_output_contract_tests {
+    use super::*;
+    use crate::model::{EffectId, MissionId, OutputSemantics, RuntimeConfigurationEvidence};
+    use crate::ports::RoleRunOutcome;
+
+    fn no_handoff() -> RoleRunOutcome {
+        RoleRunOutcome {
+            handoff: None,
+            artifact: None,
+            runtime_configuration: RuntimeConfigurationEvidence {
+                requested_model: Some("configured-model".into()),
+                applied_model: Some("configured-model".into()),
+                ..Default::default()
+            },
+            final_response: "Can you clarify the acceptance criterion?".into(),
+        }
+    }
+
+    #[test]
+    fn required_output_can_never_be_reclassified_as_dialogue() {
+        let mission_id = MissionId::parse("m000000000001").unwrap();
+        let effect_id = EffectId::parse("0".repeat(64)).unwrap();
+        for output in [
+            OutputSemantics::EmitsVerdict,
+            OutputSemantics::EmitsGapVerdict,
+        ] {
+            let failure =
+                validated_role_success(no_handoff(), output, "base", &mission_id, &effect_id)
+                    .expect_err("a judge cannot ask dialogue in place of its verdict");
+            assert!(failure.is_invalid_output());
+            assert_eq!(failure.evidence().code.as_deref(), Some("handoff.missing"));
+            assert_eq!(
+                failure.evidence().final_response,
+                "Can you clarify the acceptance criterion?"
+            );
+            assert_eq!(
+                failure.evidence().configuration.applied_model.as_deref(),
+                Some("configured-model")
+            );
+        }
+        for output in [
+            OutputSemantics::ProducesReport,
+            OutputSemantics::ProducesArtifact,
+            OutputSemantics::ProposesPlan,
+        ] {
+            assert!(
+                validated_role_success(no_handoff(), output, "base", &mission_id, &effect_id,)
+                    .is_ok()
+            );
+        }
+    }
 }
 
 fn render_conversation_message(

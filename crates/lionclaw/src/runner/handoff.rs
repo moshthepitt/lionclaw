@@ -1,6 +1,6 @@
 //! Strict handoff parsing. The agent writes `/mission/handoff/handoff.json`;
-//! the engine never infers success from prose — a missing or malformed
-//! handoff is a failed attempt. Schemas mirror Zenith's `WorkHandoff` /
+//! the engine never infers required output from prose — a missing required or
+//! malformed handoff is a failed attempt. Schemas mirror Zenith's `WorkHandoff` /
 //! `ValidateHandoff` (Apache-2.0, Intelligent Internet).
 
 use std::path::Path;
@@ -169,8 +169,8 @@ pub fn read_handoff(dir: &Path, output: OutputSemantics) -> Result<Handoff, Type
     parse_handoff(&raw, output)
 }
 
-/// Read an optional role handoff. Absence is a successful dialogue checkpoint;
-/// every present filesystem object is still validated fail-closed by
+/// Read a role handoff under its output-owned presence policy. Optional absence
+/// is a successful dialogue checkpoint; every present filesystem object is validated fail-closed by
 /// `read_handoff`, including dangling symlinks and non-regular files.
 pub fn read_optional_handoff(
     dir: &Path,
@@ -178,7 +178,11 @@ pub fn read_optional_handoff(
 ) -> Result<Option<Handoff>, TypedFailure> {
     let path = dir.join("handoff.json");
     match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !output.requires_handoff() =>
+        {
+            Ok(None)
+        }
         _ => read_handoff(dir, output).map(Some),
     }
 }
@@ -334,6 +338,27 @@ mod tests {
         let failure = read_optional_handoff(dir.path(), OutputSemantics::ProducesArtifact)
             .expect_err("a present malformed handoff must enter schema rework");
         assert_eq!(failure.evidence().code.as_deref(), Some("handoff.schema"));
+    }
+
+    #[test]
+    fn handoff_presence_is_exhaustively_owned_by_output_semantics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for output in [
+            OutputSemantics::ProducesReport,
+            OutputSemantics::ProducesArtifact,
+            OutputSemantics::ProposesPlan,
+        ] {
+            assert_eq!(read_optional_handoff(dir.path(), output).unwrap(), None);
+        }
+        for output in [
+            OutputSemantics::EmitsVerdict,
+            OutputSemantics::EmitsGapVerdict,
+        ] {
+            let failure = read_optional_handoff(dir.path(), output)
+                .expect_err("verdict semantics require their typed handoff");
+            assert!(failure.is_invalid_output());
+            assert_eq!(failure.evidence().code.as_deref(), Some("handoff.missing"));
+        }
     }
 
     #[test]

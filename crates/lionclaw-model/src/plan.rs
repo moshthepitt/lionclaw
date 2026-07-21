@@ -61,6 +61,16 @@ pub enum OutputSemantics {
 }
 
 impl OutputSemantics {
+    /// Whether a completed turn must carry the typed handoff for this output.
+    /// Dialogue-producing roles may pause to ask the lead a question; judges
+    /// cannot turn an absent verdict into dialogue.
+    pub const fn requires_handoff(self) -> bool {
+        match self {
+            Self::ProducesReport | Self::ProducesArtifact | Self::ProposesPlan => false,
+            Self::EmitsVerdict | Self::EmitsGapVerdict => true,
+        }
+    }
+
     /// The stable kebab-case name (matches the serde repr).
     pub const fn slug(self) -> &'static str {
         match self {

@@ -704,7 +704,7 @@ async fn initialize_repo(repo: &Path) -> String {
 }
 
 #[tokio::test]
-async fn production_planner_and_validator_resume_exact_live_conversations() {
+async fn production_planner_resumes_and_missing_validator_verdict_reworks_exact_conversation() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     initialize_repo(&repo).await;
@@ -882,32 +882,15 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .iter()
         .find(|(_, conversation)| conversation.task_id.as_str() == "validate")
         .unwrap_or_else(|| panic!("production validator conversation: {validator_state:#?}"));
-    assert_eq!(
+    assert_ne!(
         validator.lifecycle,
-        lionclaw::model::ConversationLifecycle::AwaitingLead
+        lionclaw::model::ConversationLifecycle::AwaitingLead,
+        "required verdict absence must never become a dialogue checkpoint"
     );
     let validator_id = validator_id.clone();
     let validator_generation = validator.assignment_epoch;
     assert_ne!(planner_id, validator_id);
-    cli::run_with_transports(
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "send",
-            "--mission-id",
-            mission_id.as_str(),
-            "--to",
-            validator_id.as_str(),
-            "--repo",
-            repo.to_str().unwrap(),
-            "Validate the exact TESTS-CLEAN assertion.",
-        ])
-        .unwrap(),
-        transports.clone(),
-    )
-    .await
-    .unwrap();
-    cli::run_with_transports(run_driver("validator-resume.ready"), transports.clone())
+    cli::run_with_transports(run_driver("terminal-review.ready"), transports.clone())
         .await
         .unwrap();
     let final_events = MissionStore::open(&repo)
@@ -920,7 +903,23 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let validator = &final_state.conversations[&validator_id];
     assert_eq!(validator.assignment_epoch, validator_generation);
     assert!(validator.queued.is_empty());
-    assert!(validator.consumed_through > 0);
+    assert_eq!(validator.invalid_handoff_reworks, 1);
+    let validator_outcomes = final_events
+        .iter()
+        .filter_map(|event| match &event.event {
+            lionclaw::model::MissionEvent::RoleRunCompleted {
+                request, outcome, ..
+            } if request.conversation_id == validator_id => Some(outcome),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(validator_outcomes.len(), 2);
+    assert!(matches!(
+        validator_outcomes[0],
+        Err(failure) if failure.is_invalid_output()
+            && failure.evidence().code.as_deref() == Some("handoff.missing")
+    ));
+    assert!(validator_outcomes[1].is_ok());
     assert_eq!(fold(final_events).unwrap(), final_state);
     assert!(turns.lock().unwrap().is_empty());
     let sessions = sessions.lock().unwrap();
@@ -929,9 +928,14 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert!(prompts
         .iter()
         .any(|(prompt, _)| { prompt.contains("Use the exact proposed production contract.") }));
-    assert!(prompts
-        .iter()
-        .any(|(prompt, _)| prompt.contains("Validate the exact TESTS-CLEAN assertion.")));
+    assert_eq!(
+        prompts
+            .iter()
+            .filter(|(_, runtime)| runtime.to_string_lossy().contains(validator_id.as_str()))
+            .count(),
+        2,
+        "invalid output and its repair use the same conversation runtime"
+    );
     assert!(prompts
         .iter()
         .any(|(_, runtime)| runtime.to_string_lossy().contains(planner_id.as_str())));
