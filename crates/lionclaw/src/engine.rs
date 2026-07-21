@@ -326,7 +326,8 @@ impl Engine {
             .roles
             .get(&role_name)
             .context("role missing from mission type")?;
-        let dialogue = materialize_conversation_messages(self, &state, &conversation_id).await?;
+        let dialogue =
+            materialize_conversation_messages(self, &state, &conversation_id, state.head).await?;
         let prompt = match intent.namespace {
             TaskNamespace::Planning => {
                 self.assemble_planning_request(&state, role, &intent, &dialogue)?
@@ -1770,7 +1771,13 @@ impl Engine {
                         .map(|message| message.sequence_no)
                         .collect()
                 });
-        let dialogue = match materialize_conversation_messages(self, state, &conversation_id).await
+        let dialogue = match materialize_conversation_messages(
+            self,
+            state,
+            &conversation_id,
+            message_boundary,
+        )
+        .await
         {
             Ok(dialogue) => dialogue,
             Err(error)
@@ -2268,6 +2275,7 @@ async fn materialize_conversation_messages(
     engine: &Engine,
     state: &MissionState,
     conversation_id: &crate::model::ConversationId,
+    message_boundary: u64,
 ) -> Result<Vec<String>> {
     let Some(conversation) = state.conversations.get(conversation_id) else {
         return Ok(Vec::new());
@@ -2276,7 +2284,7 @@ async fn materialize_conversation_messages(
     let repo = std::path::Path::new(&state.workspace_dir);
     let mut rendered = Vec::with_capacity(conversation.queued.len());
     for message in &conversation.queued {
-        if message.marker == crate::model::DeliveryMarker::Undeliverable {
+        if !message_is_materializable(message, message_boundary) {
             continue;
         }
         let expanded = crate::reference_materialization::materialize_references(
@@ -2296,6 +2304,11 @@ async fn materialize_conversation_messages(
         rendered.push(render_conversation_message(message, &expanded));
     }
     Ok(rendered)
+}
+
+fn message_is_materializable(message: &crate::model::QueuedMessage, message_boundary: u64) -> bool {
+    message.sequence_no <= message_boundary
+        && message.marker != crate::model::DeliveryMarker::Undeliverable
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2812,6 +2825,31 @@ mod role_output_contract_tests {
     use super::*;
     use crate::model::{EffectId, MissionId, OutputSemantics, RuntimeConfigurationEvidence};
     use crate::ports::RoleRunOutcome;
+
+    #[test]
+    fn reference_materialization_stops_at_the_request_message_boundary() {
+        let message = |sequence_no, marker| crate::model::QueuedMessage {
+            sequence_no,
+            body: "lead message".into(),
+            references: vec![crate::model::MessageReference::ReachableCommit {
+                sha: "retained-identity".into(),
+            }],
+            marker,
+        };
+
+        assert!(message_is_materializable(
+            &message(41, crate::model::DeliveryMarker::Queued),
+            41
+        ));
+        assert!(!message_is_materializable(
+            &message(42, crate::model::DeliveryMarker::Queued),
+            41
+        ));
+        assert!(!message_is_materializable(
+            &message(40, crate::model::DeliveryMarker::Undeliverable),
+            41
+        ));
+    }
 
     fn no_handoff() -> RoleRunOutcome {
         RoleRunOutcome {
