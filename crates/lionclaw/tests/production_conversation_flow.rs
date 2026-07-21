@@ -2578,14 +2578,16 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         mission_id.as_str(),
         "completed effect at current head",
     );
-    assert!(failed
-        .conversations
-        .values()
-        .next()
-        .unwrap()
-        .queued
-        .iter()
-        .all(|message| { message.marker == lionclaw::model::DeliveryMarker::PossiblyDelivered }));
+    let failed_messages = &failed.conversations.values().next().unwrap().queued;
+    assert_eq!(
+        failed_messages[0].marker,
+        lionclaw::model::DeliveryMarker::PreviouslyDelivered,
+        "a later uncertain failure must not erase the earlier proof of delivery"
+    );
+    assert_eq!(
+        failed_messages[1].marker,
+        lionclaw::model::DeliveryMarker::PossiblyDelivered
+    );
     let uncertain_status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
         &repo,
         &["mission", "status", mission_id.as_str(), "--json"],
@@ -2604,11 +2606,14 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         &uncertain_inbox["missions"][0],
     ] {
         let projected = projected_conversation(root, &conversation_id);
-        assert!(projected["queued_messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|message| message["marker"] == "possibly_delivered"));
+        assert_eq!(
+            projected["queued_messages"][0]["marker"],
+            "previously_delivered"
+        );
+        assert_eq!(
+            projected["queued_messages"][1]["marker"],
+            "possibly_delivered"
+        );
         assert_eq!(
             projected["queued_messages"][0]["body"],
             "Use the preserved release target."
@@ -2629,6 +2634,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         vec!["mission", "inbox"],
     ] {
         let human = stdout(cli_output(&repo, &args));
+        assert!(human.contains("marker=previously_delivered"));
         assert!(human.contains("marker=possibly_delivered"));
         assert!(human.contains("body=Use the preserved release target."));
         assert!(human.contains("legal_actions=mission advance|mission send"));
@@ -2676,10 +2682,14 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .unwrap();
     let delivery = &recovered.conversations[&exact_conversation_id];
     assert_eq!(delivery.assignment_epoch, assignment_generation);
-    assert!(delivery
-        .queued
-        .iter()
-        .all(|message| { message.marker == lionclaw::model::DeliveryMarker::PossiblyDelivered }));
+    assert_eq!(
+        delivery.queued[0].marker,
+        lionclaw::model::DeliveryMarker::PreviouslyDelivered
+    );
+    assert_eq!(
+        delivery.queued[1].marker,
+        lionclaw::model::DeliveryMarker::PossiblyDelivered
+    );
     let interrupted_effect = recovered.parked_effects.keys().next().unwrap().to_string();
     cli::run(
         cli::Cli::try_parse_from([

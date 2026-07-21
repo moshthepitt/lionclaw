@@ -594,7 +594,8 @@ async fn abort_cancels_an_active_oracle_while_the_driver_drains_its_batch() {
                 lionclaw::model::MissionEvent::OracleRunCompleted {
                     outcome: Err(failure @ TypedFailure::OperatorAborted { .. }),
                     ..
-                } if failure.evidence().code.as_deref() == Some("test.aborted")
+                } if failure.evidence().code.as_deref()
+                    == Some("control.aborted_before_settlement")
             )
         })
         .expect("cancelled oracle outcome")

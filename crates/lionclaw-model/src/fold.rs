@@ -26,10 +26,10 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-/// Version 27 rebuilds snapshots from sequence zero because conversation
-/// identity, response ownership, retirement, and delivery disposition are all
-/// derived folded state. The durable MissionEvent contract is unchanged.
-pub const REDUCER_VERSION: u32 = 27;
+/// Version 28 rebuilds snapshots from sequence zero because role settlement now
+/// preserves proven delivery markers and merges runtime configuration on every
+/// outcome path. The durable MissionEvent contract is unchanged.
+pub const REDUCER_VERSION: u32 = 28;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -152,26 +152,20 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }
         }
         if let Some(cancellation) = state.durable_cancellation(effect_id) {
-            let already_classified = envelope
+            let evidence = envelope
                 .event
-                .outcome_failure()
-                .is_some_and(|failure| cancellation.matches_failure(failure));
-            if !already_classified {
-                let evidence = envelope
-                    .event
-                    .outcome_failure_evidence()
-                    .unwrap_or_default();
-                let final_response = envelope.event.outcome_final_response();
-                settle_effect_failure(
-                    state,
-                    effect_id,
-                    effect,
-                    cancellation.into_failure(evidence),
-                    final_response,
-                );
-                finish_apply(state, seq);
-                return;
-            }
+                .outcome_failure_evidence()
+                .unwrap_or_default();
+            let final_response = envelope.event.outcome_final_response();
+            settle_effect_failure(
+                state,
+                effect_id,
+                effect,
+                cancellation.into_failure(evidence),
+                final_response,
+            );
+            finish_apply(state, seq);
+            return;
         }
     }
     match &envelope.event {
@@ -442,8 +436,10 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                             apply_handoff(state, *namespace, task_id, handoff);
                         }
                         if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
-                            task.last_runtime_configuration =
-                                Some(success.runtime_configuration.clone());
+                            task.last_runtime_configuration = Some(merge_runtime_configuration(
+                                observed_configuration.as_ref(),
+                                &success.runtime_configuration,
+                            ));
                             if task.status == TaskStatus::Failed {
                                 task.consecutive_failures =
                                     task.consecutive_failures.saturating_add(1);
@@ -929,15 +925,12 @@ fn settle_conversation_delivery(
     else {
         return;
     };
-    let boundary = conversation
-        .active_delivery
-        .take()
-        .expect("matched above")
-        .message_boundary;
+    let delivery = conversation.active_delivery.take().expect("matched above");
+    let boundary = delivery.message_boundary;
     conversation.consumed_through = conversation.consumed_through.max(boundary);
     conversation
         .queued
-        .retain(|message| message.sequence_no > boundary);
+        .retain(|message| !delivery.presented_messages.contains(&message.sequence_no));
     conversation.final_response = Some(final_response);
     conversation.lifecycle = if has_handoff {
         super::state::ConversationLifecycle::Completed
@@ -968,31 +961,42 @@ fn settle_failed_conversation_delivery(
     else {
         return;
     };
-    let boundary = conversation
-        .active_delivery
-        .take()
-        .expect("matched above")
-        .message_boundary;
-    conversation.final_response = final_response.cloned().or_else(|| {
-        (!failure.evidence().final_response.is_empty())
-            .then(|| PayloadRef::inline(failure.evidence().final_response.clone()))
-    });
+    let delivery = conversation.active_delivery.take().expect("matched above");
+    conversation.final_response = final_response
+        .cloned()
+        .or_else(|| {
+            (!failure.evidence().final_response.is_empty())
+                .then(|| PayloadRef::inline(failure.evidence().final_response.clone()))
+        })
+        .or_else(|| conversation.final_response.clone());
     if failure.evidence().code.as_deref() == Some("kernel.launch") {
         conversation.lifecycle = super::state::ConversationLifecycle::Ready;
         return;
     }
     let invalid_handoff = failure.is_invalid_output();
-    let marker = if invalid_handoff {
-        super::state::DeliveryMarker::PreviouslyDelivered
-    } else {
-        super::state::DeliveryMarker::PossiblyDelivered
-    };
     for message in conversation
         .queued
         .iter_mut()
-        .filter(|message| message.sequence_no <= boundary)
+        .filter(|message| delivery.presented_messages.contains(&message.sequence_no))
     {
-        message.marker = marker;
+        message.marker = match (invalid_handoff, message.marker) {
+            (true, super::state::DeliveryMarker::Queued)
+            | (true, super::state::DeliveryMarker::PossiblyDelivered) => {
+                super::state::DeliveryMarker::PreviouslyDelivered
+            }
+            (false, super::state::DeliveryMarker::Queued) => {
+                super::state::DeliveryMarker::PossiblyDelivered
+            }
+            (_, super::state::DeliveryMarker::PreviouslyDelivered) => {
+                super::state::DeliveryMarker::PreviouslyDelivered
+            }
+            (false, super::state::DeliveryMarker::PossiblyDelivered) => {
+                super::state::DeliveryMarker::PossiblyDelivered
+            }
+            (_, super::state::DeliveryMarker::Undeliverable) => {
+                super::state::DeliveryMarker::Undeliverable
+            }
+        };
     }
     if invalid_handoff && conversation.invalid_handoff_reworks < state.config.recovery.max_attempts
     {
@@ -2660,6 +2664,40 @@ mod tests {
     }
 
     #[test]
+    fn partial_success_configuration_merges_with_observed_runtime_evidence() {
+        let effect_id = role_effect(crate::TaskNamespace::Execution, "w", 1, 1);
+        let mut completed = role_completed("w", "success", work_handoff(true, false), None);
+        let MissionEvent::RoleRunCompleted {
+            outcome: Ok(success),
+            ..
+        } = &mut completed
+        else {
+            unreachable!()
+        };
+        success.runtime_configuration.applied_model = Some("applied".into());
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "success"),
+            MissionEvent::EffectRuntimeConfigured {
+                effect_id,
+                configuration: RuntimeConfigurationEvidence {
+                    requested_model: Some("requested".into()),
+                    ..Default::default()
+                },
+            },
+            completed,
+        ])
+        .expect("state");
+        let configuration = state.tasks[&tid("w")]
+            .last_runtime_configuration
+            .as_ref()
+            .expect("merged success configuration");
+        assert_eq!(configuration.requested_model.as_deref(), Some("requested"));
+        assert_eq!(configuration.applied_model.as_deref(), Some("applied"));
+    }
+
+    #[test]
     fn noncanonical_effect_id_cannot_reserve_a_future_generation() {
         let mut request = role_requested("w", "noncanonical");
         let MissionEvent::RoleRunRequested { effect_id, .. } = &mut request else {
@@ -3341,6 +3379,43 @@ mod tests {
             .expect("stopped role failure");
         assert!(matches!(failure, TypedFailure::OperatorStopped { .. }));
         assert!(state.parked_effects.contains_key(&effect_id));
+
+        let mut corrupted = role_completed("w", "stopped-role", work_handoff(true, false), None);
+        let MissionEvent::RoleRunCompleted { outcome, .. } = &mut corrupted else {
+            unreachable!()
+        };
+        *outcome = Err(TypedFailure::OperatorStopped {
+            evidence: Box::new(TypedFailureEvidence {
+                code: Some("forged.code".into()),
+                detail: "forged detail".into(),
+                stop_reason: Some("forged reason".into()),
+                final_response: "retained response".into(),
+                ..Default::default()
+            }),
+        });
+        let canonical = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "stopped-role"),
+            MissionEvent::ControlRequested {
+                effect_id,
+                action: ControlAction::Stop,
+                reason: "operator stop".into(),
+            },
+            corrupted,
+        ])
+        .expect("canonical cancellation state");
+        let evidence = canonical.tasks[&tid("w")]
+            .last_failure
+            .as_ref()
+            .expect("stopped role failure")
+            .evidence();
+        assert_eq!(
+            evidence.code.as_deref(),
+            Some("control.stopped_before_settlement")
+        );
+        assert_eq!(evidence.stop_reason.as_deref(), Some("operator stop"));
+        assert_eq!(evidence.final_response, "retained response");
     }
 
     #[test]
@@ -6460,6 +6535,7 @@ mod tests {
         let state = fold_log(seed.clone()).unwrap();
         let (conversation_id, conversation) = state.conversations.iter().next().unwrap();
         let initially_consumed_through = conversation.consumed_through;
+        let initial_response = conversation.final_response.clone();
         let recipient = super::super::event::ConversationRecipient {
             conversation_id: conversation_id.clone(),
             role: conversation.role.clone(),
@@ -6551,6 +6627,7 @@ mod tests {
                 "a message beyond the immutable request boundary was not delivered"
             );
             assert_eq!(delivery.consumed_through, initially_consumed_through);
+            assert_eq!(delivery.final_response, initial_response);
             assert!(delivery.active_delivery.is_none());
         }
     }

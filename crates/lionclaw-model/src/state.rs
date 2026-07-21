@@ -79,18 +79,6 @@ pub enum DurableCancellation {
 }
 
 impl DurableCancellation {
-    pub fn matches_failure(&self, failure: &TypedFailure) -> bool {
-        matches!(
-            (self, failure),
-            (Self::Aborted { .. }, TypedFailure::OperatorAborted { .. })
-                | (Self::Stopped { .. }, TypedFailure::OperatorStopped { .. })
-                | (
-                    Self::DeadlineReached { .. },
-                    TypedFailure::DeadlineExhausted { .. }
-                )
-        )
-    }
-
     pub fn into_failure(self, mut evidence: TypedFailureEvidence) -> TypedFailure {
         let (code, detail, reason) = match &self {
             Self::Aborted { reason } => (

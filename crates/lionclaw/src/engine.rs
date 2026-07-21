@@ -2147,13 +2147,6 @@ fn settlement_failure(
     outcome: &NewEvent,
 ) -> Option<TypedFailure> {
     let cancellation = state.durable_cancellation(effect_id)?;
-    if outcome
-        .event
-        .outcome_failure()
-        .is_some_and(|failure| cancellation.matches_failure(failure))
-    {
-        return None;
-    }
     let evidence = outcome
         .settlement_evidence
         .clone()
