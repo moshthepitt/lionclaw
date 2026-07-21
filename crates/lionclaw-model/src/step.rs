@@ -161,11 +161,27 @@ fn step_running(state: &MissionState) -> StepDecision {
         .filter_map(|(task_id, task)| (task.status == TaskStatus::Running).then_some(task_id));
     let mut awaiting_lead = false;
     for task_id in running_tasks {
-        let task_is_awaiting_lead = state.conversations.values().any(|conversation| {
-            conversation.namespace == TaskNamespace::Execution
-                && &conversation.task_id == task_id
-                && conversation.lifecycle == crate::ConversationLifecycle::AwaitingLead
-        });
+        let task_is_awaiting_lead = plan
+            .tasks
+            .iter()
+            .any(|planned| &planned.id == task_id && planned.kind == TaskKind::Work)
+            && state
+                .conversations
+                .iter()
+                .any(|(conversation_id, conversation)| {
+                    conversation_id
+                        == &crate::ConversationId::for_role_instance(
+                            &state.mission_id,
+                            conversation.namespace,
+                            &conversation.task_id,
+                            &conversation.role,
+                            conversation.assignment_epoch,
+                        )
+                        && conversation.namespace == TaskNamespace::Execution
+                        && &conversation.task_id == task_id
+                        && conversation.lifecycle == crate::ConversationLifecycle::AwaitingLead
+                        && state.conversation_is_messageable(conversation_id)
+                });
         if !task_is_awaiting_lead {
             return StepDecision::Idle;
         }
@@ -839,6 +855,55 @@ mod tests {
         let intent = dispatched(&state);
         assert_eq!(intent.task_id, tid("v1"));
         assert_eq!(intent.base_sha, "sha-0");
+    }
+
+    #[test]
+    fn noncanonical_awaiting_lead_identity_cannot_authorize_dispatch() {
+        let mut state = fold_log(vec![
+            created("sha-0"),
+            plan(
+                vec![assertion("A1")],
+                vec![work("w1", &["A1"], &[]), validate("v1", &["A1"])],
+            ),
+            role_requested("w1", 1, "k-w1-1"),
+            work_awaiting_lead("w1"),
+        ]);
+        let canonical_id = state.conversations.keys().next().unwrap().clone();
+        let conversation = state.conversations.remove(&canonical_id).unwrap();
+        let forged_id = crate::ConversationId::for_role_instance(
+            &state.mission_id,
+            TaskNamespace::Execution,
+            &tid("w1"),
+            &rname("foreign-role"),
+            conversation.assignment_epoch,
+        );
+        state.conversations.insert(forged_id, conversation);
+
+        assert_eq!(step(&state), StepDecision::Idle);
+    }
+
+    #[test]
+    fn validator_awaiting_lead_cannot_authorize_another_dispatch() {
+        let mut state = fold_log(vec![
+            created("sha-0"),
+            plan(
+                vec![assertion("A1")],
+                vec![work("w1", &["A1"], &[]), validate("v2", &["A1"])],
+            ),
+            role_requested("w1", 1, "k-w1-1"),
+            work_awaiting_lead("w1"),
+        ]);
+        state
+            .plan
+            .as_mut()
+            .unwrap()
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == tid("w1"))
+            .unwrap()
+            .kind = TaskKind::Validate;
+
+        assert_eq!(step(&state), StepDecision::Idle);
     }
 
     #[test]
