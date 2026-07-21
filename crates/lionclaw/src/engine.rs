@@ -208,6 +208,12 @@ impl MissionView {
             .conversations
             .keys()
             .any(|id| self.state.conversation_is_messageable(id));
+        let can_decide = !self.state.open_attention.is_empty();
+        let can_continue = self
+            .state
+            .parked_effects
+            .keys()
+            .any(|effect_id| self.state.parked_effect_is_continuable(effect_id));
         let mut actions = match self.disposition {
             MissionDisposition::Ready => vec!["mission advance"],
             MissionDisposition::Running => vec!["mission status"],
@@ -234,6 +240,12 @@ impl MissionView {
                 actions
             }
         };
+        if self.disposition == MissionDisposition::AwaitingLead && can_continue {
+            actions.push("mission continue");
+        }
+        if self.disposition == MissionDisposition::AwaitingLead && can_decide {
+            actions.push("mission decide");
+        }
         if can_send
             && !actions.contains(&"mission send")
             && self.disposition != MissionDisposition::Terminal

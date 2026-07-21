@@ -426,6 +426,24 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
             "mission abort"
         ]
     );
+    let mut awaiting_and_parked = parked.state.clone();
+    awaiting_and_parked
+        .conversations
+        .values_mut()
+        .next()
+        .expect("parked role conversation")
+        .lifecycle = lionclaw::model::ConversationLifecycle::AwaitingLead;
+    let composed = lionclaw::engine::MissionView::from_state(awaiting_and_parked, false);
+    assert_eq!(composed.disposition, MissionDisposition::AwaitingLead);
+    assert_eq!(
+        composed.next_actions(),
+        [
+            "mission send",
+            "mission continue",
+            "mission decide",
+            "mission abort"
+        ]
+    );
     assert_eq!(
         parked
             .state
