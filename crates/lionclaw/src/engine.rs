@@ -2388,18 +2388,34 @@ pub struct MessageCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ReferenceEligibilityError {
+pub enum ReferenceRejectionReason {
     #[error(
         "message references are not permitted for recipient {conversation_id} with output semantics {}",
         output.slug()
     )]
-    JudgmentRecipient {
+    Disallowed {
         conversation_id: crate::model::ConversationId,
         output: crate::model::OutputSemantics,
     },
-    #[error("recipient {conversation_id} has no authoritative output semantics")]
-    MissingOutputSemantics {
-        conversation_id: crate::model::ConversationId,
+    #[error(
+        "message references cannot be sent to a mixture of permitted and disallowed recipients"
+    )]
+    MixedRecipients,
+    #[error("message reference {reference:?} is stale")]
+    Stale {
+        reference: crate::model::MessageReference,
+    },
+    #[error("message reference {reference:?} is missing")]
+    Missing {
+        reference: crate::model::MessageReference,
+    },
+    #[error("message reference {reference:?} is malformed or belongs to another mission")]
+    MalformedOrForeign {
+        reference: crate::model::MessageReference,
+    },
+    #[error("message reference expansion is oversized")]
+    Oversized {
+        reference: Option<crate::model::MessageReference>,
     },
 }
 
@@ -2407,26 +2423,39 @@ fn validate_reference_eligibility(
     state: &MissionState,
     recipients: &[crate::model::ConversationRecipient],
     references: &[crate::model::MessageReference],
-) -> std::result::Result<(), ReferenceEligibilityError> {
+) -> std::result::Result<(), ReferenceRejectionReason> {
     if references.is_empty() {
         return Ok(());
     }
-    for recipient in recipients {
-        let Some(output) = state
+    let outputs = recipients.iter().map(|recipient| {
+        state
             .config
             .plan_inventory
             .roles
             .get(&recipient.role)
             .copied()
-        else {
-            return Err(ReferenceEligibilityError::MissingOutputSemantics {
+            .map(|output| (recipient, output))
+    });
+    let resolved: Vec<_> = outputs.flatten().collect();
+    // A current recipient is reducer-bound to a role in the persisted inventory.
+    // Still fail closed with typed truth if corrupt state crosses that wall.
+    if resolved.len() != recipients.len() {
+        return Err(ReferenceRejectionReason::MalformedOrForeign {
+            reference: references[0].clone(),
+        });
+    }
+    let permitted = resolved
+        .iter()
+        .filter(|(_, output)| output.permits_message_references())
+        .count();
+    if permitted != 0 && permitted != resolved.len() {
+        return Err(ReferenceRejectionReason::MixedRecipients);
+    }
+    if permitted == 0 {
+        if let Some((recipient, output)) = resolved.first() {
+            return Err(ReferenceRejectionReason::Disallowed {
                 conversation_id: recipient.conversation_id.clone(),
-            });
-        };
-        if !output.permits_message_references() {
-            return Err(ReferenceEligibilityError::JudgmentRecipient {
-                conversation_id: recipient.conversation_id.clone(),
-                output,
+                output: *output,
             });
         }
     }
@@ -2501,7 +2530,7 @@ pub async fn record_message(
         bail!("message exceeds {} bytes", crate::model::MAX_MESSAGE_BYTES);
     }
     if references.len() > crate::model::MAX_MESSAGE_REFERENCES {
-        bail!("message has too many references");
+        return Err(ReferenceRejectionReason::Oversized { reference: None }.into());
     }
     let events = store.load(mission_id).await?;
     let state = crate::model::fold(events.clone()).context("mission has no creation event")?;
@@ -2534,10 +2563,44 @@ pub async fn record_message(
             }
         };
         if !valid {
-            bail!("reference is not valid authority in this mission");
+            let known = events
+                .iter()
+                .any(|envelope| match (&envelope.event, reference) {
+                    (
+                        MissionEvent::OracleRunCompleted {
+                            effect_id: found,
+                            outcome: Ok(_),
+                            ..
+                        },
+                        crate::model::MessageReference::AuthoritativeReceipt { effect_id },
+                    ) => found == effect_id,
+                    (
+                        MissionEvent::RoleRunCompleted {
+                            effect_id: found, ..
+                        }
+                        | MissionEvent::OracleRunCompleted {
+                            effect_id: found, ..
+                        }
+                        | MissionEvent::TerminalReviewCompleted {
+                            effect_id: found, ..
+                        },
+                        crate::model::MessageReference::ParkEvidence { effect_id },
+                    ) => found == effect_id,
+                    _ => false,
+                });
+            let reason = if known {
+                ReferenceRejectionReason::Stale {
+                    reference: reference.clone(),
+                }
+            } else {
+                ReferenceRejectionReason::MalformedOrForeign {
+                    reference: reference.clone(),
+                }
+            };
+            return Err(reason.into());
         }
     }
-    crate::reference_materialization::materialize_references(
+    if let Err(error) = crate::reference_materialization::materialize_references(
         &state,
         &events,
         store.blobs(),
@@ -2545,7 +2608,27 @@ pub async fn record_message(
         &references,
     )
     .await
-    .context("message reference validation failed")?;
+    {
+        let reason = match error.cause {
+            crate::model::UnavailableReferenceCause::ExpansionLimitExceeded => {
+                ReferenceRejectionReason::Oversized {
+                    reference: Some(error.reference),
+                }
+            }
+            crate::model::UnavailableReferenceCause::SourceMissing
+            | crate::model::UnavailableReferenceCause::SourceUnreadable => {
+                ReferenceRejectionReason::Missing {
+                    reference: error.reference,
+                }
+            }
+            crate::model::UnavailableReferenceCause::InvalidContent => {
+                ReferenceRejectionReason::MalformedOrForeign {
+                    reference: error.reference,
+                }
+            }
+        };
+        return Err(reason.into());
+    }
     store
         .append(
             mission_id,

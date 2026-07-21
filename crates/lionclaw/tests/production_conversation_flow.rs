@@ -156,6 +156,12 @@ async fn assert_reference_send_rejected(
         .await
         .expect_err("invalid production reference set must fail closed");
     assert!(
+        error
+            .downcast_ref::<lionclaw::engine::ReferenceRejectionReason>()
+            .is_some(),
+        "reference rejection lost its closed typed reason: {error:#}"
+    );
+    assert!(
         format!("{error:#}").contains(expected),
         "unexpected rejection: {error:#}"
     );
@@ -3652,15 +3658,15 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     for (args, expected) in [
         (
             vec!["--commit".into(), "0".repeat(40)],
-            "not valid authority",
+            "malformed or belongs to another mission",
         ),
         (
             vec!["--commit".into(), unreachable.clone()],
-            "not valid authority",
+            "malformed or belongs to another mission",
         ),
         (
             vec!["--commit".into(), oversized_commit.to_string()],
-            "per-reference expansion bound",
+            "oversized",
         ),
         (
             vec![
@@ -3669,7 +3675,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
                 "--commit".into(),
                 unreachable.clone(),
             ],
-            "not valid authority",
+            "malformed or belongs to another mission",
         ),
     ] {
         assert_reference_send_rejected(&repo, &store, &mission, &conversation, args, expected)
@@ -3684,7 +3690,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         &mission,
         &conversation,
         too_many,
-        "message has too many references",
+        "oversized",
     )
     .await;
     let aggregate = (0..lionclaw::model::MAX_MESSAGE_REFERENCES)
@@ -3696,7 +3702,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         &mission,
         &conversation,
         aggregate,
-        "aggregate expansion bound",
+        "oversized",
     )
     .await;
 
@@ -3976,7 +3982,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             &mission,
             &conversation,
             vec![flag.into(), identity],
-            "not valid authority",
+            "malformed or belongs to another mission",
         )
         .await;
     }
@@ -4016,7 +4022,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         &mission,
         &conversation,
         vec!["--receipt".into(), receipt.to_string()],
-        "failed content verification",
+        "is missing",
     )
     .await;
 }

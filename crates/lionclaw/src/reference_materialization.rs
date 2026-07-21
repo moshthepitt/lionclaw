@@ -66,32 +66,34 @@ pub async fn materialize_references(
                     // A later `continue` deliberately removes that live-state entry,
                     // but must not invalidate the immutable queued message boundary.
                     // The same-mission completed failure is the durable material.
-                    let failure = events
+                    let outcome = events
                         .iter()
                         .rev()
                         .find_map(|envelope| match &envelope.event {
                             MissionEvent::RoleRunCompleted {
                                 effect_id: id,
-                                outcome: Err(failure),
+                                outcome,
                                 ..
-                            }
-                            | MissionEvent::OracleRunCompleted {
+                            } if id == effect_id => serde_json::to_value(outcome).ok(),
+                            MissionEvent::OracleRunCompleted {
                                 effect_id: id,
-                                outcome: Err(failure),
+                                outcome,
                                 ..
-                            } if id == effect_id => Some(failure),
+                            } if id == effect_id => serde_json::to_value(outcome).ok(),
                             MissionEvent::TerminalReviewCompleted {
                                 effect_id: id,
-                                outcome: Err(failure),
+                                outcome,
                                 ..
-                            } if id == effect_id => Some(failure),
+                            } if id == effect_id => serde_json::to_value(outcome).ok(),
                             _ => None,
                         })
                         .with_context(|| {
                             format!("park evidence {effect_id} is missing or unmaterializable")
                         })?;
+                    let mut outcome = outcome;
+                    resolve_payload_values(&mut outcome, blobs)?;
                     let bytes =
-                        serde_json::to_vec_pretty(failure).context("serializing park evidence")?;
+                        serde_json::to_vec_pretty(&outcome).context("serializing park evidence")?;
                     ("park evidence".to_string(), effect_id.to_string(), bytes)
                 }
                 MessageReference::ReachableCommit { sha } => {
@@ -131,6 +133,34 @@ pub async fn materialize_references(
         });
     }
     Ok(expanded)
+}
+
+fn resolve_payload_values(value: &mut serde_json::Value, blobs: &BlobStore) -> Result<()> {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                resolve_payload_values(value, blobs)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            if values.get("kind").and_then(serde_json::Value::as_str) == Some("blob") {
+                let payload: PayloadRef =
+                    serde_json::from_value(serde_json::Value::Object(values.clone()))
+                        .context("parsing park evidence payload reference")?;
+                *value = serde_json::Value::String(
+                    blobs
+                        .resolve_bounded(&payload, MAX_REFERENCE_BYTES)
+                        .context("resolving park evidence payload")?,
+                );
+            } else {
+                for value in values.values_mut() {
+                    resolve_payload_values(value, blobs)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn classify_unavailability(error: &anyhow::Error) -> crate::model::UnavailableReferenceCause {
@@ -244,5 +274,22 @@ mod tests {
         .expect_err("label and identity bytes are part of transient expansion");
         assert!(error.to_string().contains("aggregate expansion bound"));
         assert_eq!(total, MAX_EXPANDED_REFERENCE_BYTES - MAX_REFERENCE_BYTES);
+    }
+
+    #[test]
+    fn park_evidence_resolves_blob_payloads_instead_of_exposing_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().to_path_buf());
+        let blob = blobs.put(b"retained park diagnostic").unwrap();
+        let mut value = serde_json::json!({
+            "final_response": PayloadRef::Blob(blob),
+            "nested": [{ "report": PayloadRef::inline("inline evidence") }]
+        });
+
+        resolve_payload_values(&mut value, &blobs).unwrap();
+
+        assert_eq!(value["final_response"], "retained park diagnostic");
+        assert_eq!(value["nested"][0]["report"]["text"], "inline evidence");
+        assert!(!value.to_string().contains("sha256"));
     }
 }
