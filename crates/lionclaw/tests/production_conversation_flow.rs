@@ -2136,9 +2136,11 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         loop {
             let store = MissionStore::open(&repo).await.unwrap();
             let state = store.require_state(&mission_id).await.unwrap();
-            if state.conversations.values().any(|conversation| {
-                conversation.lifecycle == lionclaw::model::ConversationLifecycle::AwaitingLead
-            }) {
+            if state.inflight.is_empty()
+                && state.conversations.values().any(|conversation| {
+                    conversation.lifecycle == lionclaw::model::ConversationLifecycle::AwaitingLead
+                })
+            {
                 break;
             }
             tokio::task::yield_now().await;
@@ -2205,6 +2207,9 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         assert!(final_response.starts_with("Which release target should I use?"));
         assert!(final_response.len() <= lionclaw::model::MAX_FINAL_RESPONSE_BYTES as usize);
     }
+    // Activity is intentionally projected only while the durable disposition
+    // is Running. AwaitingLead plus an empty inflight set is a settled exact
+    // delivery boundary, so stale adapter activity must not leak into status.
     assert_eq!(status_json["activity"], serde_json::Value::Null);
     assert_eq!(
         status_json["next_actions"],
