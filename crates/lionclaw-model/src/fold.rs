@@ -163,6 +163,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 effect,
                 cancellation.into_failure(evidence),
                 final_response,
+                role_delivery_observation(&envelope.event),
             );
             finish_apply(state, seq);
             return;
@@ -476,6 +477,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                             effect_id,
                             &failure,
                             Some(&success.final_response),
+                            RoleDeliveryObservation::Delivered,
                         );
                         apply_role_failure(
                             state,
@@ -496,6 +498,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         effect_id,
                         failure,
                         None,
+                        RoleDeliveryObservation::from_failure(failure),
                     );
                     apply_role_failure(
                         state,
@@ -778,6 +781,14 @@ fn retire_illegal_conversations(state: &mut MissionState) {
             if conversation.lifecycle == super::state::ConversationLifecycle::Retired {
                 return None;
             }
+            if terminal
+                && conversation
+                    .active_delivery
+                    .as_ref()
+                    .is_some_and(|delivery| state.inflight.contains_key(&delivery.effect_id))
+            {
+                return None;
+            }
             let task = match conversation.namespace {
                 crate::TaskNamespace::Planning => state.planning.tasks.get(&conversation.task_id),
                 crate::TaskNamespace::Execution => state.tasks.get(&conversation.task_id),
@@ -832,7 +843,9 @@ fn retire_conversation(conversation: &mut super::state::ConversationState) {
     conversation.lifecycle = super::state::ConversationLifecycle::Retired;
     conversation.active_delivery = None;
     for message in &mut conversation.queued {
-        message.marker = super::state::DeliveryMarker::Undeliverable;
+        if message.marker != super::state::DeliveryMarker::PreviouslyDelivered {
+            message.marker = super::state::DeliveryMarker::Undeliverable;
+        }
     }
 }
 
@@ -842,6 +855,7 @@ fn settle_effect_failure(
     effect: InflightEffect,
     failure: TypedFailure,
     final_response: Option<&PayloadRef>,
+    role_delivery: Option<RoleDeliveryObservation>,
 ) {
     state.inflight.remove(effect_id);
     state.stop_requests.remove(effect_id);
@@ -865,6 +879,7 @@ fn settle_effect_failure(
                 effect_id,
                 &failure,
                 final_response,
+                role_delivery.unwrap_or(RoleDeliveryObservation::Uncertain),
             );
             apply_role_failure(
                 state,
@@ -952,6 +967,7 @@ fn settle_failed_conversation_delivery(
     effect_id: &crate::EffectId,
     failure: &TypedFailure,
     final_response: Option<&PayloadRef>,
+    delivery_observation: RoleDeliveryObservation,
 ) {
     let Some(conversation) = state
         .conversations
@@ -975,7 +991,7 @@ fn settle_failed_conversation_delivery(
                 .then(|| PayloadRef::inline(failure.evidence().final_response.clone()))
         })
         .or_else(|| conversation.final_response.clone());
-    if failure.evidence().code.as_deref() == Some("kernel.launch") {
+    if delivery_observation == RoleDeliveryObservation::NotDelivered {
         conversation.lifecycle = super::state::ConversationLifecycle::Ready;
         return;
     }
@@ -985,20 +1001,23 @@ fn settle_failed_conversation_delivery(
         .iter_mut()
         .filter(|message| delivery.presented_messages.contains(&message.sequence_no))
     {
-        message.marker = match (invalid_handoff, message.marker) {
-            (true, super::state::DeliveryMarker::Queued)
-            | (true, super::state::DeliveryMarker::PossiblyDelivered) => {
-                super::state::DeliveryMarker::PreviouslyDelivered
-            }
-            (false, super::state::DeliveryMarker::Queued) => {
+        message.marker = match (delivery_observation, message.marker) {
+            (RoleDeliveryObservation::Delivered, super::state::DeliveryMarker::Queued)
+            | (
+                RoleDeliveryObservation::Delivered,
+                super::state::DeliveryMarker::PossiblyDelivered,
+            ) => super::state::DeliveryMarker::PreviouslyDelivered,
+            (RoleDeliveryObservation::Uncertain, super::state::DeliveryMarker::Queued) => {
                 super::state::DeliveryMarker::PossiblyDelivered
             }
             (_, super::state::DeliveryMarker::PreviouslyDelivered) => {
                 super::state::DeliveryMarker::PreviouslyDelivered
             }
-            (false, super::state::DeliveryMarker::PossiblyDelivered) => {
-                super::state::DeliveryMarker::PossiblyDelivered
-            }
+            (
+                RoleDeliveryObservation::Uncertain,
+                super::state::DeliveryMarker::PossiblyDelivered,
+            ) => super::state::DeliveryMarker::PossiblyDelivered,
+            (RoleDeliveryObservation::NotDelivered, marker) => marker,
             (_, super::state::DeliveryMarker::Undeliverable) => {
                 super::state::DeliveryMarker::Undeliverable
             }
@@ -1011,6 +1030,35 @@ fn settle_failed_conversation_delivery(
     } else {
         conversation.lifecycle = super::state::ConversationLifecycle::Ready;
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoleDeliveryObservation {
+    NotDelivered,
+    Uncertain,
+    Delivered,
+}
+
+impl RoleDeliveryObservation {
+    fn from_failure(failure: &TypedFailure) -> Self {
+        if failure.evidence().code.as_deref() == Some("kernel.launch") {
+            Self::NotDelivered
+        } else if failure.is_invalid_output() {
+            Self::Delivered
+        } else {
+            Self::Uncertain
+        }
+    }
+}
+
+fn role_delivery_observation(event: &MissionEvent) -> Option<RoleDeliveryObservation> {
+    let MissionEvent::RoleRunCompleted { outcome, .. } = event else {
+        return None;
+    };
+    Some(match outcome {
+        Ok(_) => RoleDeliveryObservation::Delivered,
+        Err(failure) => RoleDeliveryObservation::from_failure(failure),
+    })
 }
 
 fn merge_failure_configuration(
@@ -3422,6 +3470,170 @@ mod tests {
         );
         assert_eq!(evidence.stop_reason.as_deref(), Some("operator stop"));
         assert_eq!(evidence.final_response, "retained response");
+    }
+
+    #[test]
+    fn cancellation_preserves_the_observed_role_delivery_classification() {
+        let effect_id = role_effect(crate::TaskNamespace::Execution, "w", 1, 1);
+        let base = vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "cancelled-delivery"),
+            MissionEvent::ControlRequested {
+                effect_id: effect_id.clone(),
+                action: ControlAction::Stop,
+                reason: "operator stop".into(),
+            },
+        ];
+        let outcomes = [
+            (
+                Ok(RoleRunSuccess {
+                    handoff: Some(work_handoff(true, false)),
+                    artifact: None,
+                    final_response: PayloadRef::inline("completed response"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
+                }),
+                super::super::state::DeliveryMarker::PreviouslyDelivered,
+            ),
+            (
+                Err(TypedFailure::invalid("handoff.schema", "malformed")),
+                super::super::state::DeliveryMarker::PreviouslyDelivered,
+            ),
+            (
+                Err(TypedFailure::Interrupted {
+                    evidence: Box::new(TypedFailureEvidence::new(None, "lost transport")),
+                }),
+                super::super::state::DeliveryMarker::PossiblyDelivered,
+            ),
+            (
+                Err(TypedFailure::permanent(
+                    "kernel.launch",
+                    "adapter refused launch",
+                )),
+                super::super::state::DeliveryMarker::Queued,
+            ),
+        ];
+
+        for (outcome, expected_marker) in outcomes {
+            let mut state = fold_log(base.clone()).expect("active state");
+            let conversation_id = state.conversations.keys().next().unwrap().clone();
+            let conversation = state.conversations.get_mut(&conversation_id).unwrap();
+            conversation
+                .queued
+                .push(super::super::state::QueuedMessage {
+                    sequence_no: 2,
+                    body: "present this".into(),
+                    references: vec![],
+                    marker: super::super::state::DeliveryMarker::Queued,
+                });
+            let delivery = conversation.active_delivery.as_mut().unwrap();
+            delivery.message_boundary = 2;
+            delivery.presented_messages = vec![2];
+            let InflightEffect::RoleRun {
+                message_boundary,
+                presented_messages,
+                ..
+            } = state.inflight.get_mut(&effect_id).unwrap()
+            else {
+                unreachable!()
+            };
+            *message_boundary = 2;
+            *presented_messages = vec![2];
+            let mut completed =
+                role_completed("w", "cancelled-delivery", work_handoff(true, false), None);
+            let MissionEvent::RoleRunCompleted {
+                request,
+                outcome: actual,
+                ..
+            } = &mut completed
+            else {
+                unreachable!()
+            };
+            request.message_boundary = 2;
+            request.presented_messages = vec![2];
+            *actual = outcome;
+            let next = state.head + 1;
+            apply(&mut state, &envelope(next, completed));
+            let conversation = &state.conversations[&conversation_id];
+            assert_eq!(conversation.queued[0].marker, expected_marker);
+            assert!(conversation.active_delivery.is_none());
+            assert!(matches!(
+                state.tasks[&tid("w")].last_failure,
+                Some(TypedFailure::OperatorStopped { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn durable_abort_waits_for_exact_active_role_boundary_settlement() {
+        let effect_id = role_effect(crate::TaskNamespace::Execution, "w", 1, 1);
+        let mut state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "aborted-role"),
+        ])
+        .expect("active state");
+        let conversation_id = state.conversations.keys().next().unwrap().clone();
+        let conversation = state.conversations.get_mut(&conversation_id).unwrap();
+        conversation.queued.extend([
+            super::super::state::QueuedMessage {
+                sequence_no: 2,
+                body: "presented".into(),
+                references: vec![],
+                marker: super::super::state::DeliveryMarker::Queued,
+            },
+            super::super::state::QueuedMessage {
+                sequence_no: 4,
+                body: "later".into(),
+                references: vec![],
+                marker: super::super::state::DeliveryMarker::Queued,
+            },
+        ]);
+        let delivery = conversation.active_delivery.as_mut().unwrap();
+        delivery.message_boundary = 2;
+        delivery.presented_messages = vec![2];
+        let InflightEffect::RoleRun {
+            message_boundary,
+            presented_messages,
+            ..
+        } = state.inflight.get_mut(&effect_id).unwrap()
+        else {
+            unreachable!()
+        };
+        *message_boundary = 2;
+        *presented_messages = vec![2];
+        let abort_seq = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(
+                abort_seq,
+                MissionEvent::MissionAborted {
+                    reason: "operator abort".into(),
+                },
+            ),
+        );
+        let mut completed = role_completed("w", "aborted-role", work_handoff(true, false), None);
+        let MissionEvent::RoleRunCompleted { request, .. } = &mut completed else {
+            unreachable!()
+        };
+        request.message_boundary = 2;
+        request.presented_messages = vec![2];
+        apply(&mut state, &envelope(abort_seq + 1, completed));
+        assert!(state.inflight.is_empty());
+        assert!(matches!(
+            state.tasks[&tid("w")].last_failure,
+            Some(TypedFailure::OperatorAborted { .. })
+        ));
+        assert!(!state.parked_effects.contains_key(&effect_id));
+        let conversation = &state.conversations[&conversation_id];
+        assert_eq!(
+            conversation.queued[0].marker,
+            super::super::state::DeliveryMarker::PreviouslyDelivered
+        );
+        assert_eq!(
+            conversation.queued[1].marker,
+            super::super::state::DeliveryMarker::Undeliverable
+        );
     }
 
     #[test]
