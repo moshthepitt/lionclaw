@@ -1,6 +1,9 @@
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc, Mutex,
+};
 
 use async_trait::async_trait;
 use common::{
@@ -61,7 +64,35 @@ enum SettlementRaceOutcome {
 
 struct SettlementRaceRunner {
     outcome: SettlementRaceOutcome,
-    delay: std::time::Duration,
+    deadline_barrier: Option<Arc<SettlementDeadlineBarrier>>,
+}
+
+struct SettlementDeadlineBarrier {
+    runner_ready: Notify,
+    release_runner: Notify,
+}
+
+struct ControlledDeadlineClock {
+    now_ms: AtomicI64,
+}
+
+impl ControlledDeadlineClock {
+    fn new(now_ms: i64) -> Self {
+        Self {
+            now_ms: AtomicI64::new(now_ms),
+        }
+    }
+
+    fn advance_past(&self, deadline_ms: i64) {
+        self.now_ms
+            .store(deadline_ms.saturating_add(1), Ordering::SeqCst);
+    }
+}
+
+impl lionclaw::ports::Clock for ControlledDeadlineClock {
+    fn now_ms(&self) -> i64 {
+        self.now_ms.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
@@ -75,7 +106,10 @@ impl RoleRunner for SettlementRaceRunner {
             })
             .await
             .unwrap();
-        tokio::time::sleep(self.delay).await;
+        if let Some(barrier) = &self.deadline_barrier {
+            barrier.runner_ready.notify_one();
+            barrier.release_runner.notified().await;
+        }
         let configuration = RuntimeConfigurationEvidence {
             requested_model: Some("requested-race-model".into()),
             applied_model: Some("applied-race-model".into()),
@@ -841,11 +875,18 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
                     definition.execution.max_task_time_secs = 1;
                 });
             }
-            let clock: Arc<dyn lionclaw::ports::Clock> = if deadline_race {
-                Arc::new(RealClock)
-            } else {
-                Arc::new(MockClock::default())
-            };
+            let deadline_clock =
+                deadline_race.then(|| Arc::new(ControlledDeadlineClock::new(1_000_000)));
+            let deadline_barrier = deadline_race.then(|| {
+                Arc::new(SettlementDeadlineBarrier {
+                    runner_ready: Notify::new(),
+                    release_runner: Notify::new(),
+                })
+            });
+            let clock: Arc<dyn lionclaw::ports::Clock> = deadline_clock
+                .clone()
+                .map(|clock| clock as Arc<dyn lionclaw::ports::Clock>)
+                .unwrap_or_else(|| Arc::new(MockClock::default()));
             let engine = Arc::new(Engine::new(
                 store.clone(),
                 mission_type,
@@ -854,11 +895,7 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
                 EngineServices::new(
                     Arc::new(SettlementRaceRunner {
                         outcome,
-                        delay: if deadline_race {
-                            std::time::Duration::from_millis(1_200)
-                        } else {
-                            std::time::Duration::ZERO
-                        },
+                        deadline_barrier: deadline_barrier.clone(),
                     }),
                     Arc::new(MockOracleRunner::exiting(0)),
                     Arc::new(SettlementCleaner {
@@ -889,6 +926,28 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
                 let mission_id = mission_id.clone();
                 async move { engine.advance(&mission_id).await.unwrap() }
             });
+            if let (Some(clock), Some(barrier)) = (&deadline_clock, &deadline_barrier) {
+                barrier.runner_ready.notified().await;
+                let started = store.require_state(&mission_id).await.unwrap();
+                let (started_effect_id, started_effect) = started.inflight.iter().next().unwrap();
+                let started_effect_id = started_effect_id.clone();
+                let started_deadline_ms = started_effect.deadline_ms();
+                clock.advance_past(started_deadline_ms);
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let current = store.require_state(&mission_id).await.unwrap();
+                        if current.reached_deadlines.get(&started_effect_id)
+                            == Some(&started_deadline_ms)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("engine must durably observe the controlled deadline");
+                barrier.release_runner.notify_one();
+            }
             entered.notified().await;
             let active = store.require_state(&mission_id).await.unwrap();
             let (effect_id, effect) = active.inflight.iter().next().unwrap();
