@@ -4,12 +4,14 @@
 mod common;
 
 use common::{
-    approve_plan, fault_append_events, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA,
+    advisory_plan, approve_plan, fault_append_events, harness, proposal, simple_plan, BASE_SHA,
+    HEAD_SHA,
 };
 use lionclaw::model::{
     apply, fold, ControlAction, ConversationId, ConversationLifecycle, ConversationRecipient,
-    MissionEvent, MissionState, OutputSemantics, ParkedEffect, RoleName, RoleRunRequestIdentity,
-    TaskId, TaskNamespace, TaskStatus, TypedFailure,
+    Handoff, MissionEvent, MissionState, OutputSemantics, ParkedEffect, PayloadRef, RoleName,
+    RoleRunRequestIdentity, RoleRunSuccess, RuntimeConfigurationEvidence, TaskId, TaskNamespace,
+    TaskStatus, TypedFailure,
 };
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -68,6 +70,60 @@ fn role_request(state: &MissionState) -> NewEvent {
         assignment_epoch: assignment.generation,
         message_boundary: state.head,
         presented_messages,
+        recreate_workspace: assignment.recreate_workspace,
+        requested_at_ms: 0,
+        not_before_ms: 0,
+        deadline_ms: 100_000,
+        budget_deadline_ms: 100_000,
+    })
+    .with_prompt_hash(PROMPT_HASH)
+}
+
+fn execution_role_request(
+    state: &MissionState,
+    task_id: TaskId,
+    role: RoleName,
+    output: OutputSemantics,
+) -> NewEvent {
+    let assignment = lionclaw::model::resolve_role_assignment(
+        &state.mission_id,
+        TaskNamespace::Execution,
+        &task_id,
+        &role,
+        lionclaw::model::RoleAssignmentContext {
+            previous: state.tasks.get(&task_id),
+            required_base: &state.current_sha,
+            lifecycle_generation: state.role_lifecycle_generation(TaskNamespace::Execution),
+            max_attempts: state.config.recovery.max_attempts,
+        },
+    );
+    let attempt_no = state
+        .tasks
+        .get(&task_id)
+        .map_or(1, |task| task.attempts + 1);
+    let effect_id = lionclaw::model::EffectId::for_role_request(
+        TaskNamespace::Execution,
+        &state.mission_id,
+        &task_id,
+        attempt_no,
+        assignment.generation,
+        PROMPT_HASH,
+    );
+    NewEvent::new(MissionEvent::RoleRunRequested {
+        conversation_id: assignment.conversation_id,
+        namespace: TaskNamespace::Execution,
+        task_id,
+        attempt_no,
+        effect_id,
+        role,
+        output,
+        runtime: "codex".into(),
+        prompt_template: lionclaw::model::RolePromptTemplate::Execution,
+        prompt_hash: PROMPT_HASH.into(),
+        base_sha: assignment.base_sha,
+        assignment_epoch: assignment.generation,
+        message_boundary: state.head,
+        presented_messages: vec![],
         recreate_workspace: assignment.recreate_workspace,
         requested_at_ms: 0,
         not_before_ms: 0,
@@ -498,6 +554,190 @@ async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
         }
         assert_eq!(cursor, replayed, "cursor split {split}");
     }
+}
+
+#[tokio::test]
+async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA)
+        .await
+        .expect("create");
+    let mut plan = advisory_plan();
+    plan.assertions[0].oracle = Some(lionclaw::model::OracleName::new("cargo-test").unwrap());
+    h.engine
+        .propose_plan(&mission_id, proposal(0, plan))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+
+    let initial = h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("initial state");
+    let writer_request = execution_role_request(
+        &initial,
+        TaskId::new("write").unwrap(),
+        RoleName::new("implementer").unwrap(),
+        OutputSemantics::ProducesArtifact,
+    );
+    let writer_identity = request_identity(&writer_request.event);
+    let MissionEvent::RoleRunRequested {
+        effect_id: writer_effect,
+        ..
+    } = &writer_request.event
+    else {
+        unreachable!()
+    };
+    let writer_completion = NewEvent::new(MissionEvent::RoleRunCompleted {
+        effect_id: writer_effect.clone(),
+        request: Box::new(writer_identity),
+        outcome: Ok(RoleRunSuccess {
+            handoff: Some(Handoff::Work {
+                done: true,
+                report: PayloadRef::inline("writer complete"),
+                request_attention: false,
+            }),
+            artifact: None,
+            final_response: PayloadRef::inline("writer complete"),
+            runtime_configuration: RuntimeConfigurationEvidence::default(),
+        }),
+    });
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        initial.head,
+        &[writer_request, writer_completion],
+        40,
+    )
+    .await;
+
+    let after_writer = h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("writer state");
+    let verdict_request = execution_role_request(
+        &after_writer,
+        TaskId::new("review").unwrap(),
+        RoleName::new("reviewer").unwrap(),
+        OutputSemantics::EmitsVerdict,
+    );
+    let verdict_identity = request_identity(&verdict_request.event);
+    let conversation_id = verdict_identity.conversation_id.clone();
+    let MissionEvent::RoleRunRequested {
+        effect_id: verdict_effect,
+        ..
+    } = &verdict_request.event
+    else {
+        unreachable!()
+    };
+    let verdict_effect = verdict_effect.clone();
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        after_writer.head,
+        &[verdict_request],
+        41,
+    )
+    .await;
+    let requested = h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("request state");
+    let snapshotted_request = h
+        .engine
+        .store()
+        .rebuild_cursors(&mission_id, 9_000_000)
+        .await
+        .expect("seed reducer-28 request snapshot");
+    assert_eq!(snapshotted_request, requested);
+
+    let runtime_configuration = RuntimeConfigurationEvidence {
+        requested_model: Some("forged-but-pinned".into()),
+        ..RuntimeConfigurationEvidence::default()
+    };
+    let final_response = PayloadRef::inline("I cannot supply the required verdict.");
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        requested.head,
+        &[NewEvent::new(MissionEvent::RoleRunCompleted {
+            effect_id: verdict_effect.clone(),
+            request: Box::new(verdict_identity),
+            outcome: Ok(RoleRunSuccess {
+                handoff: None,
+                artifact: None,
+                final_response: final_response.clone(),
+                runtime_configuration: runtime_configuration.clone(),
+            }),
+        })],
+        42,
+    )
+    .await;
+
+    let live = h.engine.load_state(&mission_id).await.expect("live fold");
+    let events = h.engine.store().load(&mission_id).await.expect("events");
+    let replayed = fold(events).expect("full replay");
+    assert_eq!(live, replayed);
+    let (snapshot_head, reducer_version) = h
+        .engine
+        .store()
+        .snapshot_meta(&mission_id)
+        .await
+        .expect("snapshot metadata")
+        .expect("snapshot");
+    assert_eq!(reducer_version, 28);
+    assert!(
+        snapshot_head < live.head,
+        "completion must be a nonempty tail"
+    );
+    assert_eq!(
+        h.engine
+            .store()
+            .load_state_snapshotted(&mission_id)
+            .await
+            .expect("snapshot-tail load")
+            .expect("state"),
+        replayed
+    );
+    assert_eq!(
+        h.engine
+            .store()
+            .rebuild_cursors(&mission_id, 9_000_000)
+            .await
+            .expect("rebuild from durable events"),
+        replayed
+    );
+
+    let review = &live.tasks[&TaskId::new("review").unwrap()];
+    assert_eq!(review.status, TaskStatus::Failed);
+    assert!(matches!(
+        review.last_failure,
+        Some(TypedFailure::InvalidOutput { .. })
+    ));
+    assert_eq!(
+        review.last_runtime_configuration,
+        Some(runtime_configuration)
+    );
+    let conversation = &live.conversations[&conversation_id];
+    assert_eq!(
+        conversation.lifecycle,
+        ConversationLifecycle::ReworkingInvalidHandoff
+    );
+    assert_eq!(conversation.invalid_handoff_reworks, 1);
+    assert_eq!(conversation.final_response, Some(final_response));
+    assert!(conversation.active_delivery.is_none());
+    assert!(!live.inflight.contains_key(&verdict_effect));
 }
 
 #[tokio::test]

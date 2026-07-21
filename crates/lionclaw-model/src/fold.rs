@@ -407,6 +407,12 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         > crate::MAX_FINAL_RESPONSE_BYTES
                     {
                         Some("role final response exceeds the durable bound")
+                    } else if success.handoff.is_none()
+                        && expected_contract
+                            .as_ref()
+                            .is_some_and(|(output, _)| output.requires_handoff())
+                    {
+                        Some("role omitted the handoff required by its output contract")
                     } else if success.handoff.is_none() && success.artifact.is_some() {
                         Some("a checkpoint without a handoff cannot return an artifact")
                     } else {
@@ -4522,6 +4528,79 @@ mod tests {
         ));
         assert_eq!(state.current_sha, "base");
         assert!(state.inflight.is_empty());
+    }
+
+    #[test]
+    fn required_output_absence_is_invalid_rework_at_the_completion_fold_boundary() {
+        let runtime_configuration = RuntimeConfigurationEvidence {
+            requested_model: Some("pinned-validator".into()),
+            ..RuntimeConfigurationEvidence::default()
+        };
+        let mut state = fold_log(vec![
+            created(),
+            plan_proposed(
+                vec![],
+                vec![work_task("writer"), validate_task("validator")],
+            ),
+            role_completed("writer", "writer", work_handoff(true, false), None),
+            role_requested_in(
+                crate::TaskNamespace::Execution,
+                "validator",
+                "required-output",
+                RoleName::new("reviewer").unwrap(),
+                OutputSemantics::EmitsVerdict,
+            ),
+        ])
+        .expect("state");
+        let (effect_id, request) = state
+            .inflight
+            .iter()
+            .find_map(|(effect_id, effect)| {
+                effect
+                    .role_request_identity()
+                    .map(|request| (effect_id.clone(), request))
+            })
+            .expect("active validator request");
+        let conversation_id = request.conversation_id.clone();
+        let next_sequence = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(
+                next_sequence,
+                MissionEvent::RoleRunCompleted {
+                    effect_id,
+                    request: Box::new(request),
+                    outcome: Ok(RoleRunSuccess {
+                        handoff: None,
+                        artifact: None,
+                        final_response: PayloadRef::inline("I cannot produce a verdict."),
+                        runtime_configuration: runtime_configuration.clone(),
+                    }),
+                },
+            ),
+        );
+
+        let task = &state.tasks[&tid("validator")];
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(matches!(
+            task.last_failure,
+            Some(TypedFailure::InvalidOutput { .. })
+        ));
+        assert_eq!(task.last_runtime_configuration, Some(runtime_configuration));
+        let conversation = &state.conversations[&conversation_id];
+        assert_eq!(
+            conversation.lifecycle,
+            super::super::state::ConversationLifecycle::ReworkingInvalidHandoff
+        );
+        assert_eq!(conversation.invalid_handoff_reworks, 1);
+        assert_eq!(
+            conversation.final_response,
+            Some(PayloadRef::inline("I cannot produce a verdict."))
+        );
+        assert_ne!(
+            conversation.lifecycle,
+            super::super::state::ConversationLifecycle::AwaitingLead
+        );
     }
 
     #[test]
