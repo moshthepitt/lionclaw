@@ -2340,6 +2340,52 @@ pub struct MessageCommand {
     pub references: Vec<crate::model::MessageReference>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReferenceEligibilityError {
+    #[error(
+        "message references are not permitted for recipient {conversation_id} with output semantics {}",
+        output.slug()
+    )]
+    JudgmentRecipient {
+        conversation_id: crate::model::ConversationId,
+        output: crate::model::OutputSemantics,
+    },
+    #[error("recipient {conversation_id} has no authoritative output semantics")]
+    MissingOutputSemantics {
+        conversation_id: crate::model::ConversationId,
+    },
+}
+
+fn validate_reference_eligibility(
+    state: &MissionState,
+    recipients: &[crate::model::ConversationRecipient],
+    references: &[crate::model::MessageReference],
+) -> std::result::Result<(), ReferenceEligibilityError> {
+    if references.is_empty() {
+        return Ok(());
+    }
+    for recipient in recipients {
+        let Some(output) = state
+            .config
+            .plan_inventory
+            .roles
+            .get(&recipient.role)
+            .copied()
+        else {
+            return Err(ReferenceEligibilityError::MissingOutputSemantics {
+                conversation_id: recipient.conversation_id.clone(),
+            });
+        };
+        if !output.permits_message_references() {
+            return Err(ReferenceEligibilityError::JudgmentRecipient {
+                conversation_id: recipient.conversation_id.clone(),
+                output,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn resolve_message_recipients(
     current: &[crate::model::ConversationRecipient],
     selectors: &[String],
@@ -2427,6 +2473,7 @@ pub async fn record_message(
         )
         .collect();
     let recipients = resolve_message_recipients(&current, &selectors, all)?;
+    validate_reference_eligibility(&state, &recipients, &references)?;
     for reference in &references {
         let valid = match reference {
             crate::model::MessageReference::AuthoritativeReceipt { effect_id } => {

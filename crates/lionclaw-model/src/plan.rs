@@ -61,6 +61,16 @@ pub enum OutputSemantics {
 }
 
 impl OutputSemantics {
+    /// Whether lead messages may carry producer-controlled reference prose to
+    /// this output boundary. Judgment outputs receive only engine-owned
+    /// evidence assembled by their dedicated prompt paths.
+    pub const fn permits_message_references(self) -> bool {
+        match self {
+            Self::ProducesReport | Self::ProducesArtifact | Self::ProposesPlan => true,
+            Self::EmitsVerdict | Self::EmitsGapVerdict => false,
+        }
+    }
+
     /// Whether a completed turn must carry the typed handoff for this output.
     /// Dialogue-producing roles may pause to ask the lead a question; judges
     /// cannot turn an absent verdict into dialogue.
@@ -90,6 +100,20 @@ impl OutputSemantics {
             Self::EmitsVerdict => Some(TaskKind::Validate),
             Self::ProducesReport | Self::EmitsGapVerdict | Self::ProposesPlan => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod output_semantics_tests {
+    use super::OutputSemantics;
+
+    #[test]
+    fn reference_policy_is_exhaustive_and_judgment_safe() {
+        assert!(OutputSemantics::ProducesReport.permits_message_references());
+        assert!(OutputSemantics::ProducesArtifact.permits_message_references());
+        assert!(OutputSemantics::ProposesPlan.permits_message_references());
+        assert!(!OutputSemantics::EmitsVerdict.permits_message_references());
+        assert!(!OutputSemantics::EmitsGapVerdict.permits_message_references());
     }
 }
 

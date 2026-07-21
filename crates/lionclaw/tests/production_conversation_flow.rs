@@ -950,6 +950,50 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         effect,
         lionclaw::model::InflightEffect::RoleRun { task_id, .. } if task_id == &validator_id
     ));
+    let validator_conversation = active
+        .conversations
+        .iter()
+        .find(|(_, conversation)| conversation.task_id == validator_id)
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    assert_reference_send_rejected(
+        &repo,
+        &store,
+        &mission,
+        &validator_conversation,
+        vec!["--commit".into(), base.clone()],
+        "output semantics emits-verdict",
+    )
+    .await;
+
+    let before_mixed = store.load(&mission).await.unwrap();
+    let mixed_error = cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission.as_str(),
+            "--all",
+            "--commit",
+            base.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "mixed recipients must reject atomically",
+        ])
+        .unwrap(),
+    )
+    .await
+    .expect_err("a mixed judgment recipient send must fail closed");
+    assert!(
+        format!("{mixed_error:#}").contains("output semantics emits-verdict"),
+        "unexpected mixed-recipient rejection: {mixed_error:#}"
+    );
+    assert_eq!(
+        store.load(&mission).await.unwrap(),
+        before_mixed,
+        "mixed-recipient rejection appended a partial recipient subset"
+    );
     assert_eq!(active.deliverable_head(), base);
     assert_eq!(active.plan.as_ref().unwrap().tasks, plan_order);
     assert_eq!(
