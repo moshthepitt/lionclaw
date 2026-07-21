@@ -110,6 +110,33 @@ struct ScriptedRuntimeProgramExecutor {
     incoming: Option<VecDeque<String>>,
 }
 
+struct LaunchRefusingRuntimeProgramExecutor;
+
+#[async_trait]
+impl RuntimeProgramExecutor for LaunchRefusingRuntimeProgramExecutor {
+    async fn execute_streaming(
+        &mut self,
+        _program: RuntimeProgramSpec,
+        _stdout: RuntimeProgramStdoutSender,
+    ) -> Result<ExecutionOutput> {
+        unreachable!("codex app server requires an interactive program")
+    }
+
+    async fn execute_captured(&mut self, _program: RuntimeProgramSpec) -> Result<ExecutionOutput> {
+        unreachable!("codex app server requires an interactive program")
+    }
+
+    async fn spawn(
+        &mut self,
+        _program: RuntimeProgramSpec,
+    ) -> Result<Box<dyn RuntimeProgramSession>> {
+        Err(anyhow::Error::new(TypedFailure::permanent(
+            "kernel.launch",
+            "codex confinement setup refused launch",
+        )))
+    }
+}
+
 #[async_trait]
 impl RuntimeProgramExecutor for ScriptedRuntimeProgramExecutor {
     async fn execute_streaming(
@@ -171,6 +198,43 @@ async fn start_codex_test_session_with_config(
         .expect("start");
     let thread_state = adapter.thread_state_for(&handle.runtime_session_id);
     (adapter, handle, thread_state)
+}
+
+#[tokio::test]
+async fn codex_adapter_preserves_typed_launch_refusal() {
+    let (adapter, handle, _) = start_codex_test_session(None).await;
+    let (journal, _journal_rx) = tokio::sync::mpsc::channel(4);
+    let error = adapter
+        .turn(
+            TurnExecution {
+                input: TurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "launch refusal probe".into(),
+                    fresh_prompt: None,
+                },
+                context: RuntimeExecutionContext {
+                    network_mode: NetworkMode::None,
+                    working_dir: None,
+                    environment: Vec::new(),
+                    runtime_state_root: None,
+                    runtime_path_projections: Vec::new(),
+                    mcp_servers: Vec::new(),
+                },
+                executor: Box::new(LaunchRefusingRuntimeProgramExecutor),
+            },
+            journal,
+        )
+        .await
+        .expect_err("codex setup refusal must fail the turn");
+    let failure = error
+        .downcast_ref::<TypedFailure>()
+        .expect("codex adapter must preserve shared typed launch evidence");
+
+    assert_eq!(failure.evidence().code.as_deref(), Some("kernel.launch"));
+    assert_eq!(
+        failure.evidence().detail,
+        "codex confinement setup refused launch"
+    );
 }
 
 fn omits_jsonrpc_header(message: &Value) -> bool {

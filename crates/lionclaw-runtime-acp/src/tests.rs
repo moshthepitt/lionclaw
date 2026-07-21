@@ -15,8 +15,8 @@ use lionclaw_runtime_api::{
     RuntimeExecutionContext, RuntimeMcpServerSpec, RuntimeMessageLane, RuntimeProgramExecutor,
     RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeResume,
     RuntimeResumeMode, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalConfig,
-    RuntimeTerminalProgramInput, TurnEvent, TurnExecution, TurnInput, RUNTIME_SESSION_READY_MARKER,
-    RUNTIME_TURN_JOURNAL_CAPACITY,
+    RuntimeTerminalProgramInput, TurnEvent, TurnExecution, TurnInput, TypedFailure,
+    RUNTIME_SESSION_READY_MARKER, RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 
 use super::{
@@ -43,6 +43,52 @@ fn opencode_acp_config(model: Option<String>, mode: Option<String>) -> AcpRuntim
 
 fn runtime_not_ready() -> RuntimeSessionReady {
     RuntimeSessionReady::not_ready()
+}
+
+#[tokio::test]
+async fn acp_adapter_preserves_typed_launch_refusal() {
+    let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+    let handle = adapter
+        .session_start(RuntimeSessionStartInput {
+            session_id: Uuid::new_v4(),
+            working_dir: None,
+            environment: Vec::new(),
+            resume: RuntimeResume::Reconstruct,
+        })
+        .await
+        .expect("start ACP session");
+    let (journal, _journal_rx) = tokio::sync::mpsc::channel(4);
+    let error = adapter
+        .turn(
+            TurnExecution {
+                input: TurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "launch refusal probe".into(),
+                    fresh_prompt: None,
+                },
+                context: RuntimeExecutionContext {
+                    network_mode: NetworkMode::None,
+                    working_dir: None,
+                    environment: Vec::new(),
+                    runtime_state_root: None,
+                    runtime_path_projections: Vec::new(),
+                    mcp_servers: Vec::new(),
+                },
+                executor: Box::new(LaunchRefusingAcpProgramExecutor),
+            },
+            journal,
+        )
+        .await
+        .expect_err("ACP setup refusal must fail the turn");
+    let failure = error
+        .downcast_ref::<TypedFailure>()
+        .expect("ACP adapter must preserve shared typed launch evidence");
+
+    assert_eq!(failure.evidence().code.as_deref(), Some("kernel.launch"));
+    assert_eq!(
+        failure.evidence().detail,
+        "ACP confinement setup refused launch"
+    );
 }
 
 fn mark_runtime_ready(runtime_state_root: &Path) -> RuntimeSessionReady {
@@ -143,6 +189,37 @@ struct FakeAcpProgramExecutor {
     inbound: VecDeque<String>,
     expected_auth: Option<RuntimeAuthKind>,
     state: Arc<Mutex<FakeAcpProgramState>>,
+}
+
+#[derive(Debug)]
+struct LaunchRefusingAcpProgramExecutor;
+
+#[async_trait::async_trait]
+impl RuntimeProgramExecutor for LaunchRefusingAcpProgramExecutor {
+    async fn execute_streaming(
+        &mut self,
+        _program: RuntimeProgramSpec,
+        _stdout: RuntimeProgramStdoutSender,
+    ) -> anyhow::Result<ExecutionOutput> {
+        unreachable!("ACP requires an interactive program")
+    }
+
+    async fn execute_captured(
+        &mut self,
+        _program: RuntimeProgramSpec,
+    ) -> anyhow::Result<ExecutionOutput> {
+        unreachable!("ACP requires an interactive program")
+    }
+
+    async fn spawn(
+        &mut self,
+        _program: RuntimeProgramSpec,
+    ) -> anyhow::Result<Box<dyn RuntimeProgramSession>> {
+        Err(anyhow::Error::new(TypedFailure::permanent(
+            "kernel.launch",
+            "ACP confinement setup refused launch",
+        )))
+    }
 }
 
 #[async_trait::async_trait]

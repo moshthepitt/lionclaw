@@ -20,10 +20,12 @@ use lionclaw::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
 use lionclaw::store::MissionStore;
 use lionclaw::{cli, workspace};
 use lionclaw_runtime_api::{
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthRegistry, RuntimeCancellation,
-    RuntimeDriverConfig, RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeResumeMode,
-    RuntimeSessionHandle, RuntimeSessionStartInput, TurnExecution, TurnResult, TypedFailure,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthContext, RuntimeAuthPreparation,
+    RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeCancellation, RuntimeDriverConfig,
+    RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeResumeMode, RuntimeSessionHandle,
+    RuntimeSessionStartInput, TurnExecution, TurnResult, TypedFailure,
 };
+use lionclaw_runtime_codex::CodexRuntimeDriver;
 
 #[derive(Clone, Copy)]
 enum DeliveryTurn {
@@ -39,6 +41,26 @@ enum DeliveryTurn {
 
 type SessionObservations = Arc<Mutex<Vec<(Option<String>, bool)>>>;
 type PromptObservations = Arc<Mutex<Vec<(String, std::path::PathBuf)>>>;
+
+struct TestCodexAuth;
+
+#[async_trait]
+impl RuntimeAuthProvider for TestCodexAuth {
+    fn kind(&self) -> &'static str {
+        "codex"
+    }
+
+    async fn validate(&self, _context: &RuntimeAuthContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn prepare(
+        &self,
+        _input: RuntimeAuthPreparation<'_>,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        anyhow::bail!("test codex auth setup refused launch")
+    }
+}
 
 fn cli_output(repo: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_lionclaw"))
@@ -2009,6 +2031,7 @@ async fn production_delivery_uses_one_exact_immutable_boundary() {
             r#"[runtimes.codex]
 driver = "codex"
 command = "external-codex"
+auth = "codex"
 native-resume = true
 confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 "#,
@@ -2034,7 +2057,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let launch_failures = Arc::new(Mutex::new(0));
     let oracle_calls = Arc::new(Mutex::new(Vec::new()));
     let transports = cli::MissionTransports::external(
-        profiles,
+        profiles.clone(),
         RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
             turns: turns.clone(),
             entered: entered.clone(),
@@ -2043,7 +2066,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             prompts: prompts.clone(),
             launch_failures: launch_failures.clone(),
         }) as Arc<dyn RuntimeDriverProvider>]),
-        RuntimeAuthRegistry::empty(),
+        RuntimeAuthRegistry::new([Arc::new(TestCodexAuth) as Arc<dyn RuntimeAuthProvider>]),
         Arc::new(ExternalOracleTransport {
             calls: oracle_calls.clone(),
         }),
@@ -2251,10 +2274,22 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     )
     .await
     .unwrap();
-    *launch_failures.lock().unwrap() = 1;
+    // Use the real Codex provider for this one failure. Its test auth provider
+    // refuses setup inside MissionProgramExecutor's interactive launch, before
+    // an app-server transport exists and without disrupting OCI cleanup.
+    let launch_transports = cli::MissionTransports::external(
+        profiles.clone(),
+        RuntimeDriverRegistry::new(
+            [Arc::new(CodexRuntimeDriver) as Arc<dyn RuntimeDriverProvider>],
+        ),
+        RuntimeAuthRegistry::new([Arc::new(TestCodexAuth) as Arc<dyn RuntimeAuthProvider>]),
+        Arc::new(ExternalOracleTransport {
+            calls: oracle_calls.clone(),
+        }),
+    );
 
     let launch_driver = tokio::spawn({
-        let transports = transports.clone();
+        let transports = launch_transports;
         let command = driver_cli(&temp.path().join("delivery-launch-failure.ready"));
         async move { cli::run_with_transports(command, transports).await }
     });
@@ -2274,8 +2309,14 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("launch failure was not recorded");
+    .await;
+    let events = match events {
+        Ok(events) => events,
+        Err(_) => panic!(
+            "launch failure was not recorded; durable events: {:#?}",
+            active_store.load(&mission_id).await.unwrap()
+        ),
+    };
     if !launch_driver.is_finished() {
         launch_driver.abort();
     }
@@ -2294,6 +2335,26 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             )
         })
         .expect("production launch failure");
+    let launch_failure = match &events[launch].event {
+        MissionEvent::RoleRunCompleted {
+            outcome: Err(failure),
+            ..
+        } => failure,
+        _ => unreachable!("launch index identifies a failed role run"),
+    };
+    assert_eq!(
+        launch_failure.evidence().code.as_deref(),
+        Some("kernel.launch")
+    );
+    assert!(launch_failure
+        .evidence()
+        .detail
+        .contains("test codex auth setup refused launch"));
+    assert_eq!(
+        launch_failure.evidence().configuration,
+        lionclaw_runtime_api::AppliedRuntimeConfiguration::default()
+    );
+    assert!(launch_failure.evidence().final_response.is_empty());
     let after_launch = fold(events[..=launch].iter().cloned()).unwrap();
     let delivery = &after_launch.conversations[&exact_conversation_id];
     assert_eq!(delivery.assignment_epoch, assignment_generation);
@@ -2304,6 +2365,39 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     );
     assert!(delivery.active_delivery.is_none());
     let parked = active_store.require_state(&mission_id).await.unwrap();
+    assert_eq!(
+        parked,
+        fold(active_store.load(&mission_id).await.unwrap()).unwrap()
+    );
+    assert_eq!(
+        parked,
+        active_store
+            .rebuild_cursors(&mission_id, 9_000_000)
+            .await
+            .expect("launch refusal snapshot-tail rebuild")
+    );
+    let launch_status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        &repo,
+        &["mission", "status", mission_id.as_str(), "--json"],
+    )))
+    .unwrap();
+    assert_eq!(
+        launch_status["tasks"][0]["failure"]["evidence"]["code"],
+        "kernel.launch"
+    );
+    assert!(launch_status["tasks"][0]["failure"]["evidence"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("test codex auth setup refused launch"));
+    assert_ne!(
+        projected_conversation(&launch_status, &conversation_id)["lifecycle"],
+        "awaiting_lead"
+    );
+    let launch_human = stdout(cli_output(
+        &repo,
+        &["mission", "status", mission_id.as_str()],
+    ));
+    assert!(launch_human.contains("test codex auth setup refused launch"));
     let parked_effect = parked.parked_effects.keys().next().unwrap().to_string();
     cli::run(
         cli::Cli::try_parse_from([
