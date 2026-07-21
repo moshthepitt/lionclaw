@@ -45,6 +45,15 @@ pub struct QueuedMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnavailableReferenceEvidence {
+    pub conversation_id: super::ConversationId,
+    pub assignment_epoch: u32,
+    pub message_sequence: u64,
+    pub reference: super::MessageReference,
+    pub cause: super::UnavailableReferenceCause,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationState {
     pub role: RoleName,
     pub namespace: super::TaskNamespace,
@@ -855,6 +864,7 @@ impl InflightEffect {
             MissionEvent::MissionCreated { .. }
             | MissionEvent::PlanProposed { .. }
             | MissionEvent::MessageSent { .. }
+            | MissionEvent::MessageReferenceUnavailable { .. }
             | MissionEvent::TaskWorkspacePrepared { .. }
             | MissionEvent::EffectRuntimeConfigured { .. }
             | MissionEvent::RoleRunCompleted { .. }
@@ -959,6 +969,9 @@ pub struct MissionState {
     /// Mission-private dialogue authority, keyed by stable role-instance id.
     #[serde(default)]
     pub conversations: BTreeMap<super::ConversationId, ConversationState>,
+    /// Exact fail-closed settlements for references lost after ingress.
+    #[serde(default)]
+    pub unavailable_references: Vec<UnavailableReferenceEvidence>,
     /// Exact same-mission evidence identities eligible for message references.
     #[serde(default)]
     pub authoritative_receipts: BTreeSet<super::EffectId>,

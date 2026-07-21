@@ -119,6 +119,82 @@ async fn reachable_commit_expands_only_at_the_typed_role_request_boundary() {
     }
 }
 
+#[tokio::test]
+async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let observed = prompts.clone();
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        observed.lock().unwrap().push(request.prompt.clone());
+        Ok(checkpoint(request))
+    }));
+    let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
+    let mission = h
+        .engine
+        .create_mission(dir.path().to_str().unwrap(), "references", BASE_SHA)
+        .await
+        .unwrap();
+    h.engine
+        .propose_plan(&mission, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &mission).await;
+    let awaiting = h.engine.advance(&mission).await.unwrap().state;
+    let conversation = awaiting.conversations.keys().next().unwrap().to_string();
+    let store = MissionStore::open(dir.path()).await.unwrap();
+
+    cli::run(send_cli(
+        dir.path(),
+        &mission,
+        &conversation,
+        &["--commit", BASE_SHA],
+    ))
+    .await
+    .unwrap();
+    cli::run(send_cli(dir.path(), &mission, &conversation, &[]))
+        .await
+        .unwrap();
+    let object = dir
+        .path()
+        .join(".git/objects")
+        .join(&BASE_SHA[..2])
+        .join(&BASE_SHA[2..]);
+    assert!(object.is_file(), "fault injection requires a loose commit");
+    std::fs::remove_file(object).unwrap();
+
+    let advanced = h.engine.advance(&mission).await.unwrap().state;
+    assert_eq!(advanced.unavailable_references.len(), 1);
+    let conversation = advanced.conversations.values().next().unwrap();
+    assert_eq!(conversation.queued.len(), 1);
+    assert_eq!(
+        conversation.queued[0].marker,
+        lionclaw::model::DeliveryMarker::Undeliverable
+    );
+    assert!(conversation.active_delivery.is_none());
+    let prompt = prompts.lock().unwrap().last().unwrap().clone();
+    assert!(prompt.contains("inspect the cited change"));
+    assert!(!prompt.contains("reachable commit"));
+
+    let replayed = lionclaw::model::fold(store.load(&mission).await.unwrap()).unwrap();
+    assert_eq!(advanced, replayed);
+    assert_eq!(
+        store.require_state(&mission).await.unwrap(),
+        advanced,
+        "reload preserves exact unavailable-reference accounting"
+    );
+    h.engine.advance(&mission).await.unwrap();
+    assert_eq!(
+        store
+            .require_state(&mission)
+            .await
+            .unwrap()
+            .unavailable_references
+            .len(),
+        1,
+        "settlement is never emitted twice"
+    );
+}
+
 fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut found = Vec::new();

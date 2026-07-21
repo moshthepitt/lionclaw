@@ -1763,11 +1763,42 @@ impl Engine {
                     conversation
                         .queued
                         .iter()
-                        .filter(|message| message.sequence_no <= message_boundary)
+                        .filter(|message| {
+                            message.sequence_no <= message_boundary
+                                && message.marker != crate::model::DeliveryMarker::Undeliverable
+                        })
                         .map(|message| message.sequence_no)
                         .collect()
                 });
-        let dialogue = materialize_conversation_messages(self, state, &conversation_id).await?;
+        let dialogue = match materialize_conversation_messages(self, state, &conversation_id).await
+        {
+            Ok(dialogue) => dialogue,
+            Err(error)
+                if error
+                    .downcast_ref::<UnavailableConversationReference>()
+                    .is_some() =>
+            {
+                let unavailable = error
+                    .downcast::<UnavailableConversationReference>()
+                    .expect("guarded unavailable reference error");
+                self.store
+                    .append(
+                        &state.mission_id,
+                        state.head,
+                        &[NewEvent::new(MissionEvent::MessageReferenceUnavailable {
+                            conversation_id,
+                            assignment_epoch: assignment.generation,
+                            message_sequence: unavailable.message_sequence,
+                            reference: unavailable.reference,
+                            cause: unavailable.cause,
+                        })],
+                        self.clock.now_ms(),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let prompt_text = match intent.namespace {
             TaskNamespace::Planning => {
                 self.assemble_planning_request(state, role, &intent, &dialogue)?
@@ -2245,6 +2276,9 @@ async fn materialize_conversation_messages(
     let repo = std::path::Path::new(&state.workspace_dir);
     let mut rendered = Vec::with_capacity(conversation.queued.len());
     for message in &conversation.queued {
+        if message.marker == crate::model::DeliveryMarker::Undeliverable {
+            continue;
+        }
         let expanded = crate::reference_materialization::materialize_references(
             state,
             &events,
@@ -2253,10 +2287,23 @@ async fn materialize_conversation_messages(
             &message.references,
         )
         .await
-        .with_context(|| format!("materializing lead message {}", message.sequence_no))?;
+        .map_err(|error| UnavailableConversationReference {
+            message_sequence: message.sequence_no,
+            reference: error.reference,
+            cause: error.cause,
+        })
+        .map_err(anyhow::Error::new)?;
         rendered.push(render_conversation_message(message, &expanded));
     }
     Ok(rendered)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("queued message {message_sequence} has an unavailable reference")]
+struct UnavailableConversationReference {
+    message_sequence: u64,
+    reference: crate::model::MessageReference,
+    cause: crate::model::UnavailableReferenceCause,
 }
 
 /// Validate and append a control against the exact replayed effect generation.

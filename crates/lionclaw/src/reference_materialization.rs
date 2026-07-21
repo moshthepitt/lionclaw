@@ -17,87 +17,113 @@ pub struct MaterializedReference {
     pub content: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+pub struct ReferenceMaterializationError {
+    pub reference: MessageReference,
+    pub cause: crate::model::UnavailableReferenceCause,
+    detail: String,
+}
+
 pub async fn materialize_references(
     state: &MissionState,
     events: &[EventEnvelope],
     blobs: &BlobStore,
     repo: &Path,
     references: &[MessageReference],
-) -> Result<Vec<MaterializedReference>> {
+) -> std::result::Result<Vec<MaterializedReference>, ReferenceMaterializationError> {
     let mut total = 0usize;
     let mut expanded = Vec::with_capacity(references.len());
     for reference in references {
-        let (label, identity, bytes) = match reference {
-            MessageReference::AuthoritativeReceipt { effect_id } => {
-                if !state.authoritative_receipts.contains(effect_id) {
-                    bail!("authoritative receipt {effect_id} is not valid in this mission");
+        let materialized: Result<(String, String, Vec<u8>)> = async {
+            Ok(match reference {
+                MessageReference::AuthoritativeReceipt { effect_id } => {
+                    if !state.authoritative_receipts.contains(effect_id) {
+                        bail!("authoritative receipt {effect_id} is not valid in this mission");
+                    }
+                    let success = events
+                        .iter()
+                        .find_map(|envelope| match &envelope.event {
+                            MissionEvent::OracleRunCompleted {
+                                effect_id: id,
+                                outcome: Ok(success),
+                                ..
+                            } if id == effect_id => Some(success),
+                            _ => None,
+                        })
+                        .with_context(|| format!("authoritative receipt {effect_id} is missing"))?;
+                    let mut text = format!("exit_code: {}\n", success.exit_code);
+                    append_payload(&mut text, "stdout", blobs, &success.stdout)?;
+                    append_payload(&mut text, "stderr", blobs, &success.stderr)?;
+                    (
+                        "authoritative receipt".to_string(),
+                        effect_id.to_string(),
+                        text.into_bytes(),
+                    )
                 }
-                let success = events
-                    .iter()
-                    .find_map(|envelope| match &envelope.event {
-                        MissionEvent::OracleRunCompleted {
-                            effect_id: id,
-                            outcome: Ok(success),
-                            ..
-                        } if id == effect_id => Some(success),
-                        _ => None,
-                    })
-                    .with_context(|| format!("authoritative receipt {effect_id} is missing"))?;
-                let mut text = format!("exit_code: {}\n", success.exit_code);
-                append_payload(&mut text, "stdout", blobs, &success.stdout)?;
-                append_payload(&mut text, "stderr", blobs, &success.stderr)?;
-                (
-                    "authoritative receipt".to_string(),
-                    effect_id.to_string(),
-                    text.into_bytes(),
-                )
-            }
-            MessageReference::ParkEvidence { effect_id } => {
-                // Ingress authorizes park evidence while the effect is parked.
-                // A later `continue` deliberately removes that live-state entry,
-                // but must not invalidate the immutable queued message boundary.
-                // The same-mission completed failure is the durable material.
-                let failure = events
-                    .iter()
-                    .rev()
-                    .find_map(|envelope| match &envelope.event {
-                        MissionEvent::RoleRunCompleted {
-                            effect_id: id,
-                            outcome: Err(failure),
-                            ..
-                        }
-                        | MissionEvent::OracleRunCompleted {
-                            effect_id: id,
-                            outcome: Err(failure),
-                            ..
-                        } if id == effect_id => Some(failure),
-                        MissionEvent::TerminalReviewCompleted {
-                            effect_id: id,
-                            outcome: Err(failure),
-                            ..
-                        } if id == effect_id => Some(failure),
-                        _ => None,
-                    })
-                    .with_context(|| {
-                        format!("park evidence {effect_id} is missing or unmaterializable")
-                    })?;
-                let bytes =
-                    serde_json::to_vec_pretty(failure).context("serializing park evidence")?;
-                ("park evidence".to_string(), effect_id.to_string(), bytes)
-            }
-            MessageReference::ReachableCommit { sha } => {
-                if !state.reachable_commits.contains(sha) {
-                    bail!("commit {sha} is not reachable in this mission");
+                MessageReference::ParkEvidence { effect_id } => {
+                    // Ingress authorizes park evidence while the effect is parked.
+                    // A later `continue` deliberately removes that live-state entry,
+                    // but must not invalidate the immutable queued message boundary.
+                    // The same-mission completed failure is the durable material.
+                    let failure = events
+                        .iter()
+                        .rev()
+                        .find_map(|envelope| match &envelope.event {
+                            MissionEvent::RoleRunCompleted {
+                                effect_id: id,
+                                outcome: Err(failure),
+                                ..
+                            }
+                            | MissionEvent::OracleRunCompleted {
+                                effect_id: id,
+                                outcome: Err(failure),
+                                ..
+                            } if id == effect_id => Some(failure),
+                            MissionEvent::TerminalReviewCompleted {
+                                effect_id: id,
+                                outcome: Err(failure),
+                                ..
+                            } if id == effect_id => Some(failure),
+                            _ => None,
+                        })
+                        .with_context(|| {
+                            format!("park evidence {effect_id} is missing or unmaterializable")
+                        })?;
+                    let bytes =
+                        serde_json::to_vec_pretty(failure).context("serializing park evidence")?;
+                    ("park evidence".to_string(), effect_id.to_string(), bytes)
                 }
-                let bytes = crate::workspace::show_commit(repo, sha)
-                    .await
-                    .with_context(|| format!("materializing reachable commit {sha}"))?;
-                ("reachable commit".to_string(), sha.clone(), bytes)
-            }
-        };
-        account_materialized_bytes(&label, &identity, bytes.len(), &mut total)?;
-        let content = String::from_utf8(bytes)
-            .with_context(|| format!("{label} {identity} is not UTF-8 material"))?;
+                MessageReference::ReachableCommit { sha } => {
+                    if !state.reachable_commits.contains(sha) {
+                        bail!("commit {sha} is not reachable in this mission");
+                    }
+                    let bytes = crate::workspace::show_commit(repo, sha)
+                        .await
+                        .with_context(|| format!("materializing reachable commit {sha}"))?;
+                    ("reachable commit".to_string(), sha.clone(), bytes)
+                }
+            })
+        }
+        .await;
+        let (label, identity, bytes) =
+            materialized.map_err(|error| ReferenceMaterializationError {
+                reference: reference.clone(),
+                cause: classify_unavailability(&error),
+                detail: format!("{error:#}"),
+            })?;
+        account_materialized_bytes(&label, &identity, bytes.len(), &mut total).map_err(
+            |error| ReferenceMaterializationError {
+                reference: reference.clone(),
+                cause: crate::model::UnavailableReferenceCause::ExpansionLimitExceeded,
+                detail: error.to_string(),
+            },
+        )?;
+        let content = String::from_utf8(bytes).map_err(|_| ReferenceMaterializationError {
+            reference: reference.clone(),
+            cause: crate::model::UnavailableReferenceCause::InvalidContent,
+            detail: format!("{label} {identity} is not UTF-8 material"),
+        })?;
         expanded.push(MaterializedReference {
             label,
             identity,
@@ -105,6 +131,23 @@ pub async fn materialize_references(
         });
     }
     Ok(expanded)
+}
+
+fn classify_unavailability(error: &anyhow::Error) -> crate::model::UnavailableReferenceCause {
+    for source in error.chain() {
+        if let Some(io) = source.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                std::io::ErrorKind::NotFound => {
+                    crate::model::UnavailableReferenceCause::SourceMissing
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    crate::model::UnavailableReferenceCause::SourceUnreadable
+                }
+                _ => crate::model::UnavailableReferenceCause::SourceUnreadable,
+            };
+        }
+    }
+    crate::model::UnavailableReferenceCause::SourceMissing
 }
 
 fn account_materialized_bytes(

@@ -41,9 +41,9 @@ pub use event::{
     EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff, MessageReference, MissionConfig,
     MissionEvent, MissionTypeRef, OracleRunSuccess, PayloadRef, PreparedInputRef, RecoveryConfig,
     RolePromptTemplate, RoleRunRequestIdentity, RoleRunSuccess, RuntimeConfigurationEvidence,
-    StopBar, TaskNamespace, TerminalReviewConfig, TerminalReviewSuccess, ValidationItem,
-    VersionStamps, MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES,
-    MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES, SCHEMA_VERSION,
+    StopBar, TaskNamespace, TerminalReviewConfig, TerminalReviewSuccess, UnavailableReferenceCause,
+    ValidationItem, VersionStamps, MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES,
+    MAX_MESSAGE_BYTES, MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES, SCHEMA_VERSION,
 };
 pub use failure::{
     bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,
@@ -71,7 +71,7 @@ pub use state::{
     MissionPhase, MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState,
     QueuedMessage, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, RoleAssignment,
     RoleAssignmentContext, SupersededAssertion, TaskAddress, TaskRuntimeState, TaskStatus,
-    TerminalReviewState, TerminalReviewVerdict,
+    TerminalReviewState, TerminalReviewVerdict, UnavailableReferenceEvidence,
 };
 pub use step::{
     step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,

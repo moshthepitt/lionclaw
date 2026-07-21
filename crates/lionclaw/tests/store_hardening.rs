@@ -659,7 +659,7 @@ async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
         .store()
         .rebuild_cursors(&mission_id, 9_000_000)
         .await
-        .expect("seed reducer-28 request snapshot");
+        .expect("seed reducer-29 request snapshot");
     assert_eq!(snapshotted_request, requested);
 
     let runtime_configuration = RuntimeConfigurationEvidence {
@@ -696,7 +696,7 @@ async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
         .await
         .expect("snapshot metadata")
         .expect("snapshot");
-    assert_eq!(reducer_version, 28);
+    assert_eq!(reducer_version, 29);
     assert!(
         snapshot_head < live.head,
         "completion must be a nonempty tail"

@@ -26,10 +26,9 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-/// Version 28 rebuilds snapshots from sequence zero because role settlement now
-/// preserves proven delivery markers and merges runtime configuration on every
-/// outcome path. The durable MissionEvent contract is unchanged.
-pub const REDUCER_VERSION: u32 = 28;
+/// Version 29 rebuilds snapshots from sequence zero so unavailable references
+/// are settled atomically at their exact queued-message boundary.
+pub const REDUCER_VERSION: u32 = 29;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -95,6 +94,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         oracle_attempts: Default::default(),
         inflight: Default::default(),
         conversations: Default::default(),
+        unavailable_references: Default::default(),
         authoritative_receipts: Default::default(),
         reachable_commits: BTreeSet::from([base_sha.clone()]),
         stop_requests: Default::default(),
@@ -307,6 +307,50 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     task.status = TaskStatus::Pending;
                 }
             }
+        }
+        MissionEvent::MessageReferenceUnavailable {
+            conversation_id,
+            assignment_epoch,
+            message_sequence,
+            reference,
+            cause,
+        } => {
+            let duplicate = state.unavailable_references.iter().any(|evidence| {
+                evidence.conversation_id == *conversation_id
+                    && evidence.assignment_epoch == *assignment_epoch
+                    && evidence.message_sequence == *message_sequence
+            });
+            let Some(message) = state
+                .conversations
+                .get_mut(conversation_id)
+                .filter(|conversation| conversation.assignment_epoch == *assignment_epoch)
+                .and_then(|conversation| {
+                    conversation
+                        .queued
+                        .iter_mut()
+                        .find(|message| message.sequence_no == *message_sequence)
+                })
+            else {
+                finish_apply(state, seq);
+                return;
+            };
+            if duplicate
+                || message.marker != super::state::DeliveryMarker::Queued
+                || !message.references.contains(reference)
+            {
+                finish_apply(state, seq);
+                return;
+            }
+            message.marker = super::state::DeliveryMarker::Undeliverable;
+            state
+                .unavailable_references
+                .push(super::state::UnavailableReferenceEvidence {
+                    conversation_id: conversation_id.clone(),
+                    assignment_epoch: *assignment_epoch,
+                    message_sequence: *message_sequence,
+                    reference: reference.clone(),
+                    cause: *cause,
+                });
         }
         MissionEvent::TaskWorkspacePrepared {
             task_id,
@@ -1178,7 +1222,10 @@ fn validated_role_dispatch(
                 conversation
                     .queued
                     .iter()
-                    .filter(|message| message.sequence_no <= *message_boundary)
+                    .filter(|message| {
+                        message.sequence_no <= *message_boundary
+                            && message.marker != super::state::DeliveryMarker::Undeliverable
+                    })
                     .map(|message| message.sequence_no)
                     .collect()
             });
@@ -6612,6 +6659,93 @@ mod tests {
         });
         let rejected = fold_log(events).expect("rejected state");
         assert_eq!(rejected.conversations[conversation_id].queued.len(), 1);
+    }
+
+    #[test]
+    fn unavailable_reference_settlement_is_exact_atomic_and_idempotent() {
+        let mut checkpoint = role_completed("w", "checkpoint", work_handoff(true, false), None);
+        let MissionEvent::RoleRunCompleted {
+            outcome: Ok(success),
+            ..
+        } = &mut checkpoint
+        else {
+            unreachable!()
+        };
+        success.handoff = None;
+        let mut events = vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "first"),
+            checkpoint,
+        ];
+        let state = fold_log(events.clone()).unwrap();
+        let (conversation_id, conversation) = state.conversations.iter().next().unwrap();
+        let conversation_id = conversation_id.clone();
+        let generation = conversation.assignment_epoch;
+        let recipient = super::super::event::ConversationRecipient {
+            conversation_id: conversation_id.clone(),
+            role: conversation.role.clone(),
+            namespace: conversation.namespace,
+            task_id: conversation.task_id.clone(),
+            assignment_epoch: generation,
+        };
+        let reference =
+            super::super::event::MessageReference::ReachableCommit { sha: "base".into() };
+        events.push(MissionEvent::MessageSent {
+            recipients: vec![recipient.clone()],
+            body: "lost whole message".into(),
+            references: vec![reference.clone()],
+        });
+        events.push(MissionEvent::MessageSent {
+            recipients: vec![recipient],
+            body: "later survives".into(),
+            references: vec![],
+        });
+        let before = fold_log(events.clone()).unwrap();
+        let cursor = before.conversations[&conversation_id].consumed_through;
+        let boundary = before.conversations[&conversation_id]
+            .active_delivery
+            .clone();
+
+        events.push(MissionEvent::MessageReferenceUnavailable {
+            conversation_id: conversation_id.clone(),
+            assignment_epoch: generation,
+            message_sequence: 5,
+            reference: reference.clone(),
+            cause: super::super::event::UnavailableReferenceCause::SourceMissing,
+        });
+        // Duplicate and mismatched settlements are deterministic no-ops.
+        events.push(MissionEvent::MessageReferenceUnavailable {
+            conversation_id: conversation_id.clone(),
+            assignment_epoch: generation,
+            message_sequence: 5,
+            reference,
+            cause: super::super::event::UnavailableReferenceCause::SourceUnreadable,
+        });
+        events.push(MissionEvent::MessageReferenceUnavailable {
+            conversation_id: conversation_id.clone(),
+            assignment_epoch: generation + 1,
+            message_sequence: 6,
+            reference: super::super::event::MessageReference::ReachableCommit {
+                sha: "base".into(),
+            },
+            cause: super::super::event::UnavailableReferenceCause::SourceMissing,
+        });
+        let settled = fold_log(events).unwrap();
+        let conversation = &settled.conversations[&conversation_id];
+        assert_eq!(conversation.consumed_through, cursor);
+        assert_eq!(conversation.active_delivery, boundary);
+        assert_eq!(conversation.queued.len(), 2);
+        assert_eq!(
+            conversation.queued[0].marker,
+            super::super::state::DeliveryMarker::Undeliverable
+        );
+        assert_eq!(
+            conversation.queued[1].marker,
+            super::super::state::DeliveryMarker::Queued
+        );
+        assert_eq!(settled.unavailable_references.len(), 1);
+        assert_eq!(settled.unavailable_references[0].message_sequence, 5);
     }
 
     #[test]

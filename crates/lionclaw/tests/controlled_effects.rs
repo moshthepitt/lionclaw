@@ -957,7 +957,7 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
             let assignment_epoch = request.assignment_epoch;
             let message_boundary = request.message_boundary;
 
-            // This is a real reducer-28 snapshot of the active request. All
+            // This is a real reducer-29 snapshot of the active request. All
             // following facts, including settlement, form a nonempty tail.
             let snapshotted = store.rebuild_cursors(&mission_id, 7_000).await.unwrap();
             assert_eq!(snapshotted, active);
@@ -1029,7 +1029,7 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
             );
             assert!(live.head > active.head, "snapshot tail must be nonempty");
             let rebuilt = store.rebuild_cursors(&mission_id, 8_000).await.unwrap();
-            assert_eq!(live, rebuilt, "live/reducer-28 rebuild");
+            assert_eq!(live, rebuilt, "live/reducer-29 rebuild");
 
             assert_eq!(
                 live.tasks.values().next().unwrap().assignment_epoch,

@@ -1203,6 +1203,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                     task_runtime_json(id, task, None)
                 }).collect::<Result<Vec<_>>>()?,
                 "conversations": conversation_views(state, &store)?,
+                "unavailable_references": state.unavailable_references,
                 "assertions": rows.iter().map(|row| serde_json::json!({
                     "id": row.id,
                     "oracle": row.oracle,
@@ -2613,6 +2614,7 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         "current_sha": state.current_sha,
         "objective": state.objective,
         "conversations": conversation_views(state, store)?,
+        "unavailable_references": state.unavailable_references,
         "tasks": state.tasks.iter().map(|(id, task)| {
             task_runtime_json(
                 id,
@@ -2765,6 +2767,16 @@ fn print_conversations(
                 );
             }
         }
+    }
+    for evidence in &state.unavailable_references {
+        println!(
+            "{indent}unavailable reference: conversation={} generation={} message={} reference={:?} cause={:?}",
+            evidence.conversation_id,
+            evidence.assignment_epoch,
+            evidence.message_sequence,
+            evidence.reference,
+            evidence.cause
+        );
     }
     Ok(())
 }

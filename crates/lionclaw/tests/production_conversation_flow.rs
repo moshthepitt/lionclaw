@@ -764,7 +764,7 @@ async fn initialize_repo(repo: &Path) -> String {
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (20, 28));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (21, 29));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -1048,7 +1048,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert_eq!(settled, replayed);
     assert!(
         settled.head > active.head,
-        "real reducer-28 snapshot has a nonempty tail"
+        "real reducer-29 snapshot has a nonempty tail"
     );
     assert_eq!(settled.deliverable_head(), base);
     assert_eq!(settled.tasks[&writer_id].status, TaskStatus::Running);
@@ -1126,7 +1126,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     ))
     .await
     .unwrap();
-    sqlx::query("UPDATE mission_snapshots SET reducer_version = 27 WHERE mission_id = ?1")
+    sqlx::query("UPDATE mission_snapshots SET reducer_version = 28 WHERE mission_id = ?1")
         .bind(mission.as_str())
         .execute(&database)
         .await

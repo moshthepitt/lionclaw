@@ -20,9 +20,9 @@ use super::plan::{OutputSemantics, PlanInventory, PlanProposal, PlanningDag};
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
 
-/// Bumped for explicit requirement-change decisions and assertion
-/// supersessions. Unreleased older logs intentionally fail loudly.
-pub const SCHEMA_VERSION: u32 = 20;
+/// Version 21 adds exact unavailable-reference settlement. Unreleased older
+/// logs intentionally fail loudly.
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -47,6 +47,17 @@ pub enum MessageReference {
     AuthoritativeReceipt { effect_id: super::EffectId },
     ParkEvidence { effect_id: super::EffectId },
     ReachableCommit { sha: String },
+}
+
+/// Runtime-neutral reason that an ingress-authorized reference could not be
+/// materialized at its immutable delivery boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableReferenceCause {
+    SourceMissing,
+    SourceUnreadable,
+    InvalidContent,
+    ExpansionLimitExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -613,6 +624,15 @@ pub enum MissionEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         references: Vec<MessageReference>,
     },
+    /// Fail-closed settlement for one whole queued message whose referenced
+    /// source disappeared after ingress validation and before dispatch.
+    MessageReferenceUnavailable {
+        conversation_id: ConversationId,
+        assignment_epoch: u32,
+        message_sequence: u64,
+        reference: MessageReference,
+        cause: UnavailableReferenceCause,
+    },
     /// Kernel-observed confirmation that the task-owned writable checkout
     /// exists at the assignment base. Request intent never updates workspace
     /// provenance; only this post-materialization fact does.
@@ -783,6 +803,7 @@ impl MissionEvent {
             Self::PlanProposed { .. } => "plan_proposed",
             Self::RoleRunRequested { .. } => "role_run_requested",
             Self::MessageSent { .. } => "message_sent",
+            Self::MessageReferenceUnavailable { .. } => "message_reference_unavailable",
             Self::TaskWorkspacePrepared { .. } => "task_workspace_prepared",
             Self::EffectRuntimeConfigured { .. } => "effect_runtime_configured",
             Self::RoleRunCompleted { .. } => "role_run_completed",
@@ -817,6 +838,7 @@ impl MissionEvent {
             Self::MissionCreated { .. }
             | Self::PlanProposed { .. }
             | Self::MessageSent { .. }
+            | Self::MessageReferenceUnavailable { .. }
             | Self::TaskWorkspacePrepared { .. }
             | Self::EffectRuntimeConfigured { .. }
             | Self::ControlRequested { .. }
