@@ -13,7 +13,7 @@ use lionclaw_confinement::{
 use lionclaw_runtime_api::{
     ExecutionOutput, RuntimeAuthContext, RuntimeAuthRegistry, RuntimeExecutionContext,
     RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-    RuntimeProgramStdoutSender,
+    RuntimeProgramStdoutSender, TypedFailure,
 };
 
 pub struct MissionProgramExecutor {
@@ -52,6 +52,13 @@ impl MissionProgramExecutor {
     }
 }
 
+fn launch_refusal(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(TypedFailure::permanent(
+        "kernel.launch",
+        format!("runtime program launch refused: {error:#}"),
+    ))
+}
+
 #[async_trait]
 impl RuntimeProgramExecutor for MissionProgramExecutor {
     async fn execute_streaming(
@@ -70,7 +77,15 @@ impl RuntimeProgramExecutor for MissionProgramExecutor {
         &mut self,
         program: RuntimeProgramSpec,
     ) -> Result<Box<dyn RuntimeProgramSession>> {
-        let session = spawn_interactive(self.request(program)).await?;
+        let session = spawn_interactive(self.request(program))
+            .await
+            .map_err(|error| {
+                // This is the last boundary before an adapter has a live native
+                // transport. Preserve a refusal to cross it as kernel launch
+                // evidence so adapter-specific runtime projection cannot flatten
+                // it into an ordinary turn failure.
+                launch_refusal(error)
+            })?;
         Ok(Box::new(RuntimeExecutionSession::new(session)))
     }
 }
@@ -100,4 +115,28 @@ pub fn mission_execution_context(plan: &EffectiveExecutionPlan) -> Result<Runtim
         runtime_path_projections: projections,
         mcp_servers: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_launch_refusal_is_typed_before_adapter_projection() {
+        let error = launch_refusal(anyhow::anyhow!("OCI setup refused the executable"));
+        let failure = error
+            .downcast_ref::<TypedFailure>()
+            .expect("launch refusal must cross the adapter boundary as typed evidence");
+
+        assert_eq!(failure.evidence().code.as_deref(), Some("kernel.launch"));
+        assert!(failure
+            .evidence()
+            .detail
+            .contains("OCI setup refused the executable"));
+        assert_eq!(
+            failure.evidence().configuration,
+            lionclaw_runtime_api::AppliedRuntimeConfiguration::default()
+        );
+        assert!(failure.evidence().final_response.is_empty());
+    }
 }
