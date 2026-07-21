@@ -21,6 +21,7 @@ fn send_cli(
     mission: &lionclaw::model::MissionId,
     conversation: &str,
     reference_args: &[&str],
+    body: &str,
 ) -> Cli {
     let mut args = vec![
         "lionclaw",
@@ -32,7 +33,7 @@ fn send_cli(
         conversation,
     ];
     args.extend_from_slice(reference_args);
-    args.extend(["--repo", repo.to_str().unwrap(), "inspect the cited change"]);
+    args.extend(["--repo", repo.to_str().unwrap(), body]);
     Cli::try_parse_from(args).expect("production mission send parser")
 }
 
@@ -81,6 +82,7 @@ async fn reachable_commit_expands_only_at_the_typed_role_request_boundary() {
         &mission,
         &conversation,
         &["--commit", BASE_SHA],
+        "inspect the cited change",
     ))
     .await
     .unwrap();
@@ -153,12 +155,19 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
         &mission,
         &conversation,
         &["--commit", BASE_SHA],
+        "failed reference message must not be presented",
     ))
     .await
     .unwrap();
-    cli::run(send_cli(dir.path(), &mission, &conversation, &[]))
-        .await
-        .unwrap();
+    cli::run(send_cli(
+        dir.path(),
+        &mission,
+        &conversation,
+        &[],
+        "distinct later message must progress",
+    ))
+    .await
+    .unwrap();
     let accepted = store.require_state(&mission).await.unwrap();
     let accepted_conversation = accepted.conversations.values().next().unwrap();
     let unavailable_sequence = accepted_conversation.queued[0].sequence_no;
@@ -203,7 +212,8 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
     );
     assert_eq!(evidence.cause, UnavailableReferenceCause::SourceMissing);
     let prompt = prompts.lock().unwrap().last().unwrap().clone();
-    assert!(prompt.contains("inspect the cited change"));
+    assert!(prompt.contains("distinct later message must progress"));
+    assert!(!prompt.contains("failed reference message must not be presented"));
     assert!(!prompt.contains("reachable commit"));
 
     let replayed = lionclaw::model::fold(store.load(&mission).await.unwrap()).unwrap();
@@ -225,6 +235,7 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
         &mission,
         conversation_id(&snapshot),
         &[],
+        "snapshot tail message",
     ))
     .await
     .unwrap();

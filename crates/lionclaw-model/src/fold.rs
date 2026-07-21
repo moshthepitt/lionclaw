@@ -320,16 +320,30 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     && evidence.assignment_epoch == *assignment_epoch
                     && evidence.message_sequence == *message_sequence
             });
-            let Some(message) = state
+            let effective_boundary = state
                 .conversations
-                .get_mut(conversation_id)
+                .get(conversation_id)
                 .filter(|conversation| conversation.assignment_epoch == *assignment_epoch)
-                .and_then(|conversation| {
+                .map(|conversation| {
                     conversation
-                        .queued
-                        .iter_mut()
-                        .find(|message| message.sequence_no == *message_sequence)
-                })
+                        .active_delivery
+                        .as_ref()
+                        .map_or(state.head, |delivery| delivery.message_boundary)
+                });
+            if effective_boundary.is_none_or(|boundary| *message_sequence > boundary) {
+                finish_apply(state, seq);
+                return;
+            }
+            let Some(message) =
+                state
+                    .conversations
+                    .get_mut(conversation_id)
+                    .and_then(|conversation| {
+                        conversation
+                            .queued
+                            .iter_mut()
+                            .find(|message| message.sequence_no == *message_sequence)
+                    })
             else {
                 finish_apply(state, seq);
                 return;
@@ -6746,6 +6760,54 @@ mod tests {
         );
         assert_eq!(settled.unavailable_references.len(), 1);
         assert_eq!(settled.unavailable_references[0].message_sequence, 5);
+    }
+
+    #[test]
+    fn unavailable_reference_cannot_settle_a_message_beyond_the_active_boundary() {
+        let mut events = vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "active"),
+        ];
+        let active = fold_log(events.clone()).unwrap();
+        let (conversation_id, conversation) = active.conversations.iter().next().unwrap();
+        let conversation_id = conversation_id.clone();
+        let active_delivery = conversation.active_delivery.clone().unwrap();
+        let recipient = super::super::event::ConversationRecipient {
+            conversation_id: conversation_id.clone(),
+            role: conversation.role.clone(),
+            namespace: conversation.namespace,
+            task_id: conversation.task_id.clone(),
+            assignment_epoch: conversation.assignment_epoch,
+        };
+        let failed_reference =
+            super::super::event::MessageReference::ReachableCommit { sha: "base".into() };
+        events.push(MissionEvent::MessageSent {
+            recipients: vec![recipient.clone()],
+            body: "future message must remain queued".into(),
+            references: vec![failed_reference.clone()],
+        });
+        events.push(MissionEvent::MessageSent {
+            recipients: vec![recipient],
+            body: "distinct later message must still progress".into(),
+            references: vec![],
+        });
+        let before = fold_log(events.clone()).unwrap();
+        let future_sequence = before.conversations[&conversation_id].queued[0].sequence_no;
+        assert!(future_sequence > active_delivery.message_boundary);
+
+        events.push(MissionEvent::MessageReferenceUnavailable {
+            conversation_id: conversation_id.clone(),
+            assignment_epoch: conversation.assignment_epoch,
+            message_sequence: future_sequence,
+            reference: failed_reference,
+            cause: super::super::event::UnavailableReferenceCause::SourceMissing,
+        });
+        let after = fold_log(events).unwrap();
+
+        assert_eq!(after.unavailable_references, before.unavailable_references);
+        assert_eq!(after.conversations, before.conversations);
+        assert_eq!(after.tasks, before.tasks);
     }
 
     #[test]
