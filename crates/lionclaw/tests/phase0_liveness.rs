@@ -134,15 +134,32 @@ fn assert_abort_preserves_authority(state: &lionclaw::model::MissionState) {
         assert_eq!(after.assignment_epoch, before.assignment_epoch);
         assert_eq!(after.final_response, before.final_response);
         assert_eq!(after.queued.len(), before.queued.len());
-        assert_eq!(
-            after.lifecycle,
-            lionclaw::model::ConversationLifecycle::Retired
-        );
-        assert!(after.active_delivery.is_none());
-        assert!(after
-            .queued
-            .iter()
-            .all(|message| message.marker == lionclaw::model::DeliveryMarker::Undeliverable));
+        let active_delivery_must_settle = before
+            .active_delivery
+            .as_ref()
+            .is_some_and(|delivery| state.inflight.contains_key(&delivery.effect_id));
+        if active_delivery_must_settle {
+            assert_eq!(after, before);
+        } else {
+            assert_eq!(
+                after.lifecycle,
+                lionclaw::model::ConversationLifecycle::Retired
+            );
+            assert!(after.active_delivery.is_none());
+            assert!(after
+                .queued
+                .iter()
+                .zip(&before.queued)
+                .all(|(after, before)| {
+                    after.marker
+                        == if before.marker == lionclaw::model::DeliveryMarker::PreviouslyDelivered
+                        {
+                            lionclaw::model::DeliveryMarker::PreviouslyDelivered
+                        } else {
+                            lionclaw::model::DeliveryMarker::Undeliverable
+                        }
+                }));
+        }
     }
     assert_eq!(aborted.authoritative_receipts, state.authoritative_receipts);
     assert_eq!(aborted.reachable_commits, state.reachable_commits);

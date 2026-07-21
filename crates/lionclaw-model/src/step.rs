@@ -151,16 +151,26 @@ fn step_running(state: &MissionState) -> StepDecision {
         return StepDecision::Idle;
     };
 
-    // A running task without an inflight effect is an impossible folded state;
-    // never double-dispatch if a future reducer encounters one.
-    let any_running = state
+    // A handoff-free response leaves its task Running while the exact
+    // conversation durably waits for the lead. That settled state may use the
+    // otherwise idle turn for an independent validator. Every other Running
+    // task without an inflight effect is impossible and must fail closed.
+    let running_tasks = state
         .tasks
-        .values()
-        .any(|t| t.status == TaskStatus::Running);
-    if any_running {
-        return StepDecision::Idle;
+        .iter()
+        .filter_map(|(task_id, task)| (task.status == TaskStatus::Running).then_some(task_id));
+    let mut awaiting_lead = false;
+    for task_id in running_tasks {
+        let task_is_awaiting_lead = state.conversations.values().any(|conversation| {
+            conversation.namespace == TaskNamespace::Execution
+                && &conversation.task_id == task_id
+                && conversation.lifecycle == crate::ConversationLifecycle::AwaitingLead
+        });
+        if !task_is_awaiting_lead {
+            return StepDecision::Idle;
+        }
+        awaiting_lead = true;
     }
-
     // Runnable = pending, all deps cleared — in plan order (zenith
     // `_all_runnable_tasks`; list order is the topo tie-break). Work tasks
     // (writers) go first and serialize; a runnable validator (read-only
@@ -178,7 +188,12 @@ fn step_running(state: &MissionState) -> StepDecision {
             task.kind == kind && is_runnable(&task.id, &task.depends_on, &status_of, &retryable)
         })
     };
-    if let Some(task) = runnable(TaskKind::Work).or_else(|| runnable(TaskKind::Validate)) {
+    let next = if awaiting_lead {
+        runnable(TaskKind::Validate)
+    } else {
+        runnable(TaskKind::Work).or_else(|| runnable(TaskKind::Validate))
+    };
+    if let Some(task) = next {
         let attempt_no = state.tasks.get(&task.id).map_or(0, |t| t.attempts) + 1;
         return StepDecision::DispatchRole(RoleDispatchIntent {
             namespace: TaskNamespace::Execution,
@@ -193,6 +208,9 @@ fn step_running(state: &MissionState) -> StepDecision {
             // Work stacks on the latest artifact; a validator judges it.
             base_sha: state.deliverable_head().to_string(),
         });
+    }
+    if awaiting_lead {
+        return StepDecision::Idle;
     }
 
     // No work left to start: settle oracle obligations against the current
@@ -539,6 +557,19 @@ mod tests {
         }
     }
 
+    fn work_awaiting_lead(task: &str) -> MissionEvent {
+        MissionEvent::RoleRunCompleted {
+            effect_id: role_effect(task, 1),
+            request: role_request_identity(task, 1, "sha-0"),
+            outcome: Ok(RoleRunSuccess {
+                handoff: None,
+                artifact: None,
+                final_response: PayloadRef::inline("Which target should I use?"),
+                runtime_configuration: RuntimeConfigurationEvidence::default(),
+            }),
+        }
+    }
+
     fn role_failed(task: &str, _key: &str) -> MissionEvent {
         MissionEvent::RoleRunCompleted {
             effect_id: role_effect(task, 1),
@@ -784,6 +815,57 @@ mod tests {
         state.inflight.clear();
         assert_eq!(state.tasks[&tid("w1")].status, TaskStatus::Running);
         assert_eq!(step(&state), StepDecision::Idle);
+    }
+
+    #[test]
+    fn independent_validator_dispatches_while_writer_awaits_lead() {
+        let state = fold_log(vec![
+            created("sha-0"),
+            plan(
+                vec![assertion("A1")],
+                vec![work("w1", &["A1"], &[]), validate("v1", &["A1"])],
+            ),
+            role_requested("w1", 1, "k-w1-1"),
+            work_awaiting_lead("w1"),
+        ]);
+
+        assert_eq!(state.tasks[&tid("w1")].status, TaskStatus::Running);
+        assert!(state.inflight.is_empty());
+        assert!(state.conversations.values().any(|conversation| {
+            conversation.namespace == TaskNamespace::Execution
+                && conversation.task_id == tid("w1")
+                && conversation.lifecycle == crate::ConversationLifecycle::AwaitingLead
+        }));
+        let intent = dispatched(&state);
+        assert_eq!(intent.task_id, tid("v1"));
+        assert_eq!(intent.base_sha, "sha-0");
+    }
+
+    #[test]
+    fn awaiting_lead_never_allows_work_or_weakens_validator_dependencies() {
+        let state = fold_log(vec![
+            created("sha-0"),
+            plan(
+                vec![assertion("A1")],
+                vec![
+                    work("w1", &["A1"], &[]),
+                    work("w2", &[], &[]),
+                    task(
+                        "v1",
+                        TaskKind::Validate,
+                        Some("checker"),
+                        "check it",
+                        &["A1"],
+                        &["w1"],
+                    ),
+                ],
+            ),
+            role_requested("w1", 1, "k-w1-1"),
+            work_awaiting_lead("w1"),
+        ]);
+
+        assert_eq!(step(&state), StepDecision::Idle);
+        assert_eq!(state.current_sha, "sha-0");
     }
 
     // --- runnable selection ---
