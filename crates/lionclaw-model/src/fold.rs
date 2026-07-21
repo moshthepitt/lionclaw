@@ -890,6 +890,18 @@ fn settle_effect_failure(
                 None,
                 final_response,
             );
+            // Abort is already terminal, so normal terminal retirement would
+            // reclassify queued messages beyond this effect's observed
+            // boundary as undeliverable. Retire the exact conversation only
+            // after failure policy has observed the settled lifecycle, so
+            // finish_apply leaves those later, unpresented messages exactly as
+            // they were recorded without manufacturing a parked retry.
+            if matches!(state.phase, MissionPhase::Aborted { .. }) {
+                if let Some(conversation) = state.conversations.get_mut(&conversation_id) {
+                    conversation.lifecycle = super::state::ConversationLifecycle::Retired;
+                }
+                state.parked_effects.remove(effect_id);
+            }
         }
         InflightEffect::OracleRun { oracle, .. } => {
             state.oracle_failures.insert(oracle.clone(), failure);
@@ -3479,10 +3491,16 @@ mod tests {
             created(),
             plan_proposed(vec![], vec![work_task("w")]),
             role_requested("w", "cancelled-delivery"),
+        ];
+        let cancellations = [
             MissionEvent::ControlRequested {
                 effect_id: effect_id.clone(),
                 action: ControlAction::Stop,
                 reason: "operator stop".into(),
+            },
+            MissionEvent::EffectDeadlineReached {
+                effect_id: effect_id.clone(),
+                deadline_ms: 100_000,
             },
         ];
         let outcomes = [
@@ -3514,53 +3532,62 @@ mod tests {
             ),
         ];
 
-        for (outcome, expected_marker) in outcomes {
-            let mut state = fold_log(base.clone()).expect("active state");
-            let conversation_id = state.conversations.keys().next().unwrap().clone();
-            let conversation = state.conversations.get_mut(&conversation_id).unwrap();
-            conversation
-                .queued
-                .push(super::super::state::QueuedMessage {
-                    sequence_no: 2,
-                    body: "present this".into(),
-                    references: vec![],
-                    marker: super::super::state::DeliveryMarker::Queued,
-                });
-            let delivery = conversation.active_delivery.as_mut().unwrap();
-            delivery.message_boundary = 2;
-            delivery.presented_messages = vec![2];
-            let InflightEffect::RoleRun {
-                message_boundary,
-                presented_messages,
-                ..
-            } = state.inflight.get_mut(&effect_id).unwrap()
-            else {
-                unreachable!()
-            };
-            *message_boundary = 2;
-            *presented_messages = vec![2];
-            let mut completed =
-                role_completed("w", "cancelled-delivery", work_handoff(true, false), None);
-            let MissionEvent::RoleRunCompleted {
-                request,
-                outcome: actual,
-                ..
-            } = &mut completed
-            else {
-                unreachable!()
-            };
-            request.message_boundary = 2;
-            request.presented_messages = vec![2];
-            *actual = outcome;
-            let next = state.head + 1;
-            apply(&mut state, &envelope(next, completed));
-            let conversation = &state.conversations[&conversation_id];
-            assert_eq!(conversation.queued[0].marker, expected_marker);
-            assert!(conversation.active_delivery.is_none());
-            assert!(matches!(
-                state.tasks[&tid("w")].last_failure,
-                Some(TypedFailure::OperatorStopped { .. })
-            ));
+        for cancellation in cancellations {
+            for (outcome, expected_marker) in outcomes.clone() {
+                let mut state = fold_log(
+                    base.clone()
+                        .into_iter()
+                        .chain([cancellation.clone()])
+                        .collect(),
+                )
+                .expect("active state");
+                let conversation_id = state.conversations.keys().next().unwrap().clone();
+                let conversation = state.conversations.get_mut(&conversation_id).unwrap();
+                conversation
+                    .queued
+                    .push(super::super::state::QueuedMessage {
+                        sequence_no: 2,
+                        body: "present this".into(),
+                        references: vec![],
+                        marker: super::super::state::DeliveryMarker::Queued,
+                    });
+                let delivery = conversation.active_delivery.as_mut().unwrap();
+                delivery.message_boundary = 2;
+                delivery.presented_messages = vec![2];
+                let InflightEffect::RoleRun {
+                    message_boundary,
+                    presented_messages,
+                    ..
+                } = state.inflight.get_mut(&effect_id).unwrap()
+                else {
+                    unreachable!()
+                };
+                *message_boundary = 2;
+                *presented_messages = vec![2];
+                let mut completed =
+                    role_completed("w", "cancelled-delivery", work_handoff(true, false), None);
+                let MissionEvent::RoleRunCompleted {
+                    request,
+                    outcome: actual,
+                    ..
+                } = &mut completed
+                else {
+                    unreachable!()
+                };
+                request.message_boundary = 2;
+                request.presented_messages = vec![2];
+                *actual = outcome;
+                let next = state.head + 1;
+                apply(&mut state, &envelope(next, completed));
+                let conversation = &state.conversations[&conversation_id];
+                assert_eq!(conversation.queued[0].marker, expected_marker);
+                assert!(conversation.active_delivery.is_none());
+                assert!(matches!(
+                    state.tasks[&tid("w")].last_failure,
+                    Some(TypedFailure::OperatorStopped { .. })
+                        | Some(TypedFailure::DeadlineExhausted { .. })
+                ));
+            }
         }
     }
 
@@ -3618,7 +3645,20 @@ mod tests {
         };
         request.message_boundary = 2;
         request.presented_messages = vec![2];
-        apply(&mut state, &envelope(abort_seq + 1, completed));
+        let mut corrupted = completed.clone();
+        let MissionEvent::RoleRunCompleted { request, .. } = &mut corrupted else {
+            unreachable!()
+        };
+        request.presented_messages.push(4);
+        let before_corruption = state.clone();
+        apply(&mut state, &envelope(abort_seq + 1, corrupted));
+        let mut expected = before_corruption;
+        expected.head = abort_seq + 1;
+        assert_eq!(
+            state, expected,
+            "corrupt delivery identity must not settle abort"
+        );
+        apply(&mut state, &envelope(abort_seq + 2, completed));
         assert!(state.inflight.is_empty());
         assert!(matches!(
             state.tasks[&tid("w")].last_failure,
@@ -3632,7 +3672,11 @@ mod tests {
         );
         assert_eq!(
             conversation.queued[1].marker,
-            super::super::state::DeliveryMarker::Undeliverable
+            super::super::state::DeliveryMarker::Queued
+        );
+        assert_eq!(
+            conversation.lifecycle,
+            super::super::state::ConversationLifecycle::Retired
         );
     }
 
