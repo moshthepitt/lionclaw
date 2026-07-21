@@ -7,9 +7,9 @@ use common::{
     approve_plan, fault_append_events, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::model::{
-    apply, fold, ConversationId, ConversationRecipient, MissionEvent, MissionState,
-    OutputSemantics, RoleName, RoleRunRequestIdentity, TaskId, TaskNamespace, TaskStatus,
-    TypedFailure,
+    apply, fold, ControlAction, ConversationId, ConversationLifecycle, ConversationRecipient,
+    MissionEvent, MissionState, OutputSemantics, ParkedEffect, RoleName, RoleRunRequestIdentity,
+    TaskId, TaskNamespace, TaskStatus, TypedFailure,
 };
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -142,7 +142,7 @@ async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
 
-    for corrupt in 0..5 {
+    for corrupt in 0..4 {
         let before = h.engine.load_state(&mission_id).await.expect("prestate");
         let mut request = role_request(&before);
         let MissionEvent::RoleRunRequested {
@@ -154,7 +154,6 @@ async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
             prompt_hash,
             assignment_epoch,
             message_boundary,
-            presented_messages,
             ..
         } = &mut request.event
         else {
@@ -175,7 +174,6 @@ async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
             }
             2 => *message_boundary = message_boundary.saturating_sub(1),
             3 => *message_boundary += 1,
-            4 => presented_messages.push(before.head),
             _ => unreachable!(),
         }
         fault_append_events(
@@ -231,10 +229,9 @@ async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
         &[NewEvent::new(MissionEvent::RoleRunCompleted {
             effect_id: effect_id.clone(),
             request: Box::new(identity.clone()),
-            outcome: Err(TypedFailure::transient(
-                "runtime.busy",
-                "retry the same assignment",
-                None,
+            outcome: Err(TypedFailure::permanent(
+                "runtime.unavailable",
+                "operator must continue the parked assignment",
             )),
         })],
         21,
@@ -244,13 +241,23 @@ async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
         .engine
         .load_state(&mission_id)
         .await
-        .expect("retry prestate");
+        .expect("parked prestate");
     assert_eq!(failed.head, failed_head);
     assert_eq!(
         failed.tasks[&TaskId::new("fix").unwrap()].status,
         TaskStatus::Failed
     );
-    let conversation = failed.conversations.values().next().unwrap();
+    assert_eq!(
+        failed.parked_effects.get(&effect_id),
+        Some(&ParkedEffect::RoleRun {
+            namespace: TaskNamespace::Execution,
+            task_id: TaskId::new("fix").unwrap(),
+        })
+    );
+    let conversation = &failed.conversations[&identity.conversation_id];
+    assert_eq!(conversation.lifecycle, ConversationLifecycle::Ready);
+    assert!(conversation.active_delivery.is_none());
+    let parked_effect_id = effect_id.clone();
     let recipient = ConversationRecipient {
         conversation_id: identity.conversation_id.clone(),
         role: conversation.role.clone(),
@@ -286,11 +293,7 @@ async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
         let mut request = role_request(&before);
         let MissionEvent::RoleRunRequested {
             conversation_id,
-            namespace,
-            task_id,
-            attempt_no,
             effect_id,
-            prompt_hash,
             assignment_epoch,
             presented_messages,
             ..
@@ -298,6 +301,7 @@ async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
         else {
             unreachable!()
         };
+        *effect_id = parked_effect_id.clone();
         match corrupt {
             0 => {
                 presented_messages.pop();
@@ -306,21 +310,6 @@ async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
             2 => presented_messages.swap(0, 1),
             3 => {
                 *assignment_epoch = assignment_epoch.saturating_sub(1);
-                *conversation_id = ConversationId::for_role_instance(
-                    &before.mission_id,
-                    *namespace,
-                    task_id,
-                    &RoleName::new("implementer").unwrap(),
-                    *assignment_epoch,
-                );
-                *effect_id = lionclaw::model::EffectId::for_role_request(
-                    *namespace,
-                    &before.mission_id,
-                    task_id,
-                    *attempt_no,
-                    *assignment_epoch,
-                    prompt_hash,
-                );
             }
             4 => *conversation_id = ConversationId::parse("e".repeat(64)).unwrap(),
             _ => unreachable!(),
@@ -344,16 +333,94 @@ async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
         .engine
         .load_state(&mission_id)
         .await
-        .expect("retry prestate");
+        .expect("parked rejection state");
+    assert_eq!(
+        retry_prestate.parked_effects.get(&effect_id),
+        Some(&ParkedEffect::RoleRun {
+            namespace: TaskNamespace::Execution,
+            task_id: TaskId::new("fix").unwrap(),
+        })
+    );
+    assert_eq!(
+        retry_prestate.tasks[&TaskId::new("fix").unwrap()].status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        retry_prestate.conversations[&identity.conversation_id].lifecycle,
+        ConversationLifecycle::Ready
+    );
+    assert!(retry_prestate.conversations[&identity.conversation_id]
+        .active_delivery
+        .is_none());
+    assert!(retry_prestate.inflight.is_empty());
+
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        retry_prestate.head,
+        &[NewEvent::new(MissionEvent::ControlRequested {
+            effect_id: effect_id.clone(),
+            action: ControlAction::Continue { automatic: false },
+            reason: "resume the supported parked assignment".into(),
+        })],
+        29,
+    )
+    .await;
+    let mut continued = h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("continued prestate");
+    assert!(!continued.parked_effects.contains_key(&effect_id));
+    assert_eq!(
+        continued.tasks[&TaskId::new("fix").unwrap()].status,
+        TaskStatus::Pending
+    );
+    assert_eq!(
+        continued.conversations[&identity.conversation_id].lifecycle,
+        ConversationLifecycle::Ready
+    );
+    for corrupt in 0..3 {
+        let before = continued;
+        let mut request = role_request(&before);
+        let MissionEvent::RoleRunRequested {
+            presented_messages, ..
+        } = &mut request.event
+        else {
+            unreachable!()
+        };
+        match corrupt {
+            0 => presented_messages.swap(0, 1),
+            1 => {
+                presented_messages.pop();
+            }
+            2 => presented_messages.push(before.head),
+            _ => unreachable!(),
+        }
+        fault_append_events(
+            dir.path(),
+            &mission_id,
+            before.head,
+            &[request],
+            30 + corrupt,
+        )
+        .await;
+        continued = h
+            .engine
+            .load_state(&mission_id)
+            .await
+            .expect("canonical-effect tuple rejection");
+        assert_only_head_advanced(&before, &continued);
+    }
     assert_eq!(
         h.engine
             .store()
-            .rebuild_cursors(&mission_id, 29)
+            .rebuild_cursors(&mission_id, 34)
             .await
             .expect("seed snapshot-tail cursor"),
-        retry_prestate
+        continued
     );
-    let retry = role_request(&retry_prestate);
+    let retry = role_request(&continued);
     let retry_identity = request_identity(&retry.event);
     let retry_effect = match &retry.event {
         MissionEvent::RoleRunRequested {
@@ -363,12 +430,12 @@ async fn role_request_tuple_is_validated_before_durable_fold_mutation() {
             ..
         } => {
             assert_eq!(*assignment_epoch, 1);
-            assert!(!recreate_workspace);
+            assert!(recreate_workspace);
             effect_id.clone()
         }
         _ => unreachable!(),
     };
-    fault_append_events(dir.path(), &mission_id, retry_prestate.head, &[retry], 30).await;
+    fault_append_events(dir.path(), &mission_id, continued.head, &[retry], 35).await;
     let accepted = h
         .engine
         .load_state(&mission_id)
