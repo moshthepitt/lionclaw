@@ -7,9 +7,12 @@ use common::{
     approve_plan, covered_requirement, initialize_repository, proposal, simple_plan,
     test_mission_type, BASE_SHA, HEAD_SHA,
 };
-use lionclaw::engine::{record_control, Engine, EngineServices, MissionDisposition};
+use lionclaw::engine::{
+    record_control, record_message, Engine, EngineServices, MessageCommand, MissionDisposition,
+};
 use lionclaw::model::{
-    Assertion, AssertionId, ControlAction, Handoff, OracleName, PayloadRef, TaskStatus,
+    fold, Assertion, AssertionId, ControlAction, DeliveryMarker, Handoff, MissionPhase, OracleName,
+    PayloadRef, RuntimeConfigurationEvidence, TaskStatus, REDUCER_VERSION,
 };
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, OracleOutcome,
@@ -46,6 +49,104 @@ struct ArtifactlessWriter;
 
 struct DeadlineRunner {
     calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SettlementRaceOutcome {
+    Success,
+    Failure,
+    InvalidOutput,
+    Question,
+}
+
+struct SettlementRaceRunner {
+    outcome: SettlementRaceOutcome,
+    delay: std::time::Duration,
+}
+
+#[async_trait]
+impl RoleRunner for SettlementRaceRunner {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        request
+            .updates
+            .send(lionclaw::ports::RoleRunUpdate::WorkspacePrepared {
+                base_sha: request.base_sha.clone(),
+                assignment_epoch: request.assignment_epoch,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(self.delay).await;
+        let configuration = RuntimeConfigurationEvidence {
+            requested_model: Some("requested-race-model".into()),
+            applied_model: Some("applied-race-model".into()),
+            model_confirmation: Some(lionclaw::model::RuntimeConfigurationConfirmation::Observed),
+            requested_mode: Some("requested-race-mode".into()),
+            applied_mode: Some("applied-race-mode".into()),
+            mode_confirmation: Some(lionclaw::model::RuntimeConfigurationConfirmation::Observed),
+        };
+        match self.outcome {
+            SettlementRaceOutcome::Success => {
+                let artifact = capture_test_artifact(&request, HEAD_SHA).await?;
+                Ok(RoleRunOutcome {
+                    handoff: Some(Handoff::Work {
+                        done: true,
+                        report: PayloadRef::inline("race success"),
+                        request_attention: false,
+                    }),
+                    artifact: Some(artifact),
+                    runtime_configuration: configuration,
+                    final_response: "success response retained".into(),
+                })
+            }
+            SettlementRaceOutcome::Question => Ok(RoleRunOutcome {
+                handoff: None,
+                artifact: None,
+                runtime_configuration: configuration,
+                final_response: "Which exact target should I use?".into(),
+            }),
+            SettlementRaceOutcome::Failure | SettlementRaceOutcome::InvalidOutput => {
+                let mut evidence = TypedFailureEvidence::new(
+                    Some(
+                        match self.outcome {
+                            SettlementRaceOutcome::Failure => "race.failure",
+                            SettlementRaceOutcome::InvalidOutput => "handoff.schema",
+                            SettlementRaceOutcome::Success | SettlementRaceOutcome::Question => {
+                                unreachable!()
+                            }
+                        }
+                        .into(),
+                    ),
+                    match self.outcome {
+                        SettlementRaceOutcome::Failure => "ordinary observed failure",
+                        SettlementRaceOutcome::InvalidOutput => "observed invalid output",
+                        SettlementRaceOutcome::Success | SettlementRaceOutcome::Question => {
+                            unreachable!()
+                        }
+                    },
+                );
+                evidence.final_response = match self.outcome {
+                    SettlementRaceOutcome::Failure => "failure response retained",
+                    SettlementRaceOutcome::InvalidOutput => "invalid response retained",
+                    SettlementRaceOutcome::Success | SettlementRaceOutcome::Question => {
+                        unreachable!()
+                    }
+                }
+                .into();
+                evidence.configuration = configuration;
+                Err(
+                    if matches!(self.outcome, SettlementRaceOutcome::InvalidOutput) {
+                        TypedFailure::InvalidOutput {
+                            evidence: Box::new(evidence),
+                        }
+                    } else {
+                        TypedFailure::PermanentRuntime {
+                            evidence: Box::new(evidence),
+                        }
+                    },
+                )
+            }
+        }
+    }
 }
 
 fn test_repository() -> tempfile::TempDir {
@@ -706,6 +807,251 @@ async fn durable_stop_wins_the_outcome_append_race_and_discards_the_candidate() 
         event.event,
         lionclaw::model::MissionEvent::RoleRunCompleted { outcome: Ok(_), .. }
     )));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SettlementCancellation {
+    Stop,
+    Deadline,
+    Abort,
+}
+
+#[tokio::test]
+async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() {
+    for cancellation in [
+        SettlementCancellation::Stop,
+        SettlementCancellation::Deadline,
+        SettlementCancellation::Abort,
+    ] {
+        for outcome in [
+            SettlementRaceOutcome::Success,
+            SettlementRaceOutcome::Failure,
+            SettlementRaceOutcome::InvalidOutput,
+            SettlementRaceOutcome::Question,
+        ] {
+            let dir = test_repository();
+            let store = MissionStore::open(dir.path()).await.unwrap();
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let mut mission_type = test_mission_type();
+            let deadline_race = matches!(cancellation, SettlementCancellation::Deadline);
+            if deadline_race {
+                mission_type.edit_for_testing(|definition| {
+                    definition.execution.default_timeout_secs = 1;
+                    definition.execution.max_task_time_secs = 1;
+                });
+            }
+            let clock: Arc<dyn lionclaw::ports::Clock> = if deadline_race {
+                Arc::new(RealClock)
+            } else {
+                Arc::new(MockClock::default())
+            };
+            let engine = Arc::new(Engine::new(
+                store.clone(),
+                mission_type,
+                "codex".into(),
+                "test-image".into(),
+                EngineServices::new(
+                    Arc::new(SettlementRaceRunner {
+                        outcome,
+                        delay: if deadline_race {
+                            std::time::Duration::from_millis(1_200)
+                        } else {
+                            std::time::Duration::ZERO
+                        },
+                    }),
+                    Arc::new(MockOracleRunner::exiting(0)),
+                    Arc::new(SettlementCleaner {
+                        entered: entered.clone(),
+                        release: release.clone(),
+                        discards: Arc::new(Mutex::new(Vec::new())),
+                        pause_on: 1,
+                    }),
+                    clock,
+                ),
+            ));
+            let mission_id = engine
+                .create_mission(
+                    dir.path().to_str().unwrap(),
+                    &format!("{cancellation:?} against {outcome:?}"),
+                    BASE_SHA,
+                )
+                .await
+                .unwrap();
+            engine
+                .propose_plan(&mission_id, proposal(0, simple_plan()))
+                .await
+                .unwrap();
+            approve_plan(&engine, &mission_id).await;
+
+            let driver = tokio::spawn({
+                let engine = engine.clone();
+                let mission_id = mission_id.clone();
+                async move { engine.advance(&mission_id).await.unwrap() }
+            });
+            entered.notified().await;
+            let active = store.require_state(&mission_id).await.unwrap();
+            let (effect_id, effect) = active.inflight.iter().next().unwrap();
+            let effect_id = effect_id.clone();
+            let request = effect.role_request_identity().unwrap();
+            let conversation_id = request.conversation_id.clone();
+            let assignment_epoch = request.assignment_epoch;
+            let message_boundary = request.message_boundary;
+
+            // This is a real reducer-28 snapshot of the active request. All
+            // following facts, including settlement, form a nonempty tail.
+            let snapshotted = store.rebuild_cursors(&mission_id, 7_000).await.unwrap();
+            assert_eq!(snapshotted, active);
+            assert_eq!(
+                store.snapshot_meta(&mission_id).await.unwrap(),
+                Some((active.head, REDUCER_VERSION))
+            );
+            record_message(
+                &store,
+                dir.path(),
+                &mission_id,
+                MessageCommand {
+                    selectors: Vec::new(),
+                    all: true,
+                    body: "arrived beyond the observed delivery boundary".into(),
+                    references: Vec::new(),
+                },
+                7_001,
+            )
+            .await
+            .unwrap();
+
+            match cancellation {
+                SettlementCancellation::Stop => {
+                    record_control(
+                        &store,
+                        7_002,
+                        &mission_id,
+                        &effect_id,
+                        ControlAction::Stop,
+                        "matrix stop",
+                    )
+                    .await
+                    .unwrap();
+                }
+                SettlementCancellation::Deadline => {
+                    let current = store.require_state(&mission_id).await.unwrap();
+                    assert_eq!(
+                        current.reached_deadlines.get(&effect_id),
+                        Some(&effect.deadline_ms())
+                    );
+                }
+                SettlementCancellation::Abort => {
+                    engine.abort(&mission_id, "matrix abort").await.unwrap();
+                }
+            }
+            release.notify_one();
+            let view = driver.await.unwrap();
+            let live = view.state;
+            let events = store.load(&mission_id).await.unwrap();
+            let replayed = fold(events.clone()).unwrap();
+            let reloaded = store.require_state(&mission_id).await.unwrap();
+            let snapshot_tail = store
+                .load_state_snapshotted(&mission_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                live, replayed,
+                "live/full replay: {cancellation:?}/{outcome:?}"
+            );
+            assert_eq!(
+                live, reloaded,
+                "live/store reload: {cancellation:?}/{outcome:?}"
+            );
+            assert_eq!(
+                live, snapshot_tail,
+                "live/snapshot tail: {cancellation:?}/{outcome:?}"
+            );
+            assert!(live.head > active.head, "snapshot tail must be nonempty");
+            let rebuilt = store.rebuild_cursors(&mission_id, 8_000).await.unwrap();
+            assert_eq!(live, rebuilt, "live/reducer-28 rebuild");
+
+            assert_eq!(
+                live.tasks.values().next().unwrap().assignment_epoch,
+                assignment_epoch
+            );
+            let conversation = &live.conversations[&conversation_id];
+            assert!(conversation.active_delivery.is_none());
+            assert_eq!(conversation.assignment_epoch, assignment_epoch);
+            assert_eq!(conversation.queued.len(), 1);
+            assert!(conversation.queued[0].sequence_no > message_boundary);
+            assert_eq!(conversation.queued[0].marker, DeliveryMarker::Queued);
+            assert_eq!(
+                conversation.queued[0].body,
+                "arrived beyond the observed delivery boundary"
+            );
+            let failure = live
+                .tasks
+                .values()
+                .next()
+                .unwrap()
+                .last_failure
+                .as_ref()
+                .unwrap();
+            assert!(matches!(
+                (cancellation, failure),
+                (
+                    SettlementCancellation::Stop,
+                    TypedFailure::OperatorStopped { .. }
+                ) | (
+                    SettlementCancellation::Deadline,
+                    TypedFailure::DeadlineExhausted { .. }
+                ) | (
+                    SettlementCancellation::Abort,
+                    TypedFailure::OperatorAborted { .. }
+                )
+            ));
+            let evidence = failure.evidence();
+            assert_eq!(
+                evidence.configuration.applied_model.as_deref(),
+                Some("applied-race-model")
+            );
+            assert_eq!(
+                evidence.configuration.applied_mode.as_deref(),
+                Some("applied-race-mode")
+            );
+            let expected_response = match outcome {
+                SettlementRaceOutcome::Success => "success response retained",
+                SettlementRaceOutcome::Failure => "failure response retained",
+                SettlementRaceOutcome::InvalidOutput => "invalid response retained",
+                SettlementRaceOutcome::Question => "Which exact target should I use?",
+            };
+            assert_eq!(evidence.final_response, expected_response);
+            match cancellation {
+                SettlementCancellation::Stop => {
+                    assert_eq!(evidence.stop_reason.as_deref(), Some("matrix stop"));
+                }
+                SettlementCancellation::Deadline => assert!(evidence
+                    .stop_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("deadline reached at "))),
+                SettlementCancellation::Abort => {
+                    assert_eq!(evidence.stop_reason.as_deref(), Some("matrix abort"));
+                }
+            }
+            if matches!(cancellation, SettlementCancellation::Abort) {
+                assert!(matches!(live.phase, MissionPhase::Aborted { .. }));
+                assert!(!live.parked_effects.contains_key(&effect_id));
+            } else {
+                assert!(live.parked_effects.contains_key(&effect_id));
+            }
+            assert_eq!(
+                live.tasks
+                    .values()
+                    .next()
+                    .unwrap()
+                    .workspace_base_sha
+                    .as_deref(),
+                Some(BASE_SHA)
+            );
+        }
+    }
 }
 
 #[tokio::test]
