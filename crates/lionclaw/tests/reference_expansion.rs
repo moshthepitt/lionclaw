@@ -2,12 +2,16 @@
 
 mod common;
 
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use common::{approve_plan, harness, proposal, simple_plan, BASE_SHA};
 use lionclaw::cli::{self, Cli};
-use lionclaw::model::{MessageReference, MissionEvent};
+use lionclaw::model::{
+    DeliveryMarker, MessageReference, MissionEvent, UnavailableReferenceCause, REDUCER_VERSION,
+    SCHEMA_VERSION,
+};
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest, RoleRunUpdate};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -121,6 +125,7 @@ async fn reachable_commit_expands_only_at_the_typed_role_request_boundary() {
 
 #[tokio::test]
 async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message() {
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (21, 29));
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let observed = prompts.clone();
@@ -154,6 +159,11 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
     cli::run(send_cli(dir.path(), &mission, &conversation, &[]))
         .await
         .unwrap();
+    let accepted = store.require_state(&mission).await.unwrap();
+    let accepted_conversation = accepted.conversations.values().next().unwrap();
+    let unavailable_sequence = accepted_conversation.queued[0].sequence_no;
+    let later_sequence = accepted_conversation.queued[1].sequence_no;
+    let attempts_before = accepted.tasks.values().next().unwrap().attempts;
     let object = dir
         .path()
         .join(".git/objects")
@@ -166,11 +176,32 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
     assert_eq!(advanced.unavailable_references.len(), 1);
     let conversation = advanced.conversations.values().next().unwrap();
     assert_eq!(conversation.queued.len(), 1);
-    assert_eq!(
-        conversation.queued[0].marker,
-        lionclaw::model::DeliveryMarker::Undeliverable
-    );
+    assert_eq!(conversation.queued[0].marker, DeliveryMarker::Undeliverable);
+    assert_eq!(conversation.queued[0].sequence_no, unavailable_sequence);
+    assert!(conversation.consumed_through > later_sequence);
     assert!(conversation.active_delivery.is_none());
+    assert_eq!(
+        advanced.tasks.values().next().unwrap().attempts,
+        attempts_before + 1
+    );
+    assert_eq!(
+        advanced.tasks.values().next().unwrap().consecutive_failures,
+        0
+    );
+    let evidence = &advanced.unavailable_references[0];
+    assert_eq!(
+        evidence.conversation_id.as_str(),
+        conversation_id(&advanced)
+    );
+    assert_eq!(evidence.assignment_epoch, conversation.assignment_epoch);
+    assert_eq!(evidence.message_sequence, unavailable_sequence);
+    assert_eq!(
+        evidence.reference,
+        MessageReference::ReachableCommit {
+            sha: BASE_SHA.to_owned()
+        }
+    );
+    assert_eq!(evidence.cause, UnavailableReferenceCause::SourceMissing);
     let prompt = prompts.lock().unwrap().last().unwrap().clone();
     assert!(prompt.contains("inspect the cited change"));
     assert!(!prompt.contains("reachable commit"));
@@ -182,17 +213,171 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
         advanced,
         "reload preserves exact unavailable-reference accounting"
     );
-    h.engine.advance(&mission).await.unwrap();
+    let snapshot = store.rebuild_cursors(&mission, 29_000).await.unwrap();
+    let snapshot_head = snapshot.head;
     assert_eq!(
-        store
-            .require_state(&mission)
-            .await
-            .unwrap()
-            .unavailable_references
-            .len(),
-        1,
-        "settlement is never emitted twice"
+        store.snapshot_meta(&mission).await.unwrap(),
+        Some((snapshot_head, REDUCER_VERSION))
     );
+
+    cli::run(send_cli(
+        dir.path(),
+        &mission,
+        conversation_id(&snapshot),
+        &[],
+    ))
+    .await
+    .unwrap();
+    let tail_sequence = store
+        .require_state(&mission)
+        .await
+        .unwrap()
+        .conversations
+        .values()
+        .next()
+        .unwrap()
+        .queued[1]
+        .sequence_no;
+    let final_state = store.require_state(&mission).await.unwrap();
+    assert!(
+        final_state.head > snapshot_head,
+        "snapshot tail must be nonempty"
+    );
+    assert_eq!(
+        final_state.unavailable_references.len(),
+        1,
+        "settlement is once-only"
+    );
+    let final_conversation = final_state.conversations.values().next().unwrap();
+    assert_eq!(
+        final_conversation.queued[0].marker,
+        DeliveryMarker::Undeliverable
+    );
+    assert_eq!(final_conversation.queued.len(), 2);
+    assert_eq!(final_conversation.queued[1].marker, DeliveryMarker::Queued);
+    assert_eq!(final_conversation.queued[1].sequence_no, tail_sequence);
+    assert_eq!(
+        final_conversation.consumed_through,
+        conversation.consumed_through
+    );
+    assert_eq!(
+        final_state.tasks.values().next().unwrap().attempts,
+        attempts_before + 1
+    );
+    assert_eq!(
+        final_state
+            .tasks
+            .values()
+            .next()
+            .unwrap()
+            .consecutive_failures,
+        0
+    );
+
+    let full = lionclaw::model::fold(store.load(&mission).await.unwrap()).unwrap();
+    assert_eq!(final_state, full);
+    assert_eq!(store.require_state(&mission).await.unwrap(), full);
+    assert_eq!(
+        store.load_state_snapshotted(&mission).await.unwrap(),
+        Some(full.clone())
+    );
+    assert_eq!(
+        store.snapshot_meta(&mission).await.unwrap(),
+        Some((snapshot_head, REDUCER_VERSION)),
+        "the asserted reducer-29 snapshot must remain behind the final log head"
+    );
+
+    assert_operator_views(
+        dir.path(),
+        &mission,
+        unavailable_sequence,
+        conversation.consumed_through,
+    );
+
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.path().join(".lionclaw/mission.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE mission_snapshots SET reducer_version = 28 WHERE mission_id = ?1")
+        .bind(mission.as_str())
+        .execute(&database)
+        .await
+        .unwrap();
+    assert_eq!(store.require_state(&mission).await.unwrap(), full);
+    assert_eq!(store.rebuild_cursors(&mission, 29_001).await.unwrap(), full);
+    assert_eq!(
+        store.snapshot_meta(&mission).await.unwrap(),
+        Some((full.head, REDUCER_VERSION))
+    );
+}
+
+fn conversation_id(state: &lionclaw::model::MissionState) -> &str {
+    state.conversations.keys().next().unwrap().as_str()
+}
+
+fn assert_operator_views(
+    repo: &std::path::Path,
+    mission: &lionclaw::model::MissionId,
+    unavailable_sequence: u64,
+    delivered_through: u64,
+) {
+    for args in [
+        vec!["mission", "status", mission.as_str(), "--json"],
+        vec!["mission", "report", mission.as_str(), "--json"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+            .args(args)
+            .arg("--repo")
+            .arg(repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let root = json
+            .get("missions")
+            .and_then(|v| v.as_array())
+            .map_or(&json, |v| &v[0]);
+        assert_eq!(
+            root["unavailable_references"][0]["message_sequence"],
+            unavailable_sequence
+        );
+        let queued = root["conversations"][0]["queued_messages"]
+            .as_array()
+            .unwrap();
+        assert_eq!(queued[0]["marker"], "undeliverable");
+        assert_eq!(queued[0]["sequence_no"], unavailable_sequence);
+        assert_eq!(
+            root["conversations"][0]["consumed_through"],
+            delivered_through
+        );
+    }
+    for args in [
+        vec!["mission", "status", mission.as_str()],
+        vec!["mission", "report", mission.as_str()],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+            .args(args)
+            .arg("--repo")
+            .arg(repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let human = String::from_utf8(output.stdout).unwrap();
+        assert!(human.contains("marker=undeliverable"));
+        assert!(human.contains(&format!("delivery_through={delivered_through}")));
+        assert!(human.contains("unavailable reference:"));
+        assert!(human.contains("cause=SourceMissing"));
+    }
+    let inbox = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+        .args(["mission", "inbox", "--json", "--repo"])
+        .arg(repo)
+        .output()
+        .unwrap();
+    assert!(inbox.status.success());
+    let inbox: serde_json::Value = serde_json::from_slice(&inbox.stdout).unwrap();
+    assert_eq!(inbox["missions"], serde_json::json!([]));
 }
 
 fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {

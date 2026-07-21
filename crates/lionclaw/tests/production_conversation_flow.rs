@@ -992,7 +992,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     .await
     .expect_err("a mixed judgment recipient send must fail closed");
     assert!(
-        format!("{mixed_error:#}").contains("output semantics emits-verdict"),
+        format!("{mixed_error:#}").contains("mixture of permitted and disallowed recipients"),
         "unexpected mixed-recipient rejection: {mixed_error:#}"
     );
     assert_eq!(
