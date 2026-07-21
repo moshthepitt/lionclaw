@@ -14,7 +14,7 @@ use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{
     apply, fold, Assertion, AssertionId, FinishClass, MissionEvent, MissionPhase, MissionState,
     OracleName, PayloadRef, Plan, PlanProposal, Requirement, RequirementDisposition, RequirementId,
-    RequirementKind, RoleName, Task, TaskId, TaskKind,
+    RequirementKind, RoleName, Task, TaskId, TaskKind, TaskStatus, REDUCER_VERSION, SCHEMA_VERSION,
 };
 use lionclaw::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
 use lionclaw::store::MissionStore;
@@ -686,6 +686,43 @@ fn plan() -> Plan {
     }
 }
 
+fn awaiting_lead_validation_plan() -> Plan {
+    let assertion = AssertionId::new("VALIDATOR-WHILE-AWAITING-LEAD").unwrap();
+    Plan {
+        requirements: vec![Requirement {
+            id: RequirementId::new("COMPOSITIONAL-TURN-SETTLEMENT").unwrap(),
+            kind: RequirementKind::Validation,
+            prose: "awaiting lead and parked role effects compose".into(),
+            disposition: RequirementDisposition::Covered {
+                assertion_ids: vec![assertion.clone()],
+            },
+        }],
+        assertions: vec![Assertion {
+            id: assertion.clone(),
+            prose: "an independent validator runs while the exact writer awaits the lead".into(),
+            oracle: Some(OracleName::new("cargo-test").unwrap()),
+        }],
+        tasks: vec![
+            Task {
+                id: TaskId::new("writer-question").unwrap(),
+                kind: TaskKind::Work,
+                body: "ask the lead for the missing release target".into(),
+                targets: vec![assertion.clone()],
+                role: Some(RoleName::new("implementer").unwrap()),
+                depends_on: vec![],
+            },
+            Task {
+                id: TaskId::new("independent-validator").unwrap(),
+                kind: TaskKind::Validate,
+                body: "validate the already available evidence".into(),
+                targets: vec![assertion],
+                role: Some(RoleName::new("validator").unwrap()),
+                depends_on: vec![],
+            },
+        ],
+    }
+}
+
 fn reference_plan() -> Plan {
     let first = AssertionId::new("REFERENCE-RECEIPT").unwrap();
     Plan {
@@ -723,6 +760,350 @@ async fn initialize_repo(repo: &Path) -> String {
     git(repo, &["add", "base.txt"]).unwrap();
     git(repo, &["commit", "-q", "-m", "base"]).unwrap();
     workspace::head_sha(repo).await.unwrap()
+}
+
+#[tokio::test]
+async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (20, 28));
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let base = initialize_repo(&repo).await;
+    let fake_oci = temp.path().join("external-oci-transport");
+    std::fs::write(&fake_oci, "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n").unwrap();
+    std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profiles = RuntimeProfiles::from_toml(
+        &format!(
+            r#"[runtimes.codex]
+driver = "codex"
+command = "external-codex"
+native-resume = true
+confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
+"#,
+            fake_oci.display()
+        ),
+        temp.path(),
+    )
+    .unwrap();
+    let mission_type = temp.path().join("mission-type");
+    materialize_mission_type(&mission_type);
+    std::fs::write(
+        mission_type.join("roles/validator.md"),
+        "---\noutput: emits-verdict\nruntime: codex\n---\nValidate existing evidence.\n",
+    )
+    .unwrap();
+    let turns = Arc::new(Mutex::new(VecDeque::from([
+        DeliveryTurn::AwaitLead,
+        DeliveryTurn::Validate,
+    ])));
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let sessions = Arc::new(Mutex::new(Vec::new()));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let transports = cli::MissionTransports::external(
+        profiles,
+        RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
+            turns: turns.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+            sessions: sessions.clone(),
+            prompts: prompts.clone(),
+            launch_failures: Arc::new(Mutex::new(0)),
+        }) as Arc<dyn RuntimeDriverProvider>]),
+        RuntimeAuthRegistry::new([Arc::new(TestCodexAuth) as Arc<dyn RuntimeAuthProvider>]),
+        Arc::new(ExternalOracleTransport {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "start",
+            "--type",
+            mission_type.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--objective",
+            "prove composition",
+            "--runtime",
+            "codex",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    let store = MissionStore::open(&repo).await.unwrap();
+    let mission = store.list_missions().await.unwrap().pop().unwrap();
+    let proposal = temp.path().join("plan.json");
+    std::fs::write(
+        &proposal,
+        serde_json::to_vec(&PlanProposal {
+            base_revision: 0,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
+            plan: awaiting_lead_validation_plan(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for command in [
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "plan",
+            "propose",
+            mission.as_str(),
+            "--file",
+            proposal.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            mission.as_str(),
+            "plan_proposal:mission",
+            "approve",
+            "--justification",
+            "approve proof",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    ] {
+        cli::run_with_transports(command, transports.clone())
+            .await
+            .unwrap();
+    }
+    let driver = tokio::spawn({
+        let transports = transports.clone();
+        let command = cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "driver",
+            mission.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--handshake",
+            temp.path().join("ready").to_str().unwrap(),
+        ])
+        .unwrap();
+        async move { cli::run_with_transports(command, transports).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire())
+        .await
+        .expect("writer did not enter")
+        .unwrap()
+        .forget();
+    let initial = store.require_state(&mission).await.unwrap();
+    let plan_order = initial.plan.as_ref().unwrap().tasks.clone();
+    release.add_permits(1);
+    assert_eq!(
+        driver.await.unwrap().unwrap(),
+        std::process::ExitCode::SUCCESS
+    );
+    let driver = tokio::spawn({
+        let transports = transports.clone();
+        let command = cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "driver",
+            mission.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--handshake",
+            temp.path().join("validator-ready").to_str().unwrap(),
+        ])
+        .unwrap();
+        async move { cli::run_with_transports(command, transports).await }
+    });
+    let validator_entered =
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire()).await;
+    if validator_entered.is_err() {
+        panic!(
+            "validator did not enter: {:#?}",
+            store.require_state(&mission).await.unwrap()
+        );
+    }
+    validator_entered.unwrap().unwrap().forget();
+    let active = store.require_state(&mission).await.unwrap();
+    let writer_id = TaskId::new("writer-question").unwrap();
+    let validator_id = TaskId::new("independent-validator").unwrap();
+    assert_eq!(active.tasks[&writer_id].status, TaskStatus::Running);
+    assert_eq!(active.tasks[&validator_id].status, TaskStatus::Running);
+    let (conversation_id, writer) = active
+        .conversations
+        .iter()
+        .find(|(_, c)| c.task_id == writer_id)
+        .unwrap();
+    assert_eq!(
+        writer.lifecycle,
+        lionclaw::model::ConversationLifecycle::AwaitingLead
+    );
+    assert!(active.conversation_is_messageable(conversation_id));
+    assert_eq!(active.inflight.len(), 1, "role effects serialize");
+    let (effect_id, effect) = active.inflight.iter().next().unwrap();
+    assert!(matches!(
+        effect,
+        lionclaw::model::InflightEffect::RoleRun { task_id, .. } if task_id == &validator_id
+    ));
+    assert_eq!(active.deliverable_head(), base);
+    assert_eq!(active.plan.as_ref().unwrap().tasks, plan_order);
+    assert_eq!(
+        store
+            .load(&mission)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.event, MissionEvent::RoleRunRequested { .. }))
+            .count(),
+        2,
+        "no Work redispatch"
+    );
+    assert_eq!(
+        store.rebuild_cursors(&mission, 28_000).await.unwrap(),
+        active
+    );
+    assert_eq!(
+        store.snapshot_meta(&mission).await.unwrap(),
+        Some((active.head, REDUCER_VERSION))
+    );
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "stop",
+            mission.as_str(),
+            effect_id.as_str(),
+            "--reason",
+            "prove cancellation composition",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    release.add_permits(1);
+    assert_eq!(
+        driver.await.unwrap().unwrap(),
+        std::process::ExitCode::SUCCESS
+    );
+    let events = store.load(&mission).await.unwrap();
+    let replayed = fold(events).unwrap();
+    let settled = MissionStore::open(&repo)
+        .await
+        .unwrap()
+        .load_state_snapshotted(&mission)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled, replayed);
+    assert!(
+        settled.head > active.head,
+        "real reducer-28 snapshot has a nonempty tail"
+    );
+    assert_eq!(settled.deliverable_head(), base);
+    assert_eq!(settled.tasks[&writer_id].status, TaskStatus::Running);
+    assert_eq!(settled.tasks[&validator_id].status, TaskStatus::Failed);
+    assert!(settled.inflight.is_empty());
+    assert_eq!(
+        (settled.parked_effects.len(), settled.open_attention.len()),
+        (1, 1)
+    );
+    assert_eq!(
+        (
+            turns.lock().unwrap().len(),
+            sessions.lock().unwrap().len(),
+            prompts.lock().unwrap().len()
+        ),
+        (0, 2, 2)
+    );
+    let view = lionclaw::engine::MissionView::from_state(settled, false);
+    assert_eq!(view.disposition, MissionDisposition::AwaitingLead);
+    assert_eq!(
+        view.next_actions(),
+        [
+            "mission send",
+            "mission continue",
+            "mission decide",
+            "mission abort"
+        ]
+    );
+    let conversation_id = conversation_id.to_string();
+    let status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        &repo,
+        &["mission", "status", mission.as_str(), "--json"],
+    )))
+    .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        &repo,
+        &["mission", "report", mission.as_str(), "--json"],
+    )))
+    .unwrap();
+    let inbox: serde_json::Value =
+        serde_json::from_str(&stdout(cli_output(&repo, &["mission", "inbox", "--json"]))).unwrap();
+    for root in [&status, &report, &inbox["missions"][0]] {
+        assert_eq!(
+            root["next_actions"],
+            serde_json::json!([
+                "mission send",
+                "mission continue",
+                "mission decide",
+                "mission abort"
+            ])
+        );
+        let conversation = projected_conversation(root, &conversation_id);
+        assert_eq!(conversation["lifecycle"], "awaiting_lead");
+        assert_eq!(
+            conversation["legal_actions"],
+            serde_json::json!(["mission send"])
+        );
+        assert!(conversation["final_response"]
+            .as_str()
+            .unwrap()
+            .starts_with("Which release target should I use?"));
+    }
+    for args in [
+        vec!["mission", "status", mission.as_str()],
+        vec!["mission", "report", mission.as_str()],
+        vec!["mission", "inbox"],
+    ] {
+        let human = stdout(cli_output(&repo, &args));
+        assert!(human.contains("mission send | mission continue | mission decide | mission abort"));
+        assert!(human.contains("lifecycle=awaiting_lead"));
+    }
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        repo.join(".lionclaw/mission.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE mission_snapshots SET reducer_version = 27 WHERE mission_id = ?1")
+        .bind(mission.as_str())
+        .execute(&database)
+        .await
+        .unwrap();
+    assert_eq!(
+        MissionStore::open(&repo)
+            .await
+            .unwrap()
+            .require_state(&mission)
+            .await
+            .unwrap(),
+        replayed
+    );
+    assert_eq!(
+        store.rebuild_cursors(&mission, 28_001).await.unwrap(),
+        replayed
+    );
+    assert_eq!(
+        store.snapshot_meta(&mission).await.unwrap(),
+        Some((replayed.head, REDUCER_VERSION))
+    );
 }
 
 #[tokio::test]
