@@ -9,14 +9,15 @@ use clap::Parser;
 use common::{approve_plan, harness, proposal, simple_plan, BASE_SHA};
 use lionclaw::cli::{self, Cli};
 use lionclaw::model::{
-    DecisionAction, DeliveryMarker, Handoff, MessageReference, MissionEvent, PayloadRef, TaskId,
-    UnavailableReferenceCause, REDUCER_VERSION, SCHEMA_VERSION,
+    DecisionAction, DeliveryMarker, Handoff, MessageReference, MissionEvent, PayloadRef, RoleName,
+    TaskId, TaskKind, UnavailableReferenceCause, REDUCER_VERSION, SCHEMA_VERSION,
 };
 use lionclaw::ports::{
     CapturedArtifact, OracleOutcome, RoleRunOutcome, RoleRunRequest, RoleRunUpdate,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
+use lionclaw_runtime_api::TypedFailure;
 
 fn send_cli(
     repo: &std::path::Path,
@@ -493,6 +494,199 @@ async fn accepted_receipt_blob_unavailable_before_dispatch_settles_once() {
     assert_eq!(
         lionclaw::model::fold(store.load(&mission).await.unwrap()).unwrap(),
         settled
+    );
+}
+
+#[tokio::test]
+async fn accepted_park_reference_survives_legal_clear_from_durable_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let observed = prompts.clone();
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        observed
+            .lock()
+            .unwrap()
+            .push((request.task_id.clone(), request.prompt.clone()));
+        if request.task_id.as_str() == "park-source" {
+            Err(TypedFailure::transient(
+                "reference.park-source",
+                "REAL-DURABLE-PARK-EVIDENCE",
+                None,
+            ))
+        } else {
+            Ok(checkpoint(request))
+        }
+    }));
+    let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
+    let mission = h
+        .engine
+        .create_mission(dir.path().to_str().unwrap(), "park lifecycle", BASE_SHA)
+        .await
+        .unwrap();
+    let mut plan = simple_plan();
+    plan.tasks[0].id = TaskId::new("recipient").unwrap();
+    let mut park_source = plan.tasks[0].clone();
+    park_source.id = TaskId::new("park-source").unwrap();
+    park_source.kind = TaskKind::Validate;
+    park_source.role = Some(RoleName::new("reviewer").unwrap());
+    plan.tasks.push(park_source);
+    h.engine
+        .propose_plan(&mission, proposal(0, plan))
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &mission).await;
+
+    for _ in 0..8 {
+        h.engine.advance(&mission).await.unwrap();
+        let state = h.engine.load_state(&mission).await.unwrap();
+        if !state.parked_effects.is_empty()
+            && state.conversations.iter().any(|(id, conversation)| {
+                conversation.task_id.as_str() == "recipient"
+                    && state.conversation_is_messageable(id)
+            })
+        {
+            break;
+        }
+    }
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let parked = store.require_state(&mission).await.unwrap();
+    let park = parked
+        .parked_effects
+        .keys()
+        .next()
+        .unwrap_or_else(|| panic!("real role failure did not park: {parked:#?}"))
+        .clone();
+    let recipient = parked
+        .conversations
+        .iter()
+        .find(|(_, conversation)| conversation.task_id.as_str() == "recipient")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+
+    let pre_clear = lionclaw::reference_materialization::materialize_references(
+        &parked,
+        &store.load(&mission).await.unwrap(),
+        store.blobs(),
+        dir.path(),
+        &[MessageReference::ParkEvidence {
+            effect_id: park.clone(),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(pre_clear.len(), 1);
+    assert!(pre_clear[0].content.contains("REAL-DURABLE-PARK-EVIDENCE"));
+
+    cli::run(send_cli(
+        dir.path(),
+        &mission,
+        recipient.as_str(),
+        &["--park", park.as_str()],
+        "accepted before clear and delivered after clear",
+    ))
+    .await
+    .unwrap();
+    let accepted = store.require_state(&mission).await.unwrap();
+    let accepted_message = accepted.conversations[&recipient].queued[0].clone();
+    let source_event = store
+        .load(&mission)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| matches!(&event.event, MissionEvent::RoleRunCompleted { effect_id, .. } if effect_id == &park))
+        .expect("immutable park source event");
+    cli::run(
+        Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "continue",
+            mission.as_str(),
+            park.as_str(),
+            "--reason",
+            "clear park through production control",
+            "--repo",
+            dir.path().to_str().unwrap(),
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let cleared = store.require_state(&mission).await.unwrap();
+    assert!(!cleared.parked_effects.contains_key(&park));
+    assert_eq!(
+        cleared.conversations[&recipient].queued[0],
+        accepted_message
+    );
+
+    h.engine.advance(&mission).await.unwrap();
+    let delivered = store.require_state(&mission).await.unwrap();
+    assert!(delivered.unavailable_references.is_empty());
+    assert!(delivered.conversations[&recipient].queued.is_empty());
+    let post_clear = prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(task, prompt)| {
+            task.as_str() == "recipient"
+                && prompt.contains("accepted before clear and delivered after clear")
+        })
+        .unwrap()
+        .1
+        .clone();
+    assert!(post_clear.contains(&format!("park evidence {park}:")));
+    assert!(post_clear.contains("REAL-DURABLE-PARK-EVIDENCE"));
+    let events = store.load(&mission).await.unwrap();
+    assert!(events.iter().any(|event| event == &source_event));
+    assert!(!events.iter().any(|event| matches!(
+        event.event,
+        MissionEvent::MessageReferenceUnavailable { .. }
+    )));
+
+    cli::run(send_cli(
+        dir.path(),
+        &mission,
+        recipient.as_str(),
+        &[],
+        "distinct later boundary progresses",
+    ))
+    .await
+    .unwrap();
+    if let Some(blocking_effect) = store
+        .require_state(&mission)
+        .await
+        .unwrap()
+        .parked_effects
+        .keys()
+        .next()
+        .cloned()
+    {
+        cli::run(
+            Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "continue",
+                mission.as_str(),
+                blocking_effect.as_str(),
+                "--reason",
+                "allow the distinct later boundary",
+                "--repo",
+                dir.path().to_str().unwrap(),
+            ])
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    h.engine.advance(&mission).await.unwrap();
+    let final_state = store.require_state(&mission).await.unwrap();
+    assert!(final_state.conversations[&recipient].queued.is_empty());
+    assert!(prompts.lock().unwrap().iter().any(|(task, prompt)| {
+        task.as_str() == "recipient" && prompt.contains("distinct later boundary progresses")
+    }));
+    assert_eq!(
+        lionclaw::model::fold(store.load(&mission).await.unwrap()).unwrap(),
+        final_state
     );
 }
 
