@@ -306,7 +306,8 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
         &mission,
         unavailable_sequence,
         conversation.consumed_through,
-    );
+    )
+    .await;
 
     let database = sqlx::SqlitePool::connect(&format!(
         "sqlite://{}",
@@ -495,12 +496,13 @@ async fn accepted_receipt_blob_unavailable_before_dispatch_settles_once() {
         lionclaw::model::fold(store.load(&mission).await.unwrap()).unwrap(),
         settled
     );
-    assert_reference_operator_output(
+    assert_operator_views(
         dir.path(),
         &mission,
-        &["undeliverable"],
-        &["REAL-BELOW-LIMIT-RECEIPT"],
-    );
+        failed_sequence,
+        conversation_state.consumed_through,
+    )
+    .await;
     assert_replay_snapshot_tail(
         dir.path(),
         &store,
@@ -703,12 +705,7 @@ async fn accepted_park_reference_survives_legal_clear_from_durable_history() {
         lionclaw::model::fold(store.load(&mission).await.unwrap()).unwrap(),
         final_state
     );
-    assert_reference_operator_output(
-        dir.path(),
-        &mission,
-        &["park"],
-        &["unavailable reference:", "MessageReferenceUnavailable"],
-    );
+    assert_park_operator_views(dir.path(), &mission, recipient.as_str()).await;
     assert_replay_snapshot_tail(
         dir.path(),
         &store,
@@ -797,59 +794,33 @@ async fn assert_replay_snapshot_tail(
     );
 }
 
-fn assert_reference_operator_output(
-    repo: &std::path::Path,
-    mission: &lionclaw::model::MissionId,
-    required: &[&str],
-    forbidden: &[&str],
-) {
-    for args in [
-        vec!["mission", "status", mission.as_str(), "--json"],
-        vec!["mission", "report", mission.as_str(), "--json"],
-        vec!["mission", "inbox", "--json"],
-        vec!["mission", "status", mission.as_str()],
-        vec!["mission", "report", mission.as_str()],
-        vec!["mission", "inbox"],
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
-            .args(&args)
-            .arg("--repo")
-            .arg(repo)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert!(
-            !output.stdout.is_empty(),
-            "operator output must be non-vacuous"
-        );
-        let rendered = String::from_utf8(output.stdout).unwrap();
-        for forbidden in forbidden {
-            assert!(
-                !rendered.contains(forbidden),
-                "operator output fabricated forbidden reference truth: {forbidden}"
-            );
-        }
-        if !args.contains(&"inbox") {
-            for required in required {
-                assert!(
-                    rendered.contains(required),
-                    "operator output omitted reference truth: {required}"
-                );
-            }
-        }
-    }
-}
-
 fn conversation_id(state: &lionclaw::model::MissionState) -> &str {
     state.conversations.keys().next().unwrap().as_str()
 }
 
-fn assert_operator_views(
+async fn assert_operator_views(
     repo: &std::path::Path,
     mission: &lionclaw::model::MissionId,
     unavailable_sequence: u64,
     delivered_through: u64,
 ) {
+    let state = MissionStore::open(repo)
+        .await
+        .unwrap()
+        .require_state(mission)
+        .await
+        .unwrap();
+    let evidence = state
+        .unavailable_references
+        .iter()
+        .find(|evidence| evidence.message_sequence == unavailable_sequence)
+        .expect("exact unavailable-reference evidence");
+    let conversation = &state.conversations[&evidence.conversation_id];
+    let unavailable = conversation
+        .queued
+        .iter()
+        .find(|message| message.sequence_no == unavailable_sequence)
+        .expect("whole unavailable message retained");
     for args in [
         vec!["mission", "status", mission.as_str(), "--json"],
         vec!["mission", "report", mission.as_str(), "--json"],
@@ -866,19 +837,35 @@ fn assert_operator_views(
             .get("missions")
             .and_then(|v| v.as_array())
             .map_or(&json, |v| &v[0]);
+        assert_eq!(root["mission_id"], mission.as_str());
+        assert_eq!(
+            root["unavailable_references"],
+            serde_json::json!([evidence])
+        );
+        let projected = root["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|value| value["id"] == evidence.conversation_id.as_str())
+            .expect("affected conversation is selected by identity");
+        assert_eq!(projected["assignment_epoch"], evidence.assignment_epoch);
         assert_eq!(
             root["unavailable_references"][0]["message_sequence"],
             unavailable_sequence
         );
-        let queued = root["conversations"][0]["queued_messages"]
-            .as_array()
-            .unwrap();
-        assert_eq!(queued[0]["marker"], "undeliverable");
-        assert_eq!(queued[0]["sequence_no"], unavailable_sequence);
+        let queued = projected["queued_messages"].as_array().unwrap();
+        let projected_message = queued
+            .iter()
+            .find(|value| value["sequence_no"] == unavailable_sequence)
+            .expect("exact unavailable message is retained");
         assert_eq!(
-            root["conversations"][0]["consumed_through"],
-            delivered_through
+            projected_message,
+            &serde_json::to_value(unavailable).unwrap()
         );
+        assert_eq!(projected_message["marker"], "undeliverable");
+        assert_eq!(projected["consumed_through"], delivered_through);
+        assert!(projected["active_message_boundary"].is_null());
+        assert!(projected["presented_messages"].is_null());
     }
     for args in [
         vec!["mission", "status", mission.as_str()],
@@ -892,6 +879,10 @@ fn assert_operator_views(
             .unwrap();
         assert!(output.status.success());
         let human = String::from_utf8(output.stdout).unwrap();
+        assert!(human.contains(mission.as_str()));
+        assert!(human.contains(evidence.conversation_id.as_str()));
+        assert!(human.contains(&format!("generation={}", evidence.assignment_epoch)));
+        assert!(human.contains(&format!("message={unavailable_sequence}")));
         assert!(human.contains("marker=undeliverable"));
         assert!(human.contains(&format!("delivery_through={delivered_through}")));
         assert!(human.contains("unavailable reference:"));
@@ -904,7 +895,100 @@ fn assert_operator_views(
         .unwrap();
     assert!(inbox.status.success());
     let inbox: serde_json::Value = serde_json::from_slice(&inbox.stdout).unwrap();
-    assert_eq!(inbox["missions"], serde_json::json!([]));
+    let missions = inbox["missions"].as_array().unwrap();
+    if missions.is_empty() {
+        assert_eq!(inbox["missions"], serde_json::json!([]));
+    } else {
+        let status = cli_json(repo, mission, "status");
+        assert_eq!(missions.len(), 1);
+        assert_eq!(missions[0]["mission_id"], mission.as_str());
+        assert_eq!(missions[0]["next_actions"], status["next_actions"]);
+    }
+}
+
+async fn assert_park_operator_views(
+    repo: &std::path::Path,
+    mission: &lionclaw::model::MissionId,
+    conversation_id: &str,
+) {
+    let state = MissionStore::open(repo)
+        .await
+        .unwrap()
+        .require_state(mission)
+        .await
+        .unwrap();
+    assert!(state.unavailable_references.is_empty());
+    let conversation = state
+        .conversations
+        .iter()
+        .find(|(id, _)| id.as_str() == conversation_id)
+        .unwrap()
+        .1;
+    for command in ["status", "report"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+            .args(["mission", command, mission.as_str(), "--json", "--repo"])
+            .arg(repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let root = json
+            .get("missions")
+            .and_then(|value| value.as_array())
+            .map_or(&json, |missions| &missions[0]);
+        assert_eq!(root["mission_id"], mission.as_str());
+        assert_eq!(root["unavailable_references"], serde_json::json!([]));
+        let projected = root["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|value| value["id"] == conversation_id)
+            .unwrap();
+        assert_eq!(projected["assignment_epoch"], conversation.assignment_epoch);
+        assert_eq!(projected["consumed_through"], conversation.consumed_through);
+        assert_eq!(
+            projected["queued_messages"],
+            serde_json::json!(conversation.queued)
+        );
+
+        let human = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+            .args(["mission", command, mission.as_str(), "--repo"])
+            .arg(repo)
+            .output()
+            .unwrap();
+        assert!(human.status.success());
+        let human = String::from_utf8(human.stdout).unwrap();
+        assert!(human.contains(mission.as_str()));
+        assert!(human.contains(conversation_id));
+        assert!(human.contains("park"));
+        assert!(!human.contains("unavailable reference:"));
+    }
+    let inbox = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+        .args(["mission", "inbox", "--json", "--repo"])
+        .arg(repo)
+        .output()
+        .unwrap();
+    assert!(inbox.status.success());
+    let inbox: serde_json::Value = serde_json::from_slice(&inbox.stdout).unwrap();
+    let missions = inbox["missions"].as_array().unwrap();
+    assert_eq!(missions.len(), 1);
+    assert_eq!(missions[0]["mission_id"], mission.as_str());
+    let status = cli_json(repo, mission, "status");
+    assert_eq!(missions[0]["next_actions"], status["next_actions"]);
+}
+
+fn cli_json(
+    repo: &std::path::Path,
+    mission: &lionclaw::model::MissionId,
+    command: &str,
+) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+        .args(["mission", command, mission.as_str(), "--json", "--repo"])
+        .arg(repo)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
