@@ -371,7 +371,13 @@ impl RuntimeAdapter for DeliveryTransport {
             DeliveryTurn::Complete | DeliveryTurn::CompleteWithOversizedReference => {
                 let runtime = execution.context.runtime_state_root.as_ref().unwrap();
                 let work = runtime.parent().unwrap().join("work");
-                std::fs::write(work.join("delivery.txt"), "complete\n")?;
+                let artifact = work.join("delivery.txt");
+                let contents = if execution.input.prompt.contains("TERMINAL-DIRECT-PROSE") {
+                    "reference-bearing retry complete\n"
+                } else {
+                    "complete\n"
+                };
+                std::fs::write(&artifact, contents)?;
                 git(&work, &["add", "delivery.txt"])?;
                 if matches!(turn, DeliveryTurn::CompleteWithOversizedReference) {
                     std::fs::write(work.join("reference-bound.txt"), "B".repeat(70 * 1024))?;
@@ -452,6 +458,20 @@ struct DeliveryProvider {
     sessions: SessionObservations,
     prompts: PromptObservations,
     launch_failures: Arc<Mutex<usize>>,
+}
+
+struct RenamedDeliveryProvider {
+    inner: DeliveryProvider,
+}
+
+impl RuntimeDriverProvider for RenamedDeliveryProvider {
+    fn driver(&self) -> &'static str {
+        "unrelated-provider-identity"
+    }
+
+    fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
+        self.inner.create_adapter(config)
+    }
 }
 
 impl RuntimeDriverProvider for DeliveryProvider {
@@ -591,6 +611,26 @@ impl RuntimeDriverProvider for NativeProvider {
 
 struct ExternalOracleTransport {
     calls: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+struct ReferenceIsolationOracleTransport {
+    attempts: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl OracleRunner for ReferenceIsolationOracleTransport {
+    async fn run(&self, _request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+        let mut attempts = self.attempts.lock().unwrap();
+        *attempts += 1;
+        Ok(OracleOutcome {
+            exit_code: i32::from(*attempts == 1),
+            exit_signal: None,
+            stdout: b"TERMINAL-RECEIPT-PROSE\n".to_vec(),
+            stderr: Vec::new(),
+            prepared_inputs: Vec::new(),
+            duration_ms: 1,
+        })
+    }
 }
 
 fn scripted_oracle_outcome(oracle: &str) -> (i32, &'static [u8], u64) {
@@ -1170,6 +1210,338 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert_eq!(
         store.snapshot_meta(&mission).await.unwrap(),
         Some((replayed.head, REDUCER_VERSION))
+    );
+}
+
+#[tokio::test]
+async fn renamed_terminal_gap_verdict_prompt_excludes_all_reference_prose() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let base = initialize_repo(&repo).await;
+    let fake_oci = temp.path().join("external-oci-transport");
+    std::fs::write(
+        &fake_oci,
+        "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profiles = RuntimeProfiles::from_toml(
+        &format!(
+            r#"[runtimes.unrelated-runtime-identity]
+driver = "unrelated-provider-identity"
+command = "external-agent"
+native-resume = true
+confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
+"#,
+            fake_oci.display()
+        ),
+        temp.path(),
+    )
+    .unwrap();
+    let mission_type = temp.path().join("mission-type");
+    materialize_mission_type(&mission_type);
+    let manifest = std::fs::read_to_string(mission_type.join("mission.toml")).unwrap();
+    std::fs::write(
+        mission_type.join("mission.toml"),
+        manifest.replace("gap-reviewer", "renamed-closing-role"),
+    )
+    .unwrap();
+    std::fs::rename(
+        mission_type.join("roles/gap-reviewer.md"),
+        mission_type.join("roles/renamed-closing-role.md"),
+    )
+    .unwrap();
+    for role in ["implementer.md", "renamed-closing-role.md"] {
+        let path = mission_type.join("roles").join(role);
+        if path.exists() {
+            let contents = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                &path,
+                contents.replace("runtime: codex", "runtime: unrelated-runtime-identity"),
+            )
+            .unwrap();
+        }
+    }
+    let turns = Arc::new(Mutex::new(VecDeque::from([
+        DeliveryTurn::Complete,
+        DeliveryTurn::Fail,
+        DeliveryTurn::Complete,
+        DeliveryTurn::Review,
+    ])));
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(16));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let transports = cli::MissionTransports::external(
+        profiles,
+        RuntimeDriverRegistry::new([Arc::new(RenamedDeliveryProvider {
+            inner: DeliveryProvider {
+                turns: turns.clone(),
+                entered,
+                release,
+                sessions: Arc::new(Mutex::new(Vec::new())),
+                prompts: prompts.clone(),
+                launch_failures: Arc::new(Mutex::new(0)),
+            },
+        }) as Arc<dyn RuntimeDriverProvider>]),
+        RuntimeAuthRegistry::empty(),
+        Arc::new(ReferenceIsolationOracleTransport {
+            attempts: Arc::new(Mutex::new(0)),
+        }),
+    );
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "start",
+            "--type",
+            mission_type.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--objective",
+            "prove semantic terminal reference isolation",
+            "--runtime",
+            "unrelated-runtime-identity",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    let store = MissionStore::open(&repo).await.unwrap();
+    let mission = store.list_missions().await.unwrap().pop().unwrap();
+    let proposal = temp.path().join("plan.json");
+    std::fs::write(
+        &proposal,
+        serde_json::to_vec(&PlanProposal {
+            base_revision: 0,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
+            plan: reference_plan(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for command in [
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "plan",
+            "propose",
+            mission.as_str(),
+            "--file",
+            proposal.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            mission.as_str(),
+            "plan_proposal:mission",
+            "approve",
+            "--justification",
+            "approve semantic isolation proof",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    ] {
+        cli::run_with_transports(command, transports.clone())
+            .await
+            .unwrap();
+    }
+    let driver = |label: &str| {
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "driver",
+            mission.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--handshake",
+            temp.path().join(label).to_str().unwrap(),
+        ])
+        .unwrap()
+    };
+    for attempt in 0..4 {
+        cli::run_with_transports(
+            driver(&format!("mint-receipt-{attempt}.ready")),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+        let state = store.require_state(&mission).await.unwrap();
+        if !state.authoritative_receipts.is_empty() && !state.open_attention.is_empty() {
+            break;
+        }
+    }
+    let failed = store.require_state(&mission).await.unwrap();
+    let attention = failed
+        .open_attention
+        .keys()
+        .next()
+        .expect("failed oracle attention");
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            mission.as_str(),
+            attention,
+            "repair",
+            "--justification",
+            "retry through a parked reference-bearing turn",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    for attempt in 0..4 {
+        cli::run_with_transports(
+            driver(&format!("park-retry-{attempt}.ready")),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+        if !store
+            .require_state(&mission)
+            .await
+            .unwrap()
+            .parked_effects
+            .is_empty()
+        {
+            break;
+        }
+    }
+    let parked = store.require_state(&mission).await.unwrap();
+    let (conversation, _) = parked
+        .conversations
+        .iter()
+        .find(|(id, conversation)| {
+            conversation.task_id.as_str() == "mint-receipt"
+                && parked.conversation_is_messageable(id)
+        })
+        .unwrap_or_else(|| panic!("parked writer conversation: {parked:#?}"));
+    let conversation = conversation.clone();
+    let park = parked
+        .parked_effects
+        .keys()
+        .next()
+        .expect("park evidence identity")
+        .clone();
+    let receipt = parked
+        .authoritative_receipts
+        .iter()
+        .next()
+        .expect("authoritative validator receipt")
+        .clone();
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "send",
+            "--mission-id",
+            mission.as_str(),
+            "--to",
+            conversation.as_str(),
+            "--park",
+            park.as_str(),
+            "--receipt",
+            receipt.as_str(),
+            "--commit",
+            base.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "TERMINAL-DIRECT-PROSE",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "continue",
+            mission.as_str(),
+            park.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--reason",
+            "resume after reference delivery",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    for attempt in 0..6 {
+        cli::run_with_transports(
+            driver(&format!("finish-{attempt}.ready")),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+        if matches!(
+            store.require_state(&mission).await.unwrap().phase,
+            MissionPhase::Done { .. }
+        ) {
+            break;
+        }
+    }
+    let captured = prompts.lock().unwrap();
+    let resumed = captured
+        .iter()
+        .find(|(prompt, _)| prompt.contains("TERMINAL-DIRECT-PROSE"))
+        .expect("permitted worker received reference expansions");
+    for marker in [
+        "TERMINAL-RECEIPT-PROSE",
+        "base.txt",
+        "scripted external transport failure",
+    ] {
+        assert!(resumed.0.contains(marker), "worker prompt omitted {marker}");
+    }
+    let terminal = captured
+        .iter()
+        .find(|(prompt, _)| prompt.contains("## Handoff nonce"))
+        .expect("real terminal RoleRunRequest prompt");
+    for producer_controlled in [
+        "TERMINAL-DIRECT-PROSE",
+        "TERMINAL-RECEIPT-PROSE",
+        "base.txt",
+        "scripted external transport failure",
+    ] {
+        assert!(
+            !terminal.0.contains(producer_controlled),
+            "reference prose leaked into renamed EmitsGapVerdict prompt: {producer_controlled}"
+        );
+    }
+    let terminal_role = store
+        .load(&mission)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|event| match event.event {
+            MissionEvent::TerminalReviewRequested { role, .. } => Some(role),
+            _ => None,
+        })
+        .expect("persisted terminal request");
+    assert_eq!(terminal_role.as_str(), "renamed-closing-role");
+    assert_eq!(
+        store
+            .require_state(&mission)
+            .await
+            .unwrap()
+            .config
+            .plan_inventory
+            .roles[&terminal_role],
+        OutputSemantics::EmitsGapVerdict
     );
 }
 
