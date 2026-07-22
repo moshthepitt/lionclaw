@@ -117,8 +117,17 @@ async fn input_cache_key(
     checkout: &Path,
     input: &PreparedInput,
 ) -> Result<String> {
+    input_cache_key_for_format(profile, checkout, input, PREPARED_INPUT_FORMAT).await
+}
+
+async fn input_cache_key_for_format(
+    profile: &MissionRuntimeProfile,
+    checkout: &Path,
+    input: &PreparedInput,
+    format: &[u8],
+) -> Result<String> {
     let mut digest = ContentDigest::new();
-    digest.feed("format", PREPARED_INPUT_FORMAT, false);
+    digest.feed("format", format, false);
     digest.feed("name", input.name.as_str().as_bytes(), false);
     digest.feed(
         "image",
@@ -292,6 +301,35 @@ async fn prepare_one(
     digest: &str,
     effect_id: &crate::model::EffectId,
 ) -> Result<PathBuf> {
+    prepare_cached(
+        state_dir,
+        attempt_dir,
+        input,
+        digest,
+        |staging| async move {
+            run_preparation_program(profile, checkout, input, effect_id, &staging).await
+        },
+    )
+    .await
+}
+
+struct PreparationStaging {
+    output: PathBuf,
+    scratch: PathBuf,
+    program_dir: PathBuf,
+}
+
+async fn prepare_cached<F, Fut>(
+    state_dir: &Path,
+    attempt_dir: &Path,
+    input: &PreparedInput,
+    digest: &str,
+    prepare: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce(PreparationStaging) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let parent = state_dir
         .join("inputs")
         .join("sha256")
@@ -310,13 +348,41 @@ async fn prepare_one(
     tokio::fs::create_dir_all(&parent).await?;
     let staging = attempt_dir.join(format!("input-{}", input.name));
     crate::workspace::remove_dir(&staging).await?;
-    let output = staging.join("output");
-    let scratch = staging.join("scratch");
-    let program_dir = staging.join("program");
-    for directory in [&output, &scratch, &program_dir] {
+    let staging = PreparationStaging {
+        output: staging.join("output"),
+        scratch: staging.join("scratch"),
+        program_dir: staging.join("program"),
+    };
+    for directory in [&staging.output, &staging.scratch, &staging.program_dir] {
         tokio::fs::create_dir_all(directory).await?;
     }
-    let program = program_dir.join("prepare");
+    let output = staging.output.clone();
+    prepare(staging).await?;
+
+    match std::fs::rename(&output, &destination) {
+        Ok(()) => {}
+        Err(_) if destination.is_dir() => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "publishing prepared input '{}' at '{}'",
+                    input.name,
+                    destination.display()
+                )
+            });
+        }
+    }
+    Ok(destination)
+}
+
+async fn run_preparation_program(
+    profile: &MissionRuntimeProfile,
+    checkout: &Path,
+    input: &PreparedInput,
+    effect_id: &crate::model::EffectId,
+    staging: &PreparationStaging,
+) -> Result<()> {
+    let program = staging.program_dir.join("prepare");
     tokio::fs::copy(&input.program, &program).await?;
     crate::workspace::make_executable(&program)?;
 
@@ -330,17 +396,17 @@ async fn prepare_one(
             workspace: checkout.to_path_buf(),
             extras: vec![
                 MountSpec {
-                    source: program_dir,
+                    source: staging.program_dir.clone(),
                     target: "/mission/input".to_string(),
                     access: MountAccess::ReadOnly,
                 },
                 MountSpec {
-                    source: output.clone(),
+                    source: staging.output.clone(),
                     target: INPUT_OUTPUT_TARGET.to_string(),
                     access: MountAccess::ReadWrite,
                 },
                 MountSpec {
-                    source: scratch,
+                    source: staging.scratch.clone(),
                     target: SCRATCH_MOUNT_TARGET.to_string(),
                     access: MountAccess::ReadWrite,
                 },
@@ -376,20 +442,7 @@ async fn prepare_one(
         );
     }
 
-    match std::fs::rename(&output, &destination) {
-        Ok(()) => {}
-        Err(_) if destination.is_dir() => {}
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "publishing prepared input '{}' at '{}'",
-                    input.name,
-                    destination.display()
-                )
-            });
-        }
-    }
-    Ok(destination)
+    Ok(())
 }
 
 fn preparation_environment() -> Vec<(String, String)> {
@@ -557,5 +610,84 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("depth limit"));
+    }
+
+    #[tokio::test]
+    async fn prior_format_cache_is_regenerated_and_v2_cache_is_immutable() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("checkout");
+        let state = root.path().join("state");
+        let attempt = root.path().join("attempt");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&attempt).unwrap();
+        let program = root.path().join("prepare");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::write(checkout.join("Cargo.lock"), "key-v1").unwrap();
+        let input = input(program, "Cargo.lock");
+        let profile = profile();
+
+        let old_digest =
+            input_cache_key_for_format(&profile, &checkout, &input, b"lionclaw-prepared-input-v1")
+                .await
+                .unwrap();
+        let old = state
+            .join("inputs/sha256")
+            .join(&old_digest[..2])
+            .join(&old_digest[2..4])
+            .join(&old_digest);
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("complete"), "stale contents").unwrap();
+
+        let digest = input_cache_key(&profile, &checkout, &input).await.unwrap();
+        assert_ne!(digest, old_digest);
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = runs.clone();
+        let published = prepare_cached(&state, &attempt, &input, &digest, move |staging| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                let package = staging.output.join("vendor/representative/src");
+                tokio::fs::create_dir_all(&package).await?;
+                tokio::fs::write(
+                    staging.output.join("vendor/representative/Cargo.toml"),
+                    "[package]\nname='representative'\nversion='1.0.0'\n",
+                )
+                .await?;
+                tokio::fs::write(package.join("lib.rs"), "pub fn retained() {}\n").await?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(published.file_name().unwrap(), digest.as_str());
+        assert!(published.join("vendor/representative/Cargo.toml").is_file());
+        assert!(published.join("vendor/representative/src/lib.rs").is_file());
+        assert_eq!(
+            std::fs::read_to_string(old.join("complete")).unwrap(),
+            "stale contents"
+        );
+
+        let cached = prepare_cached(&state, &attempt, &input, &digest, |_| async {
+            panic!("an unchanged complete v2 input must be a stable cache hit")
+        })
+        .await
+        .unwrap();
+        assert_eq!(cached, published);
+
+        std::fs::write(checkout.join("Cargo.lock"), "key-v2").unwrap();
+        let changed = input_cache_key(&profile, &checkout, &input).await.unwrap();
+        assert_ne!(changed, digest);
+        let observed = runs.clone();
+        let changed_path = prepare_cached(&state, &attempt, &input, &changed, move |staging| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                tokio::fs::write(staging.output.join("regenerated"), "new key").await?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(changed_path, published);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

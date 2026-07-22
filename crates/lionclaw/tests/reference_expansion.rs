@@ -896,14 +896,8 @@ async fn assert_operator_views(
     assert!(inbox.status.success());
     let inbox: serde_json::Value = serde_json::from_slice(&inbox.stdout).unwrap();
     let missions = inbox["missions"].as_array().unwrap();
-    if missions.is_empty() {
-        assert_eq!(inbox["missions"], serde_json::json!([]));
-    } else {
-        let status = cli_json(repo, mission, "status");
-        assert_eq!(missions.len(), 1);
-        assert_eq!(missions[0]["mission_id"], mission.as_str());
-        assert_eq!(missions[0]["next_actions"], status["next_actions"]);
-    }
+    let status = cli_json(repo, mission, "status");
+    assert_inbox_binding(mission.as_str(), &status, missions);
 }
 
 async fn assert_park_operator_views(
@@ -975,6 +969,57 @@ async fn assert_park_operator_views(
     assert_eq!(missions[0]["mission_id"], mission.as_str());
     let status = cli_json(repo, mission, "status");
     assert_eq!(missions[0]["next_actions"], status["next_actions"]);
+}
+
+fn assert_inbox_binding(mission_id: &str, status: &serde_json::Value, inbox: &[serde_json::Value]) {
+    assert_eq!(status["mission_id"], mission_id);
+    let selected = inbox
+        .iter()
+        .filter(|record| record["mission_id"] == mission_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected.len(),
+        inbox.len(),
+        "unrelated inbox mission record"
+    );
+    if let Some(record) = selected.first() {
+        assert_eq!(selected.len(), 1);
+        assert_eq!(record["mission_id"], status["mission_id"]);
+        assert_eq!(record["attention"], status["attention"]);
+        assert_eq!(record["next_actions"], status["next_actions"]);
+        assert_eq!(record["conversations"], status["conversations"]);
+        return;
+    }
+
+    assert_eq!(status["attention"], serde_json::json!([]));
+    assert_eq!(status["disposition"], "ready");
+    assert_eq!(
+        status["next_actions"],
+        serde_json::json!(["mission advance", "mission send", "mission abort"])
+    );
+    for conversation in status["conversations"].as_array().unwrap() {
+        assert_eq!(conversation["lifecycle"], "ready");
+        assert_eq!(
+            conversation["legal_actions"],
+            serde_json::json!(["mission advance", "mission send"])
+        );
+    }
+}
+
+#[test]
+#[should_panic]
+fn inbox_binding_rejects_omitted_mission_that_awaits_lead_input() {
+    let status = serde_json::json!({
+        "mission_id": "m-awaiting",
+        "attention": [],
+        "disposition": "awaiting_lead",
+        "next_actions": ["mission send", "mission abort"],
+        "conversations": [{
+            "lifecycle": "awaiting_lead",
+            "legal_actions": ["mission send"]
+        }]
+    });
+    assert_inbox_binding("m-awaiting", &status, &[]);
 }
 
 fn cli_json(
