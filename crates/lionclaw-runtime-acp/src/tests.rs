@@ -65,7 +65,6 @@ async fn acp_adapter_preserves_typed_launch_refusal() {
                 input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "launch refusal probe".into(),
-                    fresh_prompt: None,
                 },
                 context: RuntimeExecutionContext {
                     network_mode: NetworkMode::None,
@@ -729,7 +728,6 @@ async fn acp_turn_uses_profile_driver_journal() {
                 input: TurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: "hello".to_string(),
-                    fresh_prompt: None,
                 },
                 context,
                 executor: Box::new(executor),
@@ -847,7 +845,6 @@ async fn acp_turn_projects_runtime_mcp_servers() {
                 input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "hello".to_string(),
-                    fresh_prompt: None,
                 },
                 context,
                 executor: Box::new(executor),
@@ -930,7 +927,6 @@ async fn acp_cancel_sends_session_cancel_for_active_prompt() {
                     input: TurnInput {
                         runtime_session_id: handle_for_task.runtime_session_id,
                         prompt: "cancel me".to_string(),
-                        fresh_prompt: None,
                     },
                     context: acp_driver_context(runtime_state_root),
                     executor: Box::new(CancelableAcpProgramExecutor {
@@ -1150,7 +1146,6 @@ async fn acp_resume_uses_effective_working_directory() {
                 input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "continue".to_string(),
-                    fresh_prompt: None,
                 },
                 context,
                 executor: Box::new(executor),
@@ -1227,7 +1222,6 @@ async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
                 input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "continue".to_string(),
-                    fresh_prompt: None,
                 },
                 context,
                 executor: Box::new(executor),
@@ -1301,7 +1295,6 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
                 input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "hello".to_string(),
-                    fresh_prompt: None,
                 },
                 context: acp_driver_context(runtime_state_root.clone()),
                 executor: Box::new(executor),
@@ -1333,7 +1326,7 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
 }
 
 #[tokio::test]
-async fn acp_ready_session_without_reopen_capability_falls_back_to_fresh_prompt() {
+async fn acp_ready_session_without_reopen_capability_uses_canonical_prompt() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
@@ -1376,8 +1369,7 @@ async fn acp_ready_session_without_reopen_capability_falls_back_to_fresh_prompt(
             TurnExecution {
                 input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
-                    prompt: "resume prompt".to_string(),
-                    fresh_prompt: Some("fresh prompt".to_string()),
+                    prompt: "canonical prompt".to_string(),
                 },
                 context: acp_driver_context(runtime_state_root.clone()),
                 executor: Box::new(executor),
@@ -1410,6 +1402,6 @@ async fn acp_ready_session_without_reopen_capability_falls_back_to_fresh_prompt(
     assert_eq!(sent[2]["params"]["sessionId"], json!("ses_fresh"));
     assert_eq!(
         sent[2]["params"]["prompt"][0]["text"],
-        json!("fresh prompt")
+        json!("canonical prompt")
     );
 }

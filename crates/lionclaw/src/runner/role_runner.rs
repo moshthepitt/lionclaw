@@ -786,7 +786,6 @@ async fn execute_turn_attempt(
             input: TurnInput {
                 runtime_session_id: handle.runtime_session_id.clone(),
                 prompt: request.prompt.clone(),
-                fresh_prompt: None,
             },
             context,
             executor: Box::new(MissionProgramExecutor::new(

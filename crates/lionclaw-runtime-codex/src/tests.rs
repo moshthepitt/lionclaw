@@ -215,7 +215,6 @@ async fn codex_adapter_preserves_typed_launch_refusal() {
                 input: TurnInput {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "launch refusal probe".into(),
-                    fresh_prompt: None,
                 },
                 context: RuntimeExecutionContext {
                     network_mode: NetworkMode::None,
@@ -751,7 +750,6 @@ async fn app_server_rejects_oversized_turn_id_from_start_response() {
                 input: TurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: "test".into(),
-                    fresh_prompt: None,
                 },
                 context: RuntimeExecutionContext {
                     network_mode: NetworkMode::None,

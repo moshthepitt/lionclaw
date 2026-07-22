@@ -243,13 +243,13 @@ impl AcpTurnRunner {
                 &opened_session.session_id,
                 cancel_tx,
             )?);
-            let prompt = if opened_session.resumed_existing {
-                &input.prompt
-            } else {
-                input.fresh_prompt.as_deref().unwrap_or(&input.prompt)
-            };
             let prompt_result = client
-                .prompt(&opened_session.session_id, prompt, &journal, &mut cancel_rx)
+                .prompt(
+                    &opened_session.session_id,
+                    &input.prompt,
+                    &journal,
+                    &mut cancel_rx,
+                )
                 .await;
             let final_response = prompt_result?;
             Ok(TurnResult {

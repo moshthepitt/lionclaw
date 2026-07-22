@@ -74,7 +74,6 @@ pub struct RuntimeTerminalProgramInput {
 pub struct TurnInput {
     pub runtime_session_id: String,
     pub prompt: String,
-    pub fresh_prompt: Option<String>,
 }
 
 pub struct TurnExecution {
