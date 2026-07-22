@@ -10,11 +10,12 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use clap::Parser;
 use lionclaw::config::RuntimeProfiles;
-use lionclaw::engine::MissionDisposition;
+use lionclaw::engine::{MissionDisposition, ReferenceRejectionReason};
 use lionclaw::model::{
-    apply, fold, Assertion, AssertionId, FinishClass, MissionEvent, MissionPhase, MissionState,
-    OracleName, PayloadRef, Plan, PlanProposal, Requirement, RequirementDisposition, RequirementId,
-    RequirementKind, RoleName, Task, TaskId, TaskKind, TaskStatus, REDUCER_VERSION, SCHEMA_VERSION,
+    apply, fold, Assertion, AssertionId, FinishClass, MessageReference, MissionEvent, MissionPhase,
+    MissionState, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, Requirement,
+    RequirementDisposition, RequirementId, RequirementKind, RoleName, Task, TaskId, TaskKind,
+    TaskStatus, REDUCER_VERSION, SCHEMA_VERSION,
 };
 use lionclaw::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
 use lionclaw::store::MissionStore;
@@ -128,7 +129,7 @@ async fn assert_reference_send_rejected(
     mission: &lionclaw::model::MissionId,
     conversation: &lionclaw::model::ConversationId,
     reference_args: Vec<String>,
-    expected: &str,
+    expected: ReferenceRejectionReason,
 ) {
     let before_events = store.load(mission).await.unwrap();
     let before_state = fold(before_events.clone()).unwrap();
@@ -155,19 +156,18 @@ async fn assert_reference_send_rejected(
     let error = cli::run(cli::Cli::try_parse_from(args).unwrap())
         .await
         .expect_err("invalid production reference set must fail closed");
-    assert!(
-        error
-            .downcast_ref::<lionclaw::engine::ReferenceRejectionReason>()
-            .is_some(),
-        "reference rejection lost its closed typed reason: {error:#}"
-    );
-    assert!(
-        format!("{error:#}").contains(expected),
-        "unexpected rejection: {error:#}"
+    assert_eq!(
+        error.downcast_ref::<ReferenceRejectionReason>(),
+        Some(&expected),
+        "reference rejection lost exact typed truth: {error:#}"
     );
     let after_events = store.load(mission).await.unwrap();
     let after_state = fold(after_events.clone()).unwrap();
     assert_eq!(after_events, before_events, "rejection partially appended");
+    assert_eq!(
+        after_state, before_state,
+        "rejection changed head, recipients, queues, cursors, delivery, presentation, or active boundary"
+    );
     assert_eq!(
         after_events
             .iter()
@@ -722,7 +722,7 @@ fn awaiting_lead_validation_plan() -> Plan {
                 kind: TaskKind::Validate,
                 body: "validate the already available evidence".into(),
                 targets: vec![assertion],
-                role: Some(RoleName::new("validator").unwrap()),
+                role: Some(RoleName::new("renamed-judgment-role").unwrap()),
                 depends_on: vec![],
             },
         ],
@@ -793,7 +793,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let mission_type = temp.path().join("mission-type");
     materialize_mission_type(&mission_type);
     std::fs::write(
-        mission_type.join("roles/validator.md"),
+        mission_type.join("roles/renamed-judgment-role.md"),
         "---\noutput: emits-verdict\nruntime: codex\n---\nValidate existing evidence.\n",
     )
     .unwrap();
@@ -952,6 +952,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert!(active.conversation_is_messageable(conversation_id));
     assert_eq!(active.inflight.len(), 1, "role effects serialize");
     let (effect_id, effect) = active.inflight.iter().next().unwrap();
+    let effect_id = effect_id.clone();
     assert!(matches!(
         effect,
         lionclaw::model::InflightEffect::RoleRun { task_id, .. } if task_id == &validator_id
@@ -962,13 +963,28 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .find(|(_, conversation)| conversation.task_id == validator_id)
         .map(|(id, _)| id.clone())
         .unwrap();
+    let validator_prompt = prompts.lock().unwrap().last().unwrap().0.clone();
+    for producer_controlled in [
+        "reachable commit ",
+        "park evidence ",
+        "authoritative receipt ",
+        "base.txt",
+    ] {
+        assert!(
+            !validator_prompt.contains(producer_controlled),
+            "reference expansion leaked into renamed EmitsVerdict prompt: {producer_controlled}"
+        );
+    }
     assert_reference_send_rejected(
         &repo,
         &store,
         &mission,
         &validator_conversation,
         vec!["--commit".into(), base.clone()],
-        "output semantics emits-verdict",
+        ReferenceRejectionReason::Disallowed {
+            conversation_id: validator_conversation.clone(),
+            output: OutputSemantics::EmitsVerdict,
+        },
     )
     .await;
 
@@ -991,9 +1007,10 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     )
     .await
     .expect_err("a mixed judgment recipient send must fail closed");
-    assert!(
-        format!("{mixed_error:#}").contains("mixture of permitted and disallowed recipients"),
-        "unexpected mixed-recipient rejection: {mixed_error:#}"
+    assert_eq!(
+        mixed_error.downcast_ref::<ReferenceRejectionReason>(),
+        Some(&ReferenceRejectionReason::MixedRecipients),
+        "mixed-recipient rejection lost exact typed truth: {mixed_error:#}"
     );
     assert_eq!(
         store.load(&mission).await.unwrap(),
@@ -3655,18 +3672,29 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     .to_string();
     assert!(repo.join(".git/objects").exists());
 
+    let malformed_sha = "0".repeat(40);
     for (args, expected) in [
         (
-            vec!["--commit".into(), "0".repeat(40)],
-            "malformed or belongs to another mission",
+            vec!["--commit".into(), malformed_sha.clone()],
+            ReferenceRejectionReason::MalformedOrForeign {
+                reference: MessageReference::ReachableCommit { sha: malformed_sha },
+            },
         ),
         (
             vec!["--commit".into(), unreachable.clone()],
-            "malformed or belongs to another mission",
+            ReferenceRejectionReason::MalformedOrForeign {
+                reference: MessageReference::ReachableCommit {
+                    sha: unreachable.clone(),
+                },
+            },
         ),
         (
             vec!["--commit".into(), oversized_commit.to_string()],
-            "oversized",
+            ReferenceRejectionReason::Oversized {
+                reference: Some(MessageReference::ReachableCommit {
+                    sha: oversized_commit.to_string(),
+                }),
+            },
         ),
         (
             vec![
@@ -3675,7 +3703,11 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
                 "--commit".into(),
                 unreachable.clone(),
             ],
-            "malformed or belongs to another mission",
+            ReferenceRejectionReason::MalformedOrForeign {
+                reference: MessageReference::ReachableCommit {
+                    sha: unreachable.clone(),
+                },
+            },
         ),
     ] {
         assert_reference_send_rejected(&repo, &store, &mission, &conversation, args, expected)
@@ -3690,7 +3722,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         &mission,
         &conversation,
         too_many,
-        "oversized",
+        ReferenceRejectionReason::Oversized { reference: None },
     )
     .await;
     let aggregate = (0..lionclaw::model::MAX_MESSAGE_REFERENCES)
@@ -3702,7 +3734,11 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         &mission,
         &conversation,
         aggregate,
-        "oversized",
+        ReferenceRejectionReason::Oversized {
+            reference: Some(MessageReference::AuthoritativeReceipt {
+                effect_id: receipt.clone(),
+            }),
+        },
     )
     .await;
 
@@ -3748,6 +3784,19 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     )
     .await
     .unwrap();
+    assert_reference_send_rejected(
+        &repo,
+        &store,
+        &mission,
+        &conversation,
+        vec!["--park".into(), park.to_string()],
+        ReferenceRejectionReason::Stale {
+            reference: MessageReference::ParkEvidence {
+                effect_id: park.clone(),
+            },
+        },
+    )
+    .await;
     cli::run_with_transports(driver("references-delivered"), transports.clone())
         .await
         .unwrap();
@@ -3972,9 +4021,21 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .next()
         .unwrap()
         .clone();
-    for (flag, identity) in [
-        ("--receipt", foreign_receipt.to_string()),
-        ("--park", foreign_park.to_string()),
+    for (flag, identity, reference) in [
+        (
+            "--receipt",
+            foreign_receipt.to_string(),
+            MessageReference::AuthoritativeReceipt {
+                effect_id: foreign_receipt.clone(),
+            },
+        ),
+        (
+            "--park",
+            foreign_park.to_string(),
+            MessageReference::ParkEvidence {
+                effect_id: foreign_park.clone(),
+            },
+        ),
     ] {
         assert_reference_send_rejected(
             &repo,
@@ -3982,7 +4043,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             &mission,
             &conversation,
             vec![flag.into(), identity],
-            "malformed or belongs to another mission",
+            ReferenceRejectionReason::MalformedOrForeign { reference },
         )
         .await;
     }
@@ -4022,7 +4083,9 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         &mission,
         &conversation,
         vec!["--receipt".into(), receipt.to_string()],
-        "is missing",
+        ReferenceRejectionReason::Missing {
+            reference: MessageReference::AuthoritativeReceipt { effect_id: receipt },
+        },
     )
     .await;
 }
