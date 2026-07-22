@@ -328,8 +328,47 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
     );
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ReceiptBlobFault {
+    Missing,
+    Corrupt,
+}
+
+impl ReceiptBlobFault {
+    fn cause(self) -> UnavailableReferenceCause {
+        match self {
+            Self::Missing => UnavailableReferenceCause::SourceMissing,
+            Self::Corrupt => UnavailableReferenceCause::InvalidContent,
+        }
+    }
+
+    fn inject(self, blob_path: &std::path::Path) {
+        match self {
+            Self::Missing => std::fs::remove_file(blob_path).unwrap(),
+            Self::Corrupt => {
+                let mut corrupted = std::fs::read(blob_path).unwrap();
+                corrupted[0] ^= 0xff;
+                let mut permissions = std::fs::metadata(blob_path).unwrap().permissions();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    permissions.set_mode(0o644);
+                }
+                std::fs::set_permissions(blob_path, permissions).unwrap();
+                std::fs::write(blob_path, corrupted).unwrap();
+            }
+        }
+    }
+}
+
 #[tokio::test]
-async fn accepted_receipt_blob_corrupt_before_dispatch_settles_once() {
+async fn accepted_receipt_blob_fault_before_dispatch_settles_once() {
+    for fault in [ReceiptBlobFault::Missing, ReceiptBlobFault::Corrupt] {
+        prove_receipt_blob_fault_settles_once(fault).await;
+    }
+}
+
+async fn prove_receipt_blob_fault_settles_once(fault: ReceiptBlobFault) {
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let observed = prompts.clone();
@@ -463,16 +502,7 @@ async fn accepted_receipt_blob_corrupt_before_dispatch_settles_once() {
         .join(&receipt_blob.hex[..2])
         .join(&receipt_blob.hex[2..4])
         .join(&receipt_blob.hex);
-    let mut corrupted = std::fs::read(&blob_path).unwrap();
-    corrupted[0] ^= 0xff;
-    let mut permissions = std::fs::metadata(&blob_path).unwrap().permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(0o644);
-    }
-    std::fs::set_permissions(&blob_path, permissions).unwrap();
-    std::fs::write(blob_path, corrupted).unwrap();
+    fault.inject(&blob_path);
 
     let attempts_before = queued.tasks[&TaskId::new("mint-receipt").unwrap()].attempts;
     let settled = h.engine.advance(&mission).await.unwrap().state;
@@ -489,10 +519,7 @@ async fn accepted_receipt_blob_corrupt_before_dispatch_settles_once() {
         settled.unavailable_references[0].reference,
         MessageReference::AuthoritativeReceipt { effect_id: receipt }
     );
-    assert_eq!(
-        settled.unavailable_references[0].cause,
-        UnavailableReferenceCause::InvalidContent
-    );
+    assert_eq!(settled.unavailable_references[0].cause, fault.cause());
     assert_eq!(
         settled.tasks[&TaskId::new("mint-receipt").unwrap()].attempts,
         attempts_before + 1
@@ -518,7 +545,7 @@ async fn accepted_receipt_blob_corrupt_before_dispatch_settles_once() {
         &mission,
         conversation.as_str(),
         &settled,
-        "receipt replay tail remains queued",
+        &format!("receipt {fault:?} replay tail remains queued"),
     )
     .await;
 }
