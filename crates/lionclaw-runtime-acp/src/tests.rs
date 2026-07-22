@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -14,9 +14,10 @@ use lionclaw_runtime_api::{
     canonical_events, ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAuthKind, RuntimeEvent,
     RuntimeExecutionContext, RuntimeMcpServerSpec, RuntimeMessageLane, RuntimeProgramExecutor,
     RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeResume,
-    RuntimeResumeMode, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalConfig,
-    RuntimeTerminalProgramInput, TurnEvent, TurnExecution, TurnInput, TypedFailure,
-    RUNTIME_SESSION_READY_MARKER, RUNTIME_TURN_JOURNAL_CAPACITY,
+    RuntimeResumeMode, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeStateDir,
+    RuntimeTerminalConfig, RuntimeTerminalProgramInput, TurnEvent, TurnExecution, TurnInput,
+    TypedFailure, RUNTIME_SESSION_READY_MARKER, RUNTIME_STATE_VALUE_LIMIT,
+    RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 
 use super::{
@@ -70,7 +71,7 @@ async fn acp_adapter_preserves_typed_launch_refusal() {
                     network_mode: NetworkMode::None,
                     working_dir: None,
                     environment: Vec::new(),
-                    runtime_state_root: None,
+                    runtime_state: None,
                     runtime_path_projections: Vec::new(),
                     mcp_servers: Vec::new(),
                 },
@@ -91,13 +92,18 @@ async fn acp_adapter_preserves_typed_launch_refusal() {
     );
 }
 
-fn mark_runtime_ready(runtime_state_root: &Path) -> RuntimeSessionReady {
+fn runtime_state(runtime_state_root: PathBuf) -> RuntimeStateDir {
+    RuntimeStateDir::new(&runtime_state_root, &runtime_state_root)
+        .expect("test-owned runtime state must be rooted")
+}
+
+fn mark_runtime_ready(runtime_state: &RuntimeStateDir) -> RuntimeSessionReady {
     std::fs::write(
-        runtime_state_root.join(RUNTIME_SESSION_READY_MARKER),
+        runtime_state.path().join(RUNTIME_SESSION_READY_MARKER),
         "ready\n",
     )
     .expect("write runtime ready marker");
-    RuntimeSessionReady::from_runtime_state_root(runtime_state_root)
+    RuntimeSessionReady::from_state_dir(runtime_state)
         .expect("runtime ready marker should be valid")
 }
 
@@ -442,7 +448,7 @@ fn acp_driver_context(runtime_state_root: PathBuf) -> RuntimeExecutionContext {
         network_mode: NetworkMode::On,
         working_dir: None,
         environment: Vec::new(),
-        runtime_state_root: Some(runtime_state_root),
+        runtime_state: Some(runtime_state(runtime_state_root)),
         runtime_path_projections: Vec::new(),
         mcp_servers: Vec::new(),
     }
@@ -686,7 +692,7 @@ async fn acp_turn_uses_profile_driver_journal() {
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_state_root.clone(),
+                state: runtime_state(runtime_state_root.clone()),
                 ready: runtime_not_ready(),
             },
         })
@@ -807,7 +813,7 @@ async fn acp_turn_projects_runtime_mcp_servers() {
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_state_root.clone(),
+                state: runtime_state(runtime_state_root.clone()),
                 ready: runtime_not_ready(),
             },
         })
@@ -878,7 +884,7 @@ async fn acp_terminal_program_uses_native_command_without_protocol_args() {
     let program = adapter
         .build_terminal_program(RuntimeTerminalProgramInput {
             session_id: Uuid::new_v4(),
-            runtime_state_root,
+            runtime_state: runtime_state(runtime_state_root),
         })
         .expect("terminal program");
 
@@ -906,7 +912,7 @@ async fn acp_cancel_sends_session_cancel_for_active_prompt() {
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_state_root.clone(),
+                state: runtime_state(runtime_state_root.clone()),
                 ready: runtime_not_ready(),
             },
         })
@@ -1051,7 +1057,8 @@ async fn acp_session_start_resumes_saved_ready_session() {
     )
     .expect("write session id");
     let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
-    let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
+    let runtime_state = runtime_state(runtime_state_root);
+    let runtime_session_ready = mark_runtime_ready(&runtime_state);
 
     let handle = adapter
         .session_start(RuntimeSessionStartInput {
@@ -1059,13 +1066,43 @@ async fn acp_session_start_resumes_saved_ready_session() {
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_state_root,
+                state: runtime_state,
                 ready: runtime_session_ready,
             },
         })
         .await
         .expect("start");
     assert!(handle.resume_mode == RuntimeResumeMode::Resumed);
+}
+
+#[tokio::test]
+async fn acp_session_start_rejects_oversized_saved_session() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    std::fs::write(
+        runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+        vec![b'x'; RUNTIME_STATE_VALUE_LIMIT + 1],
+    )
+    .expect("write oversized session id");
+    let runtime_state = runtime_state(runtime_state_root);
+    let ready = mark_runtime_ready(&runtime_state);
+    let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+
+    let error = adapter
+        .session_start(RuntimeSessionStartInput {
+            session_id: Uuid::new_v4(),
+            working_dir: None,
+            environment: Vec::new(),
+            resume: RuntimeResume::Native {
+                state: runtime_state,
+                ready,
+            },
+        })
+        .await
+        .expect_err("oversized saved ACP session must fail closed");
+
+    assert!(error.to_string().contains("4096-byte limit"));
 }
 
 #[tokio::test]
@@ -1079,14 +1116,16 @@ async fn acp_resume_uses_effective_working_directory() {
     )
     .expect("write session id");
     let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+    let runtime_state = runtime_state(runtime_state_root.clone());
+    let ready = mark_runtime_ready(&runtime_state);
     let handle = adapter
         .session_start(RuntimeSessionStartInput {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_state_root.clone(),
-                ready: mark_runtime_ready(&runtime_state_root),
+                state: runtime_state,
+                ready,
             },
         })
         .await
@@ -1154,14 +1193,16 @@ async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
     )
     .expect("write session id");
     let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+    let runtime_state = runtime_state(runtime_state_root.clone());
+    let ready = mark_runtime_ready(&runtime_state);
     let handle = adapter
         .session_start(RuntimeSessionStartInput {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_state_root.clone(),
-                ready: mark_runtime_ready(&runtime_state_root),
+                state: runtime_state,
+                ready,
             },
         })
         .await
@@ -1235,7 +1276,7 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_state_root.clone(),
+                state: runtime_state(runtime_state_root.clone()),
                 ready: runtime_not_ready(),
             },
         })
@@ -1302,14 +1343,16 @@ async fn acp_ready_session_without_reopen_capability_falls_back_to_fresh_prompt(
     )
     .expect("write stale session id");
     let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+    let runtime_state = runtime_state(runtime_state_root.clone());
+    let ready = mark_runtime_ready(&runtime_state);
     let handle = adapter
         .session_start(RuntimeSessionStartInput {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_state_root.clone(),
-                ready: mark_runtime_ready(&runtime_state_root),
+                state: runtime_state,
+                ready,
             },
         })
         .await

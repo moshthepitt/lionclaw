@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -15,8 +15,8 @@ use lionclaw_runtime_api::{
     RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMcpServerSpec, RuntimeMessageLane,
     RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
     RuntimeProgramStdoutSender, RuntimeResume, RuntimeResumeMode, RuntimeSessionHandle,
-    RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput, TurnEvent,
-    TurnExecution, TurnInput, TypedFailure, RUNTIME_SESSION_READY_MARKER,
+    RuntimeSessionReady, RuntimeSessionStartInput, RuntimeStateDir, RuntimeTerminalProgramInput,
+    TurnEvent, TurnExecution, TurnInput, TypedFailure, RUNTIME_SESSION_READY_MARKER,
 };
 
 use crate::codex_runtime_auth_kind;
@@ -33,13 +33,18 @@ fn runtime_not_ready() -> RuntimeSessionReady {
     RuntimeSessionReady::not_ready()
 }
 
-fn mark_runtime_ready(runtime_state_root: &Path) -> RuntimeSessionReady {
+fn runtime_state(runtime_state_root: PathBuf) -> RuntimeStateDir {
+    RuntimeStateDir::new(&runtime_state_root, &runtime_state_root)
+        .expect("test-owned runtime state must be rooted")
+}
+
+fn mark_runtime_ready(runtime_state: &RuntimeStateDir) -> RuntimeSessionReady {
     std::fs::write(
-        runtime_state_root.join(RUNTIME_SESSION_READY_MARKER),
+        runtime_state.path().join(RUNTIME_SESSION_READY_MARKER),
         "ready\n",
     )
     .expect("write runtime ready marker");
-    RuntimeSessionReady::from_runtime_state_root(runtime_state_root)
+    RuntimeSessionReady::from_state_dir(runtime_state)
         .expect("runtime ready marker should be valid")
 }
 
@@ -51,7 +56,7 @@ fn runtime_home_projection_context(
         network_mode: NetworkMode::On,
         working_dir: None,
         environment: Vec::new(),
-        runtime_state_root: Some(runtime_state_root.clone()),
+        runtime_state: Some(runtime_state(runtime_state_root.clone())),
         runtime_path_projections: vec![
             RuntimePathProjection::directory("/runtime", runtime_state_root)
                 .expect("runtime projection"),
@@ -188,7 +193,7 @@ async fn start_codex_test_session_with_config(
             environment: Vec::new(),
             resume: match runtime_state_root {
                 Some(state_root) => RuntimeResume::Native {
-                    state_root,
+                    state: runtime_state(state_root),
                     ready: runtime_session_ready,
                 },
                 None => RuntimeResume::Reconstruct,
@@ -216,7 +221,7 @@ async fn codex_adapter_preserves_typed_launch_refusal() {
                     network_mode: NetworkMode::None,
                     working_dir: None,
                     environment: Vec::new(),
-                    runtime_state_root: None,
+                    runtime_state: None,
                     runtime_path_projections: Vec::new(),
                     mcp_servers: Vec::new(),
                 },
@@ -370,7 +375,8 @@ fn codex_terminal_program_uses_global_options_without_saved_thread_resume() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-    save_thread_id(&runtime_state_root, "thr_saved").expect("save thread");
+    let runtime_state = runtime_state(runtime_state_root);
+    save_thread_id(&runtime_state, "thr_saved").expect("save thread");
 
     let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig {
         executable: "codex".to_string(),
@@ -379,7 +385,7 @@ fn codex_terminal_program_uses_global_options_without_saved_thread_resume() {
     let program = adapter
         .build_terminal_program(RuntimeTerminalProgramInput {
             session_id: Uuid::new_v4(),
-            runtime_state_root,
+            runtime_state,
         })
         .expect("terminal program");
 
@@ -751,7 +757,7 @@ async fn app_server_rejects_oversized_turn_id_from_start_response() {
                     network_mode: NetworkMode::None,
                     working_dir: None,
                     environment: Vec::new(),
-                    runtime_state_root: None,
+                    runtime_state: None,
                     runtime_path_projections: Vec::new(),
                     mcp_servers: Vec::new(),
                 },
@@ -775,7 +781,8 @@ async fn codex_session_rejects_oversized_restored_thread_id() {
         format!("{}\n", "x".repeat(2_048)),
     )
     .expect("write oversized thread state");
-    let ready = mark_runtime_ready(&runtime_state_root);
+    let runtime_state = runtime_state(runtime_state_root);
+    let ready = mark_runtime_ready(&runtime_state);
     let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
 
     let error = adapter
@@ -784,7 +791,7 @@ async fn codex_session_rejects_oversized_restored_thread_id() {
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_state_root,
+                state: runtime_state,
                 ready,
             },
         })
@@ -1351,7 +1358,7 @@ fn codex_generated_image_path_respects_blocked_runtime_projection() {
         network_mode: NetworkMode::On,
         working_dir: None,
         environment: Vec::new(),
-        runtime_state_root: Some(runtime_state_root.clone()),
+        runtime_state: Some(runtime_state(runtime_state_root.clone())),
         runtime_path_projections: vec![
             RuntimePathProjection::directory("/runtime", runtime_state_root.clone())
                 .expect("runtime projection"),
@@ -2260,14 +2267,15 @@ async fn symlinked_thread_file_is_rejected() {
     symlink(&target, runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE)).expect("create symlink");
 
     let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-    let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
+    let runtime_state = runtime_state(runtime_state_root);
+    let runtime_session_ready = mark_runtime_ready(&runtime_state);
     let err = adapter
         .session_start(RuntimeSessionStartInput {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_state_root,
+                state: runtime_state,
                 ready: runtime_session_ready,
             },
         })
@@ -2289,6 +2297,8 @@ async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
         .expect("write thread b");
 
     let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+    let runtime_a = runtime_state(runtime_a);
+    let runtime_b = runtime_state(runtime_b);
     let runtime_a_ready = mark_runtime_ready(&runtime_a);
     let runtime_b_ready = mark_runtime_ready(&runtime_b);
     let handle_a = adapter
@@ -2297,7 +2307,7 @@ async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_a,
+                state: runtime_a,
                 ready: runtime_a_ready,
             },
         })
@@ -2309,7 +2319,7 @@ async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_b,
+                state: runtime_b,
                 ready: runtime_b_ready,
             },
         })
@@ -2387,14 +2397,15 @@ async fn start_codex_ready_test_session(
     super::CodexThreadState,
 ) {
     let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-    let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
+    let runtime_state = runtime_state(runtime_state_root);
+    let runtime_session_ready = mark_runtime_ready(&runtime_state);
     let handle = adapter
         .session_start(RuntimeSessionStartInput {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state_root: runtime_state_root,
+                state: runtime_state,
                 ready: runtime_session_ready,
             },
         })

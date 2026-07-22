@@ -108,6 +108,9 @@ pub struct MissionTypeDefinition {
     pub stop: StopBar,
     /// The confinement image every role and oracle runs in (from `mission.toml`).
     pub image: String,
+    /// Domain-owned environment shared by roles and oracles. Kernel-owned
+    /// execution coordinates cannot be overridden here.
+    pub environment: BTreeMap<String, String>,
     /// The planning DAG (how an objective becomes a proposed contract). Empty
     /// ⇒ no in-engine planning; a mission of this type awaits a proposed plan.
     pub planning: PlanningDag,
@@ -189,6 +192,7 @@ impl MissionType {
         self.execution
             .validate_at(now_ms)
             .map_err(|error| anyhow::anyhow!("[execution] invalid execution policy: {error}"))?;
+        validate_mission_environment(&self.environment)?;
         for (name, role) in &self.roles {
             crate::authority::validate_role_authority_request(role)?;
             if name != &role.name {
@@ -274,9 +278,98 @@ impl MissionType {
     }
 }
 
+const KERNEL_ENVIRONMENT_KEYS: &[&str] = &[
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "TMPDIR",
+    "GIT_OPTIONAL_LOCKS",
+    "LIONCLAW_WORKSPACE_DIR",
+    "LIONCLAW_OUTPUT",
+    "MISSION_EFFECT",
+];
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+pub(crate) fn validate_environment_entry(name: &str, value: &str) -> Result<(), String> {
+    if !valid_environment_name(name) {
+        return Err(format!("key '{name}' is invalid"));
+    }
+    if KERNEL_ENVIRONMENT_KEYS.contains(&name) {
+        return Err(format!("key '{name}' is owned by the LionClaw kernel"));
+    }
+    if value.contains('\0') {
+        return Err(format!("value for '{name}' contains NUL"));
+    }
+    Ok(())
+}
+
+fn validate_mission_environment(environment: &BTreeMap<String, String>) -> anyhow::Result<()> {
+    for (name, value) in environment {
+        validate_environment_entry(name, value)
+            .map_err(|detail| anyhow::anyhow!("[mission-type] environment {detail}"))?;
+    }
+    Ok(())
+}
+
+/// Compose one deterministic process environment. The mission type supplies
+/// domain policy; a prepared input may explicitly replace that policy for the
+/// oracle consuming the immutable input.
+pub(crate) fn execution_environment(
+    kernel: impl IntoIterator<Item = (String, String)>,
+    mission: &BTreeMap<String, String>,
+    prepared_input: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let mut environment = BTreeMap::from_iter(kernel);
+    environment.extend(mission.clone());
+    environment.extend(prepared_input);
+    environment.into_iter().collect()
+}
+
 #[cfg(any(test, feature = "testing"))]
 fn test_definition_digest(definition: &MissionTypeDefinition) -> String {
     use sha2::{Digest, Sha256};
 
     hex::encode(Sha256::digest(format!("{definition:#?}").as_bytes()))
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+
+    #[test]
+    fn mission_environment_cannot_override_kernel_coordinates() {
+        for name in KERNEL_ENVIRONMENT_KEYS {
+            let error = validate_mission_environment(&BTreeMap::from([(
+                (*name).to_string(),
+                "override".to_string(),
+            )]))
+            .expect_err("kernel coordinate must remain authoritative");
+            assert!(error.to_string().contains("owned by the LionClaw kernel"));
+        }
+    }
+
+    #[test]
+    fn prepared_input_is_the_explicit_final_environment_overlay() {
+        let composed = execution_environment(
+            [("HOME".to_string(), "/runtime/home".to_string())],
+            &BTreeMap::from([
+                ("BUILD_CACHE".to_string(), "/scratch/cache".to_string()),
+                ("TOOL_HOME".to_string(), "/scratch/tool".to_string()),
+            ]),
+            [("TOOL_HOME".to_string(), "/inputs/tool".to_string())],
+        );
+        let composed = BTreeMap::from_iter(composed);
+        assert_eq!(composed["HOME"], "/runtime/home");
+        assert_eq!(composed["BUILD_CACHE"], "/scratch/cache");
+        assert_eq!(composed["TOOL_HOME"], "/inputs/tool");
+    }
 }

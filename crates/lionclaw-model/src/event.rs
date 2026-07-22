@@ -45,6 +45,26 @@ pub enum RolePromptTemplate {
     Judgment,
 }
 
+/// The one renderer branch compatible with a durable role contract.
+pub const fn role_prompt_template(
+    namespace: TaskNamespace,
+    output: OutputSemantics,
+) -> Option<RolePromptTemplate> {
+    match (namespace, output) {
+        (
+            TaskNamespace::Planning,
+            OutputSemantics::ProducesReport | OutputSemantics::ProposesPlan,
+        ) => Some(RolePromptTemplate::Planning),
+        (TaskNamespace::Execution, OutputSemantics::ProducesArtifact) => {
+            Some(RolePromptTemplate::Execution)
+        }
+        (TaskNamespace::Execution, OutputSemantics::EmitsVerdict) => {
+            Some(RolePromptTemplate::Judgment)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MessageReference {
@@ -531,6 +551,37 @@ pub struct RoleRunRequestIdentity {
     pub presented_messages: Vec<u64>,
 }
 
+impl RoleRunRequestIdentity {
+    /// Validate the content-derived effect identity, canonical conversation,
+    /// and immutable message boundary shared by fold and live dispatch.
+    pub fn has_canonical_coordinates(
+        &self,
+        mission_id: &MissionId,
+        effect_id: &super::EffectId,
+        requested_seq: u64,
+    ) -> bool {
+        self.conversation_id
+            == ConversationId::for_role_instance(
+                mission_id,
+                self.namespace,
+                &self.task_id,
+                &self.role,
+                self.assignment_epoch,
+            )
+            && effect_id
+                == &super::EffectId::for_role_request(
+                    self.namespace,
+                    mission_id,
+                    &self.task_id,
+                    self.attempt_no,
+                    self.assignment_epoch,
+                    &self.prompt_hash,
+                )
+            && requested_seq > 0
+            && self.message_boundary == requested_seq.saturating_sub(1)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OracleRunSuccess {
@@ -637,9 +688,9 @@ pub enum MissionEvent {
         reference: MessageReference,
         cause: UnavailableReferenceCause,
     },
-    /// Kernel-observed confirmation that the task-owned writable checkout
-    /// exists at the assignment base. Request intent never updates workspace
-    /// provenance; only this post-materialization fact does.
+    /// Kernel-observed confirmation that the conversation-owned writable
+    /// checkout exists at the assignment base. Request intent never updates
+    /// workspace provenance; only this post-materialization fact does.
     TaskWorkspacePrepared {
         task_id: TaskId,
         effect_id: super::EffectId,

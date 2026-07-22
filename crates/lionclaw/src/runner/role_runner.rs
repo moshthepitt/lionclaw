@@ -23,15 +23,14 @@ use crate::authority::{
     compile_authority, compile_role_plan, AuthorityCeiling, MissionMounts, RolePlanRequest,
 };
 use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig, RuntimeProfiles};
-use crate::model::OutputSemantics;
+use crate::model::{OutputSemantics, RoleResourceLifetime};
 use crate::ports::{ExecutionControl, RoleRunOutcome, RoleRunRequest, RoleRunner};
+use crate::resources::MissionDirs;
 
 use super::executor::{mission_execution_context, MissionProgramExecutor};
 use super::handoff::read_optional_handoff;
 use super::native_home_auth::NativeHomeAuthProvider;
-use super::{
-    await_controlled, prepare_skill_mounts, ConversationDirs, EffectDirs, SCRATCH_MOUNT_TARGET,
-};
+use super::{await_controlled, effect_mounts, prepare_skill_mounts};
 use crate::workspace;
 
 pub struct OciRoleRunner {
@@ -307,41 +306,42 @@ fn completed_turn_evidence(
 async fn prepare_writer_checkout(
     repo: &std::path::Path,
     workspace: &std::path::Path,
-    observer_index: &std::path::Path,
+    observer_index: &lionclaw_durable_fs::RootedDirectory,
     base_sha: &str,
     recreate_workspace: bool,
 ) -> Result<(), TypedFailure> {
     let mut replace = !workspace.exists();
     if workspace.exists() {
-        let head = workspace::task_head_sha(workspace)
+        let head = workspace::checkout_head_sha(workspace)
             .await
             .map_err(|e| launch(format!("failed to inspect retained checkout HEAD: {e}")))?;
         if !recreate_workspace {
-            if workspace::task_commit_exists(workspace, base_sha).await
-                && workspace::task_is_ancestor(workspace, base_sha, &head)
+            if workspace::checkout_commit_exists(workspace, base_sha).await
+                && workspace::checkout_is_ancestor(workspace, base_sha, &head)
                     .await
                     .map_err(|e| {
                         launch(format!("failed to compare retained checkout ancestry: {e}"))
                     })?
             {
-                workspace::prepare_task_observer_index(repo, observer_index, base_sha, false)
+                workspace::prepare_checkout_observer_index(repo, observer_index, base_sha, false)
                     .await
                     .map_err(|e| launch(format!("failed to prepare workspace observer: {e}")))?;
                 return Ok(());
             }
             return Err(launch(format!(
-                "retained task workspace HEAD {head} does not descend from its recorded base {base_sha}"
+                "retained conversation checkout HEAD {head} does not descend from its recorded base {base_sha}"
             )));
         }
         if head == base_sha {
             replace = false;
         } else {
-            if workspace::task_is_dirty(workspace)
+            if workspace::checkout_is_dirty(workspace)
                 .await
                 .map_err(|e| launch(format!("failed to inspect retained checkout: {e}")))?
             {
                 return Err(launch(
-                    "refusing to recreate a dirty task workspace on a moved base".to_string(),
+                    "refusing to recreate a dirty conversation checkout on a moved base"
+                        .to_string(),
                 ));
             }
             if !workspace::commit_exists(repo, &head).await
@@ -352,7 +352,7 @@ async fn prepare_writer_checkout(
                     })?
             {
                 return Err(launch(format!(
-                    "refusing to recreate task workspace with uncaptured commits at {head}"
+                    "refusing to recreate conversation checkout with uncaptured commits at {head}"
                 )));
             }
             replace = true;
@@ -363,7 +363,7 @@ async fn prepare_writer_checkout(
             .await
             .map_err(|e| launch(format!("failed to create checkout: {e}")))?;
     }
-    workspace::prepare_task_observer_index(
+    workspace::prepare_checkout_observer_index(
         repo,
         observer_index,
         base_sha,
@@ -376,19 +376,6 @@ async fn prepare_writer_checkout(
 #[async_trait]
 impl RoleRunner for OciRoleRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
-        let expected_conversation = crate::model::ConversationId::for_role_instance(
-            &request.mission_id,
-            request.namespace,
-            &request.task_id,
-            &request.role.name,
-            request.assignment_epoch,
-        );
-        if request.conversation_id != expected_conversation {
-            return Err(launch(
-                "role request conversation identity does not match its immutable coordinates"
-                    .into(),
-            ));
-        }
         if let Some(declared) = &request.role.runtime {
             if declared != &request.runtime {
                 return Err(launch(format!(
@@ -398,23 +385,42 @@ impl RoleRunner for OciRoleRunner {
             }
         }
         let profile = self.profile(&request.runtime)?;
-        let conversation_dirs = ConversationDirs::prepare(
-            &request.state_dir,
-            request.mission_id.as_str(),
-            &request.conversation_id,
-        )
-        .map_err(|e| launch(format!("failed to prepare conversation dirs: {e}")))?;
-
-        let dirs = EffectDirs::prepare(
-            &request.state_dir,
-            request.mission_id.as_str(),
-            &request.effect_id,
-        )
-        .map_err(|e| launch(format!("failed to prepare attempt dirs: {e}")))?;
+        if let Some(failure) = setup_control_failure(&profile, &request.control.borrow().clone()) {
+            return Err(failure);
+        }
+        let mission_dirs = MissionDirs::new(&request.state_dir, &request.mission_id);
+        let dirs = mission_dirs.effect(&request.effect_id).role();
+        let lifetime = request.role.output.resource_lifetime();
+        let (role_state, state_observer_index) = match lifetime {
+            RoleResourceLifetime::Conversation => {
+                let conversation_id = crate::model::ConversationId::for_role_instance(
+                    &request.mission_id,
+                    request.namespace,
+                    &request.task_id,
+                    &request.role.name,
+                    request.assignment_epoch,
+                );
+                let conversation = mission_dirs.conversation(&conversation_id);
+                (
+                    conversation.role_state().clone(),
+                    Some(conversation.files().map_err(|error| {
+                        launch(format!(
+                            "invalid conversation resource authority: {error:#}"
+                        ))
+                    })?),
+                )
+            }
+            RoleResourceLifetime::Effect => (dirs.role_state().clone(), None),
+        };
+        dirs.prepare()
+            .map_err(|e| launch(format!("failed to prepare role effect dirs: {e}")))?;
+        role_state
+            .prepare()
+            .map_err(|e| launch(format!("failed to prepare role state dirs: {e}")))?;
 
         let setup = async {
             let skill_mounts = prepare_skill_mounts(
-                &dirs.runtime_home,
+                dirs.runtime_home(),
                 &request.skills,
                 profile.skills_dir.as_ref(),
             )
@@ -422,19 +428,23 @@ impl RoleRunner for OciRoleRunner {
             let authority = compile_authority(&request.role, &self.ceiling)
                 .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
             let is_writer = authority.output() == OutputSemantics::ProducesArtifact;
-            let (workspace_source, scratch_source, observer_index) = if is_writer {
+            let (workspace_source, observer_index) = if is_writer {
+                debug_assert_eq!(lifetime, RoleResourceLifetime::Conversation);
                 let capture = request.artifact_capture.as_ref().ok_or_else(|| {
                     launch("artifact-producing role has no capture authority".into())
                 })?;
-                if capture.checkout_dir() != conversation_dirs.work {
+                if capture.checkout_dir() != role_state.work() {
                     return Err(launch(
-                        "artifact capture authority names a different task checkout".into(),
+                        "artifact capture authority names a different conversation checkout".into(),
                     ));
                 }
                 (
                     capture.checkout_dir().to_path_buf(),
-                    conversation_dirs.scratch.clone(),
-                    Some(conversation_dirs.observer_index.clone()),
+                    Some(
+                        state_observer_index
+                            .clone()
+                            .expect("writer conversation has an observer index"),
+                    ),
                 )
             } else {
                 if request.artifact_capture.is_some() {
@@ -442,11 +452,7 @@ impl RoleRunner for OciRoleRunner {
                         "read-only role received artifact capture authority".into(),
                     ));
                 }
-                (
-                    conversation_dirs.work.clone(),
-                    conversation_dirs.scratch.clone(),
-                    None,
-                )
+                (role_state.work().to_path_buf(), None)
             };
             {
                 let _guard = self.repo_lock.lock().await;
@@ -454,7 +460,7 @@ impl RoleRunner for OciRoleRunner {
                     prepare_writer_checkout(
                         &request.workspace_dir,
                         &workspace_source,
-                        observer_index.as_deref().expect("writer observer index"),
+                        observer_index.as_ref().expect("writer observer index"),
                         &request.base_sha,
                         request.recreate_workspace,
                     )
@@ -480,15 +486,9 @@ impl RoleRunner for OciRoleRunner {
             // Compile the plan through the moat. Judged roots = the workspace
             // the verdict is about (only meaningful for verdict roles, but the
             // predicate is applied uniformly).
-            let mut extras = dirs.effect_mounts(&scratch_source);
-            if let Some(runtime) = extras
-                .iter_mut()
-                .find(|mount| mount.target == lionclaw_confinement::RUNTIME_MOUNT_TARGET)
-            {
-                runtime.source = conversation_dirs.runtime.clone();
-            }
+            let mut extras = effect_mounts(&dirs, &role_state);
             extras.extend(skill_mounts);
-            let environment = mission_environment(&dirs);
+            let environment = mission_environment(&dirs, &request.environment);
             let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
             let compiled = compile_role_plan(RolePlanRequest {
                 authority: &authority,
@@ -504,19 +504,21 @@ impl RoleRunner for OciRoleRunner {
             .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
             Ok((is_writer, compiled.plan().clone()))
         };
-        let (is_writer, plan) = await_controlled(setup, request.control.clone(), |control| {
-            setup_control_failure(&profile, control)
-        })
-        .await?;
+        let (is_writer, plan) =
+            await_controlled(Box::pin(setup), request.control.clone(), |control| {
+                setup_control_failure(&profile, control)
+            })
+            .await?;
 
         // The adapter owns cancellation acknowledgement while its turn is
         // live. Setup and capture use the same engine control, but are simply
-        // dropped: their child processes are kill-on-drop and task work is not.
+        // dropped: child processes are kill-on-drop and retained conversation
+        // state stays outside disposable effect resources.
         let (applied, final_response) = self.run_turn(&profile, &request, plan).await?;
         let cancellation_configuration = applied.clone();
         let cancellation_response = final_response.clone();
         let finish = async {
-            let handoff = read_optional_handoff(&dirs.handoff, request.role.output).map_err(
+            let handoff = read_optional_handoff(dirs.handoff(), request.role.output).map_err(
                 |mut failure| {
                     failure.evidence_mut().final_response = final_response.clone();
                     failure.evidence_mut().configuration = applied.clone();
@@ -569,7 +571,7 @@ impl RoleRunner for OciRoleRunner {
                 final_response,
             })
         };
-        await_controlled(finish, request.control.clone(), |control| {
+        await_controlled(Box::pin(finish), request.control.clone(), |control| {
             setup_control_failure(&profile, control).map(|mut failure| {
                 failure.evidence_mut().configuration = cancellation_configuration.clone();
                 failure.evidence_mut().final_response = cancellation_response.clone();
@@ -587,8 +589,10 @@ impl OciRoleRunner {
         request: &RoleRunRequest,
         plan: lionclaw_confinement::EffectiveExecutionPlan,
     ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
-        self.run_turn_with_context(profile, request, plan, mission_execution_context)
-            .await
+        self.run_turn_with_context(profile, request, plan, |plan| {
+            mission_execution_context(plan, &request.state_dir)
+        })
+        .await
     }
 
     async fn run_turn_with_context(
@@ -619,18 +623,13 @@ impl OciRoleRunner {
         let context =
             context_builder(&plan).map_err(|e| launch(format!("execution context failed: {e}")))?;
 
-        let state_root = profile
+        let runtime_state = profile
             .native_resume
-            .then(|| {
-                plan.mounts
-                    .iter()
-                    .find(|m| m.target == lionclaw_confinement::RUNTIME_MOUNT_TARGET)
-                    .map(|m| m.source.clone())
-            })
+            .then(|| context.runtime_state.clone())
             .flatten();
-        let runtime_session_ready = state_root
-            .as_deref()
-            .map(RuntimeSessionReady::from_runtime_state_root)
+        let runtime_session_ready = runtime_state
+            .as_ref()
+            .map(RuntimeSessionReady::from_state_dir)
             .transpose()
             .map_err(|e| launch(format!("native session state invalid: {e}")))?
             .unwrap_or_else(RuntimeSessionReady::not_ready);
@@ -640,9 +639,9 @@ impl OciRoleRunner {
                     session_id: uuid_from_key(request.effect_id.as_str()),
                     working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
                     environment: plan.environment.clone(),
-                    resume: match state_root.clone() {
-                        Some(state_root) => RuntimeResume::Native {
-                            state_root,
+                    resume: match runtime_state.clone() {
+                        Some(state) => RuntimeResume::Native {
+                            state,
                             ready: runtime_session_ready,
                         },
                         None => RuntimeResume::Reconstruct,
@@ -651,7 +650,7 @@ impl OciRoleRunner {
                 .await
                 .map_err(|e| launch(format!("session_start failed: {e}")))
         };
-        let handle = await_controlled(start, request.control.clone(), |control| {
+        let handle = await_controlled(Box::pin(start), request.control.clone(), |control| {
             setup_control_failure(profile, control)
         })
         .await?;
@@ -696,9 +695,9 @@ impl OciRoleRunner {
                     session_id: uuid_from_key(request.effect_id.as_str()),
                     working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
                     environment: plan.environment.clone(),
-                    resume: match state_root.clone() {
-                        Some(state_root) => RuntimeResume::Native {
-                            state_root,
+                    resume: match runtime_state.clone() {
+                        Some(state) => RuntimeResume::Native {
+                            state,
                             ready: RuntimeSessionReady::not_ready(),
                         },
                         None => RuntimeResume::Reconstruct,
@@ -743,8 +742,8 @@ impl OciRoleRunner {
         // adapter durably recorded even when the delivered outcome is a
         // failure, interruption, or deadline. Adapters with no saved identity
         // truthfully reconstruct on the next request.
-        if let Some(root) = state_root {
-            lionclaw_runtime_api::record_runtime_resume_mode(&root, resume_mode)
+        if let Some(state) = runtime_state {
+            lionclaw_runtime_api::record_runtime_resume_mode(&state, resume_mode)
                 .map_err(|e| launch(format!("failed to commit native session state: {e}")))?;
         }
 
@@ -989,39 +988,34 @@ fn turn_failure_evidence(
     }
 }
 
-/// Env for a mission container: HOME/XDG under the runtime home, TMPDIR, and
-/// cargo (CARGO_HOME/CARGO_TARGET_DIR) under the writable scratch mount so
-/// builds stay out of the read-only rootfs. Kept minimal and mission-specific
-/// rather than importing the kernel planner's env builder.
-fn mission_environment(dirs: &EffectDirs) -> Vec<(String, String)> {
+/// Kernel-owned execution coordinates for a role, composed with the pinned
+/// mission type's domain environment.
+fn mission_environment(
+    dirs: &crate::resources::RoleEffectDirs,
+    declared: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
     let home = lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET;
-    vec![
-        ("HOME".to_string(), home.to_string()),
-        ("XDG_CONFIG_HOME".to_string(), format!("{home}/.config")),
-        ("XDG_CACHE_HOME".to_string(), format!("{home}/.cache")),
-        ("XDG_DATA_HOME".to_string(), format!("{home}/.local/share")),
-        ("XDG_STATE_HOME".to_string(), format!("{home}/.local/state")),
-        ("TMPDIR".to_string(), "/tmp".to_string()),
-        ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
-        (
-            "CARGO_HOME".to_string(),
-            format!("{SCRATCH_MOUNT_TARGET}/cargo"),
-        ),
-        (
-            "CARGO_TARGET_DIR".to_string(),
-            format!("{SCRATCH_MOUNT_TARGET}/target"),
-        ),
-        (
-            "LIONCLAW_WORKSPACE_DIR".to_string(),
-            WORKSPACE_MOUNT_TARGET.to_string(),
-        ),
-    ]
-    .into_iter()
-    .chain(std::iter::once((
-        "MISSION_EFFECT".to_string(),
-        dirs.root.to_string_lossy().into_owned(),
-    )))
-    .collect()
+    crate::mission_type::execution_environment(
+        [
+            ("HOME".to_string(), home.to_string()),
+            ("XDG_CONFIG_HOME".to_string(), format!("{home}/.config")),
+            ("XDG_CACHE_HOME".to_string(), format!("{home}/.cache")),
+            ("XDG_DATA_HOME".to_string(), format!("{home}/.local/share")),
+            ("XDG_STATE_HOME".to_string(), format!("{home}/.local/state")),
+            ("TMPDIR".to_string(), "/tmp".to_string()),
+            ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+            (
+                "LIONCLAW_WORKSPACE_DIR".to_string(),
+                WORKSPACE_MOUNT_TARGET.to_string(),
+            ),
+            (
+                "MISSION_EFFECT".to_string(),
+                dirs.root().to_string_lossy().into_owned(),
+            ),
+        ],
+        declared,
+        std::iter::empty(),
+    )
 }
 
 /// Deterministic session UUID derived from the effect ID (no RNG).
@@ -1037,6 +1031,7 @@ mod tests {
     use super::*;
     use crate::mission_type::SkillPackage;
     use crate::ports::{EffectCleaner, EffectCleanupRequest};
+    use crate::resources::MissionDirs;
     use lionclaw_confinement::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, InstallPolicy, MountAccess,
         MountSpec, NetworkMode, OciConfinementConfig, WorkspaceAccess,
@@ -1045,8 +1040,7 @@ mod tests {
         RuntimeAdapterInfo, RuntimeCancellation, RuntimeDriverProvider, RuntimeTurnJournalSender,
         TurnResult,
     };
-    use std::collections::BTreeSet;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::Mutex as StdMutex;
@@ -1276,13 +1270,6 @@ mod tests {
         let (activity, _activity_rx) = tokio::sync::watch::channel(None);
         RoleRunRequest {
             mission_id: crate::model::MissionId::for_creation("/workspace", "fallback", 1),
-            conversation_id: crate::model::ConversationId::for_role_instance(
-                &crate::model::MissionId::for_creation("/workspace", "fallback", 1),
-                crate::model::TaskNamespace::Execution,
-                &crate::model::TaskId::new("fallback-boundary").unwrap(),
-                &crate::model::RoleName::new("implementer").unwrap(),
-                1,
-            ),
             namespace: crate::model::TaskNamespace::Execution,
             task_id: crate::model::TaskId::new("fallback-boundary").unwrap(),
             attempt_no: 1,
@@ -1297,6 +1284,7 @@ mod tests {
                 skills: Vec::new(),
                 prompt_body: String::new(),
             },
+            environment: Default::default(),
             runtime: "codex".into(),
             skills: Vec::new(),
             prompt: "canonical current prompt\nfolded user message\nfolded assistant message"
@@ -1314,27 +1302,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn role_environment_composes_domain_policy_without_kernel_tool_assumptions() {
+        let temp = tempfile::tempdir().unwrap();
+        let mission_id = crate::model::MissionId::for_creation("/workspace", "environment", 1);
+        let effect_id = crate::model::EffectId::for_parts(&["environment"]);
+        let dirs = crate::resources::MissionDirs::new(temp.path(), &mission_id)
+            .effect(&effect_id)
+            .role();
+        let environment = BTreeMap::from_iter(mission_environment(
+            &dirs,
+            &BTreeMap::from([("BUILD_OUTPUT".to_string(), "/scratch/build".to_string())]),
+        ));
+
+        assert_eq!(environment["HOME"], "/runtime/home");
+        assert_eq!(environment["BUILD_OUTPUT"], "/scratch/build");
+        assert_eq!(environment["MISSION_EFFECT"], dirs.root().to_string_lossy());
+    }
+
     #[tokio::test]
-    async fn dispatch_rejects_a_conversation_identity_from_another_epoch() {
+    async fn durable_control_precedes_role_resource_setup() {
         let temp = tempfile::tempdir().unwrap();
         let runner = OciRoleRunner::new(
             RuntimeProfiles::built_in().unwrap(),
-            "identity-test-image".into(),
+            "unused-image".into(),
             AuthorityCeiling::default(),
         );
-        let mut request = fallback_request(temp.path());
-        request.conversation_id = crate::model::ConversationId::for_role_instance(
-            &request.mission_id,
-            request.namespace,
-            &request.task_id,
-            &request.role.name,
-            request.assignment_epoch + 1,
-        );
-
-        let failure = runner.run(request).await.expect_err("cross-epoch dispatch");
-        assert!(failure
-            .to_string()
-            .contains("conversation identity does not match"));
+        for (control, expected) in [
+            (ExecutionControl::Stop("stop".into()), "stop"),
+            (ExecutionControl::Abort("abort".into()), "abort"),
+            (ExecutionControl::DeadlineExhausted, "deadline"),
+        ] {
+            let mut request = fallback_request(temp.path());
+            request.control = tokio::sync::watch::channel(control).1;
+            let failure = runner
+                .run(request)
+                .await
+                .expect_err("durable control must win before missing state resources");
+            assert!(
+                matches!(
+                    (&failure, expected),
+                    (TypedFailure::OperatorStopped { .. }, "stop")
+                        | (TypedFailure::OperatorAborted { .. }, "abort")
+                        | (TypedFailure::DeadlineExhausted { .. }, "deadline")
+                ),
+                "expected {expected}, got {failure:?}"
+            );
+        }
+        assert!(!temp.path().join("state").exists());
     }
 
     async fn run_fallback_boundary(
@@ -1349,8 +1364,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
         std::fs::create_dir_all(temp.path().join("runtime")).unwrap();
+        let runtime_state =
+            lionclaw_runtime_api::RuntimeStateDir::new(temp.path(), temp.path().join("runtime"))
+                .unwrap();
         lionclaw_runtime_api::record_runtime_resume_mode(
-            &temp.path().join("runtime"),
+            &runtime_state,
             RuntimeResumeMode::Resumed,
         )
         .unwrap();
@@ -1391,6 +1409,7 @@ mod tests {
         });
         let context_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls = context_calls.clone();
+        let state_anchor = temp.path().to_path_buf();
         let result = runner
             .run_turn_with_context(
                 &profile,
@@ -1401,7 +1420,7 @@ mod tests {
                     if failure_point == FallbackFailurePoint::ReconstructionContext && call == 1 {
                         anyhow::bail!("scripted reconstruction context failure");
                     }
-                    mission_execution_context(plan)
+                    mission_execution_context(plan, &state_anchor)
                 },
             )
             .await;
@@ -1449,8 +1468,12 @@ mod tests {
         );
         drop(observations);
         assert!(
-            lionclaw_runtime_api::RuntimeSessionReady::from_runtime_state_root(
-                &temp.path().join("runtime")
+            lionclaw_runtime_api::RuntimeSessionReady::from_state_dir(
+                &lionclaw_runtime_api::RuntimeStateDir::new(
+                    temp.path(),
+                    temp.path().join("runtime"),
+                )
+                .unwrap(),
             )
             .unwrap()
             .is_ready(),
@@ -1617,11 +1640,12 @@ mod tests {
             &crate::model::RoleName::new("implementer").unwrap(),
             1,
         );
-        let conversation =
-            ConversationDirs::prepare(temp.path(), mission_id.as_str(), &conversation_id).unwrap();
-        std::fs::create_dir_all(&conversation.work).unwrap();
-        std::fs::write(conversation.runtime.join("opaque-session"), b"private").unwrap();
-        std::fs::write(conversation.work.join("workspace-identity"), b"stable").unwrap();
+        let mission_dirs = MissionDirs::new(temp.path(), &mission_id);
+        let conversation = mission_dirs.conversation(&conversation_id);
+        conversation.role_state().prepare().unwrap();
+        std::fs::create_dir_all(conversation.work()).unwrap();
+        std::fs::write(conversation.runtime().join("opaque-session"), b"private").unwrap();
+        std::fs::write(conversation.work().join("workspace-identity"), b"stable").unwrap();
 
         let engine = temp.path().join("fake-oci");
         std::fs::write(&engine, "#!/bin/sh\nexit 0\n").unwrap();
@@ -1644,22 +1668,20 @@ mod tests {
             // Re-open from the durable identity on every iteration, as a new
             // engine process does after loading the store. Effect identity is
             // deliberately absent from this lookup.
-            let reopened =
-                ConversationDirs::prepare(temp.path(), mission_id.as_str(), &conversation_id)
-                    .unwrap();
-            assert_eq!(reopened.root, conversation.root);
-            assert_eq!(reopened.work, conversation.work);
-            assert_eq!(reopened.runtime, conversation.runtime);
+            let reopened = mission_dirs.conversation(&conversation_id);
+            reopened.role_state().prepare().unwrap();
+            assert_eq!(reopened.work(), conversation.work());
+            assert_eq!(reopened.runtime(), conversation.runtime());
             let effect_id = crate::model::EffectId::for_parts(&["outcome", outcome]);
-            let effect = EffectDirs::prepare(temp.path(), mission_id.as_str(), &effect_id).unwrap();
+            let effect = mission_dirs.effect(&effect_id).role();
+            effect.prepare().unwrap();
             for relative in [
                 "handoff/handoff.json",
                 "runtime-home/credentials",
                 "runtime/authorization",
-                "scratch/privileged-projection",
                 "effect-work",
             ] {
-                let path = effect.root.join(relative);
+                let path = effect.root().join(relative);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).unwrap();
                 }
@@ -1675,13 +1697,13 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert!(!effect.root.exists(), "effect leaked after {outcome}");
+            assert!(!effect.root().exists(), "effect leaked after {outcome}");
             assert_eq!(
-                std::fs::read(conversation.runtime.join("opaque-session")).unwrap(),
+                std::fs::read(conversation.runtime().join("opaque-session")).unwrap(),
                 b"private"
             );
             assert_eq!(
-                std::fs::read(conversation.work.join("workspace-identity")).unwrap(),
+                std::fs::read(conversation.work().join("workspace-identity")).unwrap(),
                 b"stable"
             );
         }
@@ -1694,9 +1716,9 @@ mod tests {
         let retry_cleaner =
             crate::effect_cleanup::LocalEffectCleaner::new(engine.to_string_lossy().into_owned());
         let retry_effect_id = crate::model::EffectId::for_parts(&["outcome", "cleanup-retry"]);
-        let retry_effect =
-            EffectDirs::prepare(temp.path(), mission_id.as_str(), &retry_effect_id).unwrap();
-        std::fs::write(retry_effect.runtime_home.join("credential"), b"private").unwrap();
+        let retry_effect = mission_dirs.effect(&retry_effect_id).role();
+        retry_effect.prepare().unwrap();
+        std::fs::write(retry_effect.runtime_home().join("credential"), b"private").unwrap();
         let retry_request = EffectCleanupRequest {
             mission_id: mission_id.clone(),
             effect_id: retry_effect_id,
@@ -1710,16 +1732,16 @@ mod tests {
             .expect_err("fault-injected container cleanup must block settlement");
         // Local projections are removed even when container removal fails;
         // the retry is solely for the still-unsettled external cleanup.
-        assert!(!retry_effect.root.exists());
-        assert!(!retry_effect.runtime_home.join("credential").exists());
-        assert!(conversation.runtime.join("opaque-session").is_file());
+        assert!(!retry_effect.root().exists());
+        assert!(!retry_effect.runtime_home().join("credential").exists());
+        assert!(conversation.runtime().join("opaque-session").is_file());
         retry_cleaner.cleanup(retry_request).await.unwrap();
-        assert!(!retry_effect.root.exists());
-        assert!(conversation.runtime.join("opaque-session").is_file());
-        assert!(conversation.work.join("workspace-identity").is_file());
+        assert!(!retry_effect.root().exists());
+        assert!(conversation.runtime().join("opaque-session").is_file());
+        assert!(conversation.work().join("workspace-identity").is_file());
 
         // A replacement assignment is a new role instance and therefore
-        // cannot inherit the old native identity or task checkout.
+        // cannot inherit the old native identity or conversation checkout.
         let replacement_id = crate::model::ConversationId::for_role_instance(
             &mission_id,
             crate::model::TaskNamespace::Execution,
@@ -1728,10 +1750,10 @@ mod tests {
             2,
         );
         assert_ne!(replacement_id, conversation_id);
-        let replacement =
-            ConversationDirs::prepare(temp.path(), mission_id.as_str(), &replacement_id).unwrap();
-        assert!(!replacement.runtime.join("opaque-session").exists());
-        assert!(!replacement.work.join("workspace-identity").exists());
+        let replacement = mission_dirs.conversation(&replacement_id);
+        replacement.role_state().prepare().unwrap();
+        assert!(!replacement.runtime().join("opaque-session").exists());
+        assert!(!replacement.work().join("workspace-identity").exists());
     }
 
     #[test]
@@ -1806,10 +1828,9 @@ mod tests {
         base: &str,
         recreate: bool,
     ) -> Result<(), TypedFailure> {
-        let observer_index = task_work
-            .parent()
-            .expect("test task work has a parent")
-            .join("observer.index");
+        let observer_root = task_work.parent().expect("test task work has a parent");
+        let observer_index =
+            lionclaw_durable_fs::RootedDirectory::new(observer_root, observer_root).unwrap();
         prepare_writer_checkout(repo, task_work, &observer_index, base, recreate).await
     }
 
@@ -2067,7 +2088,10 @@ mod tests {
         prepare_test_writer(&repo, &task_work, &moved, true)
             .await
             .unwrap();
-        assert_eq!(workspace::task_head_sha(&task_work).await.unwrap(), moved);
+        assert_eq!(
+            workspace::checkout_head_sha(&task_work).await.unwrap(),
+            moved
+        );
     }
 
     #[tokio::test]
@@ -2096,7 +2120,10 @@ mod tests {
         prepare_test_writer(&repo, &task_work, &base, false)
             .await
             .unwrap();
-        assert_eq!(workspace::task_head_sha(&task_work).await.unwrap(), partial);
+        assert_eq!(
+            workspace::checkout_head_sha(&task_work).await.unwrap(),
+            partial
+        );
         assert_eq!(
             std::fs::read_to_string(task_work.join("committed-rework")).unwrap(),
             "preserve this commit\n"
@@ -2169,7 +2196,7 @@ mod tests {
             .unwrap_err();
         assert!(error.detail().contains("uncaptured commits"));
         assert_eq!(
-            workspace::task_head_sha(&task_work).await.unwrap(),
+            workspace::checkout_head_sha(&task_work).await.unwrap(),
             uncaptured
         );
         assert_eq!(
@@ -2206,6 +2233,9 @@ mod tests {
         assert!(error
             .detail()
             .contains("does not descend from its recorded base"));
-        assert_eq!(workspace::task_head_sha(&task_work).await.unwrap(), base);
+        assert_eq!(
+            workspace::checkout_head_sha(&task_work).await.unwrap(),
+            base
+        );
     }
 }

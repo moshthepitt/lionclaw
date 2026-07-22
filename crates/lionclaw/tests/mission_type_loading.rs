@@ -42,6 +42,11 @@ fn software_dev_mission_type_loads() {
     .expect("software-dev mission type loads");
     assert_eq!(mission_type.name, "software-dev");
     assert_eq!(mission_type.stop, StopBar::Verified);
+    assert_eq!(mission_type.environment["CARGO_HOME"], "/scratch/cargo");
+    assert_eq!(
+        mission_type.environment["CARGO_TARGET_DIR"],
+        "/scratch/target"
+    );
     assert!(
         mission_type
             .roles
@@ -60,6 +65,24 @@ fn software_dev_mission_type_loads() {
         lionclaw::model::OutputSemantics::ProposesPlan
     );
     assert_eq!(mission_type.roles[&planner.role].output, planner.output);
+}
+
+#[test]
+fn mission_environment_cannot_replace_kernel_coordinates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"bounded\"\nstop = \"verified\"\nimage = \"img\"\nenvironment = { HOME = \"/elsewhere\" }\n",
+    )
+    .unwrap();
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("kernel coordinate override must fail closed");
+    assert!(
+        matches!(&error, MissionTypeError::Manifest(detail) if detail.contains("owned by the LionClaw kernel")),
+        "got {error:?}"
+    );
 }
 
 #[test]
@@ -572,6 +595,25 @@ fn prepared_input_declarations_load_as_plain_mission_type_data() {
     assert!(input.network);
     assert_eq!(input.key_files, [PathBuf::from("Cargo.lock")]);
     assert_eq!(input.environment["CARGO_HOME"], "/inputs/cargo-home");
+}
+
+#[test]
+fn prepared_input_environment_cannot_replace_kernel_coordinates() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    add_input_program(dir.path(), "cache");
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[[inputs]]\nname = \"cache\"\nnetwork = false\nkey-files = [\"Cargo.lock\"]\nenvironment = { TMPDIR = \"/inputs/cache\" }\n",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        &load_err(dir.path()),
+        MissionTypeError::Input { detail, .. }
+            if detail.contains("TMPDIR") && detail.contains("owned by the LionClaw kernel")
+    ));
 }
 
 #[test]

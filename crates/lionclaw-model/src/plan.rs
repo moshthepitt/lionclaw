@@ -60,6 +60,15 @@ pub enum OutputSemantics {
     ProposesPlan,
 }
 
+/// Host-resource lifetime implied by the closed output contract. Roles that
+/// can pause for dialogue retain their state with the conversation; mandatory
+/// judgment turns are one-shot and remain inside their disposable effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleResourceLifetime {
+    Conversation,
+    Effect,
+}
+
 impl OutputSemantics {
     /// Whether lead messages may carry producer-controlled reference prose to
     /// this output boundary. Judgment outputs receive only engine-owned
@@ -78,6 +87,14 @@ impl OutputSemantics {
         match self {
             Self::ProducesReport | Self::ProducesArtifact | Self::ProposesPlan => false,
             Self::EmitsVerdict | Self::EmitsGapVerdict => true,
+        }
+    }
+
+    pub const fn resource_lifetime(self) -> RoleResourceLifetime {
+        if self.requires_handoff() {
+            RoleResourceLifetime::Effect
+        } else {
+            RoleResourceLifetime::Conversation
         }
     }
 
@@ -105,7 +122,27 @@ impl OutputSemantics {
 
 #[cfg(test)]
 mod output_semantics_tests {
-    use super::OutputSemantics;
+    use super::{OutputSemantics, RoleResourceLifetime};
+
+    #[test]
+    fn output_semantics_derive_resource_lifetime_exhaustively() {
+        for output in [
+            OutputSemantics::ProducesReport,
+            OutputSemantics::ProducesArtifact,
+            OutputSemantics::ProposesPlan,
+        ] {
+            assert_eq!(
+                output.resource_lifetime(),
+                RoleResourceLifetime::Conversation
+            );
+        }
+        for output in [
+            OutputSemantics::EmitsVerdict,
+            OutputSemantics::EmitsGapVerdict,
+        ] {
+            assert_eq!(output.resource_lifetime(), RoleResourceLifetime::Effect);
+        }
+    }
 
     #[test]
     fn reference_policy_is_exhaustive_and_judgment_safe() {

@@ -132,6 +132,7 @@ pub fn test_mission_type() -> MissionType {
         name: "software-dev-test".to_string(),
         stop: StopBar::Verified,
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
+        environment: BTreeMap::new(),
         planning: Default::default(),
         recovery: Default::default(),
         execution: lionclaw::model::ExecutionPolicy {

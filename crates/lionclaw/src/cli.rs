@@ -13,7 +13,8 @@ use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand};
 use crate::authority::AuthorityCeiling;
 use crate::config::{MissionRuntimeProfile, RuntimeProfiles};
 use crate::engine::{
-    load_mission_view, record_control, Engine, EngineServices, MissionDisposition, MissionView,
+    load_mission_view, reconcile_disposable_conversation_resources_if_idle, record_control, Engine,
+    EngineServices, MissionDisposition, MissionView,
 };
 use crate::mission_type::{
     add_skill, install_mission_type, load_materialized_mission_type, load_mission_type,
@@ -364,7 +365,9 @@ pub struct DriverArgs {
 #[derive(Args)]
 pub struct DriverStderrArgs {
     #[arg(long)]
-    pub mission_dir: PathBuf,
+    pub state_dir: PathBuf,
+    #[arg(long)]
+    pub mission_id: String,
 }
 
 #[derive(Args)]
@@ -1737,14 +1740,14 @@ impl Drop for DetachedDriver {
 
 fn spawn_detached_driver(
     command: &mut std::process::Command,
-    mission_dir: &Path,
+    mission_dirs: &crate::resources::MissionDirs,
 ) -> Result<DetachedDriver> {
-    spawn_detached_driver_with(command, mission_dir, std::process::Command::spawn)
+    spawn_detached_driver_with(command, mission_dirs, std::process::Command::spawn)
 }
 
 fn spawn_detached_driver_with(
     command: &mut std::process::Command,
-    mission_dir: &Path,
+    mission_dirs: &crate::resources::MissionDirs,
     spawn_stderr_spool: impl FnOnce(&mut std::process::Command) -> std::io::Result<std::process::Child>,
 ) -> Result<DetachedDriver> {
     let executable = std::env::current_exe()?;
@@ -1766,8 +1769,10 @@ fn spawn_detached_driver_with(
     spool
         .arg("mission")
         .arg("driver-stderr")
-        .arg("--mission-dir")
-        .arg(mission_dir)
+        .arg("--state-dir")
+        .arg(mission_dirs.state_dir())
+        .arg("--mission-id")
+        .arg(mission_dirs.mission_id().as_str())
         .stdin(std::process::Stdio::from(stderr))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -1780,15 +1785,15 @@ fn spawn_detached_driver_with(
 async fn await_driver_startup(
     child: &mut DetachedDriver,
     handshake: &Path,
-    mission_dir: &Path,
+    mission_dirs: &crate::resources::MissionDirs,
 ) -> Result<DriverStartup> {
-    await_driver_startup_with_timeout(child, handshake, mission_dir, Duration::from_secs(5)).await
+    await_driver_startup_with_timeout(child, handshake, mission_dirs, Duration::from_secs(5)).await
 }
 
 async fn await_driver_startup_with_timeout(
     child: &mut DetachedDriver,
     handshake: &Path,
-    mission_dir: &Path,
+    mission_dirs: &crate::resources::MissionDirs,
     timeout: Duration,
 ) -> Result<DriverStartup> {
     let startup = tokio::time::timeout(timeout, async {
@@ -1801,7 +1806,7 @@ async fn await_driver_startup_with_timeout(
                 if status.success() {
                     return Ok(DriverStartup::LostRace);
                 }
-                let detail = crate::activity::driver_error(mission_dir)
+                let detail = crate::activity::driver_error(mission_dirs)
                     .unwrap_or_else(|| "no driver error evidence was recorded".into());
                 bail!("mission driver exited before startup ({status}): {detail}");
             }
@@ -1850,12 +1855,13 @@ async fn cmd_advance(
         initial.disposition,
         MissionDisposition::Ready | MissionDisposition::CleanupBlocked
     ) {
-        let handshake = store.mission_dir(&mission_id).join(format!(
+        let mission_dirs = store.mission_dirs(&mission_id);
+        let handshake = mission_dirs.root().join(format!(
             "driver-{}-{}.ready",
             std::process::id(),
             SystemClock.now_ms()
         ));
-        crate::activity::clear_driver_run_evidence(&store.mission_dir(&mission_id))?;
+        crate::activity::clear_driver_run_evidence(&mission_dirs)?;
         let mut command = std::process::Command::new(std::env::current_exe()?);
         command
             .arg("mission")
@@ -1868,12 +1874,12 @@ async fn cmd_advance(
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null());
         isolate_driver_process_group(&mut command);
-        let spawned = spawn_detached_driver(&mut command, &store.mission_dir(&mission_id))?;
+        let spawned = spawn_detached_driver(&mut command, &mission_dirs)?;
         child = Some(spawned);
         let startup_result = await_driver_startup(
             child.as_mut().expect("driver was just spawned"),
             &handshake,
-            &store.mission_dir(&mission_id),
+            &mission_dirs,
         )
         .await;
         let _ = std::fs::remove_file(&handshake);
@@ -1883,17 +1889,24 @@ async fn cmd_advance(
         if let Some(mut child) = child {
             let status = child.wait().await?;
             if !status.success() {
-                let detail = crate::activity::driver_error(&store.mission_dir(&mission_id))
+                let detail = crate::activity::driver_error(&store.mission_dirs(&mission_id))
                     .unwrap_or_else(|| "no driver error evidence was recorded".into());
                 bail!("mission driver exited unsuccessfully ({status}): {detail}");
             }
             if startup == Some(DriverStartup::LostRace) {
                 wait_for_existing_driver(&store, &mission_id).await?;
             }
-        } else if matches!(initial.disposition, MissionDisposition::Running) {
+        } else if matches!(
+            initial.disposition,
+            MissionDisposition::Running | MissionDisposition::Terminal
+        ) {
             wait_for_existing_driver(&store, &mission_id).await?;
         }
     }
+    // Parked and fully terminal missions still use advance as the explicit
+    // retry after a descriptor-safe scratch removal failed. A live or newly
+    // launched driver owns its own final reconciliation.
+    reconcile_disposable_conversation_resources_if_idle(&store, &mission_id).await?;
     let engine = build_engine_for_mission(store, &repo, &mission_id, transports).await?;
     let view = load_mission_view(engine.store(), &mission_id).await?;
     let state = &view.state;
@@ -1949,8 +1962,8 @@ async fn cmd_driver(
 ) -> Result<std::process::ExitCode> {
     let mission_id = MissionId::parse(&args.mission_id)?;
     let store = MissionStore::open(&args.repo).await?;
-    let mission_dir = store.mission_dir(&mission_id);
-    crate::activity::clear_driver_error(&mission_dir)?;
+    let mission_dirs = store.mission_dirs(&mission_id);
+    crate::activity::clear_driver_error(&mission_dirs)?;
     let result = async {
         let engine = build_engine_for_mission(store, &args.repo, &mission_id, transports).await?;
         engine
@@ -1960,15 +1973,17 @@ async fn cmd_driver(
     }
     .await;
     if let Err(error) = &result {
-        let _ = crate::activity::record_driver_error(&mission_dir, error);
+        let _ = crate::activity::record_driver_error(&mission_dirs, error);
     }
     result
 }
 
 async fn cmd_driver_stderr(args: DriverStderrArgs) -> Result<std::process::ExitCode> {
+    let mission_id = MissionId::parse(&args.mission_id)?;
+    let mission_dirs = crate::resources::MissionDirs::new(&args.state_dir, &mission_id);
     tokio::task::spawn_blocking(move || {
         let stdin = std::io::stdin();
-        crate::activity::spool_driver_stderr(stdin.lock(), &args.mission_dir)
+        crate::activity::spool_driver_stderr(stdin.lock(), &mission_dirs)
     })
     .await
     .context("joining driver stderr spool")??;
@@ -2028,7 +2043,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
         if view.disposition == MissionDisposition::Running {
             print_activity(&store, state)?;
         }
-        if let Some(error) = crate::activity::driver_error(&store.mission_dir(&mission_id)) {
+        if let Some(error) = crate::activity::driver_error(&store.mission_dirs(&mission_id)) {
             println!("driver error: {error}");
         }
         for (effect_id, parked) in &state.parked_effects {
@@ -2103,7 +2118,7 @@ async fn status_json(view: &MissionView, store: &MissionStore) -> Result<serde_j
         .and_then(|activity| serde_json::to_value(activity).ok())
         .unwrap_or(serde_json::Value::Null);
     value["driver_error"] =
-        crate::activity::driver_error(&store.mission_dir(&view.state.mission_id))
+        crate::activity::driver_error(&store.mission_dirs(&view.state.mission_id))
             .map_or(serde_json::Value::Null, serde_json::Value::String);
     Ok(value)
 }
@@ -2114,13 +2129,13 @@ fn running_activity(
     disposition: MissionDisposition,
 ) -> Option<crate::activity::ActivityProjection> {
     (disposition == MissionDisposition::Running)
-        .then(|| crate::activity::load_validated(&store.mission_dir(&state.mission_id), state))
+        .then(|| crate::activity::load_validated(&store.mission_dirs(&state.mission_id), state))
         .flatten()
 }
 
 fn print_activity(store: &MissionStore, state: &crate::model::MissionState) -> Result<()> {
     let Some(activity) =
-        crate::activity::load_validated(&store.mission_dir(&state.mission_id), state)
+        crate::activity::load_validated(&store.mission_dirs(&state.mission_id), state)
     else {
         return Ok(());
     };
@@ -2527,15 +2542,22 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
                 print_conversations(state, store, "  ")?;
             }
             MissionDisposition::CleanupBlocked => {
-                let failure = state
-                    .cleanup_failure
-                    .as_ref()
-                    .expect("cleanup-blocked view has failure detail");
-                println!(
-                    "mission {mission_id}: cleanup blocked for effect {} ({:?})",
-                    failure.effect_id, failure.resource
-                );
-                println!("  {}", failure.failure.detail());
+                if let Some(failure) = &state.cleanup_failure {
+                    println!(
+                        "mission {mission_id}: cleanup blocked for effect {} ({:?})",
+                        failure.effect_id, failure.resource
+                    );
+                    println!("  {}", failure.failure.detail());
+                } else {
+                    println!(
+                        "mission {mission_id}: {} with {} inherited effect(s) awaiting cleanup",
+                        phase_slug(&state.phase),
+                        state.inflight.len()
+                    );
+                    for effect_id in state.inflight.keys() {
+                        println!("  effect {effect_id}: no live driver; recovery required");
+                    }
+                }
             }
             MissionDisposition::Terminal => {
                 println!("mission {mission_id}: {}", phase_slug(&state.phase));
@@ -2680,11 +2702,19 @@ fn task_runtime_json(
     task: &crate::model::TaskRuntimeState,
     workspace_observation: Option<&crate::activity::WorkspaceObservation>,
 ) -> Result<serde_json::Value> {
+    let assignment = task.role_assignment.as_ref();
+    let workspace = task.workspace_provenance.as_ref();
     Ok(serde_json::json!({
         "id": id.as_str(),
         "status": format!("{:?}", task.status).to_ascii_lowercase(),
-        "workspace_base_sha": task.workspace_base_sha,
-        "assignment_epoch": task.assignment_epoch,
+        "assignment_base_sha": assignment.map(|assignment| assignment.base_sha.as_str()),
+        "assignment_epoch": assignment.map(|assignment| assignment.assignment_epoch).unwrap_or(0),
+        "workspace_provenance": workspace.map(|workspace| serde_json::json!({
+            "effect_id": workspace.effect_id.as_str(),
+            "conversation_id": workspace.conversation_id.as_str(),
+            "base_sha": workspace.base_sha,
+            "assignment_epoch": workspace.assignment_epoch,
+        })),
         "workspace_observation": workspace_observation,
         "runtime_configuration": task.last_runtime_configuration,
         "failure": task.last_failure,
@@ -2699,14 +2729,18 @@ fn conversation_views(
         .conversations
         .iter()
         .map(|(id, conversation)| {
-            let runtime_root = store
-                .mission_dir(&state.mission_id)
-                .join("conversations")
-                .join(id.as_str())
-                .join("runtime");
-            let resume_mode = match lionclaw_runtime_api::recorded_runtime_resume_mode(
+            let runtime_root = crate::resources::MissionDirs::new(
+                store.lionclaw_dir(),
+                &state.mission_id,
+            )
+            .conversation(id)
+            .runtime()
+            .to_path_buf();
+            let runtime_state = lionclaw_runtime_api::RuntimeStateDir::new(
+                store.lionclaw_dir(),
                 &runtime_root,
-            )? {
+            )?;
+            let resume_mode = match lionclaw_runtime_api::recorded_runtime_resume_mode(&runtime_state)? {
                 Some(lionclaw_runtime_api::RuntimeResumeMode::Resumed) => "native_session",
                 Some(lionclaw_runtime_api::RuntimeResumeMode::Reconstructed) | None => {
                     "canonical_reconstruction"
@@ -3110,6 +3144,13 @@ mod tests {
     use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
     use std::collections::{BTreeMap, BTreeSet};
 
+    fn test_mission_dirs(root: &Path) -> crate::resources::MissionDirs {
+        let mission_id = MissionId::parse("mabc123def456").unwrap();
+        let dirs = crate::resources::MissionDirs::new(root, &mission_id);
+        dirs.prepare().unwrap();
+        dirs
+    }
+
     #[cfg(unix)]
     #[test]
     fn detached_driver_uses_a_process_group_isolated_from_the_invoker() {
@@ -3314,6 +3355,7 @@ mod tests {
             name: "runtime-test".to_string(),
             stop: StopBar::Verified,
             image: "image".to_string(),
+            environment: BTreeMap::new(),
             planning: Default::default(),
             recovery: Default::default(),
             execution: Default::default(),
@@ -3595,6 +3637,12 @@ mod tests {
                 deadline_ms: 100_000,
                 budget_deadline_ms: 100_000,
             },
+            MissionEvent::TaskWorkspacePrepared {
+                task_id: TaskId::new("fix").unwrap(),
+                effect_id: review_role_effect(),
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+            },
             MissionEvent::RoleRunCompleted {
                 effect_id: review_role_effect(),
                 request: Box::new(crate::model::RoleRunRequestIdentity {
@@ -3759,10 +3807,28 @@ mod tests {
     #[tokio::test]
     async fn mission_view_json_carries_one_disposition_and_action_projection() {
         use crate::model::{
-            PayloadRef, RuntimeConfigurationEvidence, TaskId, TaskRuntimeState, TaskStatus,
+            AssertionId, PayloadRef, RoleName, RuntimeConfigurationEvidence, Task, TaskId,
+            TaskKind, TaskRoleAssignment, TaskRuntimeState, TaskStatus, TaskWorkspaceProvenance,
         };
 
         let mut state = review_state(vec![oracle_completed(1)]);
+        state
+            .plan
+            .as_mut()
+            .unwrap()
+            .tasks
+            .extend(
+                ["retained", "unobservable"]
+                    .into_iter()
+                    .map(|task_id| Task {
+                        id: TaskId::new(task_id).unwrap(),
+                        kind: TaskKind::Work,
+                        body: "preserve the assigned workspace".into(),
+                        targets: vec![AssertionId::new("TESTS-PASS").unwrap()],
+                        role: Some(RoleName::new("implementer").unwrap()),
+                        depends_on: vec![],
+                    }),
+            );
         state.planning.tasks.insert(
             TaskId::new("planner").unwrap(),
             TaskRuntimeState {
@@ -3784,8 +3850,8 @@ mod tests {
                         lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
                     ),
                 }),
-                workspace_base_sha: Some("base".into()),
-                assignment_epoch: 1,
+                role_assignment: None,
+                workspace_provenance: None,
             },
         );
         state.tasks.insert(
@@ -3798,8 +3864,8 @@ mod tests {
                 last_failure: None,
                 feedback: Vec::new(),
                 last_runtime_configuration: None,
-                workspace_base_sha: Some("base".into()),
-                assignment_epoch: 1,
+                role_assignment: None,
+                workspace_provenance: None,
             },
         );
         state.tasks.insert(
@@ -3812,8 +3878,8 @@ mod tests {
                 last_failure: None,
                 feedback: Vec::new(),
                 last_runtime_configuration: None,
-                workspace_base_sha: Some("base".into()),
-                assignment_epoch: 1,
+                role_assignment: None,
+                workspace_provenance: None,
             },
         );
         let conversation_id = crate::model::ConversationId::for_role_instance(
@@ -3885,36 +3951,79 @@ mod tests {
             .output()
             .unwrap();
         let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
-        let retained = store
-            .lionclaw_dir()
-            .join("missions")
-            .join(mission_id.as_str())
-            .join("tasks/retained/work");
-        crate::workspace::create_checkout(temp.path(), &retained, &base)
+        let mission_dirs = crate::resources::MissionDirs::new(store.lionclaw_dir(), &mission_id);
+        let retained_dirs = mission_dirs.conversation(&conversation_id);
+        retained_dirs.role_state().prepare().unwrap();
+        crate::workspace::create_checkout(temp.path(), retained_dirs.work(), &base)
             .await
             .unwrap();
-        let observer_index = retained.parent().unwrap().join("observer.index");
-        crate::workspace::prepare_task_observer_index(temp.path(), &observer_index, &base, true)
-            .await
-            .unwrap();
-        view.state
+        crate::workspace::prepare_checkout_observer_index(
+            temp.path(),
+            &retained_dirs.files().unwrap(),
+            &base,
+            true,
+        )
+        .await
+        .unwrap();
+        let retained_task = view
+            .state
             .tasks
             .get_mut(&TaskId::new("retained").unwrap())
+            .unwrap();
+        retained_task.role_assignment = Some(TaskRoleAssignment {
+            base_sha: "moved-base".into(),
+            assignment_epoch: 2,
+        });
+        retained_task.workspace_provenance = Some(TaskWorkspaceProvenance {
+            effect_id: crate::model::EffectId::for_parts(&["retained", "prepared"]),
+            conversation_id: conversation_id.clone(),
+            base_sha: base.clone(),
+            assignment_epoch: 1,
+        });
+        view.state
+            .conversations
+            .get_mut(&conversation_id)
             .unwrap()
-            .workspace_base_sha = Some(base.clone());
+            .workspace_base_sha = base.clone();
+        std::fs::write(retained_dirs.work().join("partial.txt"), "preserved\n").unwrap();
+
+        let unobservable_task = TaskId::new("unobservable").unwrap();
+        let unobservable_id = crate::model::ConversationId::for_role_instance(
+            &mission_id,
+            crate::model::TaskNamespace::Execution,
+            &unobservable_task,
+            &crate::model::RoleName::new("implementer").unwrap(),
+            1,
+        );
         view.state
             .tasks
             .get_mut(&TaskId::new("unobservable").unwrap())
             .unwrap()
-            .workspace_base_sha = Some(base);
-        std::fs::write(retained.join("partial.txt"), "preserved\n").unwrap();
-        let unobservable = store
-            .lionclaw_dir()
-            .join("missions")
-            .join(mission_id.as_str())
-            .join("tasks/unobservable/work");
-        std::fs::create_dir_all(&unobservable).unwrap();
-        std::fs::write(unobservable.join("partial.txt"), "unknown\n").unwrap();
+            .workspace_provenance = Some(TaskWorkspaceProvenance {
+            effect_id: crate::model::EffectId::for_parts(&["unobservable", "prepared"]),
+            conversation_id: unobservable_id.clone(),
+            base_sha: base.clone(),
+            assignment_epoch: 1,
+        });
+        view.state.conversations.insert(
+            unobservable_id.clone(),
+            crate::model::ConversationState {
+                role: crate::model::RoleName::new("implementer").unwrap(),
+                namespace: crate::model::TaskNamespace::Execution,
+                task_id: unobservable_task,
+                assignment_epoch: 1,
+                workspace_base_sha: base.clone(),
+                lifecycle: crate::model::ConversationLifecycle::Completed,
+                queued: vec![],
+                consumed_through: 0,
+                active_delivery: None,
+                final_response: None,
+                invalid_handoff_reworks: 0,
+            },
+        );
+        let unobservable_dirs = mission_dirs.conversation(&unobservable_id);
+        std::fs::create_dir_all(unobservable_dirs.work()).unwrap();
+        std::fs::write(unobservable_dirs.work().join("partial.txt"), "unknown\n").unwrap();
         std::fs::write(
             crate::activity::path(&store.mission_dir(&mission_id)),
             b"stale",
@@ -3961,6 +4070,10 @@ mod tests {
             .unwrap()
             .contains("partial.txt"));
         assert_eq!(retained["workspace_observation"]["status"], "changed");
+        assert_eq!(retained["assignment_base_sha"], "moved-base");
+        assert_eq!(retained["assignment_epoch"], 2);
+        assert_eq!(retained["workspace_provenance"]["base_sha"], base);
+        assert_eq!(retained["workspace_provenance"]["assignment_epoch"], 1);
         let unobservable = json["tasks"]
             .as_array()
             .unwrap()
@@ -3989,6 +4102,7 @@ mod tests {
     #[tokio::test]
     async fn successful_driver_exit_before_handshake_is_a_benign_ownership_race() {
         let temp = tempfile::tempdir().unwrap();
+        let mission_dirs = test_mission_dirs(temp.path());
         let handshake = temp.path().join("never-published.ready");
         let process = std::process::Command::new("sh")
             .args(["-c", "exit 0"])
@@ -4005,7 +4119,7 @@ mod tests {
         };
 
         assert_eq!(
-            await_driver_startup(&mut child, &handshake, temp.path())
+            await_driver_startup(&mut child, &handshake, &mission_dirs)
                 .await
                 .unwrap(),
             DriverStartup::LostRace
@@ -4016,6 +4130,7 @@ mod tests {
     #[tokio::test]
     async fn startup_timeout_terminates_and_reaps_driver_and_spool() {
         let temp = tempfile::tempdir().unwrap();
+        let mission_dirs = test_mission_dirs(temp.path());
         let handshake = temp.path().join("never-published.ready");
         let mut command = std::process::Command::new("sh");
         command.args(["-c", "sleep 60"]);
@@ -4034,7 +4149,7 @@ mod tests {
         let error = await_driver_startup_with_timeout(
             &mut child,
             &handshake,
-            temp.path(),
+            &mission_dirs,
             Duration::from_millis(20),
         )
         .await
@@ -4055,6 +4170,7 @@ mod tests {
     #[test]
     fn spool_spawn_failure_terminates_driver_process_group() {
         let temp = tempfile::tempdir().unwrap();
+        let mission_dirs = test_mission_dirs(temp.path());
         let driver_pid_path = temp.path().join("driver.pid");
         let descendant_pid_path = temp.path().join("descendant.pid");
         let mut command = std::process::Command::new("sh");
@@ -4069,7 +4185,7 @@ mod tests {
         isolate_driver_process_group(&mut command);
 
         let mut published_pids = None;
-        let error = spawn_detached_driver_with(&mut command, temp.path(), |_| {
+        let error = spawn_detached_driver_with(&mut command, &mission_dirs, |_| {
             for _ in 0..200 {
                 let driver_pid = std::fs::read_to_string(&driver_pid_path)
                     .ok()

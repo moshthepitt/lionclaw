@@ -61,10 +61,10 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_id = self.config.normalized_runtime_id();
         let runtime_session_id = format!("{runtime_id}-{}", Uuid::new_v4());
-        let (runtime_state_root, session_id) = match input.resume {
-            RuntimeResume::Native { state_root, ready } => {
-                let session_id = load_ready_acp_session_id(&self.config, &state_root, ready)?;
-                (Some(state_root), session_id)
+        let (runtime_state, session_id) = match input.resume {
+            RuntimeResume::Native { state, ready } => {
+                let session_id = load_ready_acp_session_id(&self.config, &state, ready)?;
+                (Some(state), session_id)
             }
             RuntimeResume::Reconstruct => (None, None),
         };
@@ -75,7 +75,7 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
             .insert(
                 runtime_session_id.clone(),
                 AcpSessionState {
-                    runtime_state_root,
+                    runtime_state,
                     session_id,
                     active_turn: None,
                 },

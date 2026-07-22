@@ -16,9 +16,9 @@ use tokio::sync::Mutex;
 use crate::authority::{compile_role_plan, oracle_authority, MissionMounts, RolePlanRequest};
 use crate::config::MissionRuntimeProfile;
 use crate::ports::{ExecutionControl, OracleOutcome, OracleRunRequest, OracleRunner};
+use crate::resources::MissionDirs;
 use crate::runner::{
-    await_controlled, prepare_inputs, EffectDirs, MissionProgramExecutor, PreparedInputs,
-    SCRATCH_MOUNT_TARGET,
+    await_controlled, prepare_inputs, MissionProgramExecutor, PreparedInputs, SCRATCH_MOUNT_TARGET,
 };
 use crate::workspace;
 
@@ -44,20 +44,65 @@ fn fail(detail: impl Into<String>) -> TypedFailure {
     TypedFailure::permanent("oracle.infrastructure", detail)
 }
 
+enum ControlFailureKind {
+    Deadline,
+    Stop,
+    Abort,
+}
+
+fn control_failure(control: &ExecutionControl) -> Option<TypedFailure> {
+    let (kind, code, detail, reason) = match control {
+        ExecutionControl::RunUntil(_) => return None,
+        ExecutionControl::DeadlineExhausted => (
+            ControlFailureKind::Deadline,
+            "oracle.deadline",
+            "oracle exceeded its recorded effect deadline",
+            "effect deadline exhausted".to_string(),
+        ),
+        ExecutionControl::Stop(reason) => (
+            ControlFailureKind::Stop,
+            "oracle.stopped",
+            "oracle stopped by operator",
+            reason.clone(),
+        ),
+        ExecutionControl::Abort(reason) => (
+            ControlFailureKind::Abort,
+            "oracle.aborted",
+            "oracle cancelled because the mission was aborted",
+            reason.clone(),
+        ),
+    };
+    let mut evidence = TypedFailureEvidence::new(Some(code.to_string()), detail);
+    evidence.stop_reason = Some(reason);
+    Some(match kind {
+        ControlFailureKind::Deadline => TypedFailure::DeadlineExhausted {
+            evidence: Box::new(evidence),
+        },
+        ControlFailureKind::Stop => TypedFailure::OperatorStopped {
+            evidence: Box::new(evidence),
+        },
+        ControlFailureKind::Abort => TypedFailure::OperatorAborted {
+            evidence: Box::new(evidence),
+        },
+    })
+}
+
 #[async_trait]
 impl OracleRunner for OciOracleRunner {
     async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
-        let dirs = EffectDirs::prepare(
-            &request.state_dir,
-            request.mission_id.as_str(),
-            &request.effect_id,
-        )
-        .map_err(|e| fail(format!("failed to prepare oracle dirs: {e}")))?;
+        if let Some(failure) = control_failure(&request.control.borrow().clone()) {
+            return Err(failure);
+        }
+        let dirs = MissionDirs::new(&request.state_dir, &request.mission_id)
+            .effect(&request.effect_id)
+            .oracle();
+        dirs.prepare()
+            .map_err(|e| fail(format!("failed to prepare oracle dirs: {e}")))?;
 
         // Keep every fallible stage in one result. The engine owns the one
         // cleanup path after this runner returns, including failures before a
         // run starts and recovery after this process exits.
-        let checkout = dirs.root.join("work");
+        let checkout = dirs.work().to_path_buf();
         let result = async {
             // Complete checkout of the judged commit. The oracle receives it
             // read-only, never a worker's live checkout.
@@ -69,10 +114,7 @@ impl OracleRunner for OciOracleRunner {
             }
 
             // Copy the oracle executable into its own read-only mount.
-            let oracle_dir = dirs.root.join("oracle");
-            tokio::fs::create_dir_all(&oracle_dir)
-                .await
-                .map_err(|e| fail(e.to_string()))?;
+            let oracle_dir = dirs.program().to_path_buf();
             let oracle_dest = oracle_dir.join(request.oracle.as_str());
             tokio::fs::copy(&request.oracle_path, &oracle_dest)
                 .await
@@ -94,7 +136,7 @@ impl OracleRunner for OciOracleRunner {
                 prepare_inputs(
                     &self.profile,
                     &request.state_dir,
-                    &dirs.root,
+                    dirs.root(),
                     &checkout,
                     &request.prepared_inputs,
                     &request.effect_id,
@@ -111,14 +153,13 @@ impl OracleRunner for OciOracleRunner {
                     access: MountAccess::ReadOnly,
                 },
                 MountSpec {
-                    source: dirs.read_scratch.clone(),
+                    source: dirs.scratch().to_path_buf(),
                     target: SCRATCH_MOUNT_TARGET.to_string(),
                     access: MountAccess::ReadWrite,
                 },
             ];
             extras.extend(prepared.mounts);
-            let mut environment = oracle_environment();
-            environment.extend(prepared.environment);
+            let environment = oracle_environment(&request.environment, prepared.environment);
             let judged_roots = [crate::authority::canonical_or_lexical(&checkout)];
             let compiled = compile_role_plan(RolePlanRequest {
                 authority: &authority,
@@ -166,59 +207,25 @@ impl OracleRunner for OciOracleRunner {
                 }),
             }
         };
-        await_controlled(result, request.control.clone(), |control| match control {
-            ExecutionControl::RunUntil(_) => None,
-            ExecutionControl::DeadlineExhausted => {
-                let mut evidence = TypedFailureEvidence::new(
-                    Some("oracle.deadline".to_string()),
-                    "oracle exceeded its recorded effect deadline",
-                );
-                evidence.stop_reason = Some("effect deadline exhausted".into());
-                Some(TypedFailure::DeadlineExhausted {
-                    evidence: Box::new(evidence),
-                })
-            }
-            ExecutionControl::Stop(reason) => {
-                let mut evidence = TypedFailureEvidence::new(
-                    Some("oracle.stopped".into()),
-                    "oracle stopped by operator",
-                );
-                evidence.stop_reason = Some(reason.clone());
-                Some(TypedFailure::OperatorStopped {
-                    evidence: Box::new(evidence),
-                })
-            }
-            ExecutionControl::Abort(reason) => {
-                let mut evidence = TypedFailureEvidence::new(
-                    Some("oracle.aborted".into()),
-                    "oracle cancelled because the mission was aborted",
-                );
-                evidence.stop_reason = Some(reason.clone());
-                Some(TypedFailure::OperatorAborted {
-                    evidence: Box::new(evidence),
-                })
-            }
-        })
-        .await
+        await_controlled(Box::pin(result), request.control.clone(), control_failure).await
     }
 }
 
-/// Oracle env: cargo/target under the writable scratch mount; nothing agent-
-/// or auth-related (oracles have no agent and no network).
-fn oracle_environment() -> Vec<(String, String)> {
-    vec![
-        ("HOME".to_string(), SCRATCH_MOUNT_TARGET.to_string()),
-        ("TMPDIR".to_string(), "/tmp".to_string()),
-        ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
-        (
-            "CARGO_HOME".to_string(),
-            format!("{SCRATCH_MOUNT_TARGET}/cargo"),
-        ),
-        (
-            "CARGO_TARGET_DIR".to_string(),
-            format!("{SCRATCH_MOUNT_TARGET}/target"),
-        ),
-    ]
+/// Kernel-owned execution coordinates for an oracle. Prepared inputs are the
+/// final explicit overlay because they may publish a content-addressed cache.
+fn oracle_environment(
+    declared: &std::collections::BTreeMap<String, String>,
+    prepared_input: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    crate::mission_type::execution_environment(
+        [
+            ("HOME".to_string(), SCRATCH_MOUNT_TARGET.to_string()),
+            ("TMPDIR".to_string(), "/tmp".to_string()),
+            ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+        ],
+        declared,
+        prepared_input,
+    )
 }
 
 #[cfg(test)]
@@ -226,6 +233,21 @@ mod tests {
     use super::*;
     use crate::config::RuntimeProfiles;
     use crate::model::{EffectId, MissionId, OracleName};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn oracle_prepared_input_overrides_domain_cache_location() {
+        let environment = BTreeMap::from_iter(oracle_environment(
+            &BTreeMap::from([
+                ("BUILD_OUTPUT".to_string(), "/scratch/build".to_string()),
+                ("TOOL_HOME".to_string(), "/scratch/tool".to_string()),
+            ]),
+            vec![("TOOL_HOME".to_string(), "/inputs/tool".to_string())],
+        ));
+        assert_eq!(environment["HOME"], "/scratch");
+        assert_eq!(environment["BUILD_OUTPUT"], "/scratch/build");
+        assert_eq!(environment["TOOL_HOME"], "/inputs/tool");
+    }
 
     #[tokio::test]
     async fn production_oracle_observes_stop_before_checkout_or_runtime_launch() {
@@ -250,6 +272,7 @@ mod tests {
                 workspace_dir: temp.path().join("must-not-be-cloned"),
                 state_dir: temp.path().join("state"),
                 prepared_inputs: Vec::new(),
+                environment: Default::default(),
                 deadline_ms: 10,
                 control,
             })

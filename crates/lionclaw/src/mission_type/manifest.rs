@@ -79,6 +79,8 @@ pub(crate) struct ManifestMissionType {
     pub name: String,
     pub stop: String,
     pub image: String,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

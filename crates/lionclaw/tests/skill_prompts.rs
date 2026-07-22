@@ -176,6 +176,7 @@ fn execution_mission_type(
         name: "skill-exec-test".to_string(),
         stop: StopBar::Verified,
         image: "img".to_string(),
+        environment: BTreeMap::new(),
         planning: PlanningDag::default(),
         recovery: Default::default(),
         execution: lionclaw::model::ExecutionPolicy {
@@ -364,6 +365,7 @@ fn planning_mission_type(skill_dir: &std::path::Path) -> MissionType {
         name: "skill-plan-test".to_string(),
         stop: StopBar::Verified,
         image: "img".to_string(),
+        environment: BTreeMap::new(),
         planning: PlanningDag {
             tasks: vec![
                 PlanningTask {

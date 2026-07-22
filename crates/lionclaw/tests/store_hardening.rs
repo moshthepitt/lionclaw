@@ -599,7 +599,7 @@ async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
     };
     let writer_completion = NewEvent::new(MissionEvent::RoleRunCompleted {
         effect_id: writer_effect.clone(),
-        request: Box::new(writer_identity),
+        request: Box::new(writer_identity.clone()),
         outcome: Ok(RoleRunSuccess {
             handoff: Some(Handoff::Work {
                 done: true,
@@ -611,11 +611,17 @@ async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
             runtime_configuration: RuntimeConfigurationEvidence::default(),
         }),
     });
+    let writer_prepared = NewEvent::new(MissionEvent::TaskWorkspacePrepared {
+        task_id: writer_identity.task_id.clone(),
+        effect_id: writer_effect.clone(),
+        base_sha: writer_identity.base_sha.clone(),
+        assignment_epoch: writer_identity.assignment_epoch,
+    });
     fault_append_events(
         dir.path(),
         &mission_id,
         initial.head,
-        &[writer_request, writer_completion],
+        &[writer_request, writer_prepared, writer_completion],
         40,
     )
     .await;

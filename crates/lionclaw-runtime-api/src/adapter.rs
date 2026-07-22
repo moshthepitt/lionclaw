@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -8,7 +6,7 @@ use crate::{
     context::{RuntimeExecutionContext, RuntimeNativeHomeArtifactDir},
     event::RuntimeTurnJournalSender,
     program::{RuntimeProgramExecutor, RuntimeProgramSpec},
-    state::RuntimeSessionReady,
+    state::{RuntimeSessionReady, RuntimeStateDir},
     turn::TurnResult,
 };
 
@@ -32,7 +30,7 @@ pub struct RuntimeSessionStartInput {
 pub enum RuntimeResume {
     Reconstruct,
     Native {
-        state_root: PathBuf,
+        state: RuntimeStateDir,
         ready: RuntimeSessionReady,
     },
 }
@@ -69,7 +67,7 @@ pub enum RuntimeNativeReopenOutcome {
 #[derive(Debug, Clone)]
 pub struct RuntimeTerminalProgramInput {
     pub session_id: Uuid,
-    pub runtime_state_root: PathBuf,
+    pub runtime_state: RuntimeStateDir,
 }
 
 #[derive(Debug, Clone)]

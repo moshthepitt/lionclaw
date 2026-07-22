@@ -6,6 +6,7 @@
 //! `RoleRunner` and `OracleRunner` are deliberately separate traits:
 //! authoritative verdicts exist only on the oracle path, structurally.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -14,7 +15,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
 use crate::model::{
-    ConversationId, EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
+    EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
     RuntimeConfigurationEvidence, TaskId, TaskNamespace,
 };
 pub use crate::workspace::{ArtifactCapture, CapturedArtifact};
@@ -30,13 +31,14 @@ pub trait RoleRunner: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct RoleRunRequest {
     pub mission_id: MissionId,
-    /// Exact immutable dialogue identity recorded by `RoleRunRequested`.
-    pub conversation_id: ConversationId,
     pub namespace: TaskNamespace,
     pub task_id: TaskId,
     pub attempt_no: u32,
     pub effect_id: EffectId,
     pub role: RoleDefinition,
+    /// Domain policy from the pinned mission type. Kernel-owned coordinates
+    /// are added by the runner and cannot be declared here.
+    pub environment: BTreeMap<String, String>,
     /// Runtime profile resolved when the request event was recorded.
     pub runtime: String,
     /// Mission-owned skill packages resolved from the pinned mission type.
@@ -56,10 +58,10 @@ pub struct RoleRunRequest {
     pub activity: watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
     /// The target repository the mission operates on.
     pub workspace_dir: PathBuf,
-    /// Mission state root (attempt dirs, worktrees) — `<workspace>/.lionclaw`.
+    /// Mission state root for durable conversation and disposable effect resources.
     pub state_dir: PathBuf,
     /// Present only for artifact-producing roles and bound to this request's
-    /// exact task checkout and durable capture ref.
+    /// exact conversation checkout and durable capture ref.
     pub artifact_capture: Option<ArtifactCapture>,
 }
 
@@ -113,6 +115,8 @@ pub struct OracleRunRequest {
     pub workspace_dir: PathBuf,
     pub state_dir: PathBuf,
     pub prepared_inputs: Vec<PreparedInput>,
+    /// Domain policy from the pinned mission type.
+    pub environment: BTreeMap<String, String>,
     pub deadline_ms: i64,
     pub control: watch::Receiver<ExecutionControl>,
 }

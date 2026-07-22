@@ -13,7 +13,7 @@ use lionclaw_confinement::{
 use lionclaw_runtime_api::{
     ExecutionOutput, RuntimeAuthContext, RuntimeAuthRegistry, RuntimeExecutionContext,
     RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-    RuntimeProgramStdoutSender, TypedFailure,
+    RuntimeProgramStdoutSender, RuntimeStateDir, TypedFailure,
 };
 
 pub struct MissionProgramExecutor {
@@ -91,7 +91,10 @@ impl RuntimeProgramExecutor for MissionProgramExecutor {
 }
 
 /// The runtime-visible execution context for a compiled plan.
-pub fn mission_execution_context(plan: &EffectiveExecutionPlan) -> Result<RuntimeExecutionContext> {
+pub fn mission_execution_context(
+    plan: &EffectiveExecutionPlan,
+    state_anchor: &std::path::Path,
+) -> Result<RuntimeExecutionContext> {
     let projections = plan
         .mounts
         .iter()
@@ -111,7 +114,9 @@ pub fn mission_execution_context(plan: &EffectiveExecutionPlan) -> Result<Runtim
             .map(|dir| map_host_path_into_runtime_mount(dir, &plan.mounts, "working directory"))
             .transpose()?,
         environment: plan.environment.clone(),
-        runtime_state_root: runtime_state_mount_source(&plan.mounts).map(Into::into),
+        runtime_state: runtime_state_mount_source(&plan.mounts)
+            .map(|root| RuntimeStateDir::new(state_anchor, root))
+            .transpose()?,
         runtime_path_projections: projections,
         mcp_servers: Vec::new(),
     })

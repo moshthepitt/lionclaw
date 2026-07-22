@@ -218,14 +218,33 @@ pub struct TaskRuntimeState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_runtime_configuration: Option<RuntimeConfigurationEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_base_sha: Option<String>,
-    #[serde(default)]
+    pub role_assignment: Option<TaskRoleAssignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_provenance: Option<TaskWorkspaceProvenance>,
+}
+
+/// The sole folded authority for one task's current role generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRoleAssignment {
+    pub base_sha: String,
     pub assignment_epoch: u32,
 }
 
-/// Resolve one fresh or retry assignment from durable task state. Both the
-/// engine and replay fold use this function; request intent never becomes
-/// authority merely because it was recorded.
+/// Atomic retained authority for one writer checkout. The fold replaces this
+/// record only after the exact active effect confirms preparation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskWorkspaceProvenance {
+    pub effect_id: super::EffectId,
+    pub conversation_id: super::ConversationId,
+    pub base_sha: String,
+    pub assignment_epoch: u32,
+}
+
+/// Resolve one fresh or retry assignment from durable task state. The engine
+/// and replay fold share this candidate; only an exact validated request fold
+/// installs it as the task's role-assignment authority.
 pub fn resolve_task_assignment(
     previous: Option<&TaskRuntimeState>,
     required_base: &str,
@@ -234,21 +253,26 @@ pub fn resolve_task_assignment(
 ) -> (String, u32, bool) {
     let retrying_failure =
         previous.is_some_and(|task| task.automatic_retry_remaining(max_attempts));
+    let previous_assignment = previous.and_then(|task| task.role_assignment.as_ref());
     let base_sha = if retrying_failure {
-        previous
-            .and_then(|task| task.workspace_base_sha.clone())
+        previous_assignment
+            .map(|assignment| assignment.base_sha.clone())
             .unwrap_or_else(|| required_base.to_string())
     } else {
         required_base.to_string()
     };
-    let previous_epoch = previous.map_or(0, |task| task.assignment_epoch);
-    let recreate = previous.and_then(|task| task.workspace_base_sha.as_deref())
-        != Some(base_sha.as_str())
-        && !retrying_failure;
-    let epoch = match (previous_epoch, recreate) {
-        (0, _) => lifecycle_generation.max(1),
-        (epoch, true) => epoch.saturating_add(1).max(lifecycle_generation),
-        (epoch, false) => epoch.max(lifecycle_generation),
+    let recreate = previous
+        .and_then(|task| task.workspace_provenance.as_ref())
+        .map(|workspace| workspace.base_sha.as_str())
+        != Some(base_sha.as_str());
+    let generation_floor = lifecycle_generation.max(1);
+    let epoch = match previous_assignment {
+        None => generation_floor,
+        Some(previous) if previous.base_sha != base_sha => previous
+            .assignment_epoch
+            .saturating_add(1)
+            .max(generation_floor),
+        Some(previous) => previous.assignment_epoch.max(generation_floor),
     };
     (base_sha, epoch, recreate)
 }
@@ -1037,6 +1061,232 @@ pub struct MissionState {
 }
 
 impl MissionState {
+    /// Closed role contract shared by request folding, dispatch, and live
+    /// workspace observation.
+    pub fn role_dispatch_contract_matches(
+        &self,
+        namespace: super::TaskNamespace,
+        task_id: &TaskId,
+        role: &RoleName,
+        output: super::OutputSemantics,
+    ) -> bool {
+        match namespace {
+            super::TaskNamespace::Planning => self
+                .config
+                .planning
+                .tasks
+                .iter()
+                .find(|planned| &planned.id == task_id)
+                .is_some_and(|planned| planned.role == *role && planned.output == output),
+            super::TaskNamespace::Execution => self
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.tasks.iter().find(|planned| &planned.id == task_id))
+                .is_some_and(|planned| {
+                    planned.role.as_ref() == Some(role)
+                        && output.execution_task_kind() == Some(planned.kind)
+                }),
+        }
+    }
+
+    /// Resolve the exact folded conversation whose retained checkout belongs
+    /// to one task. Active writers pass through the stricter request validator;
+    /// settled generations remain addressable only while their task authority
+    /// is unique and internally consistent.
+    pub fn task_workspace_conversation(
+        &self,
+        namespace: super::TaskNamespace,
+        task_id: &TaskId,
+    ) -> Result<Option<(&super::ConversationId, &ConversationState)>, &'static str> {
+        let task = self.tasks_in(namespace).get(task_id);
+        let Some(task) = task else {
+            return Ok(None);
+        };
+
+        let mut inflight = self.inflight.iter().filter(|(_, effect)| {
+            matches!(
+                effect,
+                InflightEffect::RoleRun {
+                    namespace: effect_namespace,
+                    task_id: effect_task_id,
+                    output: super::OutputSemantics::ProducesArtifact,
+                    ..
+                } if *effect_namespace == namespace && effect_task_id == task_id
+            )
+        });
+        if let Some((effect_id, _)) = inflight.next() {
+            if inflight.next().is_some() {
+                return Err("multiple active effects claim one conversation workspace");
+            }
+            return self.active_workspace_conversation(effect_id).map(Some);
+        }
+
+        let Some(workspace) = task.workspace_provenance.as_ref() else {
+            return Ok(None);
+        };
+        let conversation_id = &workspace.conversation_id;
+        let Some(conversation) = self.conversations.get(conversation_id) else {
+            return Err("prepared workspace has no authoritative conversation");
+        };
+        if conversation.namespace != namespace || conversation.task_id != *task_id {
+            return Err("prepared workspace conversation belongs to another task");
+        }
+        if conversation_id
+            != &super::ConversationId::for_role_instance(
+                &self.mission_id,
+                conversation.namespace,
+                &conversation.task_id,
+                &conversation.role,
+                conversation.assignment_epoch,
+            )
+        {
+            return Err("folded conversation key does not match its identity");
+        }
+        if workspace.base_sha != conversation.workspace_base_sha
+            || workspace.assignment_epoch != conversation.assignment_epoch
+        {
+            return Err("task and conversation workspace bases disagree");
+        }
+        let assignment_agrees = match namespace {
+            super::TaskNamespace::Planning => self
+                .config
+                .planning
+                .tasks
+                .iter()
+                .find(|planned| &planned.id == task_id)
+                .is_some_and(|planned| planned.role == conversation.role),
+            super::TaskNamespace::Execution => self
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.tasks.iter().find(|planned| &planned.id == task_id))
+                .map_or(task.status == TaskStatus::Superseded, |planned| {
+                    planned.kind == super::TaskKind::Work
+                        && planned.role.as_ref() == Some(&conversation.role)
+                }),
+        };
+        if !assignment_agrees {
+            return Err("folded conversation role disagrees with the assigned role");
+        }
+        if conversation.lifecycle == ConversationLifecycle::Running
+            || conversation.active_delivery.is_some()
+        {
+            return Err("retained conversation has an active delivery without an active effect");
+        }
+        Ok(Some((conversation_id, conversation)))
+    }
+
+    /// Validate one active role against every folded fact that grants its
+    /// conversation authority. This is intentionally model-owned: filesystem
+    /// observers consume the result and never infer a current generation.
+    pub fn active_role_conversation(
+        &self,
+        effect_id: &super::EffectId,
+    ) -> Result<(&super::ConversationId, &ConversationState), &'static str> {
+        let Some(InflightEffect::RoleRun {
+            conversation_id,
+            namespace,
+            task_id,
+            attempt_no,
+            role,
+            output,
+            base_sha,
+            assignment_epoch,
+            message_boundary,
+            presented_messages,
+            requested_seq,
+            ..
+        }) = self.inflight.get(effect_id)
+        else {
+            return Err("effect is not an active role run");
+        };
+        let request = self
+            .inflight
+            .get(effect_id)
+            .and_then(InflightEffect::role_request_identity)
+            .expect("matched role effect");
+        let Some(conversation) = self.conversations.get(conversation_id) else {
+            return Err("active effect conversation is absent from folded state");
+        };
+        let Some(task) = self.tasks_in(*namespace).get(task_id) else {
+            return Err("active effect task is absent from folded state");
+        };
+        let expected_presented = conversation
+            .queued
+            .iter()
+            .filter(|message| {
+                message.sequence_no <= *message_boundary
+                    && message.marker != DeliveryMarker::Undeliverable
+            })
+            .map(|message| message.sequence_no)
+            .collect::<Vec<_>>();
+        let delivery_agrees = conversation
+            .active_delivery
+            .as_ref()
+            .is_some_and(|delivery| {
+                &delivery.effect_id == effect_id
+                    && delivery.message_boundary == *message_boundary
+                    && delivery.presented_messages == *presented_messages
+            });
+        if !request.has_canonical_coordinates(&self.mission_id, effect_id, *requested_seq)
+            || !self.role_dispatch_contract_matches(*namespace, task_id, role, *output)
+            || task.status != TaskStatus::Running
+            || task.attempts != *attempt_no
+            || task.role_assignment.as_ref()
+                != Some(&TaskRoleAssignment {
+                    base_sha: base_sha.clone(),
+                    assignment_epoch: *assignment_epoch,
+                })
+            || *requested_seq > self.head
+            || expected_presented != *presented_messages
+            || conversation.namespace != *namespace
+            || conversation.task_id != *task_id
+            || conversation.role != *role
+            || conversation.assignment_epoch != *assignment_epoch
+            || *assignment_epoch < self.role_lifecycle_generation(*namespace).max(1)
+            || conversation.workspace_base_sha != *base_sha
+            || conversation.lifecycle != ConversationLifecycle::Running
+            || !delivery_agrees
+        {
+            return Err("active effect and folded conversation workspace authority disagree");
+        }
+        Ok((conversation_id, conversation))
+    }
+
+    /// Resolve a live writer checkout only after the exact active effect has
+    /// durably recorded its successful preparation.
+    pub fn active_workspace_conversation(
+        &self,
+        effect_id: &super::EffectId,
+    ) -> Result<(&super::ConversationId, &ConversationState), &'static str> {
+        let result = self.active_role_conversation(effect_id)?;
+        let Some(InflightEffect::RoleRun {
+            namespace,
+            task_id,
+            output,
+            base_sha,
+            assignment_epoch,
+            ..
+        }) = self.inflight.get(effect_id)
+        else {
+            return Err("effect is not an active role run");
+        };
+        let Some(task) = self.tasks_in(*namespace).get(task_id) else {
+            return Err("active effect task is absent from folded state");
+        };
+        if *output != super::OutputSemantics::ProducesArtifact
+            || task.workspace_provenance.as_ref()
+                != Some(&TaskWorkspaceProvenance {
+                    effect_id: effect_id.clone(),
+                    conversation_id: result.0.clone(),
+                    base_sha: base_sha.clone(),
+                    assignment_epoch: *assignment_epoch,
+                })
+        {
+            return Err("active effect has no exact prepared workspace authority");
+        }
+        Ok(result)
+    }
+
     pub fn reference_recipient_policy(
         &self,
         recipients: &[super::ConversationRecipient],
@@ -1079,8 +1329,8 @@ impl MissionState {
 
     /// Fold-authoritative generation floor for role assignments in each
     /// namespace. Planning replacements advance `planning_generation`; plan
-    /// promotions advance `revision`. Workspace recreation remains an
-    /// independent decision and may advance a task beyond this floor.
+    /// promotions advance `revision`. Resource recreation is derived
+    /// independently; only a role-assignment replacement changes identity.
     pub fn role_lifecycle_generation(&self, namespace: super::TaskNamespace) -> u32 {
         match namespace {
             super::TaskNamespace::Planning => self.planning_generation,

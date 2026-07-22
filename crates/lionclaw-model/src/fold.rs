@@ -17,8 +17,8 @@ use super::plan::Assertion;
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
     MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState, ReviewAcceptance,
-    ReviewAcceptanceKind, ReviewOutcome, TaskAddress, TaskRuntimeState, TaskStatus,
-    TerminalReviewVerdict,
+    ReviewAcceptanceKind, ReviewOutcome, TaskAddress, TaskRoleAssignment, TaskRuntimeState,
+    TaskStatus, TaskWorkspaceProvenance, TerminalReviewVerdict,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
 use crate::prelude::*;
@@ -26,10 +26,10 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-/// Version 31 makes the retained per-conversation message bound
-/// fold-authoritative. Older snapshots must rebuild so forged over-cap ingress
-/// cannot survive replay.
-pub const REDUCER_VERSION: u32 = 31;
+/// Version 32 records one folded task role assignment and binds retained
+/// writer workspace provenance to the exact effect whose accepted preparation
+/// established it. Older snapshots must rebuild both authorities from events.
+pub const REDUCER_VERSION: u32 = 32;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -169,6 +169,20 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             finish_apply(state, seq);
             return;
         }
+        if matches!(
+            &effect,
+            InflightEffect::RoleRun {
+                output: super::OutputSemantics::ProducesArtifact,
+                ..
+            }
+        ) && matches!(
+            &envelope.event,
+            MissionEvent::RoleRunCompleted { outcome: Ok(_), .. }
+        ) && state.active_workspace_conversation(effect_id).is_err()
+        {
+            finish_apply(state, seq);
+            return;
+        }
     }
     match &envelope.event {
         MissionEvent::MissionCreated { .. } => {}
@@ -204,6 +218,10 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 .or_insert_with(pending_task);
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
+            task.role_assignment = Some(TaskRoleAssignment {
+                base_sha: base_sha.clone(),
+                assignment_epoch: *assignment_epoch,
+            });
             let expected_conversation_id = dispatch.assignment.conversation_id;
             for (id, prior) in &mut state.conversations {
                 if id != &expected_conversation_id
@@ -374,28 +392,39 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             base_sha,
             assignment_epoch,
         } => {
-            let namespace = state
-                .inflight
-                .get(effect_id)
-                .and_then(|effect| match effect {
-                    InflightEffect::RoleRun {
-                        namespace,
-                        task_id: active_task,
-                        base_sha: active_base,
-                        assignment_epoch: active_epoch,
-                        ..
-                    } if active_task == task_id
-                        && active_base == base_sha
-                        && active_epoch == assignment_epoch =>
-                    {
-                        Some(*namespace)
-                    }
-                    _ => None,
-                });
-            if let Some(namespace) = namespace {
+            let prepared =
+                state
+                    .active_role_conversation(effect_id)
+                    .ok()
+                    .and_then(|(conversation_id, _)| {
+                        state
+                            .inflight
+                            .get(effect_id)
+                            .and_then(|effect| match effect {
+                                InflightEffect::RoleRun {
+                                    namespace,
+                                    task_id: active_task,
+                                    output: super::OutputSemantics::ProducesArtifact,
+                                    base_sha: active_base,
+                                    assignment_epoch: active_epoch,
+                                    ..
+                                } if active_task == task_id
+                                    && active_base == base_sha
+                                    && active_epoch == assignment_epoch =>
+                                {
+                                    Some((*namespace, conversation_id.clone()))
+                                }
+                                _ => None,
+                            })
+                    });
+            if let Some((namespace, conversation_id)) = prepared {
                 if let Some(task) = state.tasks_in_mut(namespace).get_mut(task_id) {
-                    task.workspace_base_sha = Some(base_sha.clone());
-                    task.assignment_epoch = *assignment_epoch;
+                    task.workspace_provenance = Some(TaskWorkspaceProvenance {
+                        effect_id: effect_id.clone(),
+                        conversation_id,
+                        base_sha: base_sha.clone(),
+                        assignment_epoch: *assignment_epoch,
+                    });
                 }
             }
         }
@@ -1190,7 +1219,6 @@ fn validated_role_dispatch(
         effect_id,
         role,
         output,
-        prompt_template: _,
         prompt_hash,
         base_sha,
         assignment_epoch,
@@ -1203,22 +1231,6 @@ fn validated_role_dispatch(
     else {
         return None;
     };
-    let output_matches = match namespace {
-        super::TaskNamespace::Planning => state
-            .config
-            .planning
-            .tasks
-            .iter()
-            .find(|task| &task.id == task_id)
-            .is_some_and(|task| &task.role == role && task.output == *output),
-        super::TaskNamespace::Execution => state
-            .plan
-            .as_ref()
-            .and_then(|plan| plan.tasks.iter().find(|task| &task.id == task_id))
-            .is_some_and(|task| {
-                task.role.as_ref() == Some(role) && output.execution_task_kind() == Some(task.kind)
-            }),
-    };
     let super::step::StepDecision::DispatchRole(intent) = super::step::step(state) else {
         return None;
     };
@@ -1226,14 +1238,8 @@ fn validated_role_dispatch(
     if envelope.stamps.prompt_hash.as_deref() != Some(prompt_hash.as_str()) {
         return None;
     }
-    let expected_effect = super::EffectId::for_role_request(
-        *namespace,
-        &state.mission_id,
-        task_id,
-        *attempt_no,
-        *assignment_epoch,
-        prompt_hash,
-    );
+    let (_, candidate) = InflightEffect::from_request(&envelope.event, envelope.sequence_no)?;
+    let request = candidate.role_request_identity()?;
     let expected_conversation = &expected_assignment.conversation_id;
     let expected_presented: Vec<_> =
         state
@@ -1250,7 +1256,8 @@ fn validated_role_dispatch(
                     .map(|message| message.sequence_no)
                     .collect()
             });
-    (output_matches
+    (state.role_dispatch_contract_matches(*namespace, task_id, role, *output)
+        && request.has_canonical_coordinates(&state.mission_id, effect_id, envelope.sequence_no)
         && intent.namespace == *namespace
         && &intent.task_id == task_id
         && intent.attempt_no == *attempt_no
@@ -1258,9 +1265,7 @@ fn validated_role_dispatch(
         && expected_assignment.base_sha == *base_sha
         && expected_assignment.generation == *assignment_epoch
         && expected_assignment.recreate_workspace == *recreate_workspace
-        && expected_effect == *effect_id
         && expected_conversation == conversation_id
-        && *message_boundary == envelope.sequence_no.saturating_sub(1)
         && expected_presented == *presented_messages)
         .then_some(ValidatedRoleDispatch {
             assignment: expected_assignment,
@@ -1514,8 +1519,8 @@ fn pending_task() -> TaskRuntimeState {
         last_failure: None,
         feedback: Vec::new(),
         last_runtime_configuration: None,
-        workspace_base_sha: None,
-        assignment_epoch: 0,
+        role_assignment: None,
+        workspace_provenance: None,
     }
 }
 
@@ -1818,9 +1823,7 @@ fn start_replanning(state: &mut MissionState) {
     state.planning_base_revision = Some(state.revision);
     state.planning_generation = state.planning_generation.saturating_add(1);
     for (id, task) in &mut state.planning.tasks {
-        let assignment_epoch = task.assignment_epoch;
         *task = pending_task();
-        task.assignment_epoch = assignment_epoch;
         state.flagged_tasks.remove(&TaskAddress::new(
             crate::TaskNamespace::Planning,
             id.clone(),
@@ -2433,9 +2436,18 @@ mod tests {
 
     /// Fold hand-built events with sequence numbers assigned by position.
     fn fold_log(events: Vec<MissionEvent>) -> Option<MissionState> {
+        fold_test_log(events, true)
+    }
+
+    fn fold_test_log(
+        events: Vec<MissionEvent>,
+        synthesize_writer_preparation: bool,
+    ) -> Option<MissionState> {
         let mut known_tasks = BTreeSet::new();
         let mut requested_effects = BTreeSet::new();
         let mut synthesized_role_requests = BTreeSet::new();
+        let mut writer_requests = BTreeMap::new();
+        let mut prepared_effects = BTreeSet::new();
         let mut valid_log = Vec::new();
         for event in events {
             match &event {
@@ -2455,10 +2467,28 @@ mod tests {
                 _ => {}
             }
             match &event {
-                MissionEvent::RoleRunRequested { effect_id, .. }
-                | MissionEvent::OracleRunRequested { effect_id, .. }
+                MissionEvent::RoleRunRequested {
+                    effect_id,
+                    task_id,
+                    output,
+                    base_sha,
+                    assignment_epoch,
+                    ..
+                } => {
+                    requested_effects.insert(effect_id.clone());
+                    if *output == OutputSemantics::ProducesArtifact {
+                        writer_requests.insert(
+                            effect_id.clone(),
+                            (task_id.clone(), base_sha.clone(), *assignment_epoch),
+                        );
+                    }
+                }
+                MissionEvent::OracleRunRequested { effect_id, .. }
                 | MissionEvent::TerminalReviewRequested { effect_id, .. } => {
                     requested_effects.insert(effect_id.clone());
+                }
+                MissionEvent::TaskWorkspacePrepared { effect_id, .. } => {
+                    prepared_effects.insert(effect_id.clone());
                 }
                 _ => {}
             }
@@ -2500,6 +2530,20 @@ mod tests {
                             OutputSemantics::ProducesArtifact,
                         ),
                     };
+                    let base_sha = success
+                        .artifact
+                        .as_ref()
+                        .map_or_else(|| "base".into(), |artifact| artifact.base_sha.clone());
+                    if output == OutputSemantics::ProducesArtifact {
+                        writer_requests.insert(
+                            effect_id.clone(),
+                            (
+                                request.task_id.clone(),
+                                base_sha.clone(),
+                                request.assignment_epoch,
+                            ),
+                        );
+                    }
                     valid_log.push(MissionEvent::RoleRunRequested {
                         conversation_id: crate::ConversationId::for_role_instance(
                             &mission_id(),
@@ -2517,10 +2561,7 @@ mod tests {
                         runtime: "codex".into(),
                         prompt_template: crate::RolePromptTemplate::Execution,
                         prompt_hash: PayloadRef::inline("prompt").content_sha256().unwrap(),
-                        base_sha: success
-                            .artifact
-                            .as_ref()
-                            .map_or_else(|| "base".into(), |artifact| artifact.base_sha.clone()),
+                        base_sha,
                         assignment_epoch: request.assignment_epoch,
                         message_boundary: 0,
                         presented_messages: vec![],
@@ -2530,6 +2571,26 @@ mod tests {
                         deadline_ms: 100_000,
                         budget_deadline_ms: 100_000,
                     });
+                }
+            }
+            if let MissionEvent::RoleRunCompleted {
+                effect_id,
+                outcome: Ok(_),
+                ..
+            } = &event
+            {
+                if synthesize_writer_preparation && !prepared_effects.contains(effect_id) {
+                    if let Some((task_id, base_sha, assignment_epoch)) =
+                        writer_requests.get(effect_id)
+                    {
+                        valid_log.push(MissionEvent::TaskWorkspacePrepared {
+                            task_id: task_id.clone(),
+                            effect_id: effect_id.clone(),
+                            base_sha: base_sha.clone(),
+                            assignment_epoch: *assignment_epoch,
+                        });
+                        prepared_effects.insert(effect_id.clone());
+                    }
                 }
             }
             if let MissionEvent::OracleRunCompleted {
@@ -2896,7 +2957,7 @@ mod tests {
         .expect("state");
 
         assert!(state.inflight.is_empty());
-        assert_eq!(state.tasks[&tid("w")].assignment_epoch, 0);
+        assert_eq!(state.tasks[&tid("w")].workspace_provenance, None);
         assert_eq!(state.tasks[&tid("w")].status, TaskStatus::Pending);
     }
 
@@ -3202,7 +3263,16 @@ mod tests {
         };
         MissionEvent::RoleRunCompleted {
             effect_id: role_effect(namespace, task, attempt_no, 1),
-            request: role_identity(namespace, task, attempt_no, 1, role, output, "base", true),
+            request: role_identity(
+                namespace,
+                task,
+                attempt_no,
+                1,
+                role,
+                output,
+                "base",
+                attempt_no == 1,
+            ),
             outcome: Ok(RoleRunSuccess {
                 handoff: Some(handoff),
                 artifact,
@@ -3325,23 +3395,149 @@ mod tests {
         ])
         .expect("requested state");
         let task = requested_state.tasks.get(&tid("w")).unwrap();
-        assert_eq!(task.workspace_base_sha, None);
-        assert_eq!(task.assignment_epoch, 0);
+        assert_eq!(task.workspace_provenance, None);
 
-        let stale_state = fold_log(vec![
-            created(),
-            plan_proposed(vec![], vec![work_task("w")]),
-            requested.clone(),
+        let completed = role_completed(
+            "w",
+            "workspace",
+            work_handoff(true, false),
+            Some(ArtifactOutcome {
+                base_sha: "base".into(),
+                head_sha: "forged-head".into(),
+            }),
+        );
+        let mut checkpoint = completed.clone();
+        let MissionEvent::RoleRunCompleted { outcome, .. } = &mut checkpoint else {
+            unreachable!("known completion")
+        };
+        *outcome = Ok(RoleRunSuccess {
+            handoff: None,
+            artifact: None,
+            final_response: PayloadRef::inline("question before preparation"),
+            runtime_configuration: RuntimeConfigurationEvidence::default(),
+        });
+        for completion in [completed, checkpoint] {
+            let rejected = fold_test_log(
+                vec![
+                    created(),
+                    plan_proposed(vec![], vec![work_task("w")]),
+                    requested.clone(),
+                    completion,
+                ],
+                false,
+            )
+            .expect("unprepared completion replay");
+            assert_eq!(rejected.current_sha, "base");
+            assert_eq!(rejected.tasks[&tid("w")].status, TaskStatus::Running);
+            assert!(rejected.inflight.contains_key(&effect_id));
+            assert_eq!(rejected.tasks[&tid("w")].workspace_provenance, None);
+        }
+
+        for stale in [
             MissionEvent::TaskWorkspacePrepared {
                 task_id: tid("w"),
                 effect_id: EffectId::for_parts(&["test", "stale"]),
                 base_sha: "base".into(),
                 assignment_epoch: 1,
             },
+            MissionEvent::TaskWorkspacePrepared {
+                task_id: tid("other"),
+                effect_id: effect_id.clone(),
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+            },
+            MissionEvent::TaskWorkspacePrepared {
+                task_id: tid("w"),
+                effect_id: effect_id.clone(),
+                base_sha: "other-base".into(),
+                assignment_epoch: 1,
+            },
+            MissionEvent::TaskWorkspacePrepared {
+                task_id: tid("w"),
+                effect_id: effect_id.clone(),
+                base_sha: "base".into(),
+                assignment_epoch: 2,
+            },
+        ] {
+            let stale_state = fold_log(vec![
+                created(),
+                plan_proposed(vec![], vec![work_task("w")]),
+                requested.clone(),
+                stale,
+            ])
+            .expect("stale state");
+            assert_eq!(stale_state.tasks[&tid("w")].workspace_provenance, None);
+        }
+
+        let validator_request = role_requested_in(
+            crate::TaskNamespace::Execution,
+            "v",
+            "validator",
+            RoleName::new("reviewer").unwrap(),
+            OutputSemantics::EmitsVerdict,
+        );
+        let validator_effect = role_effect(crate::TaskNamespace::Execution, "v", 1, 1);
+        let validator_state = fold_log(vec![
+            created(),
+            plan_proposed(
+                vec![assertion("A1", Some("cargo-test"))],
+                vec![work_task("w"), validate_task("v")],
+            ),
+            role_completed(
+                "w",
+                "validator-prerequisite",
+                work_handoff(true, false),
+                Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "base".into(),
+                }),
+            ),
+            validator_request,
+            MissionEvent::TaskWorkspacePrepared {
+                task_id: tid("v"),
+                effect_id: validator_effect,
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+            },
         ])
-        .expect("stale state");
+        .expect("validator state");
+        assert_eq!(validator_state.tasks[&tid("v")].workspace_provenance, None);
+
+        let post_settlement_state = fold_test_log(
+            vec![
+                created(),
+                plan_proposed(vec![], vec![work_task("w")]),
+                requested.clone(),
+                MissionEvent::RoleRunCompleted {
+                    request: role_identity(
+                        crate::TaskNamespace::Execution,
+                        "w",
+                        1,
+                        1,
+                        RoleName::new("implementer").unwrap(),
+                        OutputSemantics::ProducesArtifact,
+                        "base",
+                        true,
+                    ),
+                    effect_id: effect_id.clone(),
+                    outcome: Err(TypedFailure::permanent(
+                        "kernel.launch",
+                        "failed before workspace preparation",
+                    )),
+                },
+                MissionEvent::TaskWorkspacePrepared {
+                    task_id: tid("w"),
+                    effect_id: effect_id.clone(),
+                    base_sha: "base".into(),
+                    assignment_epoch: 1,
+                },
+            ],
+            false,
+        )
+        .expect("post-settlement state");
+        assert!(post_settlement_state.inflight.is_empty());
         assert_eq!(
-            stale_state.tasks.get(&tid("w")).unwrap().workspace_base_sha,
+            post_settlement_state.tasks[&tid("w")].workspace_provenance,
             None
         );
 
@@ -3351,15 +3547,28 @@ mod tests {
             requested,
             MissionEvent::TaskWorkspacePrepared {
                 task_id: tid("w"),
-                effect_id,
+                effect_id: effect_id.clone(),
                 base_sha: "base".into(),
                 assignment_epoch: 1,
             },
         ])
         .expect("confirmed state");
         let task = confirmed_state.tasks.get(&tid("w")).unwrap();
-        assert_eq!(task.workspace_base_sha.as_deref(), Some("base"));
-        assert_eq!(task.assignment_epoch, 1);
+        assert_eq!(
+            task.workspace_provenance,
+            Some(TaskWorkspaceProvenance {
+                effect_id,
+                conversation_id: crate::ConversationId::for_role_instance(
+                    &mission_id(),
+                    crate::TaskNamespace::Execution,
+                    &tid("w"),
+                    &RoleName::new("implementer").unwrap(),
+                    1,
+                ),
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+            })
+        );
     }
 
     #[test]
@@ -3368,15 +3577,32 @@ mod tests {
         let second_effect = role_effect(crate::TaskNamespace::Execution, "w", 2, 2);
         let state = fold_log(vec![
             created(),
-            plan_proposed(vec![], vec![work_task("w")]),
+            plan_proposed(
+                vec![assertion("A1", Some("cargo-test"))],
+                vec![work_task("w")],
+            ),
             role_requested("w", "workspace-first"),
             MissionEvent::TaskWorkspacePrepared {
                 task_id: tid("w"),
-                effect_id: first_effect,
+                effect_id: first_effect.clone(),
                 base_sha: "base".into(),
                 assignment_epoch: 1,
             },
-            role_completed("w", "workspace-first", work_handoff(true, false), None),
+            role_completed(
+                "w",
+                "workspace-first",
+                work_handoff(true, false),
+                Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "moved".into(),
+                }),
+            ),
+            oracle_requested("A1", "moved", "workspace-repair"),
+            oracle_completed("A1", "moved", "workspace-repair", 1),
+            decision(
+                "oracle_verdict_failed:cargo-test",
+                super::super::event::DecisionAction::Repair,
+            ),
             MissionEvent::RoleRunRequested {
                 conversation_id: crate::ConversationId::for_role_instance(
                     &mission_id(),
@@ -3393,9 +3619,7 @@ mod tests {
                 output: OutputSemantics::ProducesArtifact,
                 runtime: "codex".into(),
                 prompt_template: crate::RolePromptTemplate::Execution,
-                prompt_hash: PayloadRef::inline("moved-base prompt")
-                    .content_sha256()
-                    .unwrap(),
+                prompt_hash: PayloadRef::inline("prompt").content_sha256().unwrap(),
                 base_sha: "moved".into(),
                 assignment_epoch: 2,
                 message_boundary: 0,
@@ -3426,8 +3650,24 @@ mod tests {
         ])
         .unwrap();
         let task = state.tasks.get(&tid("w")).unwrap();
-        assert_eq!(task.workspace_base_sha.as_deref(), Some("base"));
-        assert_eq!(task.assignment_epoch, 1);
+        let workspace = task.workspace_provenance.as_ref().unwrap();
+        assert_eq!(
+            task.role_assignment,
+            Some(TaskRoleAssignment {
+                base_sha: "moved".into(),
+                assignment_epoch: 2,
+            })
+        );
+        assert_eq!(task.attempts, 2);
+        assert!(
+            task.last_failure
+                .as_ref()
+                .is_some_and(|failure| failure.evidence().code.as_deref() == Some("kernel.launch")),
+            "replacement failure did not settle: {task:#?}"
+        );
+        assert_eq!(workspace.base_sha, "base");
+        assert_eq!(workspace.assignment_epoch, 1);
+        assert_eq!(workspace.effect_id, first_effect);
     }
 
     #[test]
@@ -5938,7 +6178,7 @@ mod tests {
         // Later facts remain in the log, but an aborted mission has no legal
         // dispatch obligation, so the paired role history gains no authority.
         assert_eq!(state.tasks[&tid("t1")].status, TaskStatus::Pending);
-        assert_eq!(state.head, 5);
+        assert_eq!(state.head, 6);
     }
 
     #[test]
@@ -6785,6 +7025,7 @@ mod tests {
         });
         let before = fold_log(events.clone()).unwrap();
         let cursor = before.conversations[&conversation_id].consumed_through;
+        let missing_sequence = before.conversations[&conversation_id].queued[0].sequence_no;
         let boundary = before.conversations[&conversation_id]
             .active_delivery
             .clone();
@@ -6792,7 +7033,7 @@ mod tests {
         events.push(MissionEvent::MessageReferenceUnavailable {
             conversation_id: conversation_id.clone(),
             assignment_epoch: generation,
-            message_sequence: 5,
+            message_sequence: missing_sequence,
             reference: reference.clone(),
             cause: super::super::event::UnavailableReferenceCause::SourceMissing,
         });
@@ -6800,14 +7041,14 @@ mod tests {
         events.push(MissionEvent::MessageReferenceUnavailable {
             conversation_id: conversation_id.clone(),
             assignment_epoch: generation,
-            message_sequence: 5,
+            message_sequence: missing_sequence,
             reference,
             cause: super::super::event::UnavailableReferenceCause::SourceUnreadable,
         });
         events.push(MissionEvent::MessageReferenceUnavailable {
             conversation_id: conversation_id.clone(),
             assignment_epoch: generation + 1,
-            message_sequence: 6,
+            message_sequence: missing_sequence + 1,
             reference: super::super::event::MessageReference::ReachableCommit {
                 sha: "base".into(),
             },
@@ -6827,7 +7068,10 @@ mod tests {
             super::super::state::DeliveryMarker::Queued
         );
         assert_eq!(settled.unavailable_references.len(), 1);
-        assert_eq!(settled.unavailable_references[0].message_sequence, 5);
+        assert_eq!(
+            settled.unavailable_references[0].message_sequence,
+            missing_sequence
+        );
     }
 
     #[test]
@@ -6966,11 +7210,13 @@ mod tests {
         if let MissionEvent::RoleRunRequested {
             attempt_no,
             effect_id,
+            recreate_workspace,
             ..
         } = &mut request
         {
             *attempt_no = 2;
             *effect_id = role_effect(crate::TaskNamespace::Execution, "w", 2, 1);
+            *recreate_workspace = false;
         }
         events.push(request);
         events.push(MissionEvent::MessageSent {
@@ -7277,11 +7523,13 @@ mod tests {
             if let MissionEvent::RoleRunRequested {
                 attempt_no,
                 effect_id,
+                recreate_workspace,
                 ..
             } = &mut request
             {
                 *attempt_no = 2;
                 *effect_id = role_effect(crate::TaskNamespace::Execution, "w", 2, 1);
+                *recreate_workspace = false;
             }
             events.push(request);
             events.push(MissionEvent::MessageSent {

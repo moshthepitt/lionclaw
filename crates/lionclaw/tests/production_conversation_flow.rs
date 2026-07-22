@@ -292,16 +292,9 @@ async fn capture_reference_watch(
     });
     entered.acquire().await.unwrap().forget();
     let current = store.require_state(mission).await.unwrap();
-    let mission_root = store.lionclaw_dir().join("missions").join(mission.as_str());
-    lionclaw::activity::publish_observed(
-        repo,
-        &mission_root,
-        &current,
-        lionclaw::activity::now_ms(),
-        None,
-    )
-    .await
-    .unwrap();
+    lionclaw::activity::publish_observed(store, &current, lionclaw::activity::now_ms(), None)
+        .await
+        .unwrap();
     let watched = watch_observation(repo, mission.as_str(), true, None);
     release.add_permits(8);
     assert_eq!(
@@ -333,10 +326,11 @@ impl DeliveryTransport {
     fn handoff(execution: &TurnExecution) -> std::path::PathBuf {
         let runtime = execution
             .context
-            .runtime_state_root
+            .runtime_state
             .as_ref()
             .expect("native state root");
         let mission = runtime
+            .path()
             .parent()
             .and_then(Path::parent)
             .and_then(Path::parent)
@@ -403,9 +397,11 @@ impl RuntimeAdapter for DeliveryTransport {
             execution.input.prompt.clone(),
             execution
                 .context
-                .runtime_state_root
-                .clone()
-                .expect("native state root"),
+                .runtime_state
+                .as_ref()
+                .expect("native state root")
+                .path()
+                .to_path_buf(),
         ));
         self.entered.add_permits(1);
         self.release.acquire().await.unwrap().forget();
@@ -419,8 +415,8 @@ impl RuntimeAdapter for DeliveryTransport {
                 std::fs::write(Self::handoff(&execution), b"{}")?;
             }
             DeliveryTurn::Complete | DeliveryTurn::CompleteWithOversizedReference => {
-                let runtime = execution.context.runtime_state_root.as_ref().unwrap();
-                let work = runtime.parent().unwrap().join("work");
+                let runtime = execution.context.runtime_state.as_ref().unwrap();
+                let work = runtime.path().parent().unwrap().join("work");
                 let artifact = work.join("delivery.txt");
                 let contents = if execution.input.prompt.contains("TERMINAL-DIRECT-PROSE") {
                     "reference-bearing retry complete\n"
@@ -580,12 +576,12 @@ impl RuntimeAdapter for NativeTransport {
             .lock()
             .unwrap()
             .push(execution.input.prompt.clone());
-        let runtime = execution
-            .context
-            .runtime_state_root
-            .expect("native state root");
-        std::fs::write(runtime.join("transport-session"), b"durable-native-id")?;
-        let conversation = runtime.parent().expect("conversation root");
+        let runtime = execution.context.runtime_state.expect("native state root");
+        std::fs::write(
+            runtime.path().join("transport-session"),
+            b"durable-native-id",
+        )?;
+        let conversation = runtime.path().parent().expect("conversation root");
         let mission = conversation
             .parent()
             .and_then(Path::parent)
@@ -860,7 +856,7 @@ async fn initialize_repo(repo: &Path) -> String {
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (21, 31));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (21, 32));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -1161,7 +1157,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert_eq!(settled, replayed);
     assert!(
         settled.head > active.head,
-        "real reducer-30 snapshot has a nonempty tail"
+        "real reducer-32 snapshot has a nonempty tail"
     );
     assert_eq!(settled.deliverable_head(), base);
     assert_eq!(settled.tasks[&writer_id].status, TaskStatus::Running);
@@ -1805,6 +1801,15 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             _ => None,
         })
         .collect::<Vec<_>>();
+    let validator_effects = final_events
+        .iter()
+        .filter_map(|event| match &event.event {
+            lionclaw::model::MissionEvent::RoleRunCompleted {
+                effect_id, request, ..
+            } if request.conversation_id == validator_id => Some(effect_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(validator_outcomes.len(), 2);
     assert!(matches!(
         validator_outcomes[0],
@@ -1820,20 +1825,37 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert!(prompts
         .iter()
         .any(|(prompt, _)| { prompt.contains("Use the exact proposed production contract.") }));
-    assert_eq!(
-        prompts
-            .iter()
-            .filter(|(_, runtime)| runtime.to_string_lossy().contains(validator_id.as_str()))
-            .count(),
-        2,
-        "invalid output and its repair use the same conversation runtime"
-    );
+    assert_eq!(validator_effects.len(), 2);
+    assert_ne!(validator_effects[0], validator_effects[1]);
+    assert!(validator_effects.iter().all(|effect_id| prompts
+        .iter()
+        .any(|(_, runtime)| runtime.to_string_lossy().contains(effect_id.as_str()))));
+    assert!(prompts
+        .iter()
+        .all(|(_, runtime)| !runtime.to_string_lossy().contains(validator_id.as_str())));
     assert!(prompts
         .iter()
         .any(|(_, runtime)| runtime.to_string_lossy().contains(planner_id.as_str())));
-    assert!(prompts
+    for effect_id in &validator_effects {
+        let runtime = prompts
+            .iter()
+            .find(|(_, runtime)| runtime.to_string_lossy().contains(effect_id.as_str()))
+            .map(|(_, runtime)| runtime)
+            .expect("validator effect runtime was observed");
+        assert!(
+            !runtime
+                .parent()
+                .expect("effect runtime has a root")
+                .exists(),
+            "settled validator effect resources must be removed"
+        );
+    }
+    let planner_runtime = prompts
         .iter()
-        .any(|(_, runtime)| runtime.to_string_lossy().contains(validator_id.as_str())));
+        .find(|(_, runtime)| runtime.to_string_lossy().contains(planner_id.as_str()))
+        .map(|(_, runtime)| runtime)
+        .expect("planner conversation runtime was observed");
+    assert!(planner_runtime.is_dir());
 }
 
 #[tokio::test]
@@ -3291,8 +3313,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         async move { cli::run_with_transports(command, transports).await }
     });
     entered.acquire().await.unwrap().forget();
-    let state = active_store.require_state(&mission_id).await.unwrap();
-    let delivery = state.conversations.values().next().unwrap();
+    let requested_state = active_store.require_state(&mission_id).await.unwrap();
+    let delivery = requested_state.conversations.values().next().unwrap();
     assert_eq!(delivery.queued.len(), 1);
     let active = delivery.active_delivery.as_ref().unwrap();
     let boundary = active.message_boundary;
@@ -3302,7 +3324,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     // fault-injection mutates this same identity; this production path proves
     // it actually reaches the active runner and stays stable as the log moves.
     let effect_id = active.effect_id.clone();
-    let request = state
+    let request = requested_state
         .inflight
         .get(&effect_id)
         .unwrap()
@@ -3313,11 +3335,103 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         request.presented_messages,
         vec![delivery.queued[0].sequence_no]
     );
+    drop(requested_state);
+    let state = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = active_store.require_state(&mission_id).await.unwrap();
+            if state.tasks[&request.task_id]
+                .workspace_provenance
+                .as_ref()
+                .is_some_and(|workspace| workspace.effect_id == effect_id)
+            {
+                break state;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exact workspace preparation did not become durable");
+    let workspace = state.tasks[&request.task_id]
+        .workspace_provenance
+        .as_ref()
+        .expect("prepared workspace provenance");
+    assert_eq!(workspace.effect_id, effect_id);
+    assert_eq!(workspace.conversation_id, request.conversation_id);
+    assert_eq!(workspace.base_sha, request.base_sha);
+    assert_eq!(workspace.assignment_epoch, request.assignment_epoch);
+    assert_eq!(
+        state.active_workspace_conversation(&effect_id).unwrap().0,
+        &request.conversation_id
+    );
+    let replayed = fold(active_store.load(&mission_id).await.unwrap()).unwrap();
+    assert_eq!(state, replayed);
+    drop(replayed);
+    assert_eq!(
+        state,
+        active_store
+            .load_state_snapshotted(&mission_id)
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    let (snapshot_head, reducer) = active_store
+        .snapshot_meta(&mission_id)
+        .await
+        .unwrap()
+        .expect("parked snapshot exists");
+    assert_eq!(reducer, REDUCER_VERSION);
+    assert!(snapshot_head < state.head, "snapshot tail must be nonempty");
+    let mission_dir = repo.join(".lionclaw/missions").join(mission_id.as_str());
+    let exact_work = mission_dir
+        .join("conversations")
+        .join(request.conversation_id.as_str())
+        .join("work");
+    std::fs::write(
+        exact_work.join("exact-generation-change.txt"),
+        "preserved\n",
+    )
+    .unwrap();
+
+    // Old task-shaped storage is also a valid Git checkout with a real change,
+    // but it is not folded authority for this running role generation.
+    let legacy_root = mission_dir.join("tasks").join(request.task_id.as_str());
+    let legacy_work = legacy_root.join("work");
+    lionclaw::workspace::create_checkout(&repo, &legacy_work, &base)
+        .await
+        .unwrap();
+    lionclaw::workspace::prepare_checkout_observer_index(
+        &repo,
+        &lionclaw_durable_fs::RootedDirectory::new(&repo, &legacy_root).unwrap(),
+        &base,
+        true,
+    )
+    .await
+    .unwrap();
+    std::fs::write(legacy_work.join("misleading-legacy-change.txt"), "legacy\n").unwrap();
+
     let active_status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
         &repo,
         &["mission", "status", mission_id.as_str(), "--json"],
     )))
     .unwrap();
+    let active_task = active_status["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == request.task_id.as_str())
+        .unwrap();
+    assert_eq!(active_task["workspace_observation"]["status"], "changed");
+    let task_diff = active_task["workspace_observation"]["diffstat"]
+        .as_str()
+        .unwrap();
+    assert!(task_diff.contains("exact-generation-change.txt"));
+    assert!(!task_diff.contains("misleading-legacy-change.txt"));
+    let active_human = stdout(cli_output(
+        &repo,
+        &["mission", "status", mission_id.as_str()],
+    ));
+    assert!(active_human.contains("exact-generation-change.txt"));
+    assert!(!active_human.contains("misleading-legacy-change.txt"));
     let active_projection = projected_conversation(&active_status, &conversation_id);
     assert_eq!(active_projection["lifecycle"], "running");
     assert_eq!(
@@ -3336,22 +3450,22 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     // Recompute the disposable observer through its production projection from
     // the freshly loaded fold, then require parsed status to render that exact
     // projection without promoting it to persisted mission authority.
-    let mission_dir = repo.join(".lionclaw/missions").join(mission_id.as_str());
-    lionclaw::activity::publish_observed(
-        &repo,
-        &mission_dir,
-        &state,
-        lionclaw::activity::now_ms(),
-        None,
-    )
-    .await
-    .unwrap();
+    lionclaw::activity::publish_observed(&active_store, &state, lionclaw::activity::now_ms(), None)
+        .await
+        .unwrap();
     let activity: lionclaw::activity::ActivityProjection =
         serde_json::from_slice(&std::fs::read(lionclaw::activity::path(&mission_dir)).unwrap())
             .unwrap();
     assert_eq!(activity.event_head, state.head);
     assert_eq!(activity.effects.len(), 1);
     assert_eq!(activity.effects[0].effect_id, effect_id.as_str());
+    assert_eq!(
+        activity.effects[0].workspace,
+        lionclaw::activity::WorkspaceObservation::Changed {
+            diffstat: task_diff.to_string(),
+        },
+        "activity must observe the exact folded conversation workspace"
+    );
     let refreshed_status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
         &repo,
         &["mission", "status", mission_id.as_str(), "--json"],
@@ -3361,6 +3475,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         refreshed_status["activity"],
         serde_json::to_value(&activity).unwrap()
     );
+    let observed_head = state.head;
+    drop(state);
     let activity_path = lionclaw::activity::path(&mission_dir);
     std::fs::write(&activity_path, b"not json").unwrap();
     assert_activity_suppressed(&repo, mission_id.as_str(), "malformed projection");
@@ -3389,7 +3505,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         (
             "head mismatch",
             "event_head",
-            serde_json::json!(state.head - 1),
+            serde_json::json!(observed_head - 1),
         ),
     ] {
         let mut candidate = serde_json::to_value(&activity).unwrap();
@@ -3453,6 +3569,13 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert!(active_human.contains("legal_actions=mission status|mission send"));
     assert!(active_human.contains("activity "));
 
+    // The remainder of this settlement scenario deliberately tests a clean
+    // successful artifact capture. The dirty-work observation above is the
+    // complete production assertion; remove only the test-owned file before
+    // allowing the held role to continue.
+    std::fs::remove_file(exact_work.join("exact-generation-change.txt")).unwrap();
+    std::fs::remove_dir_all(&legacy_root).unwrap();
+
     // This production-ingress append occurs while the request is held inside
     // the native adapter. It is beyond that request's boundary by definition.
     cli::run_with_transports(
@@ -3503,6 +3626,14 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         lionclaw::model::DeliveryMarker::Queued
     );
     let retry_boundary = delivery.active_delivery.as_ref().unwrap().message_boundary;
+    let retry_effect = &delivery.active_delivery.as_ref().unwrap().effect_id;
+    let retry_workspace = reworking.tasks[&request.task_id]
+        .workspace_provenance
+        .as_ref()
+        .expect("same-generation retry prepared its workspace");
+    assert_eq!(&retry_workspace.effect_id, retry_effect);
+    assert_eq!(retry_workspace.conversation_id, exact_conversation_id);
+    assert_ne!(retry_workspace.effect_id, effect_id);
     assert!(retry_boundary >= boundary);
     assert!(delivery.queued[1].sequence_no <= retry_boundary);
 
@@ -3521,6 +3652,24 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         assignment_generation
     );
     assert!(failed.inflight.is_empty());
+    let retained_workspace = failed
+        .tasks
+        .values()
+        .next()
+        .unwrap()
+        .workspace_provenance
+        .as_ref()
+        .unwrap();
+    assert_eq!(retained_workspace.conversation_id, exact_conversation_id);
+    assert!(failed
+        .parked_effects
+        .contains_key(&retained_workspace.effect_id));
+    assert_eq!(
+        lionclaw::activity::task_workspace_observations(active_store.lionclaw_dir(), &failed).await
+            [&request.task_id],
+        lionclaw::activity::WorkspaceObservation::Clean,
+        "settled work remains observable after its preparing effect leaves inflight"
+    );
     let mut completed_effect_projection = activity.clone();
     completed_effect_projection.event_head = failed.head;
     std::fs::write(

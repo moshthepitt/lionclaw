@@ -314,6 +314,17 @@ mod tests {
             events.push(env(
                 &mission_id,
                 seq,
+                MissionEvent::TaskWorkspacePrepared {
+                    task_id: task.id.clone(),
+                    effect_id: effect_id.clone(),
+                    base_sha: "s0".into(),
+                    assignment_epoch: 1,
+                },
+            ));
+            seq += 1;
+            events.push(env(
+                &mission_id,
+                seq,
                 MissionEvent::RoleRunCompleted {
                     effect_id,
                     request: test_role_identity(
@@ -321,7 +332,7 @@ mod tests {
                         &task.id,
                         "implementer",
                         crate::OutputSemantics::ProducesArtifact,
-                        seq - 2,
+                        seq - 3,
                     ),
                     outcome: Ok(crate::RoleRunSuccess {
                         handoff: Some(Handoff::Work {

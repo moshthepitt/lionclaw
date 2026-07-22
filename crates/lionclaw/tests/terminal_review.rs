@@ -17,7 +17,7 @@ use common::{
 use lionclaw::engine::{MissionDisposition, MissionView, TERMINAL_REVIEW_TASK_TAG as REVIEW_TAG};
 use lionclaw::model::{
     BlobRef, DecisionAction, FinishClass, Gap, Handoff, MissionEvent, MissionPhase, PayloadRef,
-    ReviewAcceptanceKind, ReviewOutcome, Task, TaskKind,
+    ReviewAcceptanceKind, ReviewOutcome, RoleResourceLifetime, Task, TaskKind,
 };
 use lionclaw::ports::{CapturedArtifact, RoleRunOutcome, RoleRunRequest};
 use lionclaw::testing::{review_verdict, MockOracleRunner, MockRoleRunner};
@@ -151,6 +151,31 @@ async fn a_clean_review_closes_verified_with_no_park() {
     assert_eq!(v.judged_sha, HEAD_SHA);
     assert!(v.is_fresh_at(&state.current_sha));
     assert!(!v.blocking());
+}
+
+#[tokio::test]
+async fn terminal_review_uses_effect_owned_resources() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = MockRoleRunner::new(Box::new(|request| {
+        if request.task_id.as_str() == REVIEW_TAG {
+            assert_eq!(
+                request.role.output.resource_lifetime(),
+                RoleResourceLifetime::Effect
+            );
+            assert!(request.artifact_capture.is_none());
+            Ok(review_verdict(request, true, vec![]))
+        } else {
+            assert_eq!(
+                request.role.output.resource_lifetime(),
+                RoleResourceLifetime::Conversation
+            );
+            Ok(work_outcome(request, HEAD_SHA))
+        }
+    }));
+    let (h, mission_id) = started(&dir, runner).await;
+
+    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    assert_terminal(&outcome);
 }
 
 #[tokio::test]

@@ -10,9 +10,12 @@ use common::{
     approve_plan, fault_append_events, initialize_repository, proposal, simple_plan,
     test_mission_type, BASE_SHA, HEAD_SHA,
 };
+use lionclaw::authority::AuthorityCeiling;
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
+use lionclaw::mission_type::{load_mission_type, materialize_mission_type};
 use lionclaw::model::{
-    EffectResource, Handoff, MissionEvent, PayloadRef, RuntimeConfigurationEvidence,
+    ConversationLifecycle, EffectResource, Handoff, MissionEvent, MissionPhase, PayloadRef,
+    RuntimeConfigurationEvidence,
 };
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, RoleRunOutcome, RoleRunRequest,
@@ -24,6 +27,14 @@ use lionclaw::testing::{
 };
 use lionclaw_runtime_api::TypedFailure;
 use tokio::sync::Barrier;
+
+fn software_dev_mission_type_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root")
+        .join("mission-types/software-dev")
+}
 
 struct BlockingRunner {
     started: Arc<Barrier>,
@@ -316,6 +327,164 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
     assert_eq!(calls[0].effect_id, calls[1].effect_id);
     assert!(!calls[0].discard_artifact);
     assert!(calls[1].discard_artifact);
+}
+
+#[tokio::test]
+async fn terminal_inflight_cleanup_is_recoverable_through_the_production_cli() {
+    let dir = test_repository();
+    let started = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cleaner = Arc::new(FailOnceCleaner::default());
+    let mission_type_source = software_dev_mission_type_dir();
+    let mission_type = load_mission_type(&mission_type_source, &AuthorityCeiling::default())
+        .expect("load software-dev mission type");
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(Engine::new(
+        store.clone(),
+        mission_type,
+        "codex".to_string(),
+        "test-image".to_string(),
+        EngineServices::new(
+            Arc::new(BlockingRunner {
+                started: started.clone(),
+                release,
+                calls: calls.clone(),
+            }),
+            Arc::new(MockOracleRunner::exiting(0)),
+            cleaner,
+            Arc::new(MockClock::default()),
+        ),
+    ));
+    let mission_id = create_approved_mission(&engine, dir.path()).await;
+    let mission_root = dir
+        .path()
+        .join(".lionclaw/missions")
+        .join(mission_id.as_str());
+    std::fs::create_dir_all(&mission_root).expect("mission resource root");
+    materialize_mission_type(
+        &mission_type_source,
+        &mission_root.join("mission-type"),
+        &AuthorityCeiling::default(),
+    )
+    .expect("materialize mission type snapshot");
+
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let mission_id = mission_id.clone();
+        async move { engine.advance(&mission_id).await }
+    });
+    started.wait().await;
+    let active = store.require_state(&mission_id).await.unwrap();
+    let request = active
+        .inflight
+        .values()
+        .next()
+        .and_then(|effect| effect.role_request_identity())
+        .expect("active role request");
+    let conversation_root = mission_root
+        .join("conversations")
+        .join(request.conversation_id.as_str());
+    std::fs::create_dir_all(conversation_root.join("scratch")).expect("scratch");
+    std::fs::create_dir_all(conversation_root.join("work")).expect("work");
+    std::fs::create_dir_all(conversation_root.join("runtime")).expect("runtime");
+    std::fs::write(conversation_root.join("scratch/build-output"), "discard\n").unwrap();
+    std::fs::write(conversation_root.join("work/retained"), "preserve\n").unwrap();
+    std::fs::write(
+        conversation_root.join("runtime/native-session"),
+        "preserve\n",
+    )
+    .unwrap();
+    std::fs::write(conversation_root.join("observer.index"), "preserve\n").unwrap();
+
+    let abort_store = store.clone();
+    let abort_mission = mission_id.clone();
+    let abort = tokio::spawn(async move {
+        lionclaw::engine::record_abort(
+            &abort_store,
+            10,
+            &abort_mission,
+            "driver disappeared while draining abort",
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if store
+                .require_state(&mission_id)
+                .await
+                .unwrap()
+                .phase
+                .is_terminal()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("abort becomes durable");
+    driver.abort();
+    assert!(driver.await.unwrap_err().is_cancelled());
+    abort.await.unwrap().unwrap();
+
+    let inherited = store.require_state(&mission_id).await.unwrap();
+    assert!(matches!(inherited.phase, MissionPhase::Aborted { .. }));
+    assert_eq!(inherited.inflight.len(), 1);
+    assert_eq!(
+        inherited.conversations[&request.conversation_id].lifecycle,
+        ConversationLifecycle::Running
+    );
+    let inbox = std::process::Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+        .args(["mission", "inbox", "--repo"])
+        .arg(dir.path())
+        .output()
+        .expect("render inherited cleanup through the production inbox");
+    assert!(
+        inbox.status.success(),
+        "inbox failed: {}",
+        String::from_utf8_lossy(&inbox.stderr)
+    );
+    let inbox = String::from_utf8(inbox.stdout).expect("UTF-8 inbox");
+    assert!(inbox.contains("aborted with 1 inherited effect(s) awaiting cleanup"));
+    assert!(inbox.contains("no live driver; recovery required"));
+    assert!(inbox.contains("next: mission advance | mission log"));
+
+    let blocked = engine.advance(&mission_id).await.unwrap();
+    assert_eq!(blocked.disposition, MissionDisposition::CleanupBlocked);
+    assert_eq!(blocked.next_actions(), ["mission advance", "mission log"]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(conversation_root.join("scratch/build-output").is_file());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+        .args([
+            "mission",
+            "advance",
+            mission_id.as_str(),
+            "--wait",
+            "--repo",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("run production CLI recovery");
+    assert!(
+        output.status.success(),
+        "CLI recovery failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let recovered = store.require_state(&mission_id).await.unwrap();
+    assert!(matches!(recovered.phase, MissionPhase::Aborted { .. }));
+    assert!(recovered.inflight.is_empty());
+    assert_eq!(
+        recovered.conversations[&request.conversation_id].lifecycle,
+        ConversationLifecycle::Retired
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "role must not rerun");
+    assert!(!conversation_root.join("scratch").exists());
+    assert!(conversation_root.join("work/retained").is_file());
+    assert!(conversation_root.join("runtime/native-session").is_file());
+    assert!(conversation_root.join("observer.index").is_file());
 }
 
 #[tokio::test]

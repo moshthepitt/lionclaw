@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, RwLock,
@@ -10,13 +9,14 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 use lionclaw_runtime_api::{
     clear_state_value, load_ready_state_value, save_state_value, RuntimeSessionReady,
+    RuntimeStateDir,
 };
 
 use crate::driver::AcpRuntimeConfig;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AcpSessionState {
-    pub(crate) runtime_state_root: Option<PathBuf>,
+    pub(crate) runtime_state: Option<RuntimeStateDir>,
     pub(crate) session_id: Option<String>,
     pub(crate) active_turn: Option<ActiveAcpTurn>,
 }
@@ -77,10 +77,10 @@ pub(crate) fn remember_acp_session_id(
     runtime_session_id: &str,
     session_id: &str,
 ) -> Result<()> {
-    let runtime_state_root =
+    let runtime_state =
         update_runtime_session_id(sessions, runtime_session_id, session_id.to_string())?;
-    if let Some(root) = runtime_state_root.as_deref() {
-        save_acp_session_id(config, root, session_id)?;
+    if let Some(state) = runtime_state.as_ref() {
+        save_acp_session_id(config, state, session_id)?;
     }
     Ok(())
 }
@@ -90,9 +90,9 @@ pub(crate) fn forget_acp_session_id(
     sessions: &RwLock<HashMap<String, AcpSessionState>>,
     runtime_session_id: &str,
 ) -> Result<()> {
-    let runtime_state_root = clear_runtime_session_id(sessions, runtime_session_id)?;
-    if let Some(root) = runtime_state_root.as_deref() {
-        clear_state_value(root, &config.session_id_state_file, "ACP session id")?;
+    let runtime_state = clear_runtime_session_id(sessions, runtime_session_id)?;
+    if let Some(state) = runtime_state.as_ref() {
+        clear_state_value(state, &config.session_id_state_file, "ACP session id")?;
     }
     Ok(())
 }
@@ -101,7 +101,7 @@ fn update_runtime_session_id(
     sessions: &RwLock<HashMap<String, AcpSessionState>>,
     runtime_session_id: &str,
     session_id: String,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<RuntimeStateDir>> {
     let mut sessions = sessions
         .write()
         .map_err(|_| anyhow!("ACP runtime session state lock poisoned"))?;
@@ -109,15 +109,15 @@ fn update_runtime_session_id(
         .get_mut(runtime_session_id)
         .ok_or_else(|| anyhow!("unknown ACP runtime session '{runtime_session_id}'"))?;
     state.session_id = Some(session_id);
-    let runtime_state_root = state.runtime_state_root.clone();
+    let runtime_state = state.runtime_state.clone();
     drop(sessions);
-    Ok(runtime_state_root)
+    Ok(runtime_state)
 }
 
 fn clear_runtime_session_id(
     sessions: &RwLock<HashMap<String, AcpSessionState>>,
     runtime_session_id: &str,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<RuntimeStateDir>> {
     let mut sessions = sessions
         .write()
         .map_err(|_| anyhow!("ACP runtime session state lock poisoned"))?;
@@ -125,9 +125,9 @@ fn clear_runtime_session_id(
         .get_mut(runtime_session_id)
         .ok_or_else(|| anyhow!("unknown ACP runtime session '{runtime_session_id}'"))?;
     state.session_id = None;
-    let runtime_state_root = state.runtime_state_root.clone();
+    let runtime_state = state.runtime_state.clone();
     drop(sessions);
-    Ok(runtime_state_root)
+    Ok(runtime_state)
 }
 
 pub(crate) fn register_active_acp_turn(
@@ -184,11 +184,11 @@ impl Drop for ActiveAcpTurnRegistration {
 
 fn save_acp_session_id(
     config: &AcpRuntimeConfig,
-    runtime_state_root: &Path,
+    runtime_state: &RuntimeStateDir,
     session_id: &str,
 ) -> Result<()> {
     save_state_value(
-        runtime_state_root,
+        runtime_state,
         &config.session_id_state_file,
         session_id,
         "ACP session id",
@@ -197,11 +197,11 @@ fn save_acp_session_id(
 
 pub(crate) fn load_ready_acp_session_id(
     config: &AcpRuntimeConfig,
-    runtime_state_root: &Path,
+    runtime_state: &RuntimeStateDir,
     runtime_session_ready: RuntimeSessionReady,
 ) -> Result<Option<String>> {
     load_ready_state_value(
-        runtime_state_root,
+        runtime_state,
         &config.session_id_state_file,
         "ACP session id",
         runtime_session_ready,

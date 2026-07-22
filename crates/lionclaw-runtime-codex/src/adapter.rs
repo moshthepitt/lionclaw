@@ -352,10 +352,10 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("codex-{}", Uuid::new_v4());
-        let (runtime_state_root, thread_id) = match input.resume {
-            RuntimeResume::Native { state_root, ready } => {
-                let thread_id = load_ready_saved_thread_id(&state_root, ready)?;
-                (Some(state_root), thread_id)
+        let (runtime_state, thread_id) = match input.resume {
+            RuntimeResume::Native { state, ready } => {
+                let thread_id = load_ready_saved_thread_id(&state, ready)?;
+                (Some(state), thread_id)
             }
             RuntimeResume::Reconstruct => (None, None),
         };
@@ -366,7 +366,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
             .insert(
                 runtime_session_id.clone(),
                 CodexSessionState {
-                    runtime_state_root,
+                    runtime_state,
                     thread_id,
                     active_turn: None,
                     native_reopen_failed: false,

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, bail, Result};
 use lionclaw_runtime_api::{
     clear_state_value, load_ready_state_value, save_state_value, RuntimeSessionReady,
+    RuntimeStateDir,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -26,7 +26,7 @@ pub(crate) fn validate_protocol_id(id: &str) -> Result<()> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CodexSessionState {
-    pub(crate) runtime_state_root: Option<PathBuf>,
+    pub(crate) runtime_state: Option<RuntimeStateDir>,
     pub(crate) thread_id: Option<String>,
     pub(crate) active_turn: Option<ActiveCodexTurn>,
     pub(crate) native_reopen_failed: bool,
@@ -51,11 +51,11 @@ pub(crate) struct CodexThreadState {
 }
 
 pub(crate) fn load_ready_saved_thread_id(
-    root: &Path,
+    state: &RuntimeStateDir,
     runtime_session_ready: RuntimeSessionReady,
 ) -> Result<Option<String>> {
     let thread_id = load_ready_state_value(
-        root,
+        state,
         CODEX_THREAD_ID_STATE_FILE,
         "codex thread",
         runtime_session_ready,
@@ -66,24 +66,24 @@ pub(crate) fn load_ready_saved_thread_id(
     Ok(thread_id)
 }
 
-pub(crate) fn save_thread_id(root: &Path, thread_id: &str) -> Result<()> {
+pub(crate) fn save_thread_id(state: &RuntimeStateDir, thread_id: &str) -> Result<()> {
     validate_protocol_id(thread_id)?;
-    save_state_value(root, CODEX_THREAD_ID_STATE_FILE, thread_id, "codex thread")
+    save_state_value(state, CODEX_THREAD_ID_STATE_FILE, thread_id, "codex thread")
 }
 
 pub(crate) fn forget_thread_id(
     sessions: &RwLock<HashMap<String, CodexSessionState>>,
     runtime_session_id: &str,
 ) -> Result<()> {
-    let runtime_state_root = sessions
+    let runtime_state = sessions
         .read()
         .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
         .get(runtime_session_id)
         .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))?
-        .runtime_state_root
+        .runtime_state
         .clone();
-    if let Some(root) = runtime_state_root {
-        clear_state_value(&root, CODEX_THREAD_ID_STATE_FILE, "codex thread")?;
+    if let Some(state) = runtime_state {
+        clear_state_value(&state, CODEX_THREAD_ID_STATE_FILE, "codex thread")?;
     }
     let mut sessions = sessions
         .write()
@@ -167,14 +167,14 @@ impl CodexThreadState {
             .clone())
     }
 
-    pub(crate) fn runtime_state_root(&self) -> Result<Option<PathBuf>> {
+    pub(crate) fn runtime_state(&self) -> Result<Option<RuntimeStateDir>> {
         Ok(self
             .sessions
             .read()
             .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
             .get(&self.runtime_session_id)
             .ok_or_else(|| anyhow!("runtime session '{}' not found", self.runtime_session_id))?
-            .runtime_state_root
+            .runtime_state
             .clone())
     }
 
@@ -186,11 +186,11 @@ impl CodexThreadState {
             .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
             .get(&self.runtime_session_id)
             .ok_or_else(|| anyhow!("runtime session '{}' not found", self.runtime_session_id))?
-            .runtime_state_root
+            .runtime_state
             .clone();
 
-        if let Some(root) = root.as_deref() {
-            save_thread_id(root, thread_id)?;
+        if let Some(state) = root.as_ref() {
+            save_thread_id(state, thread_id)?;
         }
 
         {

@@ -76,6 +76,7 @@ fn planning_mission_type() -> MissionType {
         name: "planning-test".to_string(),
         stop: StopBar::Verified,
         image: "img".to_string(),
+        environment: BTreeMap::new(),
         planning: planning_dag(),
         recovery: Default::default(),
         execution: Default::default(),

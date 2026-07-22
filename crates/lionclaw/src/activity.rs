@@ -1,20 +1,25 @@
 //! Bounded, disposable activity projection. Mission authority remains the
 //! append-only event log; this file exists only for cheap live observation.
 
-use std::io::{Read, Write};
+use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rustix::fs::{open, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{InflightEffect, MissionState, TaskId, TaskKind, TaskNamespace};
+use crate::model::{
+    InflightEffect, MissionState, OutputSemantics, TaskId, TaskKind, TaskNamespace,
+};
+use crate::resources::MissionDirs;
 
 const MAX_EFFECTS: usize = 32;
 const MAX_TEXT: usize = 4 * 1024;
 pub const MAX_PROJECTION_BYTES: u64 = 256 * 1024;
 const MAX_DRIVER_STDERR_BYTES: u64 = 64 * 1024;
-const MAX_DRIVER_DIAGNOSTIC_BYTES: u64 = (MAX_TEXT * 4) as u64;
+const ACTIVITY_FILE: &str = "activity.json";
+const DRIVER_ERROR_FILE: &str = "driver-error.txt";
+const DRIVER_STDERR_FILE: &str = "driver-stderr.txt";
 const MAX_CONCURRENT_OBSERVERS: usize = 4;
 const TOTAL_OBSERVATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -52,26 +57,19 @@ pub struct EffectActivity {
 
 /// Load the disposable observer only when it describes this exact fresh fold.
 /// Any read, shape, bound, or authority mismatch is deliberately suppressed.
-pub fn load_validated(mission_dir: &Path, state: &MissionState) -> Option<ActivityProjection> {
-    let descriptor = open(
-        path(mission_dir),
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .ok()?;
-    let mut file = std::fs::File::from(descriptor);
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_PROJECTION_BYTES {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    (&mut file)
-        .take(MAX_PROJECTION_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_PROJECTION_BYTES {
-        return None;
-    }
+pub(crate) fn load_validated(
+    mission_dirs: &MissionDirs,
+    state: &MissionState,
+) -> Option<ActivityProjection> {
+    let bytes = mission_dirs
+        .files()
+        .ok()?
+        .read_bounded(
+            OsStr::new(ACTIVITY_FILE),
+            MAX_PROJECTION_BYTES as usize,
+            "activity projection",
+        )
+        .ok()??;
     let projection: ActivityProjection = serde_json::from_slice(&bytes).ok()?;
     let expected = state
         .inflight
@@ -107,7 +105,7 @@ pub fn load_validated(mission_dir: &Path, state: &MissionState) -> Option<Activi
 }
 
 pub fn path(mission_dir: &Path) -> PathBuf {
-    mission_dir.join("activity.json")
+    mission_dir.join(ACTIVITY_FILE)
 }
 
 #[expect(
@@ -123,63 +121,33 @@ pub fn now_ms() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
+#[cfg(test)]
 fn driver_error_path(mission_dir: &Path) -> PathBuf {
-    mission_dir.join("driver-error.txt")
+    mission_dir.join(DRIVER_ERROR_FILE)
 }
 
+#[cfg(test)]
 fn driver_stderr_path(mission_dir: &Path) -> PathBuf {
-    mission_dir.join("driver-stderr.txt")
+    mission_dir.join(DRIVER_STDERR_FILE)
 }
 
-fn create_private_diagnostic(path: &Path) -> Result<std::fs::File> {
-    let descriptor = open(
-        path,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::RUSR | Mode::WUSR,
-    )?;
-    let file = std::fs::File::from(descriptor);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(file)
-}
-
-pub fn clear_driver_run_evidence(mission_dir: &Path) -> Result<()> {
-    for path in [
-        driver_error_path(mission_dir),
-        driver_stderr_path(mission_dir),
-    ] {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+pub(crate) fn clear_driver_run_evidence(mission_dirs: &MissionDirs) -> Result<()> {
+    let files = mission_dirs.files()?;
+    for name in [DRIVER_ERROR_FILE, DRIVER_STDERR_FILE] {
+        let _removed = files.remove_file(OsStr::new(name), "driver evidence")?;
     }
     Ok(())
 }
 
-pub fn clear_driver_error(mission_dir: &Path) -> Result<()> {
-    match std::fs::remove_file(driver_error_path(mission_dir)) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+pub(crate) fn clear_driver_error(mission_dirs: &MissionDirs) -> Result<()> {
+    let _removed = mission_dirs
+        .files()?
+        .remove_file(OsStr::new(DRIVER_ERROR_FILE), "driver error")?;
+    Ok(())
 }
 
-pub fn spool_driver_stderr(mut input: impl Read, mission_dir: &Path) -> Result<()> {
-    let mut failure = None;
-    let mut output = match std::fs::create_dir_all(mission_dir)
-        .map_err(anyhow::Error::from)
-        .and_then(|()| create_private_diagnostic(&driver_stderr_path(mission_dir)))
-    {
-        Ok(output) => Some(output),
-        Err(error) => {
-            failure = Some(error);
-            None
-        }
-    };
+pub(crate) fn spool_driver_stderr(mut input: impl Read, mission_dirs: &MissionDirs) -> Result<()> {
+    let mut bytes = Vec::with_capacity(MAX_DRIVER_STDERR_BYTES as usize);
     let mut retained = 0_u64;
     let mut buffer = [0_u8; 8 * 1024];
     loop {
@@ -190,107 +158,111 @@ pub fn spool_driver_stderr(mut input: impl Read, mission_dir: &Path) -> Result<(
         let available = MAX_DRIVER_STDERR_BYTES.saturating_sub(retained) as usize;
         let keep = read.min(available);
         if keep > 0 {
-            if let Some(writer) = output.as_mut() {
-                match writer.write_all(&buffer[..keep]) {
-                    Ok(()) => retained += keep as u64,
-                    Err(error) => {
-                        failure = Some(error.into());
-                        output = None;
-                    }
-                }
-            }
+            bytes.extend_from_slice(&buffer[..keep]);
+            retained += keep as u64;
         }
     }
-    if let Some(writer) = output.as_mut() {
-        if let Err(error) = writer.flush() {
-            failure = Some(error.into());
-        }
-    }
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    mission_dirs.prepare()?;
+    mission_dirs.files()?.write_private_atomic(
+        OsStr::new(DRIVER_STDERR_FILE),
+        &bytes,
+        MAX_DRIVER_STDERR_BYTES as usize,
+        "driver stderr",
+    )
 }
 
-pub fn record_driver_error(mission_dir: &Path, error: &anyhow::Error) -> Result<()> {
-    let target = driver_error_path(mission_dir);
-    let temporary = target.with_extension("tmp");
-    let mut output = create_private_diagnostic(&temporary)?;
-    output.write_all(bounded(&format!("{error:#}")).as_bytes())?;
-    output.flush()?;
-    drop(output);
-    std::fs::rename(temporary, target)?;
-    Ok(())
+pub(crate) fn record_driver_error(mission_dirs: &MissionDirs, error: &anyhow::Error) -> Result<()> {
+    mission_dirs.prepare()?;
+    mission_dirs.files()?.write_private_atomic(
+        OsStr::new(DRIVER_ERROR_FILE),
+        bounded(&format!("{error:#}")).as_bytes(),
+        MAX_TEXT,
+        "driver error",
+    )
 }
 
-pub fn driver_error(mission_dir: &Path) -> Option<String> {
-    read_driver_diagnostic(&driver_error_path(mission_dir))
+pub(crate) fn driver_error(mission_dirs: &MissionDirs) -> Option<String> {
+    read_driver_diagnostic(mission_dirs, DRIVER_ERROR_FILE)
         .filter(|text| !text.trim().is_empty())
         .or_else(|| {
-            read_driver_diagnostic(&driver_stderr_path(mission_dir))
+            read_driver_diagnostic(mission_dirs, DRIVER_STDERR_FILE)
                 .map(|text| bounded(&text))
                 .filter(|text| !text.trim().is_empty())
         })
 }
 
-fn read_driver_diagnostic(path: &Path) -> Option<String> {
-    let descriptor = open(
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .ok()?;
-    let file = std::fs::File::from(descriptor);
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(MAX_DRIVER_DIAGNOSTIC_BYTES as usize);
-    file.take(MAX_DRIVER_DIAGNOSTIC_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
+fn read_driver_diagnostic(mission_dirs: &MissionDirs, file_name: &str) -> Option<String> {
+    let bytes = mission_dirs
+        .files()
+        .ok()?
+        .read_bounded(
+            OsStr::new(file_name),
+            MAX_DRIVER_STDERR_BYTES as usize,
+            "driver diagnostic",
+        )
+        .ok()??;
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub async fn publish_observed(
-    workspace_root: &Path,
-    mission_dir: &Path,
+    store: &crate::store::MissionStore,
     state: &MissionState,
     now_ms: i64,
     observation: Option<&(crate::model::EffectId, lionclaw_runtime_api::TurnEvent)>,
 ) -> Result<()> {
-    tokio::fs::create_dir_all(mission_dir)
-        .await
-        .with_context(|| format!("creating mission directory '{}'", mission_dir.display()))?;
-    let previous = load_validated(mission_dir, state);
-    let workspace_requests = state
-        .inflight
-        .iter()
-        .take(MAX_EFFECTS)
-        .filter_map(|(effect_id, effect)| match effect {
-            InflightEffect::RoleRun {
-                namespace, task_id, ..
-            } if task_workspace_applicable(state, *namespace, task_id) => Some((
-                effect_id.clone(),
-                workspace_root.to_path_buf(),
-                mission_dir
-                    .join("tasks")
-                    .join(task_id.as_str())
-                    .join("work"),
-                mission_dir
-                    .join("tasks")
-                    .join(task_id.as_str())
-                    .join("observer.index"),
-                state
-                    .tasks
-                    .get(task_id)
-                    .and_then(|task| task.workspace_base_sha.clone()),
-            )),
-            InflightEffect::RoleRun { .. }
-            | InflightEffect::OracleRun { .. }
-            | InflightEffect::TerminalReview { .. } => None,
-        })
-        .collect();
-    let workspace_observations = observe_workspaces(workspace_requests).await;
+    let workspace_root = store
+        .lionclaw_dir()
+        .parent()
+        .context(".lionclaw directory has no workspace parent")?;
+    let mission_dirs = MissionDirs::new(store.lionclaw_dir(), &state.mission_id);
+    mission_dirs.prepare().with_context(|| {
+        format!(
+            "creating mission directory '{}'",
+            mission_dirs.root().display()
+        )
+    })?;
+    let previous = load_validated(&mission_dirs, state);
+    let mut workspace_requests = Vec::new();
+    let mut workspace_observations = std::collections::BTreeMap::new();
+    for (effect_id, effect) in state.inflight.iter().take(MAX_EFFECTS) {
+        if !matches!(effect, InflightEffect::RoleRun { .. }) {
+            continue;
+        }
+        match effect {
+            InflightEffect::RoleRun { output, .. } => {
+                let authority = if *output == OutputSemantics::ProducesArtifact {
+                    state.active_workspace_conversation(effect_id)
+                } else {
+                    state.active_role_conversation(effect_id)
+                };
+                match authority {
+                    Ok((conversation_id, conversation)) => {
+                        if *output != OutputSemantics::ProducesArtifact {
+                            continue;
+                        }
+                        let dirs = mission_dirs.conversation(conversation_id);
+                        workspace_requests.push((
+                            effect_id.clone(),
+                            workspace_root.to_path_buf(),
+                            dirs.work().to_path_buf(),
+                            dirs.observer_index().to_path_buf(),
+                            Some(conversation.workspace_base_sha.clone()),
+                        ));
+                    }
+                    Err(reason) => {
+                        workspace_observations.insert(
+                            effect_id.clone(),
+                            WorkspaceObservation::Unavailable {
+                                reason: reason.into(),
+                            },
+                        );
+                    }
+                }
+            }
+            InflightEffect::OracleRun { .. } | InflightEffect::TerminalReview { .. } => {}
+        }
+    }
+    workspace_observations.extend(observe_workspaces(workspace_requests).await);
     let effects = state
         .inflight
         .iter()
@@ -372,7 +344,7 @@ pub async fn publish_observed(
     if let Some((effect_id, event)) = observation {
         apply_runtime_event(&mut projection, effect_id, event, now_ms);
     }
-    write(mission_dir, &projection).await
+    write(&mission_dirs, &projection).await
 }
 
 fn apply_runtime_event(
@@ -434,22 +406,31 @@ fn apply_runtime_event(
 }
 
 #[cfg(test)]
-async fn read(mission_dir: &Path) -> Result<ActivityProjection> {
-    let bytes = tokio::fs::read(path(mission_dir)).await?;
+async fn read(mission_dirs: &MissionDirs) -> Result<ActivityProjection> {
+    let bytes = mission_dirs
+        .files()?
+        .read_bounded(
+            OsStr::new(ACTIVITY_FILE),
+            MAX_PROJECTION_BYTES as usize,
+            "activity projection",
+        )?
+        .context("activity projection is absent")?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-async fn write(mission_dir: &Path, projection: &ActivityProjection) -> Result<()> {
+async fn write(mission_dirs: &MissionDirs, projection: &ActivityProjection) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(projection)?;
-    let target = path(mission_dir);
-    let temporary = target.with_extension("tmp");
-    tokio::fs::write(&temporary, bytes)
-        .await
-        .with_context(|| format!("writing activity projection '{}'", temporary.display()))?;
-    tokio::fs::rename(&temporary, &target)
-        .await
-        .with_context(|| format!("publishing activity projection '{}'", target.display()))?;
-    Ok(())
+    let files = mission_dirs.files()?;
+    tokio::task::spawn_blocking(move || {
+        files.write_private_atomic(
+            OsStr::new(ACTIVITY_FILE),
+            &bytes,
+            MAX_PROJECTION_BYTES as usize,
+            "activity projection",
+        )
+    })
+    .await
+    .context("joining activity projection publication")?
 }
 
 async fn workspace_observation(
@@ -468,8 +449,7 @@ async fn workspace_observation(
             reason: "workspace exists before its base was recorded".into(),
         };
     };
-    match crate::workspace::observe_task_workspace(repo, workspace, observer_index, base_sha).await
-    {
+    match crate::workspace::observe_checkout(repo, workspace, observer_index, base_sha).await {
         Ok(summary) if summary.is_empty() => WorkspaceObservation::Clean,
         Ok(diffstat) => WorkspaceObservation::Changed {
             diffstat: bounded(&diffstat),
@@ -507,33 +487,41 @@ pub async fn task_workspace_observations(
         .cloned()
         .map(|task_id| (task_id, WorkspaceObservation::NotApplicable))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let requests = state
+    let mission_dirs = MissionDirs::new(lionclaw_dir, &state.mission_id);
+    let repo = lionclaw_dir
+        .parent()
+        .expect(".lionclaw directory has a workspace parent")
+        .to_path_buf();
+    let mut requests = Vec::new();
+    for task_id in state
         .tasks
-        .iter()
-        .filter(|(task_id, _)| task_workspace_applicable(state, TaskNamespace::Execution, task_id))
-        .map(|(task_id, task)| {
-            (
-                task_id.clone(),
-                lionclaw_dir
-                    .parent()
-                    .expect(".lionclaw directory has a workspace parent")
-                    .to_path_buf(),
-                lionclaw_dir
-                    .join("missions")
-                    .join(state.mission_id.as_str())
-                    .join("tasks")
-                    .join(task_id.as_str())
-                    .join("work"),
-                lionclaw_dir
-                    .join("missions")
-                    .join(state.mission_id.as_str())
-                    .join("tasks")
-                    .join(task_id.as_str())
-                    .join("observer.index"),
-                task.workspace_base_sha.clone(),
-            )
-        })
-        .collect();
+        .keys()
+        .filter(|task_id| task_workspace_applicable(state, TaskNamespace::Execution, task_id))
+    {
+        match state.task_workspace_conversation(TaskNamespace::Execution, task_id) {
+            Ok(Some((conversation_id, conversation))) => {
+                let dirs = mission_dirs.conversation(conversation_id);
+                requests.push((
+                    task_id.clone(),
+                    repo.clone(),
+                    dirs.work().to_path_buf(),
+                    dirs.observer_index().to_path_buf(),
+                    Some(conversation.workspace_base_sha.clone()),
+                ));
+            }
+            Ok(None) => {
+                observations.insert(task_id.clone(), WorkspaceObservation::NotCreated);
+            }
+            Err(reason) => {
+                observations.insert(
+                    task_id.clone(),
+                    WorkspaceObservation::Unavailable {
+                        reason: reason.into(),
+                    },
+                );
+            }
+        }
+    }
     observations.extend(observe_workspaces(requests).await);
     observations
 }
@@ -549,7 +537,7 @@ fn task_workspace_applicable(
     state
         .tasks
         .get(task_id)
-        .is_some_and(|task| task.workspace_base_sha.is_some())
+        .is_some_and(|task| task.workspace_provenance.is_some())
         || state.plan.as_ref().is_some_and(|plan| {
             plan.tasks
                 .iter()
@@ -620,6 +608,18 @@ mod tests {
     };
     use std::io::Cursor;
 
+    fn test_mission_dirs(temp: &tempfile::TempDir) -> MissionDirs {
+        let mission_id = crate::model::MissionId::parse("mabc123def456").unwrap();
+        let dirs = MissionDirs::new(temp.path(), &mission_id);
+        dirs.prepare().unwrap();
+        dirs
+    }
+
+    fn observer_files(index: &Path) -> lionclaw_durable_fs::RootedDirectory {
+        let parent = index.parent().expect("observer index has a parent");
+        lionclaw_durable_fs::RootedDirectory::new(parent, parent).unwrap()
+    }
+
     #[test]
     fn bounded_projection_text_is_capped() {
         assert_eq!(bounded(&"x".repeat(MAX_TEXT + 10)).len(), MAX_TEXT);
@@ -657,7 +657,7 @@ mod tests {
         workspace::create_checkout(&source, &work, &base)
             .await
             .unwrap();
-        workspace::prepare_task_observer_index(&source, &index, &base, true)
+        workspace::prepare_checkout_observer_index(&source, &observer_files(&index), &base, true)
             .await
             .unwrap();
         std::fs::write(work.join("tracked"), "committed result\n").unwrap();
@@ -684,7 +684,7 @@ mod tests {
         workspace::create_checkout(&source, &work, &base)
             .await
             .unwrap();
-        workspace::prepare_task_observer_index(&source, &index, &base, true)
+        workspace::prepare_checkout_observer_index(&source, &observer_files(&index), &base, true)
             .await
             .unwrap();
         let marker = temp.path().join("host-command-ran");
@@ -766,11 +766,14 @@ mod tests {
     #[tokio::test]
     async fn only_execution_work_tasks_have_task_workspace_observations() {
         use crate::model::{
-            Assertion, AssertionId, DecisionAction, EventEnvelope, MissionConfig, MissionEvent,
+            Assertion, AssertionId, ConversationId, ConversationLifecycle, ConversationState,
+            DecisionAction, EffectId, EventEnvelope, InflightEffect, MissionConfig, MissionEvent,
             MissionId, MissionTypeRef, OracleName, OutputSemantics, Plan, PlanInventory,
             PlanProposal, Requirement, RequirementDisposition, RequirementId, RequirementKind,
-            RoleName, Task, TaskId, TaskKind, TaskNamespace, VersionStamps,
+            RoleName, RolePromptTemplate, Task, TaskId, TaskKind, TaskNamespace,
+            TaskRoleAssignment, TaskWorkspaceProvenance, VersionStamps,
         };
+        use lionclaw_model::state::ActiveDelivery;
 
         let mission_id = MissionId::parse("mabc123abc123").unwrap();
         let task = |id: &str, kind: TaskKind, role: Option<&str>| Task {
@@ -861,7 +864,7 @@ mod tests {
                 requirement_changes: vec![],
             },
         ];
-        let state = crate::model::fold(events.into_iter().enumerate().map(|(index, event)| {
+        let mut state = crate::model::fold(events.into_iter().enumerate().map(|(index, event)| {
             EventEnvelope {
                 mission_id: mission_id.clone(),
                 sequence_no: index as u64,
@@ -892,6 +895,407 @@ mod tests {
             TaskNamespace::Planning,
             &TaskId::new("work").unwrap()
         ));
+
+        let base = init_repo(temp.path());
+        let task_id = TaskId::new("work").unwrap();
+        let role = RoleName::new("worker").unwrap();
+        let conversation_id = ConversationId::for_role_instance(
+            &mission_id,
+            TaskNamespace::Execution,
+            &task_id,
+            &role,
+            1,
+        );
+        let conversation = ConversationState {
+            role,
+            namespace: TaskNamespace::Execution,
+            task_id: task_id.clone(),
+            assignment_epoch: 1,
+            workspace_base_sha: base.clone(),
+            lifecycle: ConversationLifecycle::Ready,
+            queued: vec![],
+            consumed_through: 0,
+            active_delivery: None,
+            final_response: None,
+            invalid_handoff_reworks: 0,
+        };
+        let prepared_effect = EffectId::for_parts(&["settled", "prepared"]);
+        let task = state.tasks.get_mut(&task_id).unwrap();
+        task.workspace_provenance = Some(TaskWorkspaceProvenance {
+            effect_id: prepared_effect,
+            conversation_id: conversation_id.clone(),
+            base_sha: base.clone(),
+            assignment_epoch: 1,
+        });
+        state
+            .conversations
+            .insert(conversation_id.clone(), conversation.clone());
+
+        let state_dir = temp.path().join(".lionclaw");
+        std::fs::create_dir(&state_dir).unwrap();
+        let mission_dirs = MissionDirs::new(&state_dir, &mission_id);
+        let conversation_dirs = mission_dirs.conversation(&conversation_id);
+        conversation_dirs.role_state().prepare().unwrap();
+        workspace::create_checkout(temp.path(), conversation_dirs.work(), &base)
+            .await
+            .unwrap();
+        workspace::prepare_checkout_observer_index(
+            temp.path(),
+            &conversation_dirs.files().unwrap(),
+            &base,
+            true,
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            conversation_dirs.work().join("tracked"),
+            "conversation change\n",
+        )
+        .unwrap();
+
+        // A populated legacy task path must not compete with the folded
+        // conversation generation for observation authority.
+        let legacy_root = mission_dirs.root().join("tasks/work");
+        let legacy = legacy_root.join("work");
+        workspace::create_checkout(temp.path(), &legacy, &base)
+            .await
+            .unwrap();
+        workspace::prepare_checkout_observer_index(
+            temp.path(),
+            &observer_files(&legacy_root.join("observer.index")),
+            &base,
+            true,
+        )
+        .await
+        .unwrap();
+        std::fs::write(legacy.join("misleading"), "legacy\n").unwrap();
+        let observations = task_workspace_observations(&state_dir, &state).await;
+        let WorkspaceObservation::Changed { diffstat } = &observations[&task_id] else {
+            panic!("exact conversation work must be observed")
+        };
+        assert!(diffstat.contains("tracked"));
+        assert!(!diffstat.contains("misleading"));
+
+        let mut missing = state.clone();
+        missing.conversations.remove(&conversation_id);
+        let observations = task_workspace_observations(&state_dir, &missing).await;
+        let WorkspaceObservation::Unavailable { reason } = &observations[&task_id] else {
+            panic!("prepared workspace without conversation authority must fail closed")
+        };
+        assert!(reason.contains("no authoritative conversation"));
+
+        let mut orphaned_running = state.clone();
+        orphaned_running
+            .conversations
+            .get_mut(&conversation_id)
+            .unwrap()
+            .lifecycle = ConversationLifecycle::Running;
+        let observations = task_workspace_observations(&state_dir, &orphaned_running).await;
+        let WorkspaceObservation::Unavailable { reason } = &observations[&task_id] else {
+            panic!("running conversation without an effect must fail closed")
+        };
+        assert!(reason.contains("without an active effect"));
+
+        let mut stale_delivery = state.clone();
+        stale_delivery
+            .conversations
+            .get_mut(&conversation_id)
+            .unwrap()
+            .active_delivery = Some(ActiveDelivery {
+            effect_id: EffectId::for_parts(&["stale", "delivery"]),
+            message_boundary: state.head,
+            presented_messages: vec![],
+        });
+        let observations = task_workspace_observations(&state_dir, &stale_delivery).await;
+        let WorkspaceObservation::Unavailable { reason } = &observations[&task_id] else {
+            panic!("settled conversation with active delivery must fail closed")
+        };
+        assert!(reason.contains("without an active effect"));
+
+        let mut corrupt = state.clone();
+        let conflicting_id = ConversationId::for_role_instance(
+            &mission_id,
+            TaskNamespace::Execution,
+            &task_id,
+            &RoleName::new("conflicting-worker").unwrap(),
+            1,
+        );
+        corrupt.conversations.insert(
+            conflicting_id,
+            ConversationState {
+                role: RoleName::new("conflicting-worker").unwrap(),
+                ..conversation.clone()
+            },
+        );
+        let observations = task_workspace_observations(&state_dir, &corrupt).await;
+        let WorkspaceObservation::Changed { diffstat } = &observations[&task_id] else {
+            panic!("unreferenced conversation state must not compete with exact provenance")
+        };
+        assert!(diffstat.contains("tracked"));
+
+        let mut wrong_role = state.clone();
+        wrong_role.conversations.remove(&conversation_id);
+        wrong_role.conversations.insert(
+            ConversationId::for_role_instance(
+                &mission_id,
+                TaskNamespace::Execution,
+                &task_id,
+                &RoleName::new("other-worker").unwrap(),
+                1,
+            ),
+            ConversationState {
+                role: RoleName::new("other-worker").unwrap(),
+                ..conversation.clone()
+            },
+        );
+        let observations = task_workspace_observations(&state_dir, &wrong_role).await;
+        let WorkspaceObservation::Unavailable { reason } = &observations[&task_id] else {
+            panic!("a different role must not own the current plan task's workspace")
+        };
+        assert!(reason.contains("no authoritative conversation"));
+
+        // A same-base plan generation moves conversation identity without a
+        // workspace recreation decision, but it cannot claim the checkout
+        // until its own preparation fact replaces the retained provenance.
+        let mut active = state.clone();
+        active.revision = 2;
+        active.current_sha = base.clone();
+        let replacement_id = ConversationId::for_role_instance(
+            &mission_id,
+            TaskNamespace::Execution,
+            &task_id,
+            &conversation.role,
+            2,
+        );
+        let effect_id = EffectId::for_role_request(
+            TaskNamespace::Execution,
+            &mission_id,
+            &task_id,
+            2,
+            2,
+            "replacement-prompt",
+        );
+        let active_task = active.tasks.get_mut(&task_id).unwrap();
+        active_task.status = crate::model::TaskStatus::Running;
+        active_task.attempts = 2;
+        active_task.role_assignment = Some(TaskRoleAssignment {
+            base_sha: base.clone(),
+            assignment_epoch: 2,
+        });
+        active.conversations.insert(
+            replacement_id.clone(),
+            ConversationState {
+                assignment_epoch: 2,
+                lifecycle: ConversationLifecycle::Running,
+                active_delivery: Some(ActiveDelivery {
+                    effect_id: effect_id.clone(),
+                    message_boundary: active.head.saturating_sub(1),
+                    presented_messages: vec![],
+                }),
+                ..conversation.clone()
+            },
+        );
+        active.inflight.insert(
+            effect_id.clone(),
+            InflightEffect::RoleRun {
+                conversation_id: replacement_id.clone(),
+                namespace: TaskNamespace::Execution,
+                task_id: task_id.clone(),
+                attempt_no: 2,
+                role: conversation.role.clone(),
+                output: OutputSemantics::ProducesArtifact,
+                runtime: "codex".into(),
+                prompt_template: RolePromptTemplate::Execution,
+                prompt_hash: "replacement-prompt".into(),
+                base_sha: base.clone(),
+                assignment_epoch: 2,
+                message_boundary: active.head.saturating_sub(1),
+                presented_messages: vec![],
+                recreate_workspace: false,
+                runtime_configuration: None,
+                requested_at_ms: 0,
+                not_before_ms: 0,
+                deadline_ms: 1,
+                budget_deadline_ms: 1,
+                requested_seq: active.head,
+            },
+        );
+        let replacement_dirs = mission_dirs.conversation(&replacement_id);
+        workspace::create_checkout(temp.path(), replacement_dirs.work(), &base)
+            .await
+            .unwrap();
+        workspace::prepare_checkout_observer_index(
+            temp.path(),
+            &replacement_dirs.files().unwrap(),
+            &base,
+            true,
+        )
+        .await
+        .unwrap();
+        std::fs::write(replacement_dirs.work().join("replacement"), "new\n").unwrap();
+
+        let observations = task_workspace_observations(&state_dir, &active).await;
+        let WorkspaceObservation::Unavailable { reason } = &observations[&task_id] else {
+            panic!("pre-preparation active workspace must fail closed")
+        };
+        assert!(reason.contains("exact prepared workspace authority"));
+
+        active.tasks.get_mut(&task_id).unwrap().workspace_provenance =
+            Some(TaskWorkspaceProvenance {
+                effect_id: effect_id.clone(),
+                conversation_id: replacement_id.clone(),
+                base_sha: base.clone(),
+                assignment_epoch: 2,
+            });
+        let reloaded: MissionState = serde_json::from_slice(
+            &serde_json::to_vec(&active).expect("serialize valid inflight state"),
+        )
+        .expect("reload valid inflight state");
+        let observations = task_workspace_observations(&state_dir, &reloaded).await;
+        let WorkspaceObservation::Changed { diffstat } = &observations[&task_id] else {
+            panic!(
+                "active conversation must outrank the last prepared task epoch: {:?}",
+                observations[&task_id]
+            )
+        };
+        assert!(diffstat.contains("replacement"));
+        assert!(!diffstat.contains("tracked"));
+
+        let forged_generation = 3;
+        let forged_generation_id = ConversationId::for_role_instance(
+            &mission_id,
+            TaskNamespace::Execution,
+            &task_id,
+            &conversation.role,
+            forged_generation,
+        );
+        let forged_effect_id = EffectId::for_role_request(
+            TaskNamespace::Execution,
+            &mission_id,
+            &task_id,
+            2,
+            forged_generation,
+            "replacement-prompt",
+        );
+        let mut coherent_forgery = active.clone();
+        let mut forged_effect = coherent_forgery.inflight.remove(&effect_id).unwrap();
+        let InflightEffect::RoleRun {
+            conversation_id: forged_conversation_id,
+            assignment_epoch: forged_assignment_epoch,
+            ..
+        } = &mut forged_effect
+        else {
+            unreachable!("known role effect")
+        };
+        *forged_conversation_id = forged_generation_id.clone();
+        *forged_assignment_epoch = forged_generation;
+        coherent_forgery
+            .inflight
+            .insert(forged_effect_id.clone(), forged_effect);
+        let mut forged_conversation = coherent_forgery
+            .conversations
+            .remove(&replacement_id)
+            .unwrap();
+        forged_conversation.assignment_epoch = forged_generation;
+        forged_conversation.active_delivery = Some(ActiveDelivery {
+            effect_id: forged_effect_id.clone(),
+            message_boundary: active.head.saturating_sub(1),
+            presented_messages: vec![],
+        });
+        coherent_forgery
+            .conversations
+            .insert(forged_generation_id.clone(), forged_conversation);
+        coherent_forgery
+            .tasks
+            .get_mut(&task_id)
+            .unwrap()
+            .workspace_provenance = Some(TaskWorkspaceProvenance {
+            effect_id: forged_effect_id.clone(),
+            conversation_id: forged_generation_id.clone(),
+            base_sha: base.clone(),
+            assignment_epoch: forged_generation,
+        });
+        let forged_dirs = mission_dirs.conversation(&forged_generation_id);
+        workspace::create_checkout(temp.path(), forged_dirs.work(), &base)
+            .await
+            .unwrap();
+        workspace::prepare_checkout_observer_index(
+            temp.path(),
+            &forged_dirs.files().unwrap(),
+            &base,
+            true,
+        )
+        .await
+        .unwrap();
+        std::fs::write(forged_dirs.work().join("forged-generation"), "forged\n").unwrap();
+        let observations = task_workspace_observations(&state_dir, &coherent_forgery).await;
+        let WorkspaceObservation::Unavailable { reason } = &observations[&task_id] else {
+            panic!("coherently forged active generation must not select a workspace")
+        };
+        assert!(reason.contains("folded conversation workspace authority"));
+
+        let forged_id = ConversationId::for_role_instance(
+            &mission_id,
+            TaskNamespace::Execution,
+            &task_id,
+            &RoleName::new("forged-key").unwrap(),
+            2,
+        );
+        let mut forged_active = active.clone();
+        let replacement = forged_active.conversations.remove(&replacement_id).unwrap();
+        forged_active
+            .conversations
+            .insert(forged_id.clone(), replacement);
+        let store = crate::store::MissionStore::open(temp.path()).await.unwrap();
+        publish_observed(&store, &forged_active, 0, None)
+            .await
+            .unwrap();
+        let projection: ActivityProjection = serde_json::from_slice(
+            &std::fs::read(path(mission_dirs.root())).expect("read activity projection"),
+        )
+        .expect("decode activity projection");
+        let WorkspaceObservation::Unavailable { reason } = &projection.effects[0].workspace else {
+            panic!("forged active identity must not select a workspace")
+        };
+        assert!(reason.contains("absent from folded state"));
+
+        let mut wrong_output = active.clone();
+        let InflightEffect::RoleRun { output, .. } = wrong_output
+            .inflight
+            .get_mut(&effect_id)
+            .expect("active role effect")
+        else {
+            unreachable!("known role effect")
+        };
+        *output = OutputSemantics::EmitsVerdict;
+        publish_observed(&store, &wrong_output, 0, None)
+            .await
+            .unwrap();
+        let projection: ActivityProjection = serde_json::from_slice(
+            &std::fs::read(path(mission_dirs.root())).expect("read activity projection"),
+        )
+        .expect("decode activity projection");
+        let WorkspaceObservation::Unavailable { reason } = &projection.effects[0].workspace else {
+            panic!("a role output that disagrees with the plan must fail closed")
+        };
+        assert!(reason.contains("workspace authority disagree"));
+
+        let mut forged = active;
+        forged.inflight.clear();
+        let task = forged.tasks.get_mut(&task_id).unwrap();
+        task.workspace_provenance = Some(TaskWorkspaceProvenance {
+            effect_id: EffectId::for_parts(&["forged", "prepared"]),
+            conversation_id: forged_id.clone(),
+            base_sha: base,
+            assignment_epoch: 2,
+        });
+        let replacement = forged.conversations.remove(&replacement_id).unwrap();
+        forged.conversations.insert(forged_id, replacement);
+        let observations = task_workspace_observations(&state_dir, &forged).await;
+        let WorkspaceObservation::Unavailable { reason } = &observations[&task_id] else {
+            panic!("a forged conversation key must not become filesystem authority")
+        };
+        assert!(reason.contains("does not match its identity"));
     }
 
     #[test]
@@ -943,9 +1347,10 @@ mod tests {
     #[tokio::test]
     async fn runtime_journal_updates_configuration_and_activity_without_message_content() {
         let temp = tempfile::tempdir().unwrap();
+        let mission_dirs = test_mission_dirs(&temp);
         let effect_id = crate::model::EffectId::for_parts(&["activity", "effect"]);
         write(
-            temp.path(),
+            &mission_dirs,
             &ActivityProjection {
                 version: 4,
                 mission_id: "mission".into(),
@@ -967,7 +1372,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut projection = read(temp.path()).await.unwrap();
+        let mut projection = read(&mission_dirs).await.unwrap();
         apply_runtime_event(
             &mut projection,
             &effect_id,
@@ -992,9 +1397,9 @@ mod tests {
             }),
             21,
         );
-        write(temp.path(), &projection).await.unwrap();
+        write(&mission_dirs, &projection).await.unwrap();
 
-        let projection = read(temp.path()).await.unwrap();
+        let projection = read(&mission_dirs).await.unwrap();
         let effect = &projection.effects[0];
         assert_eq!(effect.applied_model.as_deref(), Some("canonical-id"));
         assert_eq!(
@@ -1015,47 +1420,49 @@ mod tests {
     #[test]
     fn driver_diagnostics_preserve_unexpected_stderr_but_prefer_structured_errors() {
         let temp = tempfile::tempdir().unwrap();
-        clear_driver_run_evidence(temp.path()).unwrap();
+        let mission_dirs = test_mission_dirs(&temp);
+        clear_driver_run_evidence(&mission_dirs).unwrap();
         std::fs::write(
-            driver_stderr_path(temp.path()),
+            driver_stderr_path(mission_dirs.root()),
             "panic from detached driver\n",
         )
         .unwrap();
         assert_eq!(
-            driver_error(temp.path()).as_deref(),
+            driver_error(&mission_dirs).as_deref(),
             Some("panic from detached driver\n")
         );
 
-        record_driver_error(temp.path(), &anyhow::anyhow!("typed driver failure")).unwrap();
+        record_driver_error(&mission_dirs, &anyhow::anyhow!("typed driver failure")).unwrap();
         assert_eq!(
-            driver_error(temp.path()).as_deref(),
+            driver_error(&mission_dirs).as_deref(),
             Some("typed driver failure")
         );
-        clear_driver_run_evidence(temp.path()).unwrap();
-        assert_eq!(driver_error(temp.path()), None);
+        clear_driver_run_evidence(&mission_dirs).unwrap();
+        assert_eq!(driver_error(&mission_dirs), None);
     }
 
     #[test]
     fn detached_driver_stderr_retention_is_bounded() {
         let temp = tempfile::tempdir().unwrap();
+        let mission_dirs = test_mission_dirs(&temp);
         let source = vec![b'x'; 128 * 1024];
         let mut stderr = Cursor::new(source);
-        spool_driver_stderr(&mut stderr, temp.path()).unwrap();
+        spool_driver_stderr(&mut stderr, &mission_dirs).unwrap();
 
         assert_eq!(stderr.position(), 128 * 1024, "the spool keeps draining");
         assert_eq!(
-            std::fs::metadata(driver_stderr_path(temp.path()))
+            std::fs::metadata(driver_stderr_path(mission_dirs.root()))
                 .unwrap()
                 .len(),
             MAX_DRIVER_STDERR_BYTES,
             "retained diagnostics have a fixed disk bound"
         );
-        assert_eq!(driver_error(temp.path()).unwrap().len(), MAX_TEXT);
+        assert_eq!(driver_error(&mission_dirs).unwrap().len(), MAX_TEXT);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                std::fs::metadata(driver_stderr_path(temp.path()))
+                std::fs::metadata(driver_stderr_path(mission_dirs.root()))
                     .unwrap()
                     .permissions()
                     .mode()
@@ -1068,12 +1475,13 @@ mod tests {
     #[test]
     fn detached_driver_stderr_keeps_draining_when_retention_fails() {
         let temp = tempfile::tempdir().unwrap();
-        let invalid_mission_dir = temp.path().join("not-a-directory");
-        std::fs::write(&invalid_mission_dir, "occupied").unwrap();
+        std::fs::write(temp.path().join("missions"), "occupied").unwrap();
+        let mission_id = crate::model::MissionId::parse("mabc123def456").unwrap();
+        let invalid_mission_dirs = MissionDirs::new(temp.path(), &mission_id);
         let source = vec![b'x'; 128 * 1024];
         let mut stderr = Cursor::new(source);
 
-        spool_driver_stderr(&mut stderr, &invalid_mission_dir)
+        spool_driver_stderr(&mut stderr, &invalid_mission_dirs)
             .expect_err("invalid retention path must be reported");
         assert_eq!(
             stderr.position(),
@@ -1088,20 +1496,43 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
+        let mission_dirs = test_mission_dirs(&temp);
         let external = temp.path().join("external.txt");
         std::fs::write(&external, "must not be disclosed").unwrap();
-        symlink(&external, driver_error_path(temp.path())).unwrap();
+        symlink(&external, driver_error_path(mission_dirs.root())).unwrap();
 
-        assert_eq!(driver_error(temp.path()), None);
-        std::fs::remove_file(driver_error_path(temp.path())).unwrap();
+        assert_eq!(driver_error(&mission_dirs), None);
+        std::fs::remove_file(driver_error_path(mission_dirs.root())).unwrap();
         rustix::fs::mkfifoat(
             rustix::fs::CWD,
-            driver_error_path(temp.path()),
+            driver_error_path(mission_dirs.root()),
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
         )
         .unwrap();
         let started = tokio::time::Instant::now();
-        assert_eq!(driver_error(temp.path()), None);
+        assert_eq!(driver_error(&mission_dirs), None);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn driver_evidence_rejects_a_symlinked_mission_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("missions")).unwrap();
+        let mission_id = crate::model::MissionId::parse("mabc123def456").unwrap();
+        let mission_dirs = MissionDirs::new(temp.path(), &mission_id);
+        symlink(outside.path(), mission_dirs.root()).unwrap();
+        std::fs::write(outside.path().join(DRIVER_ERROR_FILE), "private\n").unwrap();
+
+        assert_eq!(driver_error(&mission_dirs), None);
+        record_driver_error(&mission_dirs, &anyhow::anyhow!("must not escape"))
+            .expect_err("symlinked mission root must fail closed");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join(DRIVER_ERROR_FILE)).unwrap(),
+            "private\n"
+        );
     }
 }

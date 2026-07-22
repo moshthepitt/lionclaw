@@ -36,15 +36,16 @@ pub mod verdict;
 
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
-    resolve_execution_deadline_ms, role_success_contract_error, ArtifactOutcome, BlobRef,
-    ControlAction, ConversationRecipient, DecisionAction, EffectEventClass, EffectResource,
-    EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff, MessageReference, MissionConfig,
-    MissionEvent, MissionTypeRef, OracleRunSuccess, PayloadRef, PreparedInputRef, RecoveryConfig,
-    RolePromptTemplate, RoleRunRequestIdentity, RoleRunSuccess, RuntimeConfigurationEvidence,
-    StopBar, TaskNamespace, TerminalReviewConfig, TerminalReviewSuccess, UnavailableReferenceCause,
-    ValidationItem, VersionStamps, MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES,
-    MAX_MESSAGE_BYTES, MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES,
-    MAX_QUEUED_MESSAGES_PER_CONVERSATION, SCHEMA_VERSION,
+    resolve_execution_deadline_ms, role_prompt_template, role_success_contract_error,
+    ArtifactOutcome, BlobRef, ControlAction, ConversationRecipient, DecisionAction,
+    EffectEventClass, EffectResource, EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff,
+    MessageReference, MissionConfig, MissionEvent, MissionTypeRef, OracleRunSuccess, PayloadRef,
+    PreparedInputRef, RecoveryConfig, RolePromptTemplate, RoleRunRequestIdentity, RoleRunSuccess,
+    RuntimeConfigurationEvidence, StopBar, TaskNamespace, TerminalReviewConfig,
+    TerminalReviewSuccess, UnavailableReferenceCause, ValidationItem, VersionStamps,
+    MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES,
+    MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES, MAX_QUEUED_MESSAGES_PER_CONVERSATION,
+    SCHEMA_VERSION,
 };
 pub use failure::{
     bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,
@@ -58,8 +59,8 @@ pub use ids::{
 };
 pub use plan::{
     Assertion, AssertionSupersession, OutputSemantics, Plan, PlanInventory, PlanProposal,
-    PlanningDag, PlanningTask, Requirement, RequirementDisposition, RequirementKind, Task,
-    TaskKind,
+    PlanningDag, PlanningTask, Requirement, RequirementDisposition, RequirementKind,
+    RoleResourceLifetime, Task, TaskKind,
 };
 pub use plan_validation::{
     validate_plan, validate_plan_proposal, validate_planning_dag, PlanValidationError,
@@ -71,8 +72,9 @@ pub use state::{
     DurableCancellation, EffectCleanupFailure, FailureEvidence, FailureFeedback, InflightEffect,
     MissionPhase, MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState,
     QueuedMessage, ReferenceRecipientPolicy, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
-    RoleAssignment, RoleAssignmentContext, SupersededAssertion, TaskAddress, TaskRuntimeState,
-    TaskStatus, TerminalReviewState, TerminalReviewVerdict, UnavailableReferenceEvidence,
+    RoleAssignment, RoleAssignmentContext, SupersededAssertion, TaskAddress, TaskRoleAssignment,
+    TaskRuntimeState, TaskStatus, TaskWorkspaceProvenance, TerminalReviewState,
+    TerminalReviewVerdict, UnavailableReferenceEvidence,
 };
 pub use step::{
     step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,

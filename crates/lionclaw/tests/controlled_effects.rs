@@ -1081,6 +1081,7 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
             .await
             .unwrap();
 
+            let mut abort_reconciliation = None;
             match cancellation {
                 SettlementCancellation::Stop => {
                     record_control(
@@ -1102,11 +1103,34 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
                     );
                 }
                 SettlementCancellation::Abort => {
-                    engine.abort(&mission_id, "matrix abort").await.unwrap();
+                    let abort_engine = engine.clone();
+                    let abort_mission = mission_id.clone();
+                    abort_reconciliation = Some(tokio::spawn(async move {
+                        abort_engine.abort(&abort_mission, "matrix abort").await
+                    }));
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        loop {
+                            if store
+                                .require_state(&mission_id)
+                                .await
+                                .unwrap()
+                                .phase
+                                .is_terminal()
+                            {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("abort must be durable before settlement is released");
                 }
             }
             release.notify_one();
             let view = driver.await.unwrap();
+            if let Some(abort) = abort_reconciliation {
+                abort.await.unwrap().unwrap();
+            }
             let live = view.state;
             let events = store.load(&mission_id).await.unwrap();
             let replayed = fold(events.clone()).unwrap();
@@ -1133,7 +1157,14 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
             assert_eq!(live, rebuilt, "live/reducer-30 rebuild");
 
             assert_eq!(
-                live.tasks.values().next().unwrap().assignment_epoch,
+                live.tasks
+                    .values()
+                    .next()
+                    .unwrap()
+                    .workspace_provenance
+                    .as_ref()
+                    .unwrap()
+                    .assignment_epoch,
                 assignment_epoch
             );
             let conversation = &live.conversations[&conversation_id];
@@ -1206,8 +1237,9 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
                     .values()
                     .next()
                     .unwrap()
-                    .workspace_base_sha
-                    .as_deref(),
+                    .workspace_provenance
+                    .as_ref()
+                    .map(|workspace| workspace.base_sha.as_str()),
                 Some(BASE_SHA)
             );
         }

@@ -52,7 +52,10 @@ struct NoopRoleRunner;
 
 #[async_trait]
 impl RoleRunner for NoopRoleRunner {
-    async fn run(&self, _request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        prepare_scripted_writer(&request)
+            .await
+            .map_err(|error| TypedFailure::permanent("selftest.runner", format!("{error:#}")))?;
         Ok(RoleRunOutcome {
             handoff: Some(Handoff::Work {
                 done: true,
@@ -108,6 +111,9 @@ impl RoleRunner for ReviewParkRoleRunner {
                 final_response: "self-test scripted review".to_string(),
             })
         } else {
+            prepare_scripted_writer(&request).await.map_err(|error| {
+                TypedFailure::permanent("selftest.runner", format!("{error:#}"))
+            })?;
             Ok(RoleRunOutcome {
                 handoff: Some(Handoff::Work {
                     done: true,
@@ -330,6 +336,7 @@ const BROKEN_LIB: &str = include_str!("../tests/fixtures/eval/interval-bug/src/l
 fn manifest_toml(name: &str) -> String {
     format!(
         "[mission-type]\nname = \"{name}\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n\
+         environment = {{ CARGO_HOME = \"/scratch/cargo\", CARGO_TARGET_DIR = \"/scratch/target\" }}\n\
          \n[execution]\ndefault-timeout-secs = 1800\nmax-task-time-secs = 1800\n\
          extension-step-secs = 300\nauto-continue-candidate = true\nauto-continue-proof = true\n"
     )
@@ -517,20 +524,11 @@ impl RoleRunner for ScriptedRoleRunner {
 
 impl ScriptedRoleRunner {
     async fn run_inner(&self, request: RoleRunRequest) -> Result<RoleRunOutcome> {
+        let dest = prepare_scripted_writer(&request).await?;
         let capture = request
             .artifact_capture
             .as_ref()
-            .context("scripted writer received no artifact capture authority")?;
-        let dest = capture.checkout_dir().to_path_buf();
-        workspace::create_checkout(&request.workspace_dir, &dest, &request.base_sha).await?;
-        request
-            .updates
-            .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
-                base_sha: request.base_sha.clone(),
-                assignment_epoch: request.assignment_epoch,
-            })
-            .await
-            .context("engine role update receiver closed")?;
+            .expect("workspace preparation requires artifact capture authority");
         // The produces-artifact role compiles to a writable workspace.
         let authority = compile_authority(&request.role, &AuthorityCeiling::default())
             .map_err(|e| anyhow::anyhow!("authority refused to compile: {e}"))?;
@@ -560,6 +558,27 @@ impl ScriptedRoleRunner {
             final_response: "self-test scripted fix".to_string(),
         })
     }
+}
+
+/// Prepare the exact checkout authority required by a successful scripted
+/// writer. Self-test runners bypass the production adapter, so they must emit
+/// the same durable preparation observation explicitly.
+async fn prepare_scripted_writer(request: &RoleRunRequest) -> Result<std::path::PathBuf> {
+    let capture = request
+        .artifact_capture
+        .as_ref()
+        .context("scripted writer received no artifact capture authority")?;
+    let checkout = capture.checkout_dir().to_path_buf();
+    workspace::create_checkout(&request.workspace_dir, &checkout, &request.base_sha).await?;
+    request
+        .updates
+        .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
+            base_sha: request.base_sha.clone(),
+            assignment_epoch: request.assignment_epoch,
+        })
+        .await
+        .context("engine role update receiver closed")?;
+    Ok(checkout)
 }
 
 /// Run a shell command in a real container under a compiled role plan. Shared
@@ -1153,4 +1172,28 @@ async fn check_runtime_skill_mount() -> Result<()> {
     std::fs::remove_dir_all(runtime_home.path().join(".agents"))
         .context("native skill mountpoints were not removable after the container exited")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_cargo_mission_declares_writable_build_resources() {
+        let root = tempfile::tempdir().unwrap();
+        materialize_sw_mission_type(root.path()).unwrap();
+
+        let mission_type = load_mission_type(root.path(), &AuthorityCeiling::default()).unwrap();
+
+        assert_eq!(mission_type.environment["CARGO_HOME"], "/scratch/cargo");
+        assert_eq!(
+            mission_type.environment["CARGO_TARGET_DIR"],
+            "/scratch/target"
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_writer_preparation_reaches_terminal_review_closure() {
+        check_terminal_review().await.unwrap();
+    }
 }

@@ -73,6 +73,6 @@ pub use program::{
 pub use state::{
     clear_state_value, load_ready_state_value, load_state_value, record_runtime_resume_mode,
     recorded_runtime_resume_mode, runtime_session_ready_marker_exists, save_state_value,
-    RuntimeSessionReady, RUNTIME_SESSION_READY_MARKER,
+    RuntimeSessionReady, RuntimeStateDir, RUNTIME_SESSION_READY_MARKER, RUNTIME_STATE_VALUE_LIMIT,
 };
 pub use turn::TurnResult;

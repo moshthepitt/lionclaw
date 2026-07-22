@@ -97,6 +97,9 @@ async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_complet
             .values()
             .next()
             .unwrap()
+            .workspace_provenance
+            .as_ref()
+            .unwrap()
             .assignment_epoch,
         assignment_epoch
     );

@@ -3,7 +3,10 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::model::InputName;
 
-use super::{has_shebang, is_executable, PreparedInput, MAX_PREPARED_INPUT_CONTENT_BYTES};
+use super::{
+    has_shebang, is_executable, validate_environment_entry, PreparedInput,
+    MAX_PREPARED_INPUT_CONTENT_BYTES,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PreparedInputContractError {
@@ -51,10 +54,9 @@ pub(crate) fn validate_prepared_inputs(
                 )));
             }
         }
-        for variable in input.environment.keys() {
-            if !valid_environment_name(variable) {
-                return Err(invalid(format!("environment key '{variable}' is invalid")));
-            }
+        for (variable, value) in &input.environment {
+            validate_environment_entry(variable, value)
+                .map_err(|detail| invalid(format!("environment {detail}")))?;
             if let Some(owner) = environment_owners.insert(variable.clone(), name.clone()) {
                 return Err(invalid(format!(
                     "environment key '{variable}' is already provided by input '{owner}'"
@@ -93,12 +95,4 @@ fn safe_relative_path(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
-}
-
-fn valid_environment_name(name: &str) -> bool {
-    let mut characters = name.chars();
-    characters
-        .next()
-        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
-        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }

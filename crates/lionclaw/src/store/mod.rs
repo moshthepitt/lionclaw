@@ -98,8 +98,8 @@ impl MissionStore {
         &self.blobs
     }
 
-    /// Mission-state root (`<workspace>/.lionclaw`): attempt dirs and
-    /// worktrees live under here.
+    /// Mission-state root (`<workspace>/.lionclaw`): durable conversation
+    /// resources and disposable effect resources live under here.
     pub fn lionclaw_dir(&self) -> &Path {
         &self.lionclaw_dir
     }
@@ -108,8 +108,12 @@ impl MissionStore {
         self.mission_dir(mission_id).join("mission-type")
     }
 
+    pub(crate) fn mission_dirs(&self, mission_id: &MissionId) -> crate::resources::MissionDirs {
+        crate::resources::MissionDirs::new(&self.lionclaw_dir, mission_id)
+    }
+
     pub(crate) fn mission_dir(&self, mission_id: &MissionId) -> PathBuf {
-        self.lionclaw_dir.join("missions").join(mission_id.as_str())
+        self.mission_dirs(mission_id).root().to_path_buf()
     }
 
     pub(crate) fn driver_lock_path(&self, mission_id: &MissionId) -> PathBuf {

@@ -674,6 +674,22 @@ mod tests {
     /// test steps is one the real fold produced.
     fn fold_log(events: Vec<MissionEvent>) -> MissionState {
         let events = events.into_iter().flat_map(|event| {
+            let preparation = match &event {
+                MissionEvent::RoleRunRequested {
+                    task_id,
+                    effect_id,
+                    output: crate::OutputSemantics::ProducesArtifact,
+                    base_sha,
+                    assignment_epoch,
+                    ..
+                } => Some(MissionEvent::TaskWorkspacePrepared {
+                    task_id: task_id.clone(),
+                    effect_id: effect_id.clone(),
+                    base_sha: base_sha.clone(),
+                    assignment_epoch: *assignment_epoch,
+                }),
+                _ => None,
+            };
             let approve = matches!(&event, MissionEvent::PlanProposed { .. }).then(|| {
                 MissionEvent::DecisionRecorded {
                     attention_id: "plan_proposal:mission".into(),
@@ -682,7 +698,7 @@ mod tests {
                     requirement_changes: vec![],
                 }
             });
-            std::iter::once(event).chain(approve)
+            std::iter::once(event).chain(preparation).chain(approve)
         });
         let mut role_boundaries = std::collections::BTreeMap::new();
         fold(events.enumerate().map(|(i, mut event)| {

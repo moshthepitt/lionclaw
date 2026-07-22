@@ -212,6 +212,12 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                 budget_deadline_ms: 100_000,
             })
             .with_prompt_hash(CRASHED_PROMPT_HASH),
+            NewEvent::new(MissionEvent::TaskWorkspacePrepared {
+                task_id: task_id.clone(),
+                effect_id: role_effect.clone(),
+                base_sha: BASE_SHA.to_string(),
+                assignment_epoch: 1,
+            }),
             NewEvent::new(MissionEvent::RoleRunCompleted {
                 effect_id: role_effect,
                 request: Box::new(lionclaw::model::RoleRunRequestIdentity {

@@ -43,7 +43,10 @@ fn has_current_recipient(state: &lionclaw::model::MissionState) -> bool {
 fn assert_advertised_actions_are_legal(view: &MissionView) {
     for action in view.next_actions() {
         match action {
-            "mission advance" => assert!(!view.state.phase.is_terminal()),
+            "mission advance" => assert!(
+                !view.state.phase.is_terminal() || !view.state.inflight.is_empty(),
+                "terminal advance is legal only to settle inherited effects"
+            ),
             "mission status" => assert_eq!(view.disposition, MissionDisposition::Running),
             "mission send" => assert!(has_current_recipient(&view.state)),
             "mission plan propose" => {
@@ -166,7 +169,14 @@ fn assert_abort_preserves_authority(state: &lionclaw::model::MissionState) {
     assert!(aborted.parked_effects.is_empty());
     for driver_running in [false, true] {
         let view = MissionView::from_state(aborted.clone(), driver_running);
-        assert_eq!(view.disposition, MissionDisposition::Terminal);
+        let expected = if aborted.inflight.is_empty() {
+            MissionDisposition::Terminal
+        } else if driver_running {
+            MissionDisposition::Running
+        } else {
+            MissionDisposition::CleanupBlocked
+        };
+        assert_eq!(view.disposition, expected);
         assert_advertised_actions_are_legal(&view);
         assert!(!view.next_actions().contains(&"mission abort"));
     }

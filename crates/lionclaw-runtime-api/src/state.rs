@@ -1,20 +1,39 @@
-use std::{
-    ffi::OsString,
-    fs::File,
-    io::Read,
-    path::{Component, Path},
-};
+use std::{ffi::OsStr, path::Path};
 
 use anyhow::{anyhow, Context, Result};
-use lionclaw_durable_fs::write_file_atomically;
-use rustix::{
-    fs::{open, openat, unlinkat, AtFlags, Mode, OFlags},
-    io::Errno,
-};
+use lionclaw_durable_fs::RootedDirectory;
 
 pub const RUNTIME_SESSION_READY_MARKER: &str = ".lionclaw-runtime-session";
+pub const RUNTIME_STATE_VALUE_LIMIT: usize = 4 * 1024;
 const RECONSTRUCTED_RESUME_MODE: &str = "reconstructed";
 const RESUMED_RESUME_MODE: &str = "resumed";
+
+/// Host-owned native runtime state beneath one explicit trusted state anchor.
+///
+/// Keeping both coordinates in one value prevents adapters from inferring a
+/// security boundary by walking parents from the runtime leaf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeStateDir {
+    files: RootedDirectory,
+}
+
+impl RuntimeStateDir {
+    pub fn new(
+        state_anchor: impl AsRef<Path>,
+        runtime_state_root: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Ok(Self {
+            files: RootedDirectory::new(
+                state_anchor.as_ref().to_path_buf(),
+                runtime_state_root.as_ref().to_path_buf(),
+            )?,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        self.files.path()
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RuntimeSessionReady {
@@ -28,9 +47,9 @@ impl RuntimeSessionReady {
         }
     }
 
-    pub fn from_runtime_state_root(runtime_state_root: &Path) -> Result<Self> {
+    pub fn from_state_dir(runtime_state: &RuntimeStateDir) -> Result<Self> {
         Ok(Self {
-            marker_present: runtime_session_ready_marker_exists(runtime_state_root)?,
+            marker_present: runtime_session_ready_marker_exists(runtime_state)?,
         })
     }
 
@@ -40,7 +59,7 @@ impl RuntimeSessionReady {
 }
 
 pub fn load_ready_state_value(
-    runtime_state_root: &Path,
+    runtime_state: &RuntimeStateDir,
     file_name: &str,
     label: &str,
     runtime_session_ready: RuntimeSessionReady,
@@ -48,43 +67,25 @@ pub fn load_ready_state_value(
     if !runtime_session_ready.is_ready() {
         return Ok(None);
     }
-    load_state_value(runtime_state_root, file_name, label)
+    load_state_value(runtime_state, file_name, label)
 }
 
-pub fn runtime_session_ready_marker_exists(runtime_state_root: &Path) -> Result<bool> {
-    let marker_path = runtime_state_root.join(RUNTIME_SESSION_READY_MARKER);
-    let Some(root) = open_existing_state_root(runtime_state_root)? else {
-        return Ok(false);
-    };
-    let marker = match openat(
-        &root,
-        RUNTIME_SESSION_READY_MARKER,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(marker) => File::from(marker),
-        Err(Errno::NOENT) => return Ok(false),
-        Err(Errno::LOOP) => {
-            return Err(anyhow!(
-                "runtime session marker '{}' cannot be a symlink",
-                marker_path.display()
-            ))
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to open {}", marker_path.display()))
-        }
-    };
-    let metadata = marker
-        .metadata()
-        .with_context(|| format!("failed to stat {}", marker_path.display()))?;
-    Ok(metadata.is_file())
+pub fn runtime_session_ready_marker_exists(runtime_state: &RuntimeStateDir) -> Result<bool> {
+    Ok(runtime_state
+        .files
+        .read_bounded(
+            OsStr::new(RUNTIME_SESSION_READY_MARKER),
+            RUNTIME_STATE_VALUE_LIMIT,
+            "runtime session marker",
+        )?
+        .is_some())
 }
 
 /// Records the adapter-observed mode in mission-private conversation state.
 /// The same file remains the commit marker which permits native state to be
 /// considered by the next process.
 pub fn record_runtime_resume_mode(
-    runtime_state_root: &Path,
+    runtime_state: &RuntimeStateDir,
     mode: crate::RuntimeResumeMode,
 ) -> Result<()> {
     let value = match mode {
@@ -92,7 +93,7 @@ pub fn record_runtime_resume_mode(
         crate::RuntimeResumeMode::Resumed => RESUMED_RESUME_MODE,
     };
     save_state_value(
-        runtime_state_root,
+        runtime_state,
         RUNTIME_SESSION_READY_MARKER,
         value,
         "runtime resume mode",
@@ -101,10 +102,10 @@ pub fn record_runtime_resume_mode(
 
 /// Reads the last adapter-observed mode without exposing native identity.
 pub fn recorded_runtime_resume_mode(
-    runtime_state_root: &Path,
+    runtime_state: &RuntimeStateDir,
 ) -> Result<Option<crate::RuntimeResumeMode>> {
     match load_state_value(
-        runtime_state_root,
+        runtime_state,
         RUNTIME_SESSION_READY_MARKER,
         "runtime resume mode",
     )?
@@ -118,205 +119,56 @@ pub fn recorded_runtime_resume_mode(
 }
 
 pub fn load_state_value(
-    runtime_state_root: &Path,
+    runtime_state: &RuntimeStateDir,
     file_name: &str,
     label: &str,
 ) -> Result<Option<String>> {
-    let target_name = state_file_name(file_name)?;
-    let Some(root) = open_existing_state_root(runtime_state_root)? else {
+    let Some(contents) = runtime_state.files.read_bounded(
+        OsStr::new(file_name),
+        RUNTIME_STATE_VALUE_LIMIT,
+        &format!("{label} state file"),
+    )?
+    else {
         return Ok(None);
     };
-    let file = match openat(
-        &root,
-        &target_name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(file) => file,
-        Err(Errno::NOENT) => return Ok(None),
-        Err(Errno::LOOP) => {
-            return Err(anyhow!(
-                "{label} state file '{}' cannot be a symlink",
-                runtime_state_root.join(file_name).display()
-            ))
-        }
-        Err(err) => {
-            return Err(anyhow!(
-                "failed to open {label} state file '{}' in '{}': {err}",
-                file_name,
-                runtime_state_root.display()
-            ))
-        }
-    };
-
-    let mut file = File::from(file);
-    if !file
-        .metadata()
-        .with_context(|| {
-            format!(
-                "failed to stat {label} state file '{}' in '{}'",
-                file_name,
-                runtime_state_root.display()
-            )
-        })?
-        .is_file()
-    {
-        return Ok(None);
-    }
-
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).with_context(|| {
+    let contents = String::from_utf8(contents).with_context(|| {
         format!(
-            "failed to read {label} state file '{}' in '{}'",
-            file_name,
-            runtime_state_root.display()
+            "{label} state file '{}' is not UTF-8",
+            runtime_state.path().join(file_name).display()
         )
     })?;
     normalize_state_value(contents, label)
 }
 
 pub fn save_state_value(
-    runtime_state_root: &Path,
+    runtime_state: &RuntimeStateDir,
     file_name: &str,
     value: &str,
     label: &str,
 ) -> Result<()> {
-    let target_name = state_file_name(file_name)?;
     let value = match normalize_state_value(value, label)? {
         Some(value) => value,
         None => return Ok(()),
     };
-    let root = open_state_root(runtime_state_root)?;
-    validate_existing_state_file(&root, runtime_state_root, file_name, &target_name, label)?;
-
     let mut contents = value.into_bytes();
     contents.push(b'\n');
-    write_file_atomically(
-        &root,
-        runtime_state_root,
-        &target_name,
+    runtime_state.files.write_private_atomic(
+        OsStr::new(file_name),
         &contents,
-        0o600,
-        None,
+        RUNTIME_STATE_VALUE_LIMIT,
         &format!("{label} state file"),
     )
 }
 
-pub fn clear_state_value(runtime_state_root: &Path, file_name: &str, label: &str) -> Result<()> {
-    let target_name = state_file_name(file_name)?;
-    let Some(root) = open_existing_state_root(runtime_state_root)? else {
-        return Ok(());
-    };
-    validate_existing_state_file(&root, runtime_state_root, file_name, &target_name, label)?;
-    match unlinkat(&root, &target_name, AtFlags::empty()) {
-        Ok(()) | Err(Errno::NOENT) => Ok(()),
-        Err(err) => Err(anyhow!(
-            "failed to remove {label} state file '{}' in '{}': {err}",
-            file_name,
-            runtime_state_root.display()
-        )),
-    }
-}
-
-fn validate_existing_state_file(
-    root: &File,
-    runtime_state_root: &Path,
+pub fn clear_state_value(
+    runtime_state: &RuntimeStateDir,
     file_name: &str,
-    target_name: &OsString,
     label: &str,
 ) -> Result<()> {
-    let file = match openat(
-        root,
-        target_name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(file) => file,
-        Err(Errno::NOENT) => return Ok(()),
-        Err(Errno::LOOP) => {
-            return Err(anyhow!(
-                "{label} state file '{}' cannot be a symlink",
-                runtime_state_root.join(file_name).display()
-            ))
-        }
-        Err(err) => {
-            return Err(anyhow!(
-                "failed to open existing {label} state file '{}' in '{}': {err}",
-                file_name,
-                runtime_state_root.display()
-            ))
-        }
-    };
-    let file = File::from(file);
-    if !file
-        .metadata()
-        .with_context(|| {
-            format!(
-                "failed to stat existing {label} state file '{}' in '{}'",
-                file_name,
-                runtime_state_root.display()
-            )
-        })?
-        .is_file()
-    {
-        return Err(anyhow!(
-            "{label} state path '{}' must be a regular file",
-            runtime_state_root.join(file_name).display()
-        ));
-    }
+    let _removed = runtime_state
+        .files
+        .remove_file(OsStr::new(file_name), &format!("{label} state file"))?;
     Ok(())
-}
-
-fn open_state_root(runtime_state_root: &Path) -> Result<File> {
-    let root = match open(
-        runtime_state_root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(root) => root,
-        Err(Errno::LOOP | Errno::NOTDIR) => {
-            return Err(anyhow!(
-                "runtime state root '{}' must be a directory and cannot be a symlink",
-                runtime_state_root.display()
-            ))
-        }
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to open '{}'", runtime_state_root.display()))
-        }
-    };
-    Ok(File::from(root))
-}
-
-fn open_existing_state_root(runtime_state_root: &Path) -> Result<Option<File>> {
-    match open(
-        runtime_state_root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(root) => Ok(Some(File::from(root))),
-        Err(Errno::NOENT) => Ok(None),
-        Err(Errno::LOOP | Errno::NOTDIR) => Err(anyhow!(
-            "runtime state root '{}' must be a directory and cannot be a symlink",
-            runtime_state_root.display()
-        )),
-        Err(err) => Err(anyhow!(
-            "failed to open runtime state root '{}': {err}",
-            runtime_state_root.display()
-        )),
-    }
-}
-
-fn state_file_name(file_name: &str) -> Result<OsString> {
-    let path = Path::new(file_name);
-    let mut components = path.components();
-    let Some(Component::Normal(name)) = components.next() else {
-        return Err(anyhow!("runtime state file name '{file_name}' is invalid"));
-    };
-    if components.next().is_some() {
-        return Err(anyhow!("runtime state file name '{file_name}' is invalid"));
-    }
-    Ok(OsString::from(name))
 }
 
 fn normalize_state_value(value: impl AsRef<str>, label: &str) -> Result<Option<String>> {
@@ -335,21 +187,31 @@ mod tests {
     use super::*;
     use crate::RuntimeResumeMode;
 
+    fn runtime_state(root: &tempfile::TempDir) -> RuntimeStateDir {
+        RuntimeStateDir::new(root.path(), root.path().join("missions/m1/runtime")).unwrap()
+    }
+
+    fn prepare(runtime_state: &RuntimeStateDir) {
+        std::fs::create_dir_all(runtime_state.path()).unwrap();
+    }
+
     #[test]
     fn recorded_resume_mode_is_truthful_and_replaces_prior_observation() {
         let root = tempfile::tempdir().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
 
-        assert_eq!(recorded_runtime_resume_mode(root.path()).unwrap(), None);
-        record_runtime_resume_mode(root.path(), RuntimeResumeMode::Reconstructed).unwrap();
-        assert!(runtime_session_ready_marker_exists(root.path()).unwrap());
+        assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
+        record_runtime_resume_mode(&runtime_state, RuntimeResumeMode::Reconstructed).unwrap();
+        assert!(runtime_session_ready_marker_exists(&runtime_state).unwrap());
         assert_eq!(
-            recorded_runtime_resume_mode(root.path()).unwrap(),
+            recorded_runtime_resume_mode(&runtime_state).unwrap(),
             Some(RuntimeResumeMode::Reconstructed)
         );
 
-        record_runtime_resume_mode(root.path(), RuntimeResumeMode::Resumed).unwrap();
+        record_runtime_resume_mode(&runtime_state, RuntimeResumeMode::Resumed).unwrap();
         assert_eq!(
-            recorded_runtime_resume_mode(root.path()).unwrap(),
+            recorded_runtime_resume_mode(&runtime_state).unwrap(),
             Some(RuntimeResumeMode::Resumed)
         );
     }
@@ -357,11 +219,63 @@ mod tests {
     #[test]
     fn invalid_recorded_resume_mode_is_not_projected_as_native() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join(RUNTIME_SESSION_READY_MARKER), b"pretend\n").unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+        std::fs::write(
+            runtime_state.path().join(RUNTIME_SESSION_READY_MARKER),
+            b"pretend\n",
+        )
+        .unwrap();
 
-        let error = recorded_runtime_resume_mode(root.path()).unwrap_err();
+        let error = recorded_runtime_resume_mode(&runtime_state).unwrap_err();
         assert!(error
             .to_string()
             .contains("unknown recorded runtime resume mode 'pretend'"));
+    }
+
+    #[test]
+    fn missing_runtime_root_reads_absent_but_cannot_be_written() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_state = runtime_state(&root);
+
+        assert_eq!(
+            load_state_value(&runtime_state, "session", "test").unwrap(),
+            None
+        );
+        assert!(!runtime_session_ready_marker_exists(&runtime_state).unwrap());
+        assert!(save_state_value(&runtime_state, "session", "one", "test")
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
+    }
+
+    #[test]
+    fn oversized_runtime_state_is_rejected_before_allocation() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+        std::fs::write(
+            runtime_state.path().join("session"),
+            vec![b'x'; RUNTIME_STATE_VALUE_LIMIT + 1],
+        )
+        .unwrap();
+
+        let error = load_state_value(&runtime_state, "session", "test").unwrap_err();
+        assert!(error.to_string().contains("4096-byte limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_runtime_ancestor_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("missions")).unwrap();
+        symlink(outside.path(), root.path().join("missions/m1")).unwrap();
+        let runtime_state = runtime_state(&root);
+
+        let error = load_state_value(&runtime_state, "session", "test").unwrap_err();
+        assert!(error.to_string().contains("must be a real directory"));
     }
 }

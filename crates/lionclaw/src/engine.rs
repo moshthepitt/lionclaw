@@ -31,6 +31,7 @@ use crate::prompt::{
     render, ExecutionContext, JudgmentContext, PlanningPromptContext, PlanningPromptInput,
     PlanningPromptRefinement, TerminalReviewPromptContext, TurnContext,
 };
+use crate::resources::MissionDirs;
 use crate::runner::MAX_HANDOFF_REPORT_BYTES;
 use crate::store::{AppendError, MissionStore, NewEvent};
 
@@ -77,14 +78,9 @@ impl ActivityReporter {
                 let Ok(state) = store.require_state(&mission_id).await else {
                     continue;
                 };
-                let mission_dir = store.mission_dir(&mission_id);
                 let observation = activity.borrow().clone();
                 match crate::activity::publish_observed(
-                    store
-                        .lionclaw_dir()
-                        .parent()
-                        .expect(".lionclaw directory has a workspace parent"),
-                    &mission_dir,
+                    &store,
                     &state,
                     crate::activity::now_ms(),
                     observation.as_ref(),
@@ -174,7 +170,8 @@ pub struct MissionView {
 impl MissionView {
     /// Project one replayed state into its operator disposition and actions.
     pub fn from_state(state: MissionState, driver_running: bool) -> Self {
-        let disposition = if state.phase.is_terminal() {
+        let terminal = state.phase.is_terminal();
+        let disposition = if terminal && state.inflight.is_empty() {
             MissionDisposition::Terminal
         } else if driver_running {
             MissionDisposition::Running
@@ -182,6 +179,7 @@ impl MissionView {
             .cleanup_failure
             .as_ref()
             .is_some_and(|failure| state.inflight.contains_key(&failure.effect_id))
+            || terminal
         {
             MissionDisposition::CleanupBlocked
         } else if state.conversations.iter().any(|(id, conversation)| {
@@ -247,13 +245,10 @@ impl MissionView {
         if self.disposition == MissionDisposition::AwaitingLead && can_decide {
             actions.push("mission decide");
         }
-        if can_send
-            && !actions.contains(&"mission send")
-            && self.disposition != MissionDisposition::Terminal
-        {
+        if can_send && !actions.contains(&"mission send") && !self.state.phase.is_terminal() {
             actions.push("mission send");
         }
-        if self.disposition != MissionDisposition::Terminal {
+        if !self.state.phase.is_terminal() {
             actions.push("mission abort");
         }
         actions
@@ -269,6 +264,78 @@ pub async fn load_mission_view(
     drop(guard);
     let state = store.require_state(mission_id).await?;
     Ok(MissionView::from_state(state, driver_running))
+}
+
+/// Reconcile disposable resources after any current mission driver releases
+/// ownership. The state is reloaded only after acquiring the lock, so an event
+/// appended between a driver's final fold and lock release cannot be missed.
+pub(crate) async fn reconcile_disposable_conversation_resources(
+    store: &MissionStore,
+    mission_id: &MissionId,
+) -> Result<()> {
+    let lock_path = store.driver_lock_path(mission_id);
+    let guard = tokio::task::spawn_blocking(move || DriverGuard::acquire(&lock_path))
+        .await
+        .context("joining disposable resource lock waiter")??;
+    reconcile_disposable_conversation_resources_with_guard(store, mission_id, &guard).await
+}
+
+/// Reconcile only if no driver currently owns the mission. This is used by
+/// nonblocking operator observations such as plain `mission advance`; a live
+/// driver remains responsible for its own final cleanup.
+pub(crate) async fn reconcile_disposable_conversation_resources_if_idle(
+    store: &MissionStore,
+    mission_id: &MissionId,
+) -> Result<()> {
+    let Some(guard) = DriverGuard::try_acquire(&store.driver_lock_path(mission_id))? else {
+        return Ok(());
+    };
+    reconcile_disposable_conversation_resources_with_guard(store, mission_id, &guard).await
+}
+
+async fn reconcile_disposable_conversation_resources_with_guard(
+    store: &MissionStore,
+    mission_id: &MissionId,
+    guard: &DriverGuard,
+) -> Result<()> {
+    let state = store.require_state(mission_id).await?;
+    cleanup_settled_conversation_scratch(store, &state, guard).await
+}
+
+/// Remove only disposable scratch for conversations whose folded lifecycle is
+/// settled and which have no inflight role owner. The driver guard makes the
+/// folded ownership check stable for the duration of the removal.
+async fn cleanup_settled_conversation_scratch(
+    store: &MissionStore,
+    state: &MissionState,
+    _driver_guard: &DriverGuard,
+) -> Result<()> {
+    let mission_dirs = MissionDirs::new(store.lionclaw_dir(), &state.mission_id);
+    for (conversation_id, conversation) in &state.conversations {
+        if !matches!(
+            conversation.lifecycle,
+            crate::model::ConversationLifecycle::Completed
+                | crate::model::ConversationLifecycle::Retired
+        ) || state.inflight.values().any(|effect| {
+            matches!(
+                effect,
+                InflightEffect::RoleRun {
+                    conversation_id: active,
+                    ..
+                } if active == conversation_id
+            )
+        }) {
+            continue;
+        }
+        mission_dirs
+            .conversation(conversation_id)
+            .remove_disposable_scratch()
+            .await
+            .with_context(|| {
+                format!("cleaning disposable scratch for conversation '{conversation_id}'")
+            })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -337,15 +404,8 @@ impl Engine {
                 self.assemble_execution_request(&state, role, &intent, &dialogue)?
             }
         };
-        let actual_template = match intent.namespace {
-            TaskNamespace::Planning => crate::model::RolePromptTemplate::Planning,
-            TaskNamespace::Execution
-                if role.output == crate::model::OutputSemantics::EmitsVerdict =>
-            {
-                crate::model::RolePromptTemplate::Judgment
-            }
-            TaskNamespace::Execution => crate::model::RolePromptTemplate::Execution,
-        };
+        let actual_template = crate::model::role_prompt_template(intent.namespace, role.output)
+            .context("role output has no valid prompt template in this namespace")?;
         let actual_hash = hex::encode(Sha256::digest(prompt.as_bytes()));
         if template != actual_template || expected_hash != actual_hash {
             bail!("canonical role prompt drift")
@@ -535,7 +595,7 @@ impl Engine {
     ) -> Result<MissionView> {
         let lock_path = self.store.driver_lock_path(mission_id);
         let started = tokio::time::Instant::now();
-        let _guard = loop {
+        let guard = loop {
             if let Some(guard) = DriverGuard::try_acquire(&lock_path)? {
                 break guard;
             }
@@ -561,25 +621,22 @@ impl Engine {
         let (activity, observed_activity) = tokio::sync::watch::channel(None);
         let reporter =
             ActivityReporter::start(self.store.clone(), mission_id.clone(), observed_activity);
-        let drive_result = self.drive(mission_id, activity).await;
-        // Persist a fold snapshot before parking or exiting so the next
-        // invocation resumes without re-folding the whole log.
-        let state = match drive_result {
-            Ok(()) => {
-                let state = self.load_state(mission_id).await?;
-                self.store
-                    .save_snapshot(&state, self.clock.now_ms())
-                    .await?;
-                state
-            }
-            Err(error) => {
-                reporter.shutdown().await;
-                return Err(error);
-            }
-        };
+        let drive_result = async {
+            self.drive(mission_id, activity).await?;
+            let state = self.load_state(mission_id).await?;
+            cleanup_settled_conversation_scratch(&self.store, &state, &guard).await?;
+            // Persist a fold snapshot before parking or exiting so the next
+            // invocation resumes without re-folding the whole log.
+            self.store
+                .save_snapshot(&state, self.clock.now_ms())
+                .await?;
+            Ok::<_, anyhow::Error>(state)
+        }
+        .await;
         // Projection latency is deliberately outside all authoritative state
         // transitions, deadline decisions, and cleanup.
         reporter.shutdown().await;
+        let state = drive_result?;
         Ok(MissionView::from_state(state, false))
     }
 
@@ -740,7 +797,10 @@ impl Engine {
                 }
             }
         };
-        tokio::pin!(execution);
+        // Each effect type carries its complete bounded execution path. Pin
+        // the sum once on the heap instead of embedding its largest variant
+        // in the driver thread's stack frame.
+        let mut execution = Box::pin(execution);
         let outcome = loop {
             tokio::select! {
                 outcome = &mut execution => break outcome?,
@@ -966,7 +1026,6 @@ impl Engine {
         effect_id: &EffectId,
         request: RoleRunRequest,
         mut updates: tokio::sync::mpsc::Receiver<RoleRunUpdate>,
-        record_workspace: bool,
     ) -> Result<std::result::Result<crate::ports::RoleRunOutcome, TypedFailure>> {
         let run = self.role_runner.run(request);
         tokio::pin!(run);
@@ -974,13 +1033,13 @@ impl Engine {
             tokio::select! {
                 result = &mut run => {
                     while let Ok(update) = updates.try_recv() {
-                        self.record_role_update(state, effect_id, update, record_workspace).await?;
+                        self.record_role_update(state, effect_id, update).await?;
                     }
                     return Ok(result);
                 }
                 update = updates.recv() => {
                     if let Some(update) = update {
-                        self.record_role_update(state, effect_id, update, record_workspace).await?;
+                        self.record_role_update(state, effect_id, update).await?;
                     }
                 }
             }
@@ -992,15 +1051,18 @@ impl Engine {
         state: &MissionState,
         effect_id: &EffectId,
         update: RoleRunUpdate,
-        record_workspace: bool,
     ) -> Result<()> {
         match update {
             RoleRunUpdate::WorkspacePrepared {
                 base_sha,
                 assignment_epoch,
-            } if record_workspace => {
+            } => {
                 let task_id = match state.inflight.get(effect_id) {
-                    Some(InflightEffect::RoleRun { task_id, .. }) => task_id.clone(),
+                    Some(InflightEffect::RoleRun {
+                        task_id,
+                        output: crate::model::OutputSemantics::ProducesArtifact,
+                        ..
+                    }) => task_id.clone(),
                     _ => return Ok(()),
                 };
                 self.append_fact(
@@ -1015,7 +1077,6 @@ impl Engine {
                 )
                 .await
             }
-            RoleRunUpdate::WorkspacePrepared { .. } => Ok(()),
             RoleRunUpdate::RuntimeConfigured(configuration) => {
                 let configuration = configuration.projected();
                 self.append_fact(
@@ -1144,6 +1205,12 @@ impl Engine {
                 outcome,
             })
         };
+        if let Err(reason) = state.active_role_conversation(effect_id) {
+            return Ok(completed(Err(TypedFailure::permanent(
+                "role.authority",
+                reason,
+            ))));
+        }
         let Some(role) = self.mission_type.roles.get(role_name) else {
             return Ok(completed(Err(TypedFailure::permanent(
                 "role.missing",
@@ -1180,14 +1247,10 @@ impl Engine {
         let (updates, update_rx) = tokio::sync::mpsc::channel(8);
         let artifact_capture =
             (*output == crate::model::OutputSemantics::ProducesArtifact).then(|| {
-                let checkout = self
-                    .store
-                    .lionclaw_dir()
-                    .join("missions")
-                    .join(state.mission_id.as_str())
-                    .join("conversations")
-                    .join(conversation_id.as_str())
-                    .join("work");
+                let checkout = MissionDirs::new(self.store.lionclaw_dir(), &state.mission_id)
+                    .conversation(conversation_id)
+                    .work()
+                    .to_path_buf();
                 ArtifactCapture::new(
                     state.workspace_dir.clone().into(),
                     checkout,
@@ -1198,12 +1261,12 @@ impl Engine {
             });
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
-            conversation_id: conversation_id.clone(),
             namespace: *namespace,
             task_id: task_id.clone(),
             attempt_no,
             effect_id: effect_id.clone(),
             role: role.clone(),
+            environment: self.mission_type.environment.clone(),
             runtime: runtime.clone(),
             skills,
             prompt: prompt_text,
@@ -1220,7 +1283,7 @@ impl Engine {
         };
         let previous_task = state.tasks_in(*namespace).get(task_id);
         match self
-            .run_role_observed(state, effect_id, request, update_rx, true)
+            .run_role_observed(state, effect_id, request, update_rx)
             .await?
         {
             Ok(outcome) => {
@@ -1354,6 +1417,7 @@ impl Engine {
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
             prepared_inputs: self.mission_type.inputs.values().cloned().collect(),
+            environment: self.mission_type.environment.clone(),
             deadline_ms: effect.deadline_ms(),
             control,
         };
@@ -1430,6 +1494,12 @@ impl Engine {
                 ),
             ))));
         };
+        if role.output != crate::model::OutputSemantics::EmitsGapVerdict {
+            return Ok(completed(Err(TypedFailure::permanent(
+                "role.output_contract",
+                "the pinned terminal-review role no longer emits a gap verdict",
+            ))));
+        }
         let skills = match self.resolve_role_skills(role) {
             Ok(skills) => skills,
             Err(detail) => {
@@ -1443,18 +1513,12 @@ impl Engine {
         let (updates, update_rx) = tokio::sync::mpsc::channel(8);
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
-            conversation_id: crate::model::ConversationId::for_role_instance(
-                &state.mission_id,
-                TaskNamespace::Execution,
-                &TaskId::new(TERMINAL_REVIEW_TASK_TAG).expect("valid literal task id"),
-                role_name,
-                attempt_no,
-            ),
             namespace: TaskNamespace::Execution,
             task_id: TaskId::new(TERMINAL_REVIEW_TASK_TAG).expect("valid literal task id"),
             attempt_no,
             effect_id: effect_id.clone(),
             role: role.clone(),
+            environment: self.mission_type.environment.clone(),
             runtime: runtime.clone(),
             skills,
             prompt: prompt_text,
@@ -1470,7 +1534,7 @@ impl Engine {
             artifact_capture: None,
         };
         let outcome = match self
-            .run_role_observed(state, effect_id, request, update_rx, false)
+            .run_role_observed(state, effect_id, request, update_rx)
             .await?
         {
             Ok(outcome) => match validated_role_success(
@@ -1850,15 +1914,8 @@ impl Engine {
                 .runtime
                 .clone()
                 .unwrap_or_else(|| state.runtime.clone()),
-            prompt_template: match intent.namespace {
-                TaskNamespace::Planning => crate::model::RolePromptTemplate::Planning,
-                TaskNamespace::Execution
-                    if role.output == crate::model::OutputSemantics::EmitsVerdict =>
-                {
-                    crate::model::RolePromptTemplate::Judgment
-                }
-                TaskNamespace::Execution => crate::model::RolePromptTemplate::Execution,
-            },
+            prompt_template: crate::model::role_prompt_template(intent.namespace, role.output)
+                .context("role output has no valid prompt template in this namespace")?,
             prompt_hash: prompt_hash.clone(),
             base_sha,
             assignment_epoch,
@@ -2241,11 +2298,18 @@ pub async fn record_decision(
     store
         .append(mission_id, state.head, &[event], now_ms)
         .await?;
+    reconcile_disposable_conversation_resources(store, mission_id)
+        .await
+        .with_context(|| {
+            format!(
+                "decision was recorded durably for mission '{mission_id}', but disposable resource cleanup failed; run 'lionclaw mission advance {mission_id}' to retry"
+            )
+        })?;
     Ok(())
 }
 
 /// Record mission closure without requiring or resolving an attention item.
-/// Abort never approves, accepts, verifies, or deletes mission-owned evidence.
+/// Abort never approves, accepts, verifies, or deletes retained mission evidence.
 pub async fn record_abort(
     store: &MissionStore,
     now_ms: i64,
@@ -2269,6 +2333,13 @@ pub async fn record_abort(
             now_ms,
         )
         .await?;
+    reconcile_disposable_conversation_resources(store, mission_id)
+        .await
+        .with_context(|| {
+            format!(
+                "mission '{mission_id}' was aborted durably, but disposable resource cleanup failed; run 'lionclaw mission advance {mission_id}' to retry"
+            )
+        })?;
     Ok(())
 }
 
@@ -2960,6 +3031,9 @@ mod assignment_tests {
     use crate::model::{resolve_task_assignment, TaskRuntimeState, TaskStatus};
 
     fn task(status: TaskStatus, base: &str, epoch: u32) -> TaskRuntimeState {
+        let mission_id = MissionId::for_creation("/workspace", "assignment-test", 1);
+        let task_id = TaskId::new("assignment-test").unwrap();
+        let role = crate::model::RoleName::new("implementer").unwrap();
         TaskRuntimeState {
             status,
             attempts: epoch,
@@ -2968,8 +3042,22 @@ mod assignment_tests {
             last_failure: None,
             feedback: Vec::new(),
             last_runtime_configuration: None,
-            workspace_base_sha: Some(base.to_string()),
-            assignment_epoch: epoch,
+            role_assignment: Some(crate::model::TaskRoleAssignment {
+                base_sha: base.to_string(),
+                assignment_epoch: epoch,
+            }),
+            workspace_provenance: Some(crate::model::TaskWorkspaceProvenance {
+                effect_id: EffectId::for_parts(&["assignment-test", &epoch.to_string()]),
+                conversation_id: crate::model::ConversationId::for_role_instance(
+                    &mission_id,
+                    TaskNamespace::Execution,
+                    &task_id,
+                    &role,
+                    epoch,
+                ),
+                base_sha: base.to_string(),
+                assignment_epoch: epoch,
+            }),
         }
     }
 

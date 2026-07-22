@@ -13,7 +13,7 @@ pub use handoff::MAX_HANDOFF_REPORT_BYTES;
 pub(crate) use prepared_input::{prepare_inputs, PreparedInputs};
 pub use role_runner::OciRoleRunner;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use lionclaw_confinement::{
@@ -22,19 +22,19 @@ use lionclaw_confinement::{
 
 use crate::config::RuntimeSkillsDir;
 use crate::mission_type::SkillPackage;
-use crate::model::{EffectId, TaskId};
 use crate::ports::ExecutionControl;
+use crate::resources::{RoleEffectDirs, RoleStateDirs};
 
 pub(crate) async fn await_controlled<T, F, M>(
-    future: F,
+    mut future: std::pin::Pin<Box<F>>,
     mut control: tokio::sync::watch::Receiver<ExecutionControl>,
     map_control: M,
 ) -> std::result::Result<T, lionclaw_runtime_api::TypedFailure>
 where
-    F: std::future::Future<Output = std::result::Result<T, lionclaw_runtime_api::TypedFailure>>,
+    F: std::future::Future<Output = std::result::Result<T, lionclaw_runtime_api::TypedFailure>>
+        + ?Sized,
     M: Fn(&ExecutionControl) -> Option<lionclaw_runtime_api::TypedFailure>,
 {
-    tokio::pin!(future);
     if let Some(failure) = map_control(&control.borrow().clone()) {
         return Err(failure);
     }
@@ -58,119 +58,13 @@ where
 pub const HANDOFF_MOUNT_TARGET: &str = "/mission/handoff";
 pub const SCRATCH_MOUNT_TARGET: &str = "/scratch";
 
-/// Effect-scoped resources. Cleanup may remove this entire tree after any
-/// outcome; no recoverable task work lives here.
-pub struct EffectDirs {
-    pub root: PathBuf,
-    pub handoff: PathBuf,
-    pub read_scratch: PathBuf,
-    pub runtime: PathBuf,
-    pub runtime_home: PathBuf,
-}
-
-impl EffectDirs {
-    pub fn prepare(
-        state_dir: &Path,
-        mission_id: &str,
-        effect_id: &EffectId,
-    ) -> std::io::Result<Self> {
-        let root = state_dir
-            .join("missions")
-            .join(mission_id)
-            .join("effects")
-            .join(effect_id.as_str());
-        let dirs = Self {
-            handoff: root.join("handoff"),
-            read_scratch: root.join("scratch"),
-            runtime: root.join("runtime"),
-            runtime_home: root.join("runtime-home"),
-            root,
-        };
-        for dir in [
-            &dirs.handoff,
-            &dirs.read_scratch,
-            &dirs.runtime,
-            &dirs.runtime_home,
-        ] {
-            std::fs::create_dir_all(dir)?;
-        }
-        Ok(dirs)
-    }
-
-    pub fn effect_mounts(&self, scratch: &Path) -> Vec<MountSpec> {
-        vec![
-            rw(&self.handoff, HANDOFF_MOUNT_TARGET),
-            rw(scratch, SCRATCH_MOUNT_TARGET),
-            rw(&self.runtime, RUNTIME_MOUNT_TARGET),
-            rw(&self.runtime_home, RUNTIME_HOME_MOUNT_TARGET),
-        ]
-    }
-}
-
-/// Durable task-owned writer resources. `work` and `scratch` survive every
-/// effect outcome and are removed only by explicit mission cleanup.
-pub struct TaskDirs {
-    pub root: PathBuf,
-    pub work: PathBuf,
-    pub scratch: PathBuf,
-    pub observer_index: PathBuf,
-}
-
-/// Mission-private resources retained for one stable role instance. This tree
-/// is intentionally outside `effects/`, so effect cleanup cannot erase native
-/// session or checkout continuity.
-pub struct ConversationDirs {
-    pub root: PathBuf,
-    pub work: PathBuf,
-    pub scratch: PathBuf,
-    pub observer_index: PathBuf,
-    pub runtime: PathBuf,
-}
-
-impl ConversationDirs {
-    pub fn prepare(
-        state_dir: &Path,
-        mission_id: &str,
-        conversation_id: &crate::model::ConversationId,
-    ) -> std::io::Result<Self> {
-        let root = state_dir
-            .join("missions")
-            .join(mission_id)
-            .join("conversations")
-            .join(conversation_id.as_str());
-        let dirs = Self {
-            work: root.join("work"),
-            scratch: root.join("scratch"),
-            observer_index: root.join("observer.index"),
-            runtime: root.join("runtime"),
-            root,
-        };
-        std::fs::create_dir_all(&dirs.scratch)?;
-        std::fs::create_dir_all(&dirs.runtime)?;
-        Ok(dirs)
-    }
-}
-
-impl TaskDirs {
-    pub fn new(state_dir: &Path, mission_id: &str, task_id: &TaskId) -> Self {
-        let root = state_dir
-            .join("missions")
-            .join(mission_id)
-            .join("tasks")
-            .join(task_id.as_str());
-        Self {
-            work: root.join("work"),
-            scratch: root.join("scratch"),
-            observer_index: root.join("observer.index"),
-            root,
-        }
-    }
-
-    pub fn prepare(state_dir: &Path, mission_id: &str, task_id: &TaskId) -> std::io::Result<Self> {
-        let dirs = Self::new(state_dir, mission_id, task_id);
-        std::fs::create_dir_all(&dirs.scratch)?;
-        Ok(dirs)
-    }
+pub(crate) fn effect_mounts(effect: &RoleEffectDirs, role_state: &RoleStateDirs) -> Vec<MountSpec> {
+    vec![
+        rw(effect.handoff(), HANDOFF_MOUNT_TARGET),
+        rw(role_state.scratch(), SCRATCH_MOUNT_TARGET),
+        rw(role_state.runtime(), RUNTIME_MOUNT_TARGET),
+        rw(effect.runtime_home(), RUNTIME_HOME_MOUNT_TARGET),
+    ]
 }
 
 fn rw(source: &Path, target: &str) -> MountSpec {
@@ -277,7 +171,7 @@ mod control_tests {
                 Ok(())
             }
         };
-        let controlled = tokio::spawn(await_controlled(future, control_rx, stopped));
+        let controlled = tokio::spawn(await_controlled(Box::pin(future), control_rx, stopped));
         entered.notified().await;
         control_tx.send_replace(ExecutionControl::RunUntil(20));
         tokio::task::yield_now().await;
@@ -300,7 +194,7 @@ mod control_tests {
         drop(control_tx);
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            await_controlled(async { Ok(7) }, control_rx, stopped),
+            await_controlled(Box::pin(async { Ok(7) }), control_rx, stopped),
         )
         .await
         .expect("closed control channel must not cause a busy loop")
@@ -323,7 +217,7 @@ mod control_tests {
             }
         });
 
-        let failure = await_controlled(future, control_rx, stopped)
+        let failure = await_controlled(Box::pin(future), control_rx, stopped)
             .await
             .expect_err("durable stop must win when completion is also ready");
 
@@ -335,41 +229,5 @@ mod control_tests {
             failure.evidence().stop_reason.as_deref(),
             Some("already recorded")
         );
-    }
-}
-
-#[cfg(test)]
-mod conversation_dir_tests {
-    use super::*;
-
-    #[test]
-    fn conversation_resources_are_stable_and_outside_effect_cleanup() {
-        let root = tempfile::tempdir().unwrap();
-        let mission = crate::model::MissionId::for_creation("/workspace", "test", 1);
-        let task = crate::model::TaskId::new("worker").unwrap();
-        let role = crate::model::RoleName::new("implementer").unwrap();
-        let id = crate::model::ConversationId::for_role_instance(
-            &mission,
-            crate::model::TaskNamespace::Execution,
-            &task,
-            &role,
-            1,
-        );
-        let first = ConversationDirs::prepare(root.path(), mission.as_str(), &id).unwrap();
-        let second = ConversationDirs::prepare(root.path(), mission.as_str(), &id).unwrap();
-
-        assert_eq!(first.root, second.root);
-        assert!(first.root.starts_with(
-            root.path()
-                .join("missions")
-                .join(mission.as_str())
-                .join("conversations")
-        ));
-        assert!(!first
-            .root
-            .components()
-            .any(|part| part.as_os_str() == "effects"));
-        assert!(first.runtime.is_dir());
-        assert!(first.scratch.is_dir());
     }
 }

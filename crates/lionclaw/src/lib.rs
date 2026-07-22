@@ -21,6 +21,7 @@ pub mod oracle;
 pub mod ports;
 pub mod prompt;
 pub mod reference_materialization;
+mod resources;
 pub mod runner;
 pub mod selftest;
 pub mod store;

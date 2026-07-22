@@ -136,6 +136,7 @@ pub(crate) fn load_materialized_mission_type(
         name: manifest.mission_type.name,
         stop,
         image: manifest.mission_type.image,
+        environment: manifest.mission_type.environment,
         planning,
         recovery: manifest.recovery,
         execution: manifest.execution,

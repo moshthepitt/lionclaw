@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{anyhow, Result};
 
 use crate::program::NetworkMode;
+use crate::RuntimeStateDir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeMcpServerSpec {
@@ -17,7 +18,7 @@ pub struct RuntimeExecutionContext {
     /// Runtime-visible current working directory for program-backed turns.
     pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
-    pub runtime_state_root: Option<PathBuf>,
+    pub runtime_state: Option<RuntimeStateDir>,
     pub runtime_path_projections: Vec<RuntimePathProjection>,
     pub mcp_servers: Vec<RuntimeMcpServerSpec>,
 }
@@ -52,9 +53,9 @@ impl RuntimeExecutionContext {
             None => {}
         }
 
-        let runtime_state_root = self.runtime_state_root.as_ref()?;
+        let runtime_state_root = self.runtime_state.as_ref()?.path();
         if runtime_path == Path::new("/runtime") {
-            return Some(runtime_state_root.clone());
+            return Some(runtime_state_root.to_path_buf());
         }
         let relative_path = runtime_path.strip_prefix("/runtime").ok()?;
         Some(runtime_state_root.join(safe_relative_path(relative_path)?))
