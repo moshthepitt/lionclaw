@@ -29,6 +29,10 @@ pub const SCHEMA_VERSION: u32 = 21;
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_MESSAGE_RECIPIENTS: usize = 64;
 pub const MAX_MESSAGE_REFERENCES: usize = 32;
+/// Maximum retained message records in one conversation generation. At the
+/// current body and expansion bounds this keeps queued dialogue below the same
+/// aggregate scale as the existing 16-way upstream-context ceiling.
+pub const MAX_QUEUED_MESSAGES_PER_CONVERSATION: usize = 16;
 pub const MAX_FINAL_RESPONSE_BYTES: u64 = 64 * 1024;
 
 /// Closed renderer identity for a durable role request.  The rendered turn is

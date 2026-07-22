@@ -43,7 +43,8 @@ pub use event::{
     RolePromptTemplate, RoleRunRequestIdentity, RoleRunSuccess, RuntimeConfigurationEvidence,
     StopBar, TaskNamespace, TerminalReviewConfig, TerminalReviewSuccess, UnavailableReferenceCause,
     ValidationItem, VersionStamps, MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES,
-    MAX_MESSAGE_BYTES, MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES, SCHEMA_VERSION,
+    MAX_MESSAGE_BYTES, MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES,
+    MAX_QUEUED_MESSAGES_PER_CONVERSATION, SCHEMA_VERSION,
 };
 pub use failure::{
     bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,

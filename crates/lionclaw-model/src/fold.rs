@@ -26,10 +26,10 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-/// Version 30 makes output-semantic reference isolation and unavailable-
-/// reference settlement obligations fold-authoritative. Older snapshots must
-/// rebuild so forged ingress and actionless settlements cannot survive replay.
-pub const REDUCER_VERSION: u32 = 30;
+/// Version 31 makes the retained per-conversation message bound
+/// fold-authoritative. Older snapshots must rebuild so forged over-cap ingress
+/// cannot survive replay.
+pub const REDUCER_VERSION: u32 = 31;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -279,7 +279,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                                 && c.namespace == r.namespace
                                 && c.task_id == r.task_id
                                 && c.assignment_epoch == r.assignment_epoch
-                                && state.conversation_is_messageable(&r.conversation_id)
+                                && state.conversation_accepts_message(&r.conversation_id)
                         })
                 })
             {
@@ -1004,32 +1004,48 @@ fn settle_conversation_delivery(
     has_handoff: bool,
     final_response: super::PayloadRef,
 ) {
-    let Some(conversation) = state
-        .conversations
-        .get_mut(conversation_id)
-        .filter(|conversation| {
-            conversation.assignment_epoch == assignment_epoch
-                && conversation.lifecycle == super::state::ConversationLifecycle::Running
-                && conversation
-                    .active_delivery
-                    .as_ref()
-                    .is_some_and(|delivery| &delivery.effect_id == effect_id)
-        })
-    else {
-        return;
+    let ready_task = {
+        let Some(conversation) =
+            state
+                .conversations
+                .get_mut(conversation_id)
+                .filter(|conversation| {
+                    conversation.assignment_epoch == assignment_epoch
+                        && conversation.lifecycle == super::state::ConversationLifecycle::Running
+                        && conversation
+                            .active_delivery
+                            .as_ref()
+                            .is_some_and(|delivery| &delivery.effect_id == effect_id)
+                })
+        else {
+            return;
+        };
+        let delivery = conversation.active_delivery.take().expect("matched above");
+        let boundary = delivery.message_boundary;
+        conversation.consumed_through = conversation.consumed_through.max(boundary);
+        conversation
+            .queued
+            .retain(|message| !delivery.presented_messages.contains(&message.sequence_no));
+        conversation.final_response = Some(final_response);
+        let has_pending_input = !has_handoff
+            && conversation
+                .queued
+                .iter()
+                .any(|message| message.marker != super::state::DeliveryMarker::Undeliverable);
+        conversation.lifecycle = if has_handoff {
+            super::state::ConversationLifecycle::Completed
+        } else if has_pending_input {
+            super::state::ConversationLifecycle::Ready
+        } else {
+            super::state::ConversationLifecycle::AwaitingLead
+        };
+        has_pending_input.then(|| (conversation.namespace, conversation.task_id.clone()))
     };
-    let delivery = conversation.active_delivery.take().expect("matched above");
-    let boundary = delivery.message_boundary;
-    conversation.consumed_through = conversation.consumed_through.max(boundary);
-    conversation
-        .queued
-        .retain(|message| !delivery.presented_messages.contains(&message.sequence_no));
-    conversation.final_response = Some(final_response);
-    conversation.lifecycle = if has_handoff {
-        super::state::ConversationLifecycle::Completed
-    } else {
-        super::state::ConversationLifecycle::AwaitingLead
-    };
+    if let Some((namespace, task_id)) = ready_task {
+        if let Some(task) = state.tasks_in_mut(namespace).get_mut(&task_id) {
+            task.status = TaskStatus::Pending;
+        }
+    }
 }
 
 fn settle_failed_conversation_delivery(
@@ -7018,6 +7034,36 @@ mod tests {
         }
 
         events.pop();
+        let mut question = role_completed_at(
+            crate::TaskNamespace::Execution,
+            "w",
+            2,
+            "question with queued response",
+            work_handoff(true, false),
+            None,
+        );
+        let MissionEvent::RoleRunCompleted {
+            outcome: Ok(success),
+            ..
+        } = &mut question
+        else {
+            unreachable!()
+        };
+        success.handoff = None;
+        let mut queued_question = events.clone();
+        queued_question.push(question);
+        let ready = fold_log(queued_question).unwrap();
+        assert_eq!(ready.tasks[&tid("w")].status, TaskStatus::Pending);
+        assert_eq!(
+            ready.conversations[conversation_id].lifecycle,
+            super::super::state::ConversationLifecycle::Ready
+        );
+        assert_eq!(ready.conversations[conversation_id].queued.len(), 1);
+        assert_eq!(
+            ready.conversations[conversation_id].queued[0].body,
+            "during"
+        );
+
         events.push(role_completed_at(
             crate::TaskNamespace::Execution,
             "w",
@@ -7148,6 +7194,48 @@ mod tests {
         );
         assert_eq!(state.conversations[&alpha.conversation_id].queued.len(), 2);
         assert_eq!(state.conversations[&beta.conversation_id].queued.len(), 1);
+
+        // Capacity is the complete retained queue, independent of delivery
+        // classification. One full recipient rejects the entire immutable
+        // recipient snapshot before another conversation is mutated.
+        state
+            .conversations
+            .get_mut(&alpha.conversation_id)
+            .unwrap()
+            .queued[0]
+            .marker = super::super::state::DeliveryMarker::Undeliverable;
+        while state.conversations[&alpha.conversation_id].queued.len()
+            < crate::MAX_QUEUED_MESSAGES_PER_CONVERSATION
+        {
+            let sequence_no = state.head + 1;
+            apply(
+                &mut state,
+                &envelope(
+                    sequence_no,
+                    MissionEvent::MessageSent {
+                        recipients: vec![alpha.clone()],
+                        body: format!("fill {sequence_no}"),
+                        references: vec![],
+                    },
+                ),
+            );
+        }
+        let alpha_before = state.conversations[&alpha.conversation_id].clone();
+        let beta_before = state.conversations[&beta.conversation_id].clone();
+        let sequence_no = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(
+                sequence_no,
+                MissionEvent::MessageSent {
+                    recipients: vec![alpha.clone(), beta.clone()],
+                    body: "one recipient is full".into(),
+                    references: vec![],
+                },
+            ),
+        );
+        assert_eq!(state.conversations[&alpha.conversation_id], alpha_before);
+        assert_eq!(state.conversations[&beta.conversation_id], beta_before);
     }
 
     #[test]

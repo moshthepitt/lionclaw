@@ -37,7 +37,7 @@ fn has_current_recipient(state: &lionclaw::model::MissionState) -> bool {
     state
         .conversations
         .keys()
-        .any(|conversation_id| state.conversation_is_messageable(conversation_id))
+        .any(|conversation_id| state.conversation_accepts_message(conversation_id))
 }
 
 fn assert_advertised_actions_are_legal(view: &MissionView) {

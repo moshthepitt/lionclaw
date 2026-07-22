@@ -7,11 +7,12 @@ use std::sync::Arc;
 use clap::Parser;
 use common::{approve_plan, covered_requirement, harness, proposal, BASE_SHA};
 use lionclaw::cli::{self, Cli};
+use lionclaw::engine::ConversationQueueFull;
 use lionclaw::model::{
     fold, Assertion, AssertionId, ConversationId, ConversationLifecycle, DeliveryMarker,
     MissionEvent, OracleName, Plan, RoleName, Task, TaskId, TaskKind, TaskNamespace,
 };
-use lionclaw::store::MissionStore;
+use lionclaw::store::{AppendError, MissionStore};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 fn send_cli(repo: &std::path::Path, mission: &str, args: &[&str]) -> Cli {
@@ -209,17 +210,24 @@ async fn production_cli_routes_atomically_only_to_explicit_live_conversations() 
     }
     let mut ok = 0;
     let mut conflicts = 0;
+    let mut full = 0;
     for writer in writers {
         match writer.await.unwrap() {
             Ok(_) => ok += 1,
-            Err(error) if error.to_string().contains("append conflict") => conflicts += 1,
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<AppendError>(),
+                    Some(AppendError::Conflict { .. })
+                ) =>
+            {
+                conflicts += 1
+            }
+            Err(error) if error.downcast_ref::<ConversationQueueFull>().is_some() => full += 1,
             Err(error) => panic!("unexpected send failure: {error:#}"),
         }
     }
-    assert!(
-        ok > 0 && conflicts > 0,
-        "the race must exercise both CAS outcomes"
-    );
+    assert!(ok > 0, "at least one exact recipient snapshot must commit");
+    assert_eq!(ok + conflicts + full, 16);
     let after = store.load(&mission).await.unwrap();
     assert_eq!(after.len(), race_before.len() + ok);
     let race_events: Vec<_> = after
@@ -237,6 +245,7 @@ async fn production_cli_routes_atomically_only_to_explicit_live_conversations() 
     let before_queued = &race_state_before.conversations[&current_conversation].queued;
     let after_queued = &race_state_after.conversations[&current_conversation].queued;
     assert_eq!(after_queued.len(), before_queued.len() + ok);
+    assert!(after_queued.len() <= lionclaw::model::MAX_QUEUED_MESSAGES_PER_CONVERSATION);
     assert_eq!(race_state_after.head, race_state_before.head + ok as u64);
 
     // Accepting a real replacement plan retires the old AwaitingLead

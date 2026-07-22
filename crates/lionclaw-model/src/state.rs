@@ -1103,6 +1103,15 @@ impl MissionState {
                 })
     }
 
+    /// Whether this exact live conversation can accept another retained message.
+    /// Every delivery marker consumes capacity because every entry remains part
+    /// of the serialized authoritative state until exact successful settlement.
+    pub fn conversation_accepts_message(&self, conversation_id: &super::ConversationId) -> bool {
+        self.conversation_is_messageable(conversation_id)
+            && self.conversations[conversation_id].queued.len()
+                < crate::MAX_QUEUED_MESSAGES_PER_CONVERSATION
+    }
+
     pub fn conversation_legal_actions(
         &self,
         conversation_id: &super::ConversationId,
@@ -1110,14 +1119,18 @@ impl MissionState {
         if !self.conversation_is_messageable(conversation_id) {
             return Vec::new();
         }
-        match self.conversations[conversation_id].lifecycle {
-            ConversationLifecycle::AwaitingLead => vec!["mission send"],
-            ConversationLifecycle::Running => vec!["mission status", "mission send"],
+        let mut actions = match self.conversations[conversation_id].lifecycle {
+            ConversationLifecycle::AwaitingLead => Vec::new(),
+            ConversationLifecycle::Running => vec!["mission status"],
             ConversationLifecycle::Ready | ConversationLifecycle::ReworkingInvalidHandoff => {
-                vec!["mission advance", "mission send"]
+                vec!["mission advance"]
             }
-            ConversationLifecycle::Completed | ConversationLifecycle::Retired => Vec::new(),
+            ConversationLifecycle::Completed | ConversationLifecycle::Retired => return Vec::new(),
+        };
+        if self.conversation_accepts_message(conversation_id) {
+            actions.push("mission send");
         }
+        actions
     }
 
     /// The authoritative serial artifact head. Later slices may change how

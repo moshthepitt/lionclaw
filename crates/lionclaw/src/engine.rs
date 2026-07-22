@@ -207,7 +207,7 @@ impl MissionView {
             .state
             .conversations
             .keys()
-            .any(|id| self.state.conversation_is_messageable(id));
+            .any(|id| self.state.conversation_accepts_message(id));
         let can_decide = !self.state.open_attention.is_empty();
         let can_continue = self
             .state
@@ -217,7 +217,8 @@ impl MissionView {
         let mut actions = match self.disposition {
             MissionDisposition::Ready => vec!["mission advance"],
             MissionDisposition::Running => vec!["mission status"],
-            MissionDisposition::AwaitingLead => vec!["mission send"],
+            MissionDisposition::AwaitingLead if can_send => vec!["mission send"],
+            MissionDisposition::AwaitingLead => Vec::new(),
             MissionDisposition::AwaitingPlan => vec!["mission plan propose"],
             MissionDisposition::Parked
                 if self
@@ -2424,6 +2425,16 @@ pub struct MessageCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "conversation {conversation_id} has {retained_messages} retained messages; the limit is {limit}"
+)]
+pub struct ConversationQueueFull {
+    pub conversation_id: crate::model::ConversationId,
+    pub retained_messages: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReferenceRejectionReason {
     #[error(
         "message references are not permitted for recipient {conversation_id} with output semantics {}",
@@ -2581,6 +2592,17 @@ pub async fn record_message(
         )
         .collect();
     let recipients = resolve_message_recipients(&current, &selectors, all)?;
+    if let Some(recipient) = recipients
+        .iter()
+        .find(|recipient| !state.conversation_accepts_message(&recipient.conversation_id))
+    {
+        return Err(ConversationQueueFull {
+            conversation_id: recipient.conversation_id.clone(),
+            retained_messages: state.conversations[&recipient.conversation_id].queued.len(),
+            limit: crate::model::MAX_QUEUED_MESSAGES_PER_CONVERSATION,
+        }
+        .into());
+    }
     validate_reference_eligibility(&state, &recipients, &references)?;
     for reference in &references {
         let valid = match reference {
