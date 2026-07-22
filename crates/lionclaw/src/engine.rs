@@ -2422,6 +2422,10 @@ pub enum ReferenceRejectionReason {
     Missing {
         reference: crate::model::MessageReference,
     },
+    #[error("message reference {reference:?} has invalid content")]
+    InvalidContent {
+        reference: crate::model::MessageReference,
+    },
     #[error("message reference {reference:?} is malformed or belongs to another mission")]
     MalformedOrForeign {
         reference: crate::model::MessageReference,
@@ -2635,7 +2639,7 @@ pub async fn record_message(
                 }
             }
             crate::model::UnavailableReferenceCause::InvalidContent => {
-                ReferenceRejectionReason::MalformedOrForeign {
+                ReferenceRejectionReason::InvalidContent {
                     reference: error.reference,
                 }
             }

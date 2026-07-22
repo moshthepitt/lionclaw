@@ -4455,7 +4455,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         &mission,
         &conversation,
         vec!["--receipt".into(), receipt.to_string()],
-        ReferenceRejectionReason::Missing {
+        ReferenceRejectionReason::InvalidContent {
             reference: MessageReference::AuthoritativeReceipt { effect_id: receipt },
         },
     )

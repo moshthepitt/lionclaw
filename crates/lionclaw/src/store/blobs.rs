@@ -13,6 +13,20 @@ use crate::model::{BlobRef, PayloadRef};
 /// Payloads above this many bytes are externalized at append time.
 pub const BLOB_INLINE_MAX: usize = 100 * 1024;
 
+/// Structured failure from reading immutable content-addressed storage.
+#[derive(Debug, thiserror::Error)]
+pub enum BlobReadError {
+    #[error("{operation} blob '{path}'")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{0}")]
+    InvalidContent(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct BlobStore {
     root: PathBuf,
@@ -49,15 +63,21 @@ impl BlobStore {
         })
     }
 
-    pub fn get(&self, blob: &BlobRef) -> Result<Vec<u8>> {
+    pub fn get(&self, blob: &BlobRef) -> std::result::Result<Vec<u8>, BlobReadError> {
         if blob.algo != "sha256" {
-            bail!("unsupported blob algo '{}'", blob.algo);
+            return Err(BlobReadError::InvalidContent(format!(
+                "unsupported blob algo '{}'",
+                blob.algo
+            )));
         }
         // The ref can come from an agent-authored handoff (PayloadRef::Blob), so
         // validate the hex before slicing it into a path — a short or non-hex
         // value must be a clean error, never a panic (byte-index/char-boundary).
         if blob.hex.len() != 64 || !blob.hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            bail!("malformed blob hex '{}'", blob.hex);
+            return Err(BlobReadError::InvalidContent(format!(
+                "malformed blob hex '{}'",
+                blob.hex
+            )));
         }
         let path = self
             .root
@@ -66,31 +86,37 @@ impl BlobStore {
             .join(&blob.hex[2..4])
             .join(&blob.hex);
         let stored_len = fs::metadata(&path)
-            .with_context(|| format!("failed to stat blob '{}'", path.display()))?
+            .map_err(|source| BlobReadError::Io {
+                operation: "failed to stat",
+                path: path.clone(),
+                source,
+            })?
             .len();
         if stored_len != blob.len {
-            bail!(
+            return Err(BlobReadError::InvalidContent(format!(
                 "blob '{}' length mismatch (declared {}, stored {stored_len})",
-                blob.hex,
-                blob.len
-            );
+                blob.hex, blob.len
+            )));
         }
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read blob '{}'", path.display()))?;
+        let bytes = fs::read(&path).map_err(|source| BlobReadError::Io {
+            operation: "failed to read",
+            path: path.clone(),
+            source,
+        })?;
         if bytes.len() as u64 != blob.len {
-            bail!(
+            return Err(BlobReadError::InvalidContent(format!(
                 "blob '{}' changed length while reading (declared {}, read {})",
                 blob.hex,
                 blob.len,
                 bytes.len()
-            );
+            )));
         }
         let actual = hex::encode(Sha256::digest(&bytes));
         if actual != blob.hex {
-            bail!(
+            return Err(BlobReadError::InvalidContent(format!(
                 "blob '{}' failed content verification (got {actual})",
                 blob.hex
-            );
+            )));
         }
         Ok(bytes)
     }

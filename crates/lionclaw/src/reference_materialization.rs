@@ -165,6 +165,12 @@ fn resolve_payload_values(value: &mut serde_json::Value, blobs: &BlobStore) -> R
 
 fn classify_unavailability(error: &anyhow::Error) -> crate::model::UnavailableReferenceCause {
     for source in error.chain() {
+        if matches!(
+            source.downcast_ref::<crate::store::BlobReadError>(),
+            Some(crate::store::BlobReadError::InvalidContent(_))
+        ) {
+            return crate::model::UnavailableReferenceCause::InvalidContent;
+        }
         if let Some(io) = source.downcast_ref::<std::io::Error>() {
             return match io.kind() {
                 std::io::ErrorKind::NotFound => {

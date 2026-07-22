@@ -10,7 +10,7 @@ mod blobs;
 mod events;
 mod snapshots;
 
-pub use blobs::{BlobStore, BLOB_INLINE_MAX};
+pub use blobs::{BlobReadError, BlobStore, BLOB_INLINE_MAX};
 pub use events::{AppendError, NewEvent};
 
 use std::fs;

@@ -329,7 +329,7 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
 }
 
 #[tokio::test]
-async fn accepted_receipt_blob_unavailable_before_dispatch_settles_once() {
+async fn accepted_receipt_blob_corrupt_before_dispatch_settles_once() {
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let observed = prompts.clone();
@@ -463,7 +463,16 @@ async fn accepted_receipt_blob_unavailable_before_dispatch_settles_once() {
         .join(&receipt_blob.hex[..2])
         .join(&receipt_blob.hex[2..4])
         .join(&receipt_blob.hex);
-    std::fs::remove_file(blob_path).unwrap();
+    let mut corrupted = std::fs::read(&blob_path).unwrap();
+    corrupted[0] ^= 0xff;
+    let mut permissions = std::fs::metadata(&blob_path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o644);
+    }
+    std::fs::set_permissions(&blob_path, permissions).unwrap();
+    std::fs::write(blob_path, corrupted).unwrap();
 
     let attempts_before = queued.tasks[&TaskId::new("mint-receipt").unwrap()].attempts;
     let settled = h.engine.advance(&mission).await.unwrap().state;
@@ -482,7 +491,7 @@ async fn accepted_receipt_blob_unavailable_before_dispatch_settles_once() {
     );
     assert_eq!(
         settled.unavailable_references[0].cause,
-        UnavailableReferenceCause::SourceMissing
+        UnavailableReferenceCause::InvalidContent
     );
     assert_eq!(
         settled.tasks[&TaskId::new("mint-receipt").unwrap()].attempts,
@@ -886,7 +895,7 @@ async fn assert_operator_views(
         assert!(human.contains("marker=undeliverable"));
         assert!(human.contains(&format!("delivery_through={delivered_through}")));
         assert!(human.contains("unavailable reference:"));
-        assert!(human.contains("cause=SourceMissing"));
+        assert!(human.contains(&format!("cause={:?}", evidence.cause)));
     }
     let inbox = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
         .args(["mission", "inbox", "--json", "--repo"])
