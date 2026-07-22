@@ -11,6 +11,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +21,20 @@ use rustix::fs::{open, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::model::EffectId;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CommitMaterializationError {
+    #[error("commit object is missing")]
+    Missing,
+    #[error("commit object has invalid content: {0}")]
+    InvalidContent(String),
+    #[error("commit object is unreadable: {0}")]
+    Unreadable(String),
+    #[error("commit expansion exceeds its materialization limit")]
+    ExpansionLimit,
+}
 
 /// Proof that LionClaw observed and fetched one clean worker HEAD for one exact
 /// effect. The durable event payload and binding are intentionally hidden.
@@ -615,15 +629,383 @@ pub async fn diff(repo: &Path, from: &str, to: &str) -> Result<String> {
 }
 
 /// Render one trusted, already-authorized commit for transient message context.
-pub async fn show_commit(repo: &Path, sha: &str) -> Result<Vec<u8>> {
-    if !valid_object_id(sha) || !commit_exists(repo, sha).await {
-        bail!("commit is missing from the mission workspace");
+pub async fn show_commit(repo: &Path, sha: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    if !valid_object_id(sha) {
+        return Err(
+            CommitMaterializationError::InvalidContent("invalid object identity".into()).into(),
+        );
     }
-    git_bytes(
-        repo,
-        &["show", "--format=fuller", "--no-ext-diff", "--binary", sha],
+    let sha = sha.to_ascii_lowercase();
+    let observer = CommitGitObserver::open(repo, &sha).await?;
+    verify_commit_object(&observer, &sha).await?;
+    let mut command = observer.command();
+    configure_commit_show(&mut command, &sha);
+    let output = run_git_bounded(&mut command, None, max_bytes, MAX_GIT_DIAGNOSTIC_BYTES)
+        .await
+        .map_err(|error| match error {
+            BoundedGitError::Limit(GitStream::Stdout) => CommitMaterializationError::ExpansionLimit,
+            error => CommitMaterializationError::Unreadable(error.to_string()),
+        })?;
+    if !output.status.success() {
+        if let Err(error) = verify_commit_object(&observer, &sha).await {
+            return Err(error.into());
+        }
+        return Err(
+            CommitMaterializationError::InvalidContent(git_diagnostic(&output.stderr)).into(),
+        );
+    }
+    Ok(output.stdout)
+}
+
+fn configure_commit_show(command: &mut Command, sha: &str) {
+    command.args([
+        "show",
+        "--format=fuller",
+        "--no-use-mailmap",
+        "--no-notes",
+        "--no-show-signature",
+        "--no-decorate",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-color",
+        "--full-index",
+        "--binary",
+        sha,
+        "--",
+    ]);
+}
+
+struct CommitGitObserver {
+    metadata: PathBuf,
+    objects: PathBuf,
+}
+
+impl CommitGitObserver {
+    async fn open(repo: &Path, sha: &str) -> std::result::Result<Self, CommitMaterializationError> {
+        let mut command = managed_git_command();
+        command.current_dir(repo).args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ]);
+        let output = run_git_bounded(
+            &mut command,
+            None,
+            MAX_GIT_PATH_BYTES,
+            MAX_GIT_DIAGNOSTIC_BYTES,
+        )
+        .await
+        .map_err(|error| CommitMaterializationError::Unreadable(error.to_string()))?;
+        if !output.status.success() {
+            return Err(CommitMaterializationError::Unreadable(git_diagnostic(
+                &output.stderr,
+            )));
+        }
+        let objects = parse_git_path(&output.stdout)?;
+        let objects = std::fs::canonicalize(objects).map_err(|error| {
+            CommitMaterializationError::Unreadable(format!(
+                "resolving Git object database: {error}"
+            ))
+        })?;
+        let metadata = std::fs::metadata(&objects).map_err(|error| {
+            CommitMaterializationError::Unreadable(format!(
+                "reading Git object database '{}': {error}",
+                objects.display()
+            ))
+        })?;
+        if !metadata.is_dir() {
+            return Err(CommitMaterializationError::InvalidContent(format!(
+                "Git object database '{}' is not a directory",
+                objects.display()
+            )));
+        }
+        let metadata = create_isolated_git_metadata(sha)
+            .map_err(|error| CommitMaterializationError::Unreadable(error.to_string()))?;
+        Ok(Self { metadata, objects })
+    }
+
+    fn command(&self) -> Command {
+        isolated_git_command(&self.metadata, &self.objects)
+    }
+
+    fn loose_object_path(&self, sha: &str) -> PathBuf {
+        self.objects.join(&sha[..2]).join(&sha[2..])
+    }
+}
+
+impl Drop for CommitGitObserver {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.metadata);
+    }
+}
+
+fn parse_git_path(bytes: &[u8]) -> std::result::Result<PathBuf, CommitMaterializationError> {
+    let path = std::str::from_utf8(bytes).map_err(|_| {
+        CommitMaterializationError::InvalidContent("Git object path is not UTF-8".into())
+    })?;
+    let path = path.strip_suffix('\n').unwrap_or(path);
+    if path.is_empty() || path.contains(['\n', '\r', '\0']) {
+        return Err(CommitMaterializationError::InvalidContent(
+            "Git object path is malformed".into(),
+        ));
+    }
+    Ok(PathBuf::from(path))
+}
+
+async fn verify_commit_object(
+    observer: &CommitGitObserver,
+    sha: &str,
+) -> std::result::Result<(), CommitMaterializationError> {
+    let loose_object = inspect_loose_object(observer, sha)?;
+    let mut command = observer.command();
+    command.args([
+        "cat-file",
+        "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+    ]);
+    let input = format!("{sha}\n");
+    let output = run_git_bounded(
+        &mut command,
+        Some(input.as_bytes()),
+        MAX_GIT_PROTOCOL_BYTES,
+        MAX_GIT_DIAGNOSTIC_BYTES,
     )
     .await
+    .map_err(|error| CommitMaterializationError::Unreadable(error.to_string()))?;
+    if !output.status.success() {
+        return Err(CommitMaterializationError::Unreadable(git_diagnostic(
+            &output.stderr,
+        )));
+    }
+    let fields = output
+        .stdout
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if fields.len() == 3
+        && fields[0] == sha.as_bytes()
+        && fields[1] == b"commit"
+        && fields[2].iter().all(u8::is_ascii_digit)
+    {
+        return Ok(());
+    }
+    if fields.len() == 2 && fields[0] == sha.as_bytes() && fields[1] == b"missing" {
+        return match (loose_object, output.stderr.is_empty()) {
+            (LooseObjectState::Absent, true) => Err(CommitMaterializationError::Missing),
+            (LooseObjectState::Absent, false) => Err(CommitMaterializationError::Unreadable(
+                git_diagnostic(&output.stderr),
+            )),
+            (LooseObjectState::Readable, _) => Err(CommitMaterializationError::InvalidContent(
+                "Git rejected the readable loose object".into(),
+            )),
+        };
+    }
+    Err(CommitMaterializationError::InvalidContent(git_diagnostic(
+        &output.stderr,
+    )))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LooseObjectState {
+    Absent,
+    Readable,
+}
+
+fn inspect_loose_object(
+    observer: &CommitGitObserver,
+    sha: &str,
+) -> std::result::Result<LooseObjectState, CommitMaterializationError> {
+    let path = observer.loose_object_path(sha);
+    let descriptor = match open(
+        &path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(Errno::NOENT) => return Ok(LooseObjectState::Absent),
+        Err(Errno::ACCESS | Errno::PERM) => {
+            return Err(CommitMaterializationError::Unreadable(format!(
+                "permission denied opening '{}'",
+                path.display()
+            )))
+        }
+        Err(Errno::LOOP) => {
+            return Err(CommitMaterializationError::InvalidContent(format!(
+                "loose object '{}' is a symlink",
+                path.display()
+            )))
+        }
+        Err(error) => {
+            return Err(CommitMaterializationError::Unreadable(format!(
+                "opening loose object '{}': {error}",
+                path.display()
+            )))
+        }
+    };
+    let file = File::from(descriptor);
+    let metadata = file.metadata().map_err(|error| {
+        CommitMaterializationError::Unreadable(format!(
+            "reading loose object metadata '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(CommitMaterializationError::InvalidContent(format!(
+            "loose object '{}' is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(LooseObjectState::Readable)
+}
+
+const MAX_GIT_PROTOCOL_BYTES: usize = 256;
+const MAX_GIT_PATH_BYTES: usize = 4 * 1024;
+const MAX_GIT_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const GIT_MATERIALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+struct BoundedGitOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GitStream {
+    Stdout,
+    Stderr,
+}
+
+impl std::fmt::Display for GitStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum BoundedGitError {
+    #[error("failed to spawn Git: {0}")]
+    Spawn(#[source] std::io::Error),
+    #[error("Git {0} exceeds its capture limit")]
+    Limit(GitStream),
+    #[error("failed to read Git {stream}: {source}")]
+    Read {
+        stream: GitStream,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write Git stdin: {0}")]
+    Write(#[source] std::io::Error),
+    #[error("failed to wait for Git: {0}")]
+    Wait(#[source] std::io::Error),
+    #[error("Git materialization exceeded its execution deadline")]
+    TimedOut,
+}
+
+async fn run_git_bounded(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> std::result::Result<BoundedGitOutput, BoundedGitError> {
+    run_git_bounded_with_timeout(
+        command,
+        input,
+        stdout_limit,
+        stderr_limit,
+        GIT_MATERIALIZATION_TIMEOUT,
+    )
+    .await
+}
+
+async fn run_git_bounded_with_timeout(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    timeout: Duration,
+) -> std::result::Result<BoundedGitOutput, BoundedGitError> {
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(BoundedGitError::Spawn)?;
+    let mut stdout = child.stdout.take().expect("Git stdout is configured");
+    let mut stderr = child.stderr.take().expect("Git stderr is configured");
+    let operation = async {
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                BoundedGitError::Write(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Git stdin was not captured",
+                ))
+            })?;
+            stdin
+                .write_all(input)
+                .await
+                .map_err(BoundedGitError::Write)?;
+            stdin.shutdown().await.map_err(BoundedGitError::Write)?;
+        }
+        tokio::try_join!(
+            read_git_stream(&mut stdout, stdout_limit, GitStream::Stdout),
+            read_git_stream(&mut stderr, stderr_limit, GitStream::Stderr),
+            async { child.wait().await.map_err(BoundedGitError::Wait) },
+        )
+    };
+    match tokio::time::timeout(timeout, operation).await {
+        Ok(Ok((stdout, stderr, status))) => Ok(BoundedGitOutput {
+            status,
+            stdout,
+            stderr,
+        }),
+        Ok(Err(error)) => {
+            terminate_and_reap(&mut child).await;
+            Err(error)
+        }
+        Err(_) => {
+            terminate_and_reap(&mut child).await;
+            Err(BoundedGitError::TimedOut)
+        }
+    }
+}
+
+async fn read_git_stream<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+    stream: GitStream,
+) -> std::result::Result<Vec<u8>, BoundedGitError> {
+    let mut bytes = Vec::with_capacity(limit.min(16 * 1024));
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|source| BoundedGitError::Read { stream, source })?;
+    if bytes.len() > limit {
+        return Err(BoundedGitError::Limit(stream));
+    }
+    Ok(bytes)
+}
+
+async fn terminate_and_reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+fn git_diagnostic(stderr: &[u8]) -> String {
+    let diagnostic = String::from_utf8_lossy(stderr).trim().to_string();
+    if diagnostic.is_empty() {
+        "Git rejected the commit object".into()
+    } else {
+        diagnostic
+    }
 }
 
 /// Create a branch `name` at `sha` without touching HEAD or the worktree. With
@@ -728,6 +1110,7 @@ fn managed_git_command() -> Command {
     command
         .kill_on_drop(true)
         .arg("--no-optional-locks")
+        .arg("--no-replace-objects")
         .args(["-c", "core.fsmonitor=false"])
         .args(["-c", "core.hooksPath=/dev/null"])
         .args(["-c", "core.pager=cat"])
@@ -736,6 +1119,32 @@ fn managed_git_command() -> Command {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null");
     command
+}
+
+fn isolated_git_command(metadata: &Path, objects: &Path) -> Command {
+    let mut command = Command::new("git");
+    configure_isolated_git_command(&mut command, metadata, objects);
+    command
+}
+
+fn configure_isolated_git_command(command: &mut Command, metadata: &Path, objects: &Path) {
+    clear_git_authority_environment(command);
+    command
+        .kill_on_drop(true)
+        .arg("--no-optional-locks")
+        .arg("--no-replace-objects")
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "core.pager=cat"])
+        .args(["-c", "core.attributesFile=/dev/null"])
+        .args(["-c", "diff.external="])
+        .env("GIT_DIR", metadata)
+        .env("GIT_OBJECT_DIRECTORY", objects)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG", "/dev/null")
+        .env("GIT_ATTR_NOSYSTEM", "1");
 }
 
 fn clear_git_authority_environment(command: &mut Command) {
@@ -749,9 +1158,15 @@ fn clear_git_authority_environment(command: &mut Command) {
         "GIT_NAMESPACE",
         "GIT_SHALLOW_FILE",
         "GIT_REPLACE_REF_BASE",
+        "GIT_CONFIG",
         "GIT_CONFIG_COUNT",
         "GIT_CONFIG_PARAMETERS",
+        "GIT_DIFF_OPTS",
         "GIT_EXTERNAL_DIFF",
+        "GIT_ATTR_NOSYSTEM",
+        "GIT_ATTR_SOURCE",
+        "GIT_NOTES_REF",
+        "GIT_NOTES_DISPLAY_REF",
     ] {
         command.env_remove(key);
     }
@@ -836,36 +1251,13 @@ impl TaskGitObserver {
         directory(worktree, "task worktree")?;
         let index = regular_file(&index, "task observer index")?;
         directory(&objects, "Git object database")?;
-        let metadata = loop {
-            let sequence = OBSERVER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let candidate = std::env::temp_dir().join(format!(
-                "lionclaw-git-observer-{}-{sequence}",
-                std::process::id()
-            ));
-            match std::fs::create_dir(&candidate) {
-                Ok(()) => break candidate,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error).context("creating isolated Git metadata"),
-            }
-        };
+        let metadata = create_isolated_git_metadata(head)?;
         let observer = Self {
             metadata,
             worktree: worktree.to_path_buf(),
             index,
             objects,
         };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&observer.metadata, std::fs::Permissions::from_mode(0o700))?;
-        }
-        std::fs::create_dir(observer.metadata.join("objects"))?;
-        std::fs::create_dir(observer.metadata.join("refs"))?;
-        std::fs::write(observer.metadata.join("HEAD"), format!("{head}\n"))?;
-        std::fs::write(
-            observer.metadata.join("config"),
-            synthetic_repository_config(head),
-        )?;
         Ok(observer)
     }
 
@@ -931,19 +1323,44 @@ impl TaskGitObserver {
     }
 
     fn configure_tokio(&self, command: &mut Command) {
-        clear_git_authority_environment(command);
+        configure_isolated_git_command(command, &self.metadata, &self.objects);
         command
-            .kill_on_drop(true)
-            .arg("--no-optional-locks")
-            .env("GIT_DIR", &self.metadata)
             .env("GIT_WORK_TREE", &self.worktree)
             .env("GIT_INDEX_FILE", &self.index)
-            .env("GIT_OBJECT_DIRECTORY", &self.objects)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG", "/dev/null");
+            .env("GIT_ATTR_NOSYSTEM", "1");
     }
+}
+
+fn create_isolated_git_metadata(head: &str) -> Result<PathBuf> {
+    let metadata = loop {
+        let sequence = OBSERVER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = std::env::temp_dir().join(format!(
+            "lionclaw-git-observer-{}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("creating isolated Git metadata"),
+        }
+    };
+    let result: Result<()> = (|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(0o700))?;
+        }
+        std::fs::create_dir(metadata.join("objects"))?;
+        std::fs::create_dir(metadata.join("refs"))?;
+        std::fs::write(metadata.join("HEAD"), format!("{head}\n"))?;
+        std::fs::write(metadata.join("config"), synthetic_repository_config(head))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&metadata);
+        return Err(error).context("materializing isolated Git metadata");
+    }
+    Ok(metadata)
 }
 
 /// Fresh task clones are transferred as packs (`--no-local`), so this budget
@@ -1818,6 +2235,336 @@ mod tests {
         assert!(commit_exists(&linked, &base).await);
         assert!(is_ancestor(&linked, &base, &base).await.unwrap());
         assert!(diff(&linked, &base, &base).await.unwrap().is_empty());
+        assert!(!show_commit(&linked, &base, 64 * 1024)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_materialization_distinguishes_missing_and_corrupt_objects() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for corrupt in [false, true] {
+            let repo = tempfile::tempdir().unwrap();
+            let head = init_repo(repo.path()).await;
+            assert!(!show_commit(repo.path(), &head, 64 * 1024)
+                .await
+                .unwrap()
+                .is_empty());
+            let object = repo
+                .path()
+                .join(".git/objects")
+                .join(&head[..2])
+                .join(&head[2..]);
+            if corrupt {
+                let mut permissions = std::fs::metadata(&object).unwrap().permissions();
+                permissions.set_mode(0o600);
+                std::fs::set_permissions(&object, permissions).unwrap();
+                std::fs::write(&object, b"invalid zlib object").unwrap();
+            } else {
+                std::fs::remove_file(&object).unwrap();
+            }
+
+            let error = show_commit(repo.path(), &head, 64 * 1024)
+                .await
+                .unwrap_err();
+            let typed = error
+                .downcast_ref::<CommitMaterializationError>()
+                .expect("typed commit materialization error");
+            assert!(matches!(
+                (corrupt, typed),
+                (false, CommitMaterializationError::Missing)
+                    | (true, CommitMaterializationError::InvalidContent(_))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_materialization_classifies_an_unreadable_loose_object() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let head = init_repo(repo.path()).await;
+        let object = repo
+            .path()
+            .join(".git/objects")
+            .join(&head[..2])
+            .join(&head[2..]);
+        let original = std::fs::metadata(&object).unwrap().permissions();
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let error = show_commit(repo.path(), &head, 64 * 1024)
+            .await
+            .expect_err("an unreadable loose object must fail closed");
+        std::fs::set_permissions(&object, original).unwrap();
+
+        assert!(matches!(
+            error.downcast_ref::<CommitMaterializationError>(),
+            Some(CommitMaterializationError::Unreadable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn commit_materialization_ignores_replacement_refs() {
+        let repo = tempfile::tempdir().unwrap();
+        let original = init_repo(repo.path()).await;
+        let replacement = commit_change(repo.path(), "replacement sentinel\n").await;
+        let replacement_tree = git(
+            repo.path(),
+            &["rev-parse", &format!("{replacement}^{{tree}}")],
+        )
+        .await
+        .unwrap();
+        let replacement_root = git(
+            repo.path(),
+            &[
+                "commit-tree",
+                replacement_tree.trim(),
+                "-m",
+                "replacement root",
+            ],
+        )
+        .await
+        .unwrap();
+        git(
+            repo.path(),
+            &["replace", &original, replacement_root.trim()],
+        )
+        .await
+        .unwrap();
+
+        let replaced = Command::new("git")
+            .current_dir(repo.path())
+            .args(["show", "--format=fuller", &original])
+            .output()
+            .await
+            .unwrap();
+        assert!(replaced.status.success());
+        let replaced = String::from_utf8(replaced.stdout).unwrap();
+        assert!(replaced.contains("replacement sentinel"));
+
+        let materialized = show_commit(repo.path(), &original, 64 * 1024)
+            .await
+            .unwrap();
+        let materialized = String::from_utf8(materialized).unwrap();
+        assert!(materialized.contains("base"));
+        assert!(!materialized.contains("replacement sentinel"));
+    }
+
+    #[tokio::test]
+    async fn commit_materialization_is_isolated_from_repository_presentation_config() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let head = commit_change(repo.path(), "canonical presentation\n").await;
+        let baseline = show_commit(repo.path(), &head, 64 * 1024).await.unwrap();
+
+        for (key, value) in [
+            ("diff.noprefix", "true"),
+            ("diff.context", "0"),
+            ("diff.algorithm", "histogram"),
+            ("core.abbrev", "5"),
+            ("log.decorate", "full"),
+        ] {
+            git(repo.path(), &["config", key, value]).await.unwrap();
+        }
+
+        assert_eq!(
+            show_commit(repo.path(), &head, 64 * 1024).await.unwrap(),
+            baseline,
+            "repository-local presentation config must not alter prompt bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_materialization_is_isolated_from_ambient_attributes() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let target = commit_change(repo.path(), "ambient attribute sentinel\n").await;
+        let baseline = show_commit(repo.path(), &target, 64 * 1024).await.unwrap();
+
+        std::fs::write(repo.path().join(".gitattributes"), "*.txt -diff\n").unwrap();
+        git(repo.path(), &["add", ".gitattributes"]).await.unwrap();
+        git(repo.path(), &["commit", "-q", "-m", "hostile attributes"])
+            .await
+            .unwrap();
+        let attribute_source = head_sha(repo.path()).await.unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let user_attributes = xdg.path().join("git/attributes");
+        std::fs::create_dir_all(user_attributes.parent().unwrap()).unwrap();
+        std::fs::write(&user_attributes, "*.txt -diff\n").unwrap();
+
+        let observer = CommitGitObserver::open(repo.path(), &target).await.unwrap();
+        let mut hostile = observer.command();
+        hostile
+            .env("GIT_ATTR_SOURCE", &attribute_source)
+            .env("XDG_CONFIG_HOME", xdg.path());
+        configure_commit_show(&mut hostile, &target);
+        let hostile = run_git_bounded(&mut hostile, None, 64 * 1024, MAX_GIT_DIAGNOSTIC_BYTES)
+            .await
+            .unwrap();
+        assert!(hostile.status.success());
+        assert_ne!(
+            hostile.stdout, baseline,
+            "the hostile attribute fixtures must affect an unprotected command"
+        );
+
+        let mut protected = Command::new("git");
+        protected
+            .env("GIT_ATTR_SOURCE", &attribute_source)
+            .env("XDG_CONFIG_HOME", xdg.path());
+        configure_isolated_git_command(&mut protected, &observer.metadata, &observer.objects);
+        configure_commit_show(&mut protected, &target);
+        let protected = run_git_bounded(&mut protected, None, 64 * 1024, MAX_GIT_DIAGNOSTIC_BYTES)
+            .await
+            .unwrap();
+        assert!(protected.status.success());
+        assert_eq!(protected.stdout, baseline);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_materialization_never_runs_textconv() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let marker = repo.path().join("textconv-ran");
+        let textconv = repo.path().join("textconv");
+        std::fs::write(
+            &textconv,
+            format!(
+                "#!/bin/sh\nprintf converted\nprintf ran > '{}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&textconv).unwrap();
+        std::fs::write(repo.path().join("opaque.bin"), b"raw sentinel\n").unwrap();
+        std::fs::write(repo.path().join(".gitattributes"), "*.bin diff=custom\n").unwrap();
+        git(
+            repo.path(),
+            &["config", "diff.custom.textconv", textconv.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        git(repo.path(), &["add", "opaque.bin", ".gitattributes"])
+            .await
+            .unwrap();
+        git(repo.path(), &["commit", "-q", "-m", "textconv fixture"])
+            .await
+            .unwrap();
+        let head = head_sha(repo.path()).await.unwrap();
+
+        let converted = git(repo.path(), &["show", "--textconv", &head])
+            .await
+            .unwrap();
+        assert!(converted.contains("converted"));
+        assert!(
+            marker.exists(),
+            "the configured converter is a real fixture"
+        );
+        std::fs::remove_file(&marker).unwrap();
+
+        let materialized = show_commit(repo.path(), &head, 64 * 1024).await.unwrap();
+        assert!(String::from_utf8(materialized)
+            .unwrap()
+            .contains("raw sentinel"));
+        assert!(
+            !marker.exists(),
+            "exact materialization must disable textconv"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bounded_git_overflow_kills_and_reaps_the_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pid");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!("printf %s $$ > '{}'; exec yes", pid_file.display()),
+        ]);
+
+        let error = run_git_bounded(&mut command, None, 1024, 1024)
+            .await
+            .expect_err("unbounded output must be rejected");
+        assert!(matches!(error, BoundedGitError::Limit(GitStream::Stdout)));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(
+            !Path::new("/proc").join(pid).exists(),
+            "overflowing process must be reaped before return"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bounded_git_deadline_kills_and_reaps_the_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pid");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!("printf %s $$ > '{}'; exec sleep 60", pid_file.display()),
+        ]);
+
+        let error =
+            run_git_bounded_with_timeout(&mut command, None, 1024, 1024, Duration::from_millis(20))
+                .await
+                .expect_err("a stalled Git process must time out");
+        assert!(matches!(error, BoundedGitError::TimedOut));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(
+            !Path::new("/proc").join(pid).exists(),
+            "timed-out process must be reaped before return"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_materialization_rejects_a_nonregular_loose_object() {
+        let repo = tempfile::tempdir().unwrap();
+        let head = init_repo(repo.path()).await;
+        let object = repo
+            .path()
+            .join(".git/objects")
+            .join(&head[..2])
+            .join(&head[2..]);
+        std::fs::remove_file(&object).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&object)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = show_commit(repo.path(), &head, 64 * 1024)
+            .await
+            .expect_err("a special-file object must fail before Git opens it");
+        assert!(matches!(
+            error.downcast_ref::<CommitMaterializationError>(),
+            Some(CommitMaterializationError::InvalidContent(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn commit_materialization_rejects_oversized_output_at_the_process_boundary() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        std::fs::write(repo.path().join("large.txt"), "x".repeat(16 * 1024)).unwrap();
+        git(repo.path(), &["add", "large.txt"]).await.unwrap();
+        git(repo.path(), &["commit", "-q", "-m", "large commit"])
+            .await
+            .unwrap();
+        let head = head_sha(repo.path()).await.unwrap();
+
+        let error = show_commit(repo.path(), &head, 1024)
+            .await
+            .expect_err("Git output must be bounded while it is read");
+        assert!(matches!(
+            error.downcast_ref::<CommitMaterializationError>(),
+            Some(CommitMaterializationError::ExpansionLimit)
+        ));
     }
 
     #[tokio::test]

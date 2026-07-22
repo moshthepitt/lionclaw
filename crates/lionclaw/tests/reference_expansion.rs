@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use common::{approve_plan, harness, proposal, simple_plan, BASE_SHA};
 use lionclaw::cli::{self, Cli};
+use lionclaw::engine::ReferenceRejectionReason;
 use lionclaw::model::{
     DecisionAction, DeliveryMarker, Handoff, MessageReference, MissionEvent, PayloadRef, RoleName,
     TaskId, TaskKind, UnavailableReferenceCause, REDUCER_VERSION, SCHEMA_VERSION,
@@ -128,9 +129,47 @@ async fn reachable_commit_expands_only_at_the_typed_role_request_boundary() {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CommitObjectFault {
+    Missing,
+    Corrupt,
+}
+
+impl CommitObjectFault {
+    fn cause(self) -> UnavailableReferenceCause {
+        match self {
+            Self::Missing => UnavailableReferenceCause::SourceMissing,
+            Self::Corrupt => UnavailableReferenceCause::InvalidContent,
+        }
+    }
+
+    fn inject(self, object: &std::path::Path) {
+        match self {
+            Self::Missing => std::fs::remove_file(object).unwrap(),
+            Self::Corrupt => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    let mut permissions = std::fs::metadata(object).unwrap().permissions();
+                    permissions.set_mode(0o600);
+                    std::fs::set_permissions(object, permissions).unwrap();
+                }
+                std::fs::write(object, b"invalid zlib object").unwrap();
+            }
+        }
+    }
+}
+
 #[tokio::test]
-async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (21, 29));
+async fn accepted_commit_object_fault_settles_once_and_does_not_block_later_messages() {
+    for fault in [CommitObjectFault::Missing, CommitObjectFault::Corrupt] {
+        prove_commit_object_fault_settles_once(fault).await;
+    }
+}
+
+async fn prove_commit_object_fault_settles_once(fault: CommitObjectFault) {
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (21, 30));
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let observed = prompts.clone();
@@ -182,7 +221,7 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
         .join(&BASE_SHA[..2])
         .join(&BASE_SHA[2..]);
     assert!(object.is_file(), "fault injection requires a loose commit");
-    std::fs::remove_file(object).unwrap();
+    fault.inject(&object);
 
     let advanced = h.engine.advance(&mission).await.unwrap().state;
     assert_eq!(advanced.unavailable_references.len(), 1);
@@ -213,7 +252,7 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
             sha: BASE_SHA.to_owned()
         }
     );
-    assert_eq!(evidence.cause, UnavailableReferenceCause::SourceMissing);
+    assert_eq!(evidence.cause, fault.cause());
     let prompt = prompts.lock().unwrap().last().unwrap().clone();
     assert!(prompt.contains("distinct later message must progress"));
     assert!(!prompt.contains("failed reference message must not be presented"));
@@ -226,6 +265,13 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
         advanced,
         "reload preserves exact unavailable-reference accounting"
     );
+    assert_operator_views(
+        dir.path(),
+        &mission,
+        unavailable_sequence,
+        conversation.consumed_through,
+    )
+    .await;
     let snapshot = store.rebuild_cursors(&mission, 29_000).await.unwrap();
     let snapshot_head = snapshot.head;
     assert_eq!(
@@ -298,16 +344,8 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
     assert_eq!(
         store.snapshot_meta(&mission).await.unwrap(),
         Some((snapshot_head, REDUCER_VERSION)),
-        "the asserted reducer-29 snapshot must remain behind the final log head"
+        "the asserted reducer-30 snapshot must remain behind the final log head"
     );
-
-    assert_operator_views(
-        dir.path(),
-        &mission,
-        unavailable_sequence,
-        conversation.consumed_through,
-    )
-    .await;
 
     let database = sqlx::SqlitePool::connect(&format!(
         "sqlite://{}",
@@ -366,6 +404,123 @@ async fn accepted_receipt_blob_fault_before_dispatch_settles_once() {
     for fault in [ReceiptBlobFault::Missing, ReceiptBlobFault::Corrupt] {
         prove_receipt_blob_fault_settles_once(fault).await;
     }
+}
+
+#[tokio::test]
+async fn oversized_authoritative_receipt_is_rejected_with_exact_typed_truth() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = MockRoleRunner::new(Box::new(|request| {
+        if request.attempt_no == 1 {
+            Ok(RoleRunOutcome {
+                handoff: Some(Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("minted oversized receipt authority"),
+                    request_attention: false,
+                }),
+                artifact: Some(CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    common::HEAD_SHA.to_string(),
+                )),
+                runtime_configuration: Default::default(),
+                final_response: "minted oversized receipt authority".into(),
+            })
+        } else {
+            Ok(checkpoint(request))
+        }
+    }));
+    let oracle = MockOracleRunner::new(Box::new(|_| {
+        let mut stdout = vec![b'R'; 128 * 1024];
+        stdout.push(0xff);
+        Ok(OracleOutcome {
+            exit_code: 1,
+            exit_signal: None,
+            stdout,
+            stderr: Vec::new(),
+            prepared_inputs: Vec::new(),
+            duration_ms: 7,
+        })
+    }));
+    let h = harness(dir.path(), runner, oracle).await;
+    let mission = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "oversized receipt reference",
+            BASE_SHA,
+        )
+        .await
+        .unwrap();
+    let mut plan = simple_plan();
+    plan.tasks[0].id = TaskId::new("mint-oversized-receipt").unwrap();
+    h.engine
+        .propose_plan(&mission, proposal(0, plan))
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &mission).await;
+    for _ in 0..8 {
+        h.engine.advance(&mission).await.unwrap();
+        let state = h.engine.load_state(&mission).await.unwrap();
+        if !state.authoritative_receipts.is_empty() && !state.open_attention.is_empty() {
+            break;
+        }
+    }
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let failed = store.require_state(&mission).await.unwrap();
+    let receipt = failed.authoritative_receipts.iter().next().unwrap().clone();
+    let receipt_is_blob_backed = store
+        .load(&mission)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|event| {
+            matches!(
+                event.event,
+                MissionEvent::OracleRunCompleted {
+                    effect_id,
+                    outcome: Ok(lionclaw::model::OracleRunSuccess {
+                        stdout: PayloadRef::Blob(_),
+                        ..
+                    }),
+                    ..
+                } if effect_id == receipt
+            )
+        });
+    assert!(receipt_is_blob_backed);
+    let attention = failed.open_attention.keys().next().unwrap().clone();
+    h.engine
+        .decide(
+            &mission,
+            &attention,
+            DecisionAction::Repair,
+            "retry recipient",
+        )
+        .await
+        .unwrap();
+    h.engine.advance(&mission).await.unwrap();
+    let ready = store.require_state(&mission).await.unwrap();
+    let conversation = ready
+        .conversations
+        .iter()
+        .find(|(id, _)| ready.conversation_is_messageable(id))
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    let before = store.load(&mission).await.unwrap();
+    let error = cli::run(send_cli(
+        dir.path(),
+        &mission,
+        conversation.as_str(),
+        &["--receipt", receipt.as_str()],
+        "must reject before ingress",
+    ))
+    .await
+    .expect_err("oversized receipt must fail closed");
+    assert_eq!(
+        error.downcast_ref::<ReferenceRejectionReason>(),
+        Some(&ReferenceRejectionReason::Oversized {
+            reference: Some(MessageReference::AuthoritativeReceipt { effect_id: receipt }),
+        })
+    );
+    assert_eq!(store.load(&mission).await.unwrap(), before);
 }
 
 async fn prove_receipt_blob_fault_settles_once(fault: ReceiptBlobFault) {
@@ -502,6 +657,13 @@ async fn prove_receipt_blob_fault_settles_once(fault: ReceiptBlobFault) {
         .join(&receipt_blob.hex[..2])
         .join(&receipt_blob.hex[2..4])
         .join(&receipt_blob.hex);
+    assert_rejected_receipt_completion_cannot_supply_reference_prose(
+        &store,
+        &mission,
+        &receipt,
+        dir.path(),
+    )
+    .await;
     fault.inject(&blob_path);
 
     let attempts_before = queued.tasks[&TaskId::new("mint-receipt").unwrap()].attempts;
@@ -548,6 +710,56 @@ async fn prove_receipt_blob_fault_settles_once(fault: ReceiptBlobFault) {
         &format!("receipt {fault:?} replay tail remains queued"),
     )
     .await;
+}
+
+async fn assert_rejected_receipt_completion_cannot_supply_reference_prose(
+    store: &MissionStore,
+    mission: &lionclaw::model::MissionId,
+    receipt: &lionclaw::model::EffectId,
+    repo: &std::path::Path,
+) {
+    let events = store.load(mission).await.unwrap();
+    let completion = events
+        .iter()
+        .position(|envelope| {
+            matches!(
+                envelope.event,
+                MissionEvent::OracleRunCompleted { ref effect_id, .. } if effect_id == receipt
+            )
+        })
+        .unwrap();
+    let mut prefix = events[..=completion].to_vec();
+    let mut legitimate = prefix.pop().unwrap();
+    let mut rejected = legitimate.clone();
+    let MissionEvent::OracleRunCompleted {
+        judged_sha,
+        outcome: Ok(success),
+        ..
+    } = &mut rejected.event
+    else {
+        unreachable!()
+    };
+    *judged_sha = "forged-unjudged-head".into();
+    success.stdout = PayloadRef::inline("FORGED-RECEIPT-PROSE");
+    legitimate.sequence_no = legitimate.sequence_no.saturating_add(1);
+    prefix.push(rejected);
+    prefix.push(legitimate);
+
+    let replayed = lionclaw::model::fold(prefix.clone()).unwrap();
+    assert!(replayed.authoritative_receipts.contains(receipt));
+    let materialized = lionclaw::reference_materialization::materialize_references(
+        &replayed,
+        &prefix,
+        store.blobs(),
+        repo,
+        &[MessageReference::AuthoritativeReceipt {
+            effect_id: receipt.clone(),
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(materialized[0].content.contains("REAL-BELOW-LIMIT-RECEIPT"));
+    assert!(!materialized[0].content.contains("FORGED-RECEIPT-PROSE"));
 }
 
 #[tokio::test]
@@ -780,7 +992,7 @@ async fn assert_replay_snapshot_tail(
     let final_state = store.require_state(mission).await.unwrap();
     assert!(
         final_state.head > snapshot_head,
-        "genuine reducer-29 snapshot must have a nonempty durable tail"
+        "genuine reducer-30 snapshot must have a nonempty durable tail"
     );
     let queued_tail = final_state.conversations
         [&lionclaw::model::ConversationId::parse(conversation).unwrap()]
@@ -906,6 +1118,7 @@ async fn assert_operator_views(
     for args in [
         vec!["mission", "status", mission.as_str()],
         vec!["mission", "report", mission.as_str()],
+        vec!["mission", "inbox"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
             .args(args)
@@ -989,8 +1202,15 @@ async fn assert_park_operator_views(
         assert!(human.status.success());
         let human = String::from_utf8(human.stdout).unwrap();
         assert!(human.contains(mission.as_str()));
-        assert!(human.contains(conversation_id));
-        assert!(human.contains("park"));
+        assert!(human.contains(&format!(
+            "conversation {conversation_id}: lifecycle={} queued={} delivery_through={}",
+            serde_json::to_value(conversation.lifecycle)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            conversation.queued.len(),
+            conversation.consumed_through
+        )));
         assert!(!human.contains("unavailable reference:"));
     }
     let inbox = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
@@ -1024,6 +1244,10 @@ fn assert_inbox_binding(mission_id: &str, status: &serde_json::Value, inbox: &[s
         assert_eq!(record["attention"], status["attention"]);
         assert_eq!(record["next_actions"], status["next_actions"]);
         assert_eq!(record["conversations"], status["conversations"]);
+        assert_eq!(
+            record["unavailable_references"],
+            status["unavailable_references"]
+        );
         return;
     }
 

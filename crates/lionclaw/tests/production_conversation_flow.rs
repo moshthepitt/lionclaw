@@ -2,10 +2,12 @@
 //! oracle transports are scripted; every boundary around them is production.
 
 use std::collections::VecDeque;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::Parser;
@@ -79,6 +81,65 @@ fn stdout(output: Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("UTF-8 CLI output")
+}
+
+fn watch_observation(
+    repo: &Path,
+    mission_id: &str,
+    json: bool,
+    final_line_contains: Option<&str>,
+) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lionclaw"));
+    command
+        .args(["mission", "status", mission_id, "--watch"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .arg("--repo")
+        .arg(repo);
+    if json {
+        command.arg("--json");
+    }
+    let mut child = command.spawn().expect("spawn status watcher");
+    let output = child.stdout.take().expect("watch stdout");
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let final_line_contains = final_line_contains.map(str::to_owned);
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(output);
+        let mut observation = String::new();
+        let result = loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break Ok(observation),
+                Ok(_) => {
+                    let complete = final_line_contains
+                        .as_ref()
+                        .is_none_or(|expected| line.contains(expected));
+                    observation.push_str(&line);
+                    if complete {
+                        break Ok(observation);
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = sender.send(result);
+    });
+    let observed = receiver.recv_timeout(Duration::from_secs(10));
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("reap status watcher");
+    reader.join().expect("join status watcher reader");
+    match observed {
+        Ok(Ok(line)) if !line.is_empty() => line,
+        Ok(Ok(_)) => panic!(
+            "watch exited without an observation: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Ok(Err(error)) => panic!("failed to read watch observation: {error}"),
+        Err(error) => panic!(
+            "watch emitted no observation before its deadlock deadline ({error}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
 }
 
 fn assert_activity_suppressed(repo: &Path, mission_id: &str, label: &str) {
@@ -241,18 +302,7 @@ async fn capture_reference_watch(
     )
     .await
     .unwrap();
-    let watched = Command::new("timeout")
-        .args(["1", env!("CARGO_BIN_EXE_lionclaw"), "mission", "status"])
-        .arg(mission.as_str())
-        .args(["--watch", "--json", "--repo"])
-        .arg(repo)
-        .output()
-        .unwrap();
-    let watched = String::from_utf8(watched.stdout).unwrap();
-    assert!(
-        watched.lines().next().is_some(),
-        "watch emitted no observation"
-    );
+    let watched = watch_observation(repo, mission.as_str(), true, None);
     release.add_permits(8);
     assert_eq!(
         active_driver.await.unwrap().unwrap(),
@@ -810,7 +860,7 @@ async fn initialize_repo(repo: &Path) -> String {
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (21, 29));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (21, 30));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -1111,7 +1161,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert_eq!(settled, replayed);
     assert!(
         settled.head > active.head,
-        "real reducer-29 snapshot has a nonempty tail"
+        "real reducer-30 snapshot has a nonempty tail"
     );
     assert_eq!(settled.deliverable_head(), base);
     assert_eq!(settled.tasks[&writer_id].status, TaskStatus::Running);
@@ -3373,14 +3423,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     std::fs::write(&activity_path, serde_json::to_vec(&duplicate).unwrap()).unwrap();
     assert_activity_suppressed(&repo, mission_id.as_str(), "duplicate effect");
     std::fs::write(&activity_path, serde_json::to_vec(&activity).unwrap()).unwrap();
-    let watched = Command::new("timeout")
-        .args(["1", env!("CARGO_BIN_EXE_lionclaw"), "mission", "status"])
-        .arg(mission_id.as_str())
-        .args(["--watch", "--json", "--repo"])
-        .arg(&repo)
-        .output()
-        .unwrap();
-    let watched_line = String::from_utf8(watched.stdout).unwrap();
+    let watched_line = watch_observation(&repo, mission_id.as_str(), true, None);
     let watched_activity: serde_json::Value =
         serde_json::from_str(watched_line.lines().next().expect("watch observation")).unwrap();
     assert_eq!(
@@ -3396,14 +3439,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         watched_activity["next_actions"],
         refreshed_status["next_actions"]
     );
-    let watched_human = Command::new("timeout")
-        .args(["1", env!("CARGO_BIN_EXE_lionclaw"), "mission", "status"])
-        .arg(mission_id.as_str())
-        .args(["--watch", "--repo"])
-        .arg(&repo)
-        .output()
-        .unwrap();
-    let watched_human = String::from_utf8(watched_human.stdout).unwrap();
+    let watched_human = watch_observation(&repo, mission_id.as_str(), false, Some("marker=queued"));
     assert!(watched_human.contains(&format!("{} ", effect_id.as_str())));
     assert!(watched_human.contains("lifecycle=running"));
     assert!(watched_human.contains("resume=canonical_reconstruction"));
@@ -4443,6 +4479,22 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .join(&receipt_blob.hex[..2])
         .join(&receipt_blob.hex[2..4])
         .join(&receipt_blob.hex);
+    let mut permissions = std::fs::metadata(&blob_path).unwrap().permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(&blob_path, permissions).unwrap();
+    assert_reference_send_rejected(
+        &repo,
+        &store,
+        &mission,
+        &conversation,
+        vec!["--receipt".into(), receipt.to_string()],
+        ReferenceRejectionReason::Unreadable {
+            reference: MessageReference::AuthoritativeReceipt {
+                effect_id: receipt.clone(),
+            },
+        },
+    )
+    .await;
     let mut permissions = std::fs::metadata(&blob_path).unwrap().permissions();
     permissions.set_mode(0o644);
     std::fs::set_permissions(&blob_path, permissions).unwrap();

@@ -14,8 +14,9 @@ use lionclaw::engine::{
     record_control, record_message, Engine, EngineServices, MessageCommand, MissionDisposition,
 };
 use lionclaw::model::{
-    fold, Assertion, AssertionId, ControlAction, DeliveryMarker, Handoff, MissionPhase, OracleName,
-    PayloadRef, RuntimeConfigurationEvidence, TaskStatus, REDUCER_VERSION,
+    fold, Assertion, AssertionId, ControlAction, DeliveryMarker, Handoff, MessageReference,
+    MissionPhase, OracleName, PayloadRef, RuntimeConfigurationEvidence, TaskStatus,
+    REDUCER_VERSION,
 };
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, OracleOutcome,
@@ -44,6 +45,10 @@ impl lionclaw::ports::Clock for RealClock {
 struct ControlledRunner {
     started: Arc<Barrier>,
     requests: Arc<Mutex<Vec<(String, u32)>>>,
+}
+
+struct RawSuccessAfterStopRunner {
+    started: Arc<Barrier>,
 }
 
 struct SleepingRunner;
@@ -393,6 +398,102 @@ impl RoleRunner for ControlledRunner {
             final_response: "completed after continue".into(),
         })
     }
+}
+
+#[async_trait]
+impl RoleRunner for RawSuccessAfterStopRunner {
+    async fn run(&self, mut request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        self.started.wait().await;
+        loop {
+            if matches!(request.control.borrow().clone(), ExecutionControl::Stop(_)) {
+                return Ok(RoleRunOutcome {
+                    handoff: Some(Handoff::Work {
+                        done: true,
+                        report: PayloadRef::inline("raw success report"),
+                        request_attention: false,
+                    }),
+                    artifact: None,
+                    runtime_configuration: Default::default(),
+                    final_response: "raw success response".into(),
+                });
+            }
+            request.control.changed().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn park_reference_materializes_the_fold_authoritative_failure() {
+    let dir = test_repository();
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let started = Arc::new(Barrier::new(2));
+    let engine = Arc::new(Engine::new(
+        store.clone(),
+        test_mission_type(),
+        "codex".to_string(),
+        "localhost/lionclaw-runtime-dev:v1".to_string(),
+        EngineServices::new(
+            Arc::new(RawSuccessAfterStopRunner {
+                started: started.clone(),
+            }),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    ));
+    let mission = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "park evidence truth",
+            BASE_SHA,
+        )
+        .await
+        .unwrap();
+    engine
+        .propose_plan(&mission, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&engine, &mission).await;
+
+    let driver = {
+        let engine = engine.clone();
+        let mission = mission.clone();
+        tokio::spawn(async move { engine.advance(&mission).await.unwrap() })
+    };
+    started.wait().await;
+    let active = store.require_state(&mission).await.unwrap();
+    let effect_id = active.inflight.keys().next().unwrap().clone();
+    record_control(
+        &store,
+        1,
+        &mission,
+        &effect_id,
+        ControlAction::Stop,
+        "materialization proof stop",
+    )
+    .await
+    .unwrap();
+    let settled = driver.await.unwrap().state;
+    assert!(settled.parked_effects.contains_key(&effect_id));
+
+    let materialized = lionclaw::reference_materialization::materialize_references(
+        &settled,
+        &store.load(&mission).await.unwrap(),
+        store.blobs(),
+        dir.path(),
+        &[MessageReference::ParkEvidence {
+            effect_id: effect_id.clone(),
+        }],
+    )
+    .await
+    .unwrap();
+    let failure: serde_json::Value = serde_json::from_str(&materialized[0].content).unwrap();
+    assert_eq!(failure["type"], "operator_stopped");
+    assert_eq!(
+        failure["evidence"]["stop_reason"],
+        "materialization proof stop"
+    );
+    assert!(failure.get("Ok").is_none());
 }
 
 #[tokio::test]
@@ -957,7 +1058,7 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
             let assignment_epoch = request.assignment_epoch;
             let message_boundary = request.message_boundary;
 
-            // This is a real reducer-29 snapshot of the active request. All
+            // This is a real reducer-30 snapshot of the active request. All
             // following facts, including settlement, form a nonempty tail.
             let snapshotted = store.rebuild_cursors(&mission_id, 7_000).await.unwrap();
             assert_eq!(snapshotted, active);
@@ -1029,7 +1130,7 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
             );
             assert!(live.head > active.head, "snapshot tail must be nonempty");
             let rebuilt = store.rebuild_cursors(&mission_id, 8_000).await.unwrap();
-            assert_eq!(live, rebuilt, "live/reducer-29 rebuild");
+            assert_eq!(live, rebuilt, "live/reducer-30 rebuild");
 
             assert_eq!(
                 live.tasks.values().next().unwrap().assignment_epoch,

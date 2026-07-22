@@ -2282,28 +2282,51 @@ async fn materialize_conversation_messages(
     };
     let events = engine.store.load(&state.mission_id).await?;
     let repo = std::path::Path::new(&state.workspace_dir);
-    let mut rendered = Vec::with_capacity(conversation.queued.len());
-    for message in &conversation.queued {
-        if !message_is_materializable(message, message_boundary) {
-            continue;
-        }
-        let expanded = crate::reference_materialization::materialize_references(
-            state,
-            &events,
-            engine.store.blobs(),
-            repo,
-            &message.references,
-        )
-        .await
-        .map_err(|error| UnavailableConversationReference {
-            message_sequence: message.sequence_no,
-            reference: error.reference,
-            cause: error.cause,
-        })
-        .map_err(anyhow::Error::new)?;
+    let messages = conversation
+        .queued
+        .iter()
+        .filter(|message| message_is_materializable(message, message_boundary))
+        .collect::<Vec<_>>();
+    let materializer = crate::reference_materialization::ReferenceMaterializer::new(
+        state,
+        &events,
+        engine.store.blobs(),
+        repo,
+        messages
+            .iter()
+            .flat_map(|message| message.references.iter()),
+    )
+    .map_err(|error| unavailable_conversation_reference(&messages, error))?;
+    let mut rendered = Vec::with_capacity(messages.len());
+    for message in messages {
+        let expanded = materializer
+            .materialize(&message.references)
+            .await
+            .map_err(|error| UnavailableConversationReference {
+                message_sequence: message.sequence_no,
+                reference: error.reference,
+                cause: error.cause,
+            })
+            .map_err(anyhow::Error::new)?;
         rendered.push(render_conversation_message(message, &expanded));
     }
     Ok(rendered)
+}
+
+fn unavailable_conversation_reference(
+    messages: &[&crate::model::QueuedMessage],
+    error: crate::reference_materialization::ReferenceMaterializationError,
+) -> anyhow::Error {
+    let message_sequence = messages
+        .iter()
+        .find(|message| message.references.contains(&error.reference))
+        .map(|message| message.sequence_no)
+        .expect("authority construction errors name a requested reference");
+    anyhow::Error::new(UnavailableConversationReference {
+        message_sequence,
+        reference: error.reference,
+        cause: error.cause,
+    })
 }
 
 fn message_is_materializable(message: &crate::model::QueuedMessage, message_boundary: u64) -> bool {
@@ -2422,6 +2445,10 @@ pub enum ReferenceRejectionReason {
     Missing {
         reference: crate::model::MessageReference,
     },
+    #[error("message reference {reference:?} is unreadable")]
+    Unreadable {
+        reference: crate::model::MessageReference,
+    },
     #[error("message reference {reference:?} has invalid content")]
     InvalidContent {
         reference: crate::model::MessageReference,
@@ -2444,35 +2471,23 @@ fn validate_reference_eligibility(
     if references.is_empty() {
         return Ok(());
     }
-    let outputs = recipients.iter().map(|recipient| {
-        state
-            .config
-            .plan_inventory
-            .roles
-            .get(&recipient.role)
-            .copied()
-            .map(|output| (recipient, output))
-    });
-    let resolved: Vec<_> = outputs.flatten().collect();
-    // A current recipient is reducer-bound to a role in the persisted inventory.
-    // Still fail closed with typed truth if corrupt state crosses that wall.
-    if resolved.len() != recipients.len() {
-        return Err(ReferenceRejectionReason::MalformedOrForeign {
-            reference: references[0].clone(),
-        });
-    }
-    let permitted = resolved
-        .iter()
-        .filter(|(_, output)| output.permits_message_references())
-        .count();
-    if permitted != 0 && permitted != resolved.len() {
-        return Err(ReferenceRejectionReason::MixedRecipients);
-    }
-    if permitted == 0 {
-        if let Some((recipient, output)) = resolved.first() {
+    match state.reference_recipient_policy(recipients) {
+        crate::model::ReferenceRecipientPolicy::Permitted => {}
+        crate::model::ReferenceRecipientPolicy::Disallowed {
+            conversation_id,
+            output,
+        } => {
             return Err(ReferenceRejectionReason::Disallowed {
-                conversation_id: recipient.conversation_id.clone(),
-                output: *output,
+                conversation_id,
+                output,
+            });
+        }
+        crate::model::ReferenceRecipientPolicy::Mixed => {
+            return Err(ReferenceRejectionReason::MixedRecipients);
+        }
+        crate::model::ReferenceRecipientPolicy::Invalid => {
+            return Err(ReferenceRejectionReason::MalformedOrForeign {
+                reference: references[0].clone(),
             });
         }
     }
@@ -2580,31 +2595,8 @@ pub async fn record_message(
             }
         };
         if !valid {
-            let known = events
-                .iter()
-                .any(|envelope| match (&envelope.event, reference) {
-                    (
-                        MissionEvent::OracleRunCompleted {
-                            effect_id: found,
-                            outcome: Ok(_),
-                            ..
-                        },
-                        crate::model::MessageReference::AuthoritativeReceipt { effect_id },
-                    ) => found == effect_id,
-                    (
-                        MissionEvent::RoleRunCompleted {
-                            effect_id: found, ..
-                        }
-                        | MissionEvent::OracleRunCompleted {
-                            effect_id: found, ..
-                        }
-                        | MissionEvent::TerminalReviewCompleted {
-                            effect_id: found, ..
-                        },
-                        crate::model::MessageReference::ParkEvidence { effect_id },
-                    ) => found == effect_id,
-                    _ => false,
-                });
+            let known =
+                crate::reference_materialization::reference_was_authoritative(&events, reference)?;
             let reason = if known {
                 ReferenceRejectionReason::Stale {
                     reference: reference.clone(),
@@ -2632,9 +2624,13 @@ pub async fn record_message(
                     reference: Some(error.reference),
                 }
             }
-            crate::model::UnavailableReferenceCause::SourceMissing
-            | crate::model::UnavailableReferenceCause::SourceUnreadable => {
+            crate::model::UnavailableReferenceCause::SourceMissing => {
                 ReferenceRejectionReason::Missing {
+                    reference: error.reference,
+                }
+            }
+            crate::model::UnavailableReferenceCause::SourceUnreadable => {
+                ReferenceRejectionReason::Unreadable {
                     reference: error.reference,
                 }
             }

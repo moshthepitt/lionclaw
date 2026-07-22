@@ -11,7 +11,7 @@ use lionclaw::model::{
     apply, fold, ControlAction, ConversationId, ConversationLifecycle, ConversationRecipient,
     Handoff, MissionEvent, MissionState, OutputSemantics, ParkedEffect, PayloadRef, RoleName,
     RoleRunRequestIdentity, RoleRunSuccess, RuntimeConfigurationEvidence, TaskId, TaskNamespace,
-    TaskStatus, TypedFailure,
+    TaskStatus, TypedFailure, REDUCER_VERSION,
 };
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -659,7 +659,7 @@ async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
         .store()
         .rebuild_cursors(&mission_id, 9_000_000)
         .await
-        .expect("seed reducer-29 request snapshot");
+        .expect("seed current-reducer request snapshot");
     assert_eq!(snapshotted_request, requested);
 
     let runtime_configuration = RuntimeConfigurationEvidence {
@@ -696,7 +696,7 @@ async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
         .await
         .expect("snapshot metadata")
         .expect("snapshot");
-    assert_eq!(reducer_version, 29);
+    assert_eq!(reducer_version, REDUCER_VERSION);
     assert!(
         snapshot_head < live.head,
         "completion must be a nonempty tail"

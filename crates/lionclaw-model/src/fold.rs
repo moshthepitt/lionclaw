@@ -26,9 +26,10 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-/// Version 29 rebuilds snapshots from sequence zero so unavailable references
-/// are settled atomically at their exact queued-message boundary.
-pub const REDUCER_VERSION: u32 = 29;
+/// Version 30 makes output-semantic reference isolation and unavailable-
+/// reference settlement obligations fold-authoritative. Older snapshots must
+/// rebuild so forged ingress and actionless settlements cannot survive replay.
+pub const REDUCER_VERSION: u32 = 30;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -260,6 +261,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         !state.reachable_commits.contains(sha)
                     }
                 })
+                || (!references.is_empty()
+                    && state.reference_recipient_policy(recipients)
+                        != super::state::ReferenceRecipientPolicy::Permitted)
             {
                 finish_apply(state, seq);
                 return;
@@ -315,25 +319,23 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             reference,
             cause,
         } => {
+            let super::step::StepDecision::DispatchRole(intent) = super::step::step(state) else {
+                finish_apply(state, seq);
+                return;
+            };
+            let expected_assignment = expected_role_assignment(state, &intent);
+            if expected_assignment.conversation_id != *conversation_id
+                || expected_assignment.generation != *assignment_epoch
+                || *message_sequence > state.head
+            {
+                finish_apply(state, seq);
+                return;
+            }
             let duplicate = state.unavailable_references.iter().any(|evidence| {
                 evidence.conversation_id == *conversation_id
                     && evidence.assignment_epoch == *assignment_epoch
                     && evidence.message_sequence == *message_sequence
             });
-            let effective_boundary = state
-                .conversations
-                .get(conversation_id)
-                .filter(|conversation| conversation.assignment_epoch == *assignment_epoch)
-                .map(|conversation| {
-                    conversation
-                        .active_delivery
-                        .as_ref()
-                        .map_or(state.head, |delivery| delivery.message_boundary)
-                });
-            if effective_boundary.is_none_or(|boundary| *message_sequence > boundary) {
-                finish_apply(state, seq);
-                return;
-            }
             let Some(message) =
                 state
                     .conversations
@@ -1204,18 +1206,7 @@ fn validated_role_dispatch(
     let super::step::StepDecision::DispatchRole(intent) = super::step::step(state) else {
         return None;
     };
-    let expected_assignment = super::state::resolve_role_assignment(
-        &state.mission_id,
-        *namespace,
-        task_id,
-        role,
-        super::state::RoleAssignmentContext {
-            previous: state.tasks_in(*namespace).get(task_id),
-            required_base: &intent.base_sha,
-            lifecycle_generation: state.role_lifecycle_generation(*namespace),
-            max_attempts: state.config.recovery.max_attempts,
-        },
-    );
+    let expected_assignment = expected_role_assignment(state, &intent);
     if envelope.stamps.prompt_hash.as_deref() != Some(prompt_hash.as_str()) {
         return None;
     }
@@ -1258,6 +1249,24 @@ fn validated_role_dispatch(
         .then_some(ValidatedRoleDispatch {
             assignment: expected_assignment,
         })
+}
+
+fn expected_role_assignment(
+    state: &MissionState,
+    intent: &super::step::RoleDispatchIntent,
+) -> super::state::RoleAssignment {
+    super::state::resolve_role_assignment(
+        &state.mission_id,
+        intent.namespace,
+        &intent.task_id,
+        &intent.role,
+        super::state::RoleAssignmentContext {
+            previous: state.tasks_in(intent.namespace).get(&intent.task_id),
+            required_base: &intent.base_sha,
+            lifecycle_generation: state.role_lifecycle_generation(intent.namespace),
+            max_attempts: state.config.recovery.max_attempts,
+        },
+    )
 }
 
 fn oracle_request_matches_obligation(
@@ -6676,6 +6685,49 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_reference_bearing_messages_at_judgment_boundaries() {
+        let mut request = role_requested_in(
+            crate::TaskNamespace::Execution,
+            "validator",
+            "validator-reference",
+            RoleName::new("reviewer").unwrap(),
+            OutputSemantics::EmitsVerdict,
+        );
+        let MissionEvent::RoleRunRequested { base_sha, .. } = &mut request else {
+            unreachable!()
+        };
+        *base_sha = "base".into();
+        let mut events = vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("work"), validate_task("validator")]),
+            role_completed("work", "work", work_handoff(true, false), None),
+            request,
+        ];
+        let running = fold_log(events.clone()).expect("validator dispatch");
+        let (conversation_id, conversation) = running
+            .conversations
+            .iter()
+            .find(|(_, conversation)| conversation.task_id == tid("validator"))
+            .expect("validator conversation");
+        events.push(MissionEvent::MessageSent {
+            recipients: vec![super::super::event::ConversationRecipient {
+                conversation_id: conversation_id.clone(),
+                role: conversation.role.clone(),
+                namespace: conversation.namespace,
+                task_id: conversation.task_id.clone(),
+                assignment_epoch: conversation.assignment_epoch,
+            }],
+            body: "producer prose must not enter judgment".into(),
+            references: vec![super::super::event::MessageReference::ReachableCommit {
+                sha: "base".into(),
+            }],
+        });
+
+        let replayed = fold_log(events).expect("replay");
+        assert!(replayed.conversations[conversation_id].queued.is_empty());
+    }
+
+    #[test]
     fn unavailable_reference_settlement_is_exact_atomic_and_idempotent() {
         let mut checkpoint = role_completed("w", "checkpoint", work_handoff(true, false), None);
         let MissionEvent::RoleRunCompleted {
@@ -6808,6 +6860,58 @@ mod tests {
         assert_eq!(after.unavailable_references, before.unavailable_references);
         assert_eq!(after.conversations, before.conversations);
         assert_eq!(after.tasks, before.tasks);
+    }
+
+    #[test]
+    fn unavailable_reference_requires_the_exact_dispatch_obligation() {
+        let mut events = vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "active"),
+        ];
+        let active = fold_log(events.clone()).unwrap();
+        let (conversation_id, conversation) = active.conversations.iter().next().unwrap();
+        let conversation_id = conversation_id.clone();
+        let assignment_epoch = conversation.assignment_epoch;
+        let reference =
+            super::super::event::MessageReference::ReachableCommit { sha: "base".into() };
+        events.push(MissionEvent::MessageSent {
+            recipients: vec![super::super::event::ConversationRecipient {
+                conversation_id: conversation_id.clone(),
+                role: conversation.role.clone(),
+                namespace: conversation.namespace,
+                task_id: conversation.task_id.clone(),
+                assignment_epoch,
+            }],
+            body: "accepted after the active request boundary".into(),
+            references: vec![reference.clone()],
+        });
+        events.push(role_completed(
+            "w",
+            "active",
+            work_handoff(true, false),
+            None,
+        ));
+        let completed = fold_log(events.clone()).unwrap();
+        let message_sequence = completed.conversations[&conversation_id].queued[0].sequence_no;
+        assert!(!matches!(
+            super::super::step::step(&completed),
+            super::super::step::StepDecision::DispatchRole(_)
+        ));
+
+        events.push(MissionEvent::MessageReferenceUnavailable {
+            conversation_id: conversation_id.clone(),
+            assignment_epoch,
+            message_sequence,
+            reference,
+            cause: super::super::event::UnavailableReferenceCause::SourceMissing,
+        });
+        let replayed = fold_log(events).unwrap();
+        assert_eq!(replayed.conversations, completed.conversations);
+        assert_eq!(
+            replayed.unavailable_references,
+            completed.unavailable_references
+        );
     }
 
     #[test]

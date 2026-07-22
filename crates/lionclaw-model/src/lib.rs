@@ -69,9 +69,9 @@ pub use state::{
     AttentionItem, AttentionKind, ConversationLifecycle, ConversationState, DeliveryMarker,
     DurableCancellation, EffectCleanupFailure, FailureEvidence, FailureFeedback, InflightEffect,
     MissionPhase, MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState,
-    QueuedMessage, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, RoleAssignment,
-    RoleAssignmentContext, SupersededAssertion, TaskAddress, TaskRuntimeState, TaskStatus,
-    TerminalReviewState, TerminalReviewVerdict, UnavailableReferenceEvidence,
+    QueuedMessage, ReferenceRecipientPolicy, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
+    RoleAssignment, RoleAssignmentContext, SupersededAssertion, TaskAddress, TaskRuntimeState,
+    TaskStatus, TerminalReviewState, TerminalReviewVerdict, UnavailableReferenceEvidence,
 };
 pub use step::{
     step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,

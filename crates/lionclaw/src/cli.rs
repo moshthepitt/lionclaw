@@ -2,6 +2,7 @@
 //! the store, fold, act, park or exit. Host-as-orchestrator: the human's
 //! agent session invokes these as tools and reads `--json` output.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1292,6 +1293,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         }
     }
     print_conversations(state, &store, "  ")?;
+    print_unavailable_references(state, "  ");
     print_non_task_failures(state);
     if let Some(failure) = &state.cleanup_failure {
         println!(
@@ -2021,6 +2023,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
             }
         }
         print_conversations(state, &store, "  ")?;
+        print_unavailable_references(state, "  ");
         print_task_workspace_observations(state, "  ", &workspace_observations);
         if view.disposition == MissionDisposition::Running {
             print_activity(&store, state)?;
@@ -2082,7 +2085,9 @@ async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) 
                     );
                 }
                 print_conversations(&view.state, store, "  ")?;
+                print_unavailable_references(&view.state, "  ");
             }
+            std::io::stdout().flush()?;
             previous = bytes;
         }
         tokio::select! {
@@ -2540,6 +2545,7 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
             }
             MissionDisposition::Ready => println!("mission {mission_id}: ready to advance"),
         }
+        print_unavailable_references(state, "  ");
         if !state.superseded_assertions.is_empty() {
             println!("  superseded assertions:");
             for superseded in &state.superseded_assertions {
@@ -2768,6 +2774,10 @@ fn print_conversations(
             }
         }
     }
+    Ok(())
+}
+
+fn print_unavailable_references(state: &crate::model::MissionState, indent: &str) {
     for evidence in &state.unavailable_references {
         println!(
             "{indent}unavailable reference: conversation={} generation={} message={} reference={:?} cause={:?}",
@@ -2778,7 +2788,6 @@ fn print_conversations(
             evidence.cause
         );
     }
-    Ok(())
 }
 
 fn planning_input_json(

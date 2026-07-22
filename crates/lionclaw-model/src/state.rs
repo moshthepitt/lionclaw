@@ -472,6 +472,20 @@ pub enum ParkedEffect {
     TerminalReview,
 }
 
+/// Fold-authoritative policy for attaching durable evidence to lead messages.
+/// Recipient identity is validated separately; this closed result keeps output
+/// semantics identical at live ingress and replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceRecipientPolicy {
+    Permitted,
+    Disallowed {
+        conversation_id: super::ConversationId,
+        output: super::OutputSemantics,
+    },
+    Mixed,
+    Invalid,
+}
+
 /// How a human accepted closure despite the review: `accept` on a gap park
 /// acknowledges the blocking verdict, while `accept` on a failure park waives
 /// the review outright. One value, so waived-and-acknowledged is unrepresentable;
@@ -1023,6 +1037,46 @@ pub struct MissionState {
 }
 
 impl MissionState {
+    pub fn reference_recipient_policy(
+        &self,
+        recipients: &[super::ConversationRecipient],
+    ) -> ReferenceRecipientPolicy {
+        if recipients.is_empty() {
+            return ReferenceRecipientPolicy::Invalid;
+        }
+        let resolved = recipients
+            .iter()
+            .map(|recipient| {
+                self.config
+                    .plan_inventory
+                    .roles
+                    .get(&recipient.role)
+                    .copied()
+                    .map(|output| (recipient, output))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(resolved) = resolved else {
+            return ReferenceRecipientPolicy::Invalid;
+        };
+        let permitted = resolved
+            .iter()
+            .filter(|(_, output)| output.permits_message_references())
+            .count();
+        if permitted == resolved.len() {
+            ReferenceRecipientPolicy::Permitted
+        } else if permitted != 0 {
+            ReferenceRecipientPolicy::Mixed
+        } else {
+            let (recipient, output) = resolved
+                .first()
+                .expect("nonempty recipients were checked above");
+            ReferenceRecipientPolicy::Disallowed {
+                conversation_id: recipient.conversation_id.clone(),
+                output: *output,
+            }
+        }
+    }
+
     /// Fold-authoritative generation floor for role assignments in each
     /// namespace. Planning replacements advance `planning_generation`; plan
     /// promotions advance `revision`. Workspace recreation remains an

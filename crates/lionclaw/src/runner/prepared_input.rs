@@ -21,9 +21,8 @@ pub(crate) const INPUTS_MOUNT_TARGET: &str = "/inputs";
 const MAX_KEY_ENTRIES: usize = 8 * 1024;
 const MAX_KEY_DEPTH: usize = 64;
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
-// V1 prepared evidence could contain an incomplete Cargo package tree. Keep
-// published inputs immutable and force regeneration through the declared
-// preparation program instead of trusting or mutating that evidence.
+// Prepared outputs are immutable, so format changes supersede known-bad prior
+// evidence with a new content identity instead of mutating it in place.
 const PREPARED_INPUT_FORMAT: &[u8] = b"lionclaw-prepared-input-v2";
 
 #[derive(Default)]

@@ -3,9 +3,11 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File};
+use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
+use rustix::fs::{fstat, open, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
 
 use crate::model::{BlobRef, PayloadRef};
@@ -64,6 +66,14 @@ impl BlobStore {
     }
 
     pub fn get(&self, blob: &BlobRef) -> std::result::Result<Vec<u8>, BlobReadError> {
+        self.read_blob_bounded(blob, blob.len)
+    }
+
+    fn read_blob_bounded(
+        &self,
+        blob: &BlobRef,
+        max_bytes: u64,
+    ) -> std::result::Result<Vec<u8>, BlobReadError> {
         if blob.algo != "sha256" {
             return Err(BlobReadError::InvalidContent(format!(
                 "unsupported blob algo '{}'",
@@ -79,36 +89,81 @@ impl BlobStore {
                 blob.hex
             )));
         }
+        if blob.len > max_bytes {
+            return Err(BlobReadError::InvalidContent(format!(
+                "blob '{}' declares {} bytes, which exceeds the {max_bytes}-byte limit",
+                blob.hex, blob.len
+            )));
+        }
         let path = self
             .root
             .join("sha256")
             .join(&blob.hex[..2])
             .join(&blob.hex[2..4])
             .join(&blob.hex);
-        let stored_len = fs::metadata(&path)
-            .map_err(|source| BlobReadError::Io {
-                operation: "failed to stat",
-                path: path.clone(),
-                source,
-            })?
-            .len();
+        let descriptor = open(
+            &path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|source| {
+            if source == rustix::io::Errno::LOOP {
+                BlobReadError::InvalidContent(format!("blob '{}' is not a regular file", blob.hex))
+            } else {
+                BlobReadError::Io {
+                    operation: "failed to open",
+                    path: path.clone(),
+                    source: source.into(),
+                }
+            }
+        })?;
+        let stat = fstat(&descriptor).map_err(|source| BlobReadError::Io {
+            operation: "failed to stat",
+            path: path.clone(),
+            source: source.into(),
+        })?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(BlobReadError::InvalidContent(format!(
+                "blob '{}' is not a regular file",
+                blob.hex
+            )));
+        }
+        let stored_len = u64::try_from(stat.st_size).map_err(|_| {
+            BlobReadError::InvalidContent(format!(
+                "blob '{}' has an invalid stored length",
+                blob.hex
+            ))
+        })?;
         if stored_len != blob.len {
             return Err(BlobReadError::InvalidContent(format!(
                 "blob '{}' length mismatch (declared {}, stored {stored_len})",
                 blob.hex, blob.len
             )));
         }
-        let bytes = fs::read(&path).map_err(|source| BlobReadError::Io {
-            operation: "failed to read",
-            path: path.clone(),
-            source,
-        })?;
-        if bytes.len() as u64 != blob.len {
+
+        let read_limit = usize::try_from(blob.len)
+            .ok()
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| {
+                BlobReadError::InvalidContent(format!(
+                    "blob '{}' declares an unsupported length",
+                    blob.hex
+                ))
+            })?;
+        let mut bytes = Vec::new();
+        File::from(descriptor)
+            .take(u64::try_from(read_limit).expect("validated blob read limit fits u64"))
+            .read_to_end(&mut bytes)
+            .map_err(|source| BlobReadError::Io {
+                operation: "failed to read",
+                path: path.clone(),
+                source,
+            })?;
+        let read_len = u64::try_from(bytes.len()).expect("usize always fits in u64");
+        if read_len != blob.len {
             return Err(BlobReadError::InvalidContent(format!(
                 "blob '{}' changed length while reading (declared {}, read {})",
-                blob.hex,
-                blob.len,
-                bytes.len()
+                blob.hex, blob.len, read_len
             )));
         }
         let actual = hex::encode(Sha256::digest(&bytes));
@@ -152,14 +207,21 @@ impl BlobStore {
     /// Resolve text only when its declared size fits the caller's remaining
     /// aggregate budget. Blob metadata is checked before any content read.
     pub fn resolve_bounded(&self, payload: &PayloadRef, max_bytes: usize) -> Result<String> {
-        let declared = match payload {
-            PayloadRef::Inline { text } => text.len() as u64,
-            PayloadRef::Blob(blob) => blob.len,
-        };
-        if declared > max_bytes as u64 {
-            bail!("payload declares {declared} bytes, which exceeds the {max_bytes}-byte limit");
+        match payload {
+            PayloadRef::Inline { text } => {
+                let declared = text.len() as u64;
+                if declared > max_bytes as u64 {
+                    bail!(
+                        "payload declares {declared} bytes, which exceeds the {max_bytes}-byte limit"
+                    );
+                }
+                Ok(text.clone())
+            }
+            PayloadRef::Blob(blob) => Ok(String::from_utf8_lossy(
+                &self.read_blob_bounded(blob, max_bytes as u64)?,
+            )
+            .into_owned()),
         }
-        self.resolve(payload)
     }
 }
 
@@ -208,8 +270,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         perms.set_mode(0o644);
         std::fs::set_permissions(&path, perms).expect("chmod");
-        std::fs::write(&path, b"tampered").expect("tamper");
-        assert!(store.get(&blob).is_err());
+        std::fs::write(&path, b"forgery").expect("tamper");
+        let error = store.get(&blob).expect_err("digest mismatch");
+        assert!(matches!(&error, BlobReadError::InvalidContent(_)));
+        assert!(error.to_string().contains("content verification"));
     }
 
     #[test]
@@ -236,6 +300,51 @@ mod tests {
             .expect_err("declared overflow must be rejected before blob I/O");
         assert!(error.to_string().contains("exceeds the 1024-byte limit"));
         assert!(!error.to_string().contains("failed to stat"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_rejects_a_symlinked_blob() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path().to_path_buf());
+        let blob = store.put(b"payload").expect("put");
+        let path = dir
+            .path()
+            .join("sha256")
+            .join(&blob.hex[..2])
+            .join(&blob.hex[2..4])
+            .join(&blob.hex);
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"payload").expect("write replacement");
+        std::fs::remove_file(&path).expect("remove blob");
+        symlink(&replacement, &path).expect("replace blob with symlink");
+
+        assert!(matches!(
+            store.get(&blob),
+            Err(BlobReadError::InvalidContent(_))
+        ));
+    }
+
+    #[test]
+    fn get_rejects_a_nonregular_blob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path().to_path_buf());
+        let blob = store.put(b"payload").expect("put");
+        let path = dir
+            .path()
+            .join("sha256")
+            .join(&blob.hex[..2])
+            .join(&blob.hex[2..4])
+            .join(&blob.hex);
+        std::fs::remove_file(&path).expect("remove blob");
+        std::fs::create_dir(&path).expect("replace blob with directory");
+
+        assert!(matches!(
+            store.get(&blob),
+            Err(BlobReadError::InvalidContent(_))
+        ));
     }
 
     // A BlobRef can come from an agent-authored handoff, so a malformed hex must

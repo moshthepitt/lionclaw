@@ -343,9 +343,9 @@ Self-test worker.
 ";
 const CARGO_TEST_ORACLE: &str = "#!/bin/sh\nset -e\ncd /workspace\nexec cargo test --locked\n";
 const PREPARED_CARGO_TEST_ORACLE: &str =
-    "#!/bin/sh\nset -e\ntest \"$(cat /inputs/fixture/sentinel)\" = prepared\ncd /workspace\nexec cargo test --locked\n";
+    "#!/bin/sh\nset -e\ntest \"$(cat /inputs/fixture/sentinel)\" = prepared\ntest -f /inputs/fixture/vendor/representative/Cargo.toml\ntest -f /inputs/fixture/vendor/representative/src/lib.rs\ngrep -q \"name = 'representative'\" /inputs/fixture/vendor/representative/Cargo.toml\ngrep -q \"pub fn retained\" /inputs/fixture/vendor/representative/src/lib.rs\ncd /workspace\nexec cargo test --locked\n";
 const PREPARE_FIXTURE_INPUT: &str =
-    "#!/bin/sh\nset -e\nprintf prepared > \"$LIONCLAW_OUTPUT/sentinel\"\n";
+    "#!/bin/sh\nset -e\nmkdir -p \"$LIONCLAW_OUTPUT/vendor/representative/src\"\nprintf prepared > \"$LIONCLAW_OUTPUT/sentinel\"\nprintf \"[package]\\nname = 'representative'\\nversion = '1.0.0'\\n\" > \"$LIONCLAW_OUTPUT/vendor/representative/Cargo.toml\"\nprintf \"pub fn retained() {}\\n\" > \"$LIONCLAW_OUTPUT/vendor/representative/src/lib.rs\"\n";
 
 // A verdict role that illegally requests secrets — the loader must refuse it.
 // (A judge can't be declared *writable* in a mission type — workspace access is
@@ -749,6 +749,17 @@ async fn check_prepared_input() -> Result<()> {
             "prepared input was not atomically published at '{}'",
             cache.display()
         );
+    }
+    for nested in [
+        "vendor/representative/Cargo.toml",
+        "vendor/representative/src/lib.rs",
+    ] {
+        if !cache.join(nested).is_file() {
+            anyhow::bail!(
+                "prepared input omitted nested output '{}' from the published cache",
+                nested
+            );
+        }
     }
     Ok(())
 }
