@@ -3,14 +3,14 @@
 
 use anyhow::Result;
 
-use crate::model::{FailureEvidence, FailureFeedback};
+use crate::model::{FailureEvidence, FailureFeedback, PayloadRef};
 use crate::store::BlobStore;
 
 const HALF_EXCERPT_BYTES: usize = 4096;
 
 pub fn render_evidence(blobs: &BlobStore, evidence: &FailureEvidence) -> Result<String> {
-    let stdout = excerpt(&blobs.resolve(&evidence.stdout)?);
-    let stderr = excerpt(&blobs.resolve(&evidence.stderr)?);
+    let stdout = render_payload(blobs, &evidence.stdout);
+    let stderr = render_payload(blobs, &evidence.stderr);
     Ok(format!(
         "exit code: {}\nsignal: {}\nstdout:\n{}\nstderr:\n{}",
         evidence.exit_code,
@@ -26,8 +26,8 @@ pub fn evidence_json(blobs: &BlobStore, evidence: &FailureEvidence) -> Result<se
     Ok(serde_json::json!({
         "exit_code": evidence.exit_code,
         "exit_signal": evidence.exit_signal,
-        "stdout": excerpt(&blobs.resolve(&evidence.stdout)?),
-        "stderr": excerpt(&blobs.resolve(&evidence.stderr)?),
+        "stdout": render_payload(blobs, &evidence.stdout),
+        "stderr": render_payload(blobs, &evidence.stderr),
     }))
 }
 
@@ -54,9 +54,41 @@ pub fn render_feedback(blobs: &BlobStore, feedback: &FailureFeedback) -> Result<
     }
     if let Some(details) = &feedback.details {
         rendered.push_str("\nDetailed report:\n");
-        rendered.push_str(&excerpt(&blobs.resolve(details)?));
+        rendered.push_str(&render_payload(blobs, details));
     }
     Ok(rendered)
+}
+
+fn render_payload(blobs: &BlobStore, payload: &PayloadRef) -> String {
+    match blobs.resolve(payload) {
+        Ok(text) => excerpt(&text),
+        Err(error) => {
+            let cause = if error
+                .chain()
+                .filter_map(|source| source.downcast_ref::<std::io::Error>())
+                .any(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                "source_missing"
+            } else if error
+                .chain()
+                .filter_map(|source| source.downcast_ref::<std::io::Error>())
+                .any(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+            {
+                "source_unreadable"
+            } else {
+                "invalid_content"
+            };
+            match payload {
+                PayloadRef::Blob(blob) => format!(
+                    "[unavailable payload: algo={} digest={} cause={cause}]",
+                    blob.algo, blob.hex
+                ),
+                PayloadRef::Inline { .. } => {
+                    format!("[unavailable inline payload: cause={cause}]")
+                }
+            }
+        }
+    }
 }
 
 pub fn excerpt(text: &str) -> String {
@@ -90,5 +122,37 @@ mod tests {
         assert!(rendered.starts_with("start-"));
         assert!(rendered.ends_with("-end"));
         assert!(rendered.contains("bytes omitted"));
+    }
+
+    #[test]
+    fn unavailable_blob_evidence_renders_bounded_typed_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().to_path_buf());
+        let blob = blobs.put(b"authoritative bytes").unwrap();
+        let payload = PayloadRef::Blob(blob.clone());
+        let path = dir
+            .path()
+            .join("sha256")
+            .join(&blob.hex[..2])
+            .join(&blob.hex[2..4])
+            .join(&blob.hex);
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            render_payload(&blobs, &payload),
+            format!(
+                "[unavailable payload: algo=sha256 digest={} cause=source_missing]",
+                blob.hex
+            )
+        );
+
+        std::fs::write(&path, b"corrupted evidence!").unwrap();
+        assert_eq!(
+            render_payload(&blobs, &payload),
+            format!(
+                "[unavailable payload: algo=sha256 digest={} cause=invalid_content]",
+                blob.hex
+            )
+        );
     }
 }

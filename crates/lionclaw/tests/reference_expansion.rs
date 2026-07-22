@@ -9,10 +9,12 @@ use clap::Parser;
 use common::{approve_plan, harness, proposal, simple_plan, BASE_SHA};
 use lionclaw::cli::{self, Cli};
 use lionclaw::model::{
-    DeliveryMarker, MessageReference, MissionEvent, UnavailableReferenceCause, REDUCER_VERSION,
-    SCHEMA_VERSION,
+    DecisionAction, DeliveryMarker, Handoff, MessageReference, MissionEvent, PayloadRef, TaskId,
+    UnavailableReferenceCause, REDUCER_VERSION, SCHEMA_VERSION,
 };
-use lionclaw::ports::{RoleRunOutcome, RoleRunRequest, RoleRunUpdate};
+use lionclaw::ports::{
+    CapturedArtifact, OracleOutcome, RoleRunOutcome, RoleRunRequest, RoleRunUpdate,
+};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
@@ -321,6 +323,176 @@ async fn dead_reachable_commit_settles_once_and_does_not_block_a_later_message()
     assert_eq!(
         store.snapshot_meta(&mission).await.unwrap(),
         Some((full.head, REDUCER_VERSION))
+    );
+}
+
+#[tokio::test]
+async fn accepted_receipt_blob_unavailable_before_dispatch_settles_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let observed = prompts.clone();
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        observed.lock().unwrap().push(request.prompt.clone());
+        if request.attempt_no == 1 {
+            Ok(RoleRunOutcome {
+                handoff: Some(Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("minted receipt authority"),
+                    request_attention: false,
+                }),
+                artifact: Some(CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    common::HEAD_SHA.to_string(),
+                )),
+                runtime_configuration: Default::default(),
+                final_response: "minted receipt authority".into(),
+            })
+        } else {
+            Ok(checkpoint(request))
+        }
+    }));
+    let oracle = MockOracleRunner::new(Box::new(|_| {
+        let mut stdout = b"REAL-BELOW-LIMIT-RECEIPT\n".to_vec();
+        stdout.extend(std::iter::repeat_n(b'R', 10 * 1024));
+        stdout.push(0xff);
+        Ok(OracleOutcome {
+            exit_code: 1,
+            exit_signal: None,
+            stdout,
+            stderr: Vec::new(),
+            prepared_inputs: Vec::new(),
+            duration_ms: 7,
+        })
+    }));
+    let h = harness(dir.path(), runner, oracle).await;
+    let mission = h
+        .engine
+        .create_mission(dir.path().to_str().unwrap(), "receipt reference", BASE_SHA)
+        .await
+        .unwrap();
+    let mut plan = simple_plan();
+    plan.tasks[0].id = TaskId::new("mint-receipt").unwrap();
+    h.engine
+        .propose_plan(&mission, proposal(0, plan))
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &mission).await;
+    for _ in 0..8 {
+        h.engine.advance(&mission).await.unwrap();
+        let state = MissionStore::open(dir.path())
+            .await
+            .unwrap()
+            .require_state(&mission)
+            .await
+            .unwrap();
+        if !state.authoritative_receipts.is_empty() && !state.open_attention.is_empty() {
+            break;
+        }
+    }
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let failed = store.require_state(&mission).await.unwrap();
+    let receipt = failed
+        .authoritative_receipts
+        .iter()
+        .next()
+        .unwrap_or_else(|| panic!("receipt was not minted: {failed:#?}"))
+        .clone();
+    let attention = failed.open_attention.keys().next().unwrap().clone();
+    h.engine
+        .decide(
+            &mission,
+            &attention,
+            DecisionAction::Repair,
+            "retry recipient",
+        )
+        .await
+        .unwrap();
+    h.engine.advance(&mission).await.unwrap();
+    let accepted = store.require_state(&mission).await.unwrap();
+    let conversation = accepted
+        .conversations
+        .iter()
+        .find(|(id, conversation)| {
+            conversation.task_id.as_str() == "mint-receipt"
+                && accepted.conversation_is_messageable(id)
+        })
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    cli::run(send_cli(
+        dir.path(),
+        &mission,
+        conversation.as_str(),
+        &["--receipt", receipt.as_str()],
+        "whole receipt message must not be presented",
+    ))
+    .await
+    .unwrap();
+    cli::run(send_cli(
+        dir.path(),
+        &mission,
+        conversation.as_str(),
+        &[],
+        "later receipt-boundary message progresses",
+    ))
+    .await
+    .unwrap();
+    let queued = store.require_state(&mission).await.unwrap();
+    let failed_sequence = queued.conversations[&conversation].queued[0].sequence_no;
+    let receipt_blob = store
+        .load(&mission)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|event| match event.event {
+            MissionEvent::OracleRunCompleted {
+                effect_id,
+                outcome: Ok(success),
+                ..
+            } if effect_id == receipt => match success.stdout {
+                PayloadRef::Blob(blob) => Some(blob),
+                PayloadRef::Inline { .. } => None,
+            },
+            _ => None,
+        })
+        .expect("non-UTF-8 production oracle output is blob-backed");
+    let blob_path = store
+        .lionclaw_dir()
+        .join("blobs/sha256")
+        .join(&receipt_blob.hex[..2])
+        .join(&receipt_blob.hex[2..4])
+        .join(&receipt_blob.hex);
+    std::fs::remove_file(blob_path).unwrap();
+
+    let attempts_before = queued.tasks[&TaskId::new("mint-receipt").unwrap()].attempts;
+    let settled = h.engine.advance(&mission).await.unwrap().state;
+    let conversation_state = &settled.conversations[&conversation];
+    assert_eq!(settled.unavailable_references.len(), 1);
+    assert_eq!(conversation_state.queued.len(), 1);
+    assert_eq!(
+        conversation_state.queued[0].marker,
+        DeliveryMarker::Undeliverable
+    );
+    assert_eq!(conversation_state.queued[0].sequence_no, failed_sequence);
+    assert!(conversation_state.active_delivery.is_none());
+    assert_eq!(
+        settled.unavailable_references[0].reference,
+        MessageReference::AuthoritativeReceipt { effect_id: receipt }
+    );
+    assert_eq!(
+        settled.unavailable_references[0].cause,
+        UnavailableReferenceCause::SourceMissing
+    );
+    assert_eq!(
+        settled.tasks[&TaskId::new("mint-receipt").unwrap()].attempts,
+        attempts_before + 1
+    );
+    let prompt = prompts.lock().unwrap().last().unwrap().clone();
+    assert!(prompt.contains("later receipt-boundary message progresses"));
+    assert!(!prompt.contains("whole receipt message must not be presented"));
+    assert!(!prompt.contains("REAL-BELOW-LIMIT-RECEIPT"));
+    assert_eq!(
+        lionclaw::model::fold(store.load(&mission).await.unwrap()).unwrap(),
+        settled
     );
 }
 

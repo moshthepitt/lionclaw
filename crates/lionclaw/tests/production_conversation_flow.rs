@@ -1495,7 +1495,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             break;
         }
     }
-    let captured = prompts.lock().unwrap();
+    let captured = prompts.lock().unwrap().clone();
     let resumed = captured
         .iter()
         .find(|(prompt, _)| prompt.contains("TERMINAL-DIRECT-PROSE"))
