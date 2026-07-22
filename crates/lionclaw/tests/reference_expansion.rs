@@ -495,6 +495,21 @@ async fn accepted_receipt_blob_unavailable_before_dispatch_settles_once() {
         lionclaw::model::fold(store.load(&mission).await.unwrap()).unwrap(),
         settled
     );
+    assert_reference_operator_output(
+        dir.path(),
+        &mission,
+        &["undeliverable"],
+        &["REAL-BELOW-LIMIT-RECEIPT"],
+    );
+    assert_replay_snapshot_tail(
+        dir.path(),
+        &store,
+        &mission,
+        conversation.as_str(),
+        &settled,
+        "receipt replay tail remains queued",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -688,6 +703,141 @@ async fn accepted_park_reference_survives_legal_clear_from_durable_history() {
         lionclaw::model::fold(store.load(&mission).await.unwrap()).unwrap(),
         final_state
     );
+    assert_reference_operator_output(
+        dir.path(),
+        &mission,
+        &["park"],
+        &["unavailable reference:", "MessageReferenceUnavailable"],
+    );
+    assert_replay_snapshot_tail(
+        dir.path(),
+        &store,
+        &mission,
+        recipient.as_str(),
+        &final_state,
+        "park replay tail remains queued",
+    )
+    .await;
+}
+
+async fn assert_replay_snapshot_tail(
+    repo: &std::path::Path,
+    store: &MissionStore,
+    mission: &lionclaw::model::MissionId,
+    conversation: &str,
+    before_tail: &lionclaw::model::MissionState,
+    tail_body: &str,
+) {
+    assert_eq!(store.require_state(mission).await.unwrap(), *before_tail);
+    assert_eq!(
+        lionclaw::model::fold(store.load(mission).await.unwrap()).unwrap(),
+        *before_tail
+    );
+    let snapshot = store.rebuild_cursors(mission, 29_100).await.unwrap();
+    assert_eq!(snapshot, *before_tail);
+    let snapshot_head = snapshot.head;
+    assert_eq!(
+        store.snapshot_meta(mission).await.unwrap(),
+        Some((snapshot_head, REDUCER_VERSION))
+    );
+
+    cli::run(send_cli(repo, mission, conversation, &[], tail_body))
+        .await
+        .unwrap();
+    let final_state = store.require_state(mission).await.unwrap();
+    assert!(
+        final_state.head > snapshot_head,
+        "genuine reducer-29 snapshot must have a nonempty durable tail"
+    );
+    let queued_tail = final_state.conversations
+        [&lionclaw::model::ConversationId::parse(conversation).unwrap()]
+        .queued
+        .iter()
+        .find(|message| message.body == tail_body)
+        .expect("snapshot-tail message retained whole");
+    assert_eq!(queued_tail.marker, DeliveryMarker::Queued);
+    assert_eq!(
+        store.snapshot_meta(mission).await.unwrap(),
+        Some((snapshot_head, REDUCER_VERSION)),
+        "the genuine snapshot head must remain strictly behind the final head"
+    );
+    let full = lionclaw::model::fold(store.load(mission).await.unwrap()).unwrap();
+    assert_eq!(final_state, full);
+    assert_eq!(
+        MissionStore::open(repo)
+            .await
+            .unwrap()
+            .require_state(mission)
+            .await
+            .unwrap(),
+        full,
+        "MissionStore reload must apply the nonempty snapshot tail"
+    );
+    assert_eq!(
+        store.load_state_snapshotted(mission).await.unwrap(),
+        Some(full.clone())
+    );
+
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        repo.join(".lionclaw/mission.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE mission_snapshots SET reducer_version = 28 WHERE mission_id = ?1")
+        .bind(mission.as_str())
+        .execute(&database)
+        .await
+        .unwrap();
+    assert_eq!(store.require_state(mission).await.unwrap(), full);
+    assert_eq!(store.rebuild_cursors(mission, 29_101).await.unwrap(), full);
+    assert_eq!(
+        store.snapshot_meta(mission).await.unwrap(),
+        Some((full.head, REDUCER_VERSION))
+    );
+}
+
+fn assert_reference_operator_output(
+    repo: &std::path::Path,
+    mission: &lionclaw::model::MissionId,
+    required: &[&str],
+    forbidden: &[&str],
+) {
+    for args in [
+        vec!["mission", "status", mission.as_str(), "--json"],
+        vec!["mission", "report", mission.as_str(), "--json"],
+        vec!["mission", "inbox", "--json"],
+        vec!["mission", "status", mission.as_str()],
+        vec!["mission", "report", mission.as_str()],
+        vec!["mission", "inbox"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+            .args(&args)
+            .arg("--repo")
+            .arg(repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            !output.stdout.is_empty(),
+            "operator output must be non-vacuous"
+        );
+        let rendered = String::from_utf8(output.stdout).unwrap();
+        for forbidden in forbidden {
+            assert!(
+                !rendered.contains(forbidden),
+                "operator output fabricated forbidden reference truth: {forbidden}"
+            );
+        }
+        if !args.contains(&"inbox") {
+            for required in required {
+                assert!(
+                    rendered.contains(required),
+                    "operator output omitted reference truth: {required}"
+                );
+            }
+        }
+    }
 }
 
 fn conversation_id(state: &lionclaw::model::MissionState) -> &str {
