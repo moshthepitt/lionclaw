@@ -23,7 +23,9 @@ pub use crate::workspace::{ArtifactCapture, CapturedArtifact};
 
 /// One full autonomous agent run — the engine never micromanages how a role
 /// works. The engine guarantees an effect ID with a recorded outcome
-/// is never re-invoked.
+/// is never re-invoked. A runner must close its adapter and stop mutating
+/// retained role state before requesting an accepted handoff acknowledgement;
+/// a successful acknowledgement is the post-turn quiescence boundary.
 #[async_trait]
 pub trait RoleRunner: Send + Sync {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure>;
@@ -121,15 +123,25 @@ impl RoleRunRequest {
         &self,
         observation: RoleHandoffObservation,
     ) -> Result<(), TypedFailure> {
-        self.confirm_update(
-            "role.handoff_observation",
-            "durable handoff observation",
-            |acknowledge| RoleRunUpdate::HandoffObserved {
+        let (acknowledge, acknowledged) = oneshot::channel();
+        self.updates
+            .send(RoleRunUpdate::HandoffObserved {
                 observation,
                 acknowledge,
-            },
-        )
-        .await
+            })
+            .await
+            .map_err(|_| {
+                TypedFailure::permanent(
+                    "role.handoff_observation",
+                    "kernel role update receiver closed before durable handoff observation",
+                )
+            })?;
+        acknowledged.await.map_err(|_| {
+            TypedFailure::permanent(
+                "role.handoff_observation",
+                "kernel closed before acknowledging durable handoff observation",
+            )
+        })?
     }
 
     /// Block further effect processing until the engine durably records and
@@ -159,7 +171,7 @@ pub enum RoleRunUpdate {
     },
     HandoffObserved {
         observation: RoleHandoffObservation,
-        acknowledge: oneshot::Sender<Result<(), String>>,
+        acknowledge: oneshot::Sender<Result<(), TypedFailure>>,
     },
     TurnObserved {
         observation: RoleTurnObservation,

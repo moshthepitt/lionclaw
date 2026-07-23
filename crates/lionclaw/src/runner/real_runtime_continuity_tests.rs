@@ -438,6 +438,13 @@ async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) 
         1,
         "{runtime} first production turn must create exactly one retained profile"
     );
+    let retained_usage = role_state
+        .assess_runtime_retention()
+        .expect("real runtime retained state remains safely account-able");
+    assert_eq!(retained_usage.profiles, 1);
+    assert!(retained_usage.bytes <= 512 * 1024 * 1024);
+    assert!(retained_usage.entries <= 100_000);
+    assert!(retained_usage.max_depth <= 128);
     let native_state_key = profile_entries
         .pop()
         .expect("one retained profile")

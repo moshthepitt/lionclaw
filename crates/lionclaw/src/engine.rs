@@ -55,6 +55,11 @@ pub struct EngineServices {
     clock: Arc<dyn Clock>,
 }
 
+enum EffectCleanupDisposition {
+    Complete(Option<TypedFailure>),
+    Blocked,
+}
+
 struct ActivityReporter {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -696,13 +701,40 @@ impl Engine {
             let Some((effect_id, _)) = state.inflight.iter().next() else {
                 return Ok(true);
             };
-            let Some(()) = self.cleanup_effect(&state, effect_id, true).await? else {
-                return Ok(false);
+            let recovered_failure = match self.cleanup_effect(&state, effect_id, true).await? {
+                EffectCleanupDisposition::Complete(failure) => failure,
+                EffectCleanupDisposition::Blocked => return Ok(false),
             };
             let current = self.load_state(mission_id).await?;
             let Some(effect) = current.inflight.get(effect_id) else {
                 continue;
             };
+            if let Some(cancellation) = current.durable_cancellation(effect_id) {
+                let failure = self.recover_role_failure(
+                    current.role_attempt_receipts.get(effect_id),
+                    cancellation.into_failure(Default::default()),
+                );
+                let outcome = failed_outcome(effect_id, effect, failure);
+                if self
+                    .append_outcome(&current.mission_id, effect_id, outcome, true)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                continue;
+            }
+            if let Some(failure) = recovered_failure {
+                let outcome = failed_outcome(effect_id, effect, failure);
+                if self
+                    .append_outcome(&current.mission_id, effect_id, outcome, true)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                continue;
+            }
             if let Some(outcome) = recovered_completed_turn_without_handoff(
                 effect_id,
                 effect,
@@ -760,11 +792,10 @@ impl Engine {
                 return Ok(true);
             };
             if let MissionPhase::Aborted { reason } = &current.phase {
-                if self
-                    .cleanup_effect(&current, effect_id, true)
-                    .await?
-                    .is_none()
-                {
+                if matches!(
+                    self.cleanup_effect(&current, effect_id, true).await?,
+                    EffectCleanupDisposition::Blocked
+                ) {
                     return Ok(false);
                 }
                 if self
@@ -782,11 +813,10 @@ impl Engine {
                 return Ok(true);
             }
             if let Some(reason) = current.stop_requests.get(effect_id) {
-                if self
-                    .cleanup_effect(&current, effect_id, true)
-                    .await?
-                    .is_none()
-                {
+                if matches!(
+                    self.cleanup_effect(&current, effect_id, true).await?,
+                    EffectCleanupDisposition::Blocked
+                ) {
                     return Ok(false);
                 }
                 if self
@@ -837,7 +867,7 @@ impl Engine {
         // the sum once on the heap instead of embedding its largest variant
         // in the driver thread's stack frame.
         let mut execution = Box::pin(execution);
-        let outcome = loop {
+        let mut outcome = loop {
             tokio::select! {
                 outcome = &mut execution => break outcome?,
                 () = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -906,16 +936,27 @@ impl Engine {
                 }
             }
         };
-        let discard_artifact = !matches!(
+        let mut discard_artifact = !matches!(
             outcome.event,
             MissionEvent::RoleRunCompleted { outcome: Ok(_), .. }
         );
-        if self
+        match self
             .cleanup_effect(state, effect_id, discard_artifact)
             .await?
-            .is_none()
         {
-            return Ok(false);
+            EffectCleanupDisposition::Complete(Some(failure))
+                if matches!(
+                    &outcome.event,
+                    MissionEvent::RoleRunCompleted { outcome: Ok(_), .. }
+                        | MissionEvent::TerminalReviewCompleted { outcome: Ok(_), .. }
+                ) =>
+            {
+                outcome = failed_outcome(effect_id, &effect, failure);
+                discard_artifact = true;
+            }
+            EffectCleanupDisposition::Complete(Some(_)) => {}
+            EffectCleanupDisposition::Complete(None) => {}
+            EffectCleanupDisposition::Blocked => return Ok(false),
         }
         let Some(outcome) = self
             .append_outcome(&state.mission_id, effect_id, outcome, discard_artifact)
@@ -958,8 +999,8 @@ impl Engine {
         state: &MissionState,
         effect_id: &EffectId,
         discard_artifact: bool,
-    ) -> Result<Option<()>> {
-        let request = EffectCleanupRequest {
+    ) -> Result<EffectCleanupDisposition> {
+        let mut request = EffectCleanupRequest {
             mission_id: state.mission_id.clone(),
             effect_id: effect_id.clone(),
             workspace_dir: state.workspace_dir.clone().into(),
@@ -968,13 +1009,17 @@ impl Engine {
         };
         if let Err(error) = self.effect_cleaner.quiesce(&request).await {
             self.record_cleanup_failure(state, effect_id, error).await?;
-            return Ok(None);
+            return Ok(EffectCleanupDisposition::Blocked);
         }
         // Evidence recovery composes store replay, bounded handoff parsing,
         // and a durable append. Keep that complete operation behind one heap
         // boundary so the sequential driver future retains a bounded stack.
-        match Box::pin(self.recover_retained_role_handoff(&state.mission_id, effect_id)).await {
-            Ok(()) => {}
+        let recovered_failure = match Box::pin(
+            self.recover_role_evidence_after_quiesce(&state.mission_id, effect_id),
+        )
+        .await
+        {
+            Ok(failure) => failure,
             Err(error) => {
                 self.record_cleanup_failure(
                     state,
@@ -987,32 +1032,45 @@ impl Engine {
                     },
                 )
                 .await?;
-                return Ok(None);
+                return Ok(EffectCleanupDisposition::Blocked);
             }
-        }
+        };
+        // Quiescence makes the completed receipt and retained state stable.
+        // Decide artifact lifetime from that authoritative evidence before the
+        // destructive cleanup request runs.
+        request.discard_artifact |= recovered_failure.is_some();
         match self.effect_cleaner.cleanup(request).await {
-            Ok(()) => Ok(Some(())),
+            Ok(()) => Ok(EffectCleanupDisposition::Complete(recovered_failure)),
             Err(error) => {
                 self.record_cleanup_failure(state, effect_id, error).await?;
-                Ok(None)
+                Ok(EffectCleanupDisposition::Blocked)
             }
         }
     }
 
-    async fn recover_retained_role_handoff(
+    async fn recover_role_evidence_after_quiesce(
         &self,
         mission_id: &MissionId,
         effect_id: &EffectId,
-    ) -> Result<()> {
+    ) -> Result<Option<TypedFailure>> {
+        let retention_failure = self
+            .completed_role_retention_failure(mission_id, effect_id)
+            .await?;
         let state = self.load_state(mission_id).await?;
         let Some(effect) = state.inflight.get(effect_id) else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(receipt) = state.role_attempt_receipts.get(effect_id) else {
-            return Ok(());
+            return Ok(None);
         };
-        if receipt.handoff.is_some() {
-            return Ok(());
+        if matches!(
+            receipt.handoff,
+            Some(crate::model::RoleHandoffObservation::Rejected { .. })
+        ) {
+            return Ok(None);
+        }
+        if let Some(failure) = retention_failure {
+            return Ok(Some(failure));
         }
         // A handoff file alone is not role evidence. The adapter must first
         // durably establish the completed turn that produced it; otherwise a
@@ -1022,12 +1080,19 @@ impl Engine {
             receipt.turn.as_ref(),
             Some(crate::model::RoleTurnObservation::Completed { .. })
         ) {
-            return Ok(());
+            return Ok(None);
         }
         let Some(output) = role_output_semantics(effect) else {
-            return Ok(());
+            return Ok(None);
         };
-        let handoff_dir = MissionDirs::new(self.store.lionclaw_dir(), mission_id)
+        let mission_dirs = MissionDirs::new(self.store.lionclaw_dir(), mission_id);
+        // An accepted or rejected observation is already durable. It only
+        // skips re-reading the effect-owned handoff after retained state has
+        // passed the same authoritative assessment as every completed turn.
+        if receipt.handoff.is_some() {
+            return Ok(None);
+        }
+        let handoff_dir = mission_dirs
             .effect(effect_id)
             .role()
             .handoff()
@@ -1036,12 +1101,62 @@ impl Engine {
             Ok(Some(handoff)) => crate::model::RoleHandoffObservation::Accepted {
                 report: handoff.report().clone(),
             },
-            Ok(None) => return Ok(()),
+            Ok(None) => return Ok(None),
             Err(failure) => crate::model::RoleHandoffObservation::Rejected { failure },
         };
         self.record_role_handoff(mission_id, effect_id, observation)
             .await?;
-        Ok(())
+        Ok(None)
+    }
+
+    async fn completed_role_retention_failure(
+        &self,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+    ) -> Result<Option<TypedFailure>> {
+        let state = self.load_state(mission_id).await?;
+        let Some(effect) = state.inflight.get(effect_id) else {
+            return Ok(None);
+        };
+        let Some(receipt) = state.role_attempt_receipts.get(effect_id) else {
+            return Ok(None);
+        };
+        if !matches!(
+            receipt.turn.as_ref(),
+            Some(crate::model::RoleTurnObservation::Completed { .. })
+        ) {
+            return Ok(None);
+        }
+        let Some(output) = role_output_semantics(effect) else {
+            return Ok(None);
+        };
+        let mission_dirs = MissionDirs::new(self.store.lionclaw_dir(), mission_id);
+        let role_state = match (effect, output.resource_lifetime()) {
+            (
+                InflightEffect::RoleRun {
+                    conversation_id, ..
+                },
+                crate::model::RoleResourceLifetime::Conversation,
+            ) => mission_dirs
+                .conversation(conversation_id)
+                .role_state()
+                .clone(),
+            (
+                InflightEffect::RoleRun { .. } | InflightEffect::TerminalReview { .. },
+                crate::model::RoleResourceLifetime::Effect,
+            ) => mission_dirs.effect(effect_id).role().role_state().clone(),
+            _ => return Ok(None),
+        };
+        // Live handoff acknowledgement pauses the runner after adapter close;
+        // recovery holds the driver lock and quiesces the exact effect first.
+        // Both boundaries exclude every LionClaw-owned retained-state writer.
+        let failure = role_state
+            .assess_runtime_retention_async()
+            .await
+            .err()
+            .map(crate::resources::runtime_retention_failure)
+            .map(|failure| self.recover_role_failure(Some(receipt), failure));
+        Ok(failure)
     }
 
     async fn record_cleanup_failure(
@@ -1077,11 +1192,10 @@ impl Engine {
             if let Some(failure) = settlement_failure(&state, effect_id, &outcome) {
                 outcome = failed_outcome(effect_id, effect, failure);
                 if !artifact_discarded {
-                    if self
-                        .cleanup_effect(&state, effect_id, true)
-                        .await?
-                        .is_none()
-                    {
+                    if matches!(
+                        self.cleanup_effect(&state, effect_id, true).await?,
+                        EffectCleanupDisposition::Blocked
+                    ) {
                         return Ok(None);
                     }
                     artifact_discarded = true;
@@ -1234,15 +1348,47 @@ impl Engine {
                 observation,
                 acknowledge,
             } => {
-                let result = self
-                    .record_role_handoff(&state.mission_id, effect_id, observation)
-                    .await;
-                let acknowledgement = match &result {
-                    Ok(()) => Ok(()),
-                    Err(error) => Err(format!("{error:#}")),
+                // The completed turn is durable, the adapter session is
+                // closed, and the runner is blocked on this acknowledgement.
+                // No LionClaw-owned retained-state writer may resume until the
+                // engine either records the handoff or returns the typed
+                // retention refusal.
+                let retention_failure = if matches!(
+                    &observation,
+                    crate::model::RoleHandoffObservation::Accepted { .. }
+                ) {
+                    self.completed_role_retention_failure(&state.mission_id, effect_id)
+                        .await
+                } else {
+                    Ok(None)
                 };
-                let _ = acknowledge.send(acknowledgement);
-                result
+                match retention_failure {
+                    Ok(Some(failure)) => {
+                        let _ = acknowledge.send(Err(failure));
+                        Ok(())
+                    }
+                    Ok(None) => {
+                        let result = self
+                            .record_role_handoff(&state.mission_id, effect_id, observation)
+                            .await;
+                        let acknowledgement = match &result {
+                            Ok(()) => Ok(()),
+                            Err(error) => Err(TypedFailure::permanent(
+                                "role.handoff_observation",
+                                format!("{error:#}"),
+                            )),
+                        };
+                        let _ = acknowledge.send(acknowledgement);
+                        result
+                    }
+                    Err(error) => {
+                        let _ = acknowledge.send(Err(TypedFailure::permanent(
+                            "role.handoff_observation",
+                            format!("{error:#}"),
+                        )));
+                        Err(error)
+                    }
+                }
             }
             RoleRunUpdate::TurnObserved {
                 observation,
@@ -1370,6 +1516,12 @@ impl Engine {
             .role_attempt_receipts
             .get(effect_id)
             .context("role handoff observation has no active attempt receipt")?;
+        if !matches!(
+            receipt.turn.as_ref(),
+            Some(crate::model::RoleTurnObservation::Completed { .. })
+        ) {
+            bail!("role handoff observation requires a durable completed turn");
+        }
         if let Some(observed) = &receipt.handoff {
             if observed == &observation {
                 return Ok(());

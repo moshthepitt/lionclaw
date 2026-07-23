@@ -513,8 +513,16 @@ impl RoleRunner for OciRoleRunner {
             |control| setup_control_failure(&profile, control),
         )
         .await?;
+        let native_state_key = profile.native_state_key(auth.identity());
+        // No adapter session exists yet. The scheduler serializes role effects,
+        // so this metadata walk has no LionClaw-owned runtime writer.
+        let admission = role_state
+            .admit_runtime_profile_async(native_state_key.clone())
+            .await
+            .map_err(|e| launch(format!("retained runtime state admission refused: {e:#}")));
+        prefer_terminal_control(&profile, &request, admission, None, "")?;
         let runtime_profile = role_state
-            .runtime_profile(&profile.native_state_key(auth.identity()))
+            .runtime_profile(&native_state_key)
             .map_err(|e| launch(format!("invalid runtime profile resource authority: {e:#}")))?;
         runtime_profile
             .prepare()
@@ -547,13 +555,27 @@ impl RoleRunner for OciRoleRunner {
             })
             .transpose()?;
 
+        let skill_mounts = prepare_skill_mounts(
+            &runtime_profile,
+            &request.skills,
+            profile.skills_dir.as_ref(),
+        )
+        .map_err(|err| launch(format!("failed to prepare role skills: {err:#}")))?;
+        // Skill mountpoint creation is complete and no checkout, compiled
+        // plan, or adapter session has started. Join the blocking accountant
+        // before observing control so cancellation cannot detach it into
+        // cleanup.
+        let prelaunch = role_state
+            .assess_runtime_retention_async()
+            .await
+            .map_err(|error| {
+                launch(format!(
+                    "retained runtime state prelaunch check refused: {error:#}"
+                ))
+            });
+        prefer_terminal_control(&profile, &request, prelaunch, None, "")?;
+
         let setup = async {
-            let skill_mounts = prepare_skill_mounts(
-                &runtime_profile,
-                &request.skills,
-                profile.skills_dir.as_ref(),
-            )
-            .map_err(|err| launch(format!("failed to prepare role skills: {err:#}")))?;
             let is_writer = authority.output() == OutputSemantics::ProducesArtifact;
             let (workspace_source, observer_index) = if is_writer {
                 debug_assert_eq!(lifetime, RoleResourceLifetime::Conversation);
@@ -1499,6 +1521,7 @@ mod tests {
         native_identity: Option<String>,
         identity_before_reconstructed_success: Option<String>,
         context_calls: usize,
+        adapters_created: usize,
     }
 
     struct FallbackAdapter {
@@ -1749,6 +1772,7 @@ mod tests {
         }
 
         fn create_adapter(&self, _config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
+            self.observations.lock().unwrap().adapters_created += 1;
             Arc::new(FallbackAdapter {
                 turns: StdMutex::new(self.turns.iter().copied().collect()),
                 observations: self.observations.clone(),
@@ -1876,6 +1900,117 @@ mod tests {
             );
         }
         assert!(!temp.path().join("state").exists());
+    }
+
+    #[tokio::test]
+    async fn ninth_retained_profile_is_refused_before_adapter_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles = RuntimeProfiles::from_toml(
+            "[runtimes.codex]\ndriver = \"codex\"\ncommand = \"codex\"\nnative-resume = true\n",
+            temp.path(),
+        )
+        .unwrap();
+        let observations = Arc::new(StdMutex::new(FallbackObservations::default()));
+        let runner = OciRoleRunner::with_registries(
+            profiles,
+            "unused-test-image".into(),
+            AuthorityCeiling::default(),
+            RuntimeDriverRegistry::new([Arc::new(FallbackProvider {
+                turns: vec![FallbackTurn::Success],
+                observations: observations.clone(),
+                failure_point: FallbackFailurePoint::None,
+                control: None,
+            }) as Arc<dyn RuntimeDriverProvider>]),
+            RuntimeAuthRegistry::empty(),
+        );
+        let request = fallback_request(temp.path());
+        std::fs::create_dir_all(&request.state_dir).unwrap();
+        let conversation_id = crate::model::ConversationId::for_role_instance(
+            &request.mission_id,
+            request.namespace,
+            &request.task_id,
+            &request.role.name,
+            request.assignment_epoch,
+        );
+        let role_state = MissionDirs::new(&request.state_dir, &request.mission_id)
+            .conversation(&conversation_id)
+            .role_state()
+            .clone();
+        role_state.prepare().unwrap();
+        let selected = runner.profile("codex").unwrap().native_state_key(None);
+        for index in 0..8 {
+            let key = format!("{index:064x}");
+            assert_ne!(key, selected);
+            role_state.runtime_profile(&key).unwrap().prepare().unwrap();
+        }
+        assert_eq!(role_state.assess_runtime_retention().unwrap().profiles, 8);
+
+        let failure = runner
+            .run(request)
+            .await
+            .expect_err("a ninth prospective profile must fail before adapter creation");
+
+        assert_eq!(failure.evidence().code.as_deref(), Some("kernel.launch"));
+        assert!(failure.detail().contains("profile limit exceeded"));
+        assert_eq!(observations.lock().unwrap().adapters_created, 0);
+    }
+
+    #[test]
+    fn post_skill_accounting_catches_state_created_after_profile_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_dir = std::iter::repeat_n("d", 125).collect::<Vec<_>>().join("/");
+        let profiles = RuntimeProfiles::from_toml(
+            &format!(
+                "[runtimes.codex]\ndriver = \"codex\"\ncommand = \"codex\"\nskills-dir = \"{skills_dir}\"\n"
+            ),
+            temp.path(),
+        )
+        .unwrap();
+        let profile = profiles.get("codex").unwrap();
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let mission = crate::model::MissionId::parse("mabc123def456").unwrap();
+        let conversation = crate::model::ConversationId::parse("f".repeat(64)).unwrap();
+        let role_state = MissionDirs::new(&state_dir, &mission)
+            .conversation(&conversation)
+            .role_state()
+            .clone();
+        role_state.prepare().unwrap();
+        let native_state_key = profile.native_state_key(None);
+        assert_eq!(
+            role_state
+                .admit_runtime_profile(&native_state_key)
+                .unwrap()
+                .profiles,
+            1
+        );
+        let runtime_profile = role_state.runtime_profile(&native_state_key).unwrap();
+        runtime_profile.prepare().unwrap();
+        let skill_root = temp.path().join("assigned-skill");
+        std::fs::create_dir(&skill_root).unwrap();
+        prepare_skill_mounts(
+            &runtime_profile,
+            &[SkillPackage {
+                name: "proof".into(),
+                root: skill_root,
+                description: "prove post-skill accounting".into(),
+            }],
+            profile.skills_dir.as_ref(),
+        )
+        .unwrap();
+
+        let error = role_state
+            .assess_runtime_retention()
+            .expect_err("skill mountpoint creation must be included in the prelaunch recheck");
+        let exceeded = error
+            .downcast_ref::<lionclaw_durable_fs::MetadataTreeLimitExceeded>()
+            .unwrap();
+        assert_eq!(
+            exceeded.limit,
+            lionclaw_durable_fs::MetadataTreeLimit::Depth
+        );
+        assert_eq!(exceeded.observed, 129);
+        assert_eq!(exceeded.maximum, 128);
     }
 
     #[tokio::test]

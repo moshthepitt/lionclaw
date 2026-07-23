@@ -14,10 +14,10 @@ use lionclaw::authority::AuthorityCeiling;
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
 use lionclaw::mission_type::{load_mission_type, materialize_mission_type};
 use lionclaw::model::{
-    fold, ConversationLifecycle, EffectId, EffectResource, EventEnvelope, Handoff, MissionEvent,
-    MissionId, MissionPhase, MissionState, OutputSemantics, PayloadRef, RoleAttemptDisposition,
-    RoleEffectSource, RoleHandoffObservation, RoleTurnObservation, RuntimeConfigurationEvidence,
-    TaskId, TaskNamespace, ValidationItem, REDUCER_VERSION,
+    fold, ConversationId, ConversationLifecycle, EffectId, EffectResource, EventEnvelope, Handoff,
+    MissionEvent, MissionId, MissionPhase, MissionState, OutputSemantics, PayloadRef,
+    RoleAttemptDisposition, RoleEffectSource, RoleHandoffObservation, RoleTurnObservation,
+    RuntimeConfigurationEvidence, TaskId, TaskNamespace, ValidationItem, REDUCER_VERSION,
 };
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, EventSink, RoleRunOutcome,
@@ -58,6 +58,28 @@ struct RetainedHandoffRunner {
     handoff: RetainedHandoff,
 }
 
+struct RetainedStateOverflowRunner {
+    started: Arc<Barrier>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum AdversarialRetentionMode {
+    RefusedBeforeHandoff,
+    AcceptedThenSuccess,
+    AcceptedThenCrash,
+    AcceptedThenFailure,
+    RejectedThenFailure,
+}
+
+struct AdversarialRetentionRunner {
+    mode: AdversarialRetentionMode,
+    started: Arc<Barrier>,
+    calls: Arc<AtomicUsize>,
+}
+
+struct CompletedOverflowFailureRunner;
+
 struct UnacknowledgedRunner {
     calls: Arc<AtomicUsize>,
 }
@@ -71,6 +93,11 @@ struct MissingValidatorHandoffRunner {
 
 struct CountingCleaner {
     calls: Arc<AtomicUsize>,
+}
+
+#[derive(Default)]
+struct ArtifactDiscardCleaner {
+    calls: Mutex<Vec<EffectCleanupRequest>>,
 }
 
 struct DurableFoldCleaner {
@@ -103,6 +130,24 @@ fn test_repository() -> tempfile::TempDir {
     dir
 }
 
+fn mission_ref_exists(
+    repo: &std::path::Path,
+    mission_id: &MissionId,
+    effect_id: &EffectId,
+) -> bool {
+    std::process::Command::new("git")
+        .current_dir(repo)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/mission/{mission_id}/{effect_id}"),
+        ])
+        .status()
+        .unwrap()
+        .success()
+}
+
 fn effect_dir(request: &EffectCleanupRequest) -> std::path::PathBuf {
     request
         .state_dir
@@ -119,6 +164,48 @@ fn role_effect_dir(request: &RoleRunRequest) -> std::path::PathBuf {
         .join(request.mission_id.as_str())
         .join("effects")
         .join(request.effect_id.as_str())
+}
+
+fn retained_runtime_dir(request: &RoleRunRequest) -> std::path::PathBuf {
+    let conversation_id = ConversationId::for_role_instance(
+        &request.mission_id,
+        request.namespace,
+        &request.task_id,
+        &request.role.name,
+        request.assignment_epoch,
+    );
+    request
+        .state_dir
+        .join("missions")
+        .join(request.mission_id.as_str())
+        .join("conversations")
+        .join(conversation_id.as_str())
+        .join("runtime")
+}
+
+fn retained_runtime_configuration() -> RuntimeConfigurationEvidence {
+    RuntimeConfigurationEvidence {
+        requested_model: Some(RETAINED_MODEL.to_string()),
+        applied_model: Some(RETAINED_MODEL.to_string()),
+        ..Default::default()
+    }
+}
+
+fn exceed_runtime_retention_limit(request: &RoleRunRequest) {
+    let runtime = retained_runtime_dir(request);
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::File::create(runtime.join("oversized-native-state"))
+        .unwrap()
+        .set_len(512 * 1024 * 1024 + 1)
+        .unwrap();
+}
+
+fn retained_work_handoff() -> Handoff {
+    Handoff::Work {
+        done: true,
+        report: PayloadRef::inline(RETAINED_REPORT),
+        request_attention: false,
+    }
 }
 
 #[async_trait]
@@ -156,6 +243,120 @@ impl RoleRunner for RetainedHandoffRunner {
             .await?;
         self.started.wait().await;
         std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl RoleRunner for RetainedStateOverflowRunner {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        lionclaw::testing::prepare_test_workspace(&request).await?;
+        std::fs::create_dir_all(role_effect_dir(&request).join("handoff")).unwrap();
+        exceed_runtime_retention_limit(&request);
+        request
+            .confirm_turn_observed(RoleTurnObservation::Completed {
+                final_response: PayloadRef::inline(RETAINED_RESPONSE),
+                runtime_configuration: retained_runtime_configuration(),
+            })
+            .await?;
+        self.started.wait().await;
+        std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl RoleRunner for AdversarialRetentionRunner {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        lionclaw::testing::prepare_test_workspace(&request).await?;
+        std::fs::create_dir_all(role_effect_dir(&request).join("handoff")).unwrap();
+        let configuration = retained_runtime_configuration();
+        let handoff = retained_work_handoff();
+
+        if matches!(
+            self.mode,
+            AdversarialRetentionMode::RefusedBeforeHandoff
+                | AdversarialRetentionMode::RejectedThenFailure
+        ) {
+            exceed_runtime_retention_limit(&request);
+        }
+        request
+            .confirm_turn_observed(RoleTurnObservation::Completed {
+                final_response: PayloadRef::inline(RETAINED_RESPONSE),
+                runtime_configuration: configuration.clone(),
+            })
+            .await?;
+
+        if matches!(self.mode, AdversarialRetentionMode::RejectedThenFailure) {
+            let mut failure =
+                TypedFailure::invalid("handoff.schema", "adversarial invalid handoff");
+            failure.evidence_mut().configuration = configuration;
+            failure.evidence_mut().final_response = RETAINED_RESPONSE.into();
+            request
+                .confirm_handoff_observed(RoleHandoffObservation::Rejected {
+                    failure: failure.clone(),
+                })
+                .await?;
+            return Err(failure);
+        }
+
+        request
+            .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                report: handoff.report().clone(),
+            })
+            .await?;
+
+        if matches!(self.mode, AdversarialRetentionMode::RefusedBeforeHandoff) {
+            unreachable!("the engine must refuse an accepted handoff over the fixed limit");
+        }
+
+        // Deliberately violate the public runner contract after the accepted
+        // acknowledgement. Cleanup and crash recovery must still fail closed.
+        exceed_runtime_retention_limit(&request);
+        let artifact =
+            lionclaw::testing::capture_prepared_test_artifact(&request, HEAD_SHA).await?;
+        match self.mode {
+            AdversarialRetentionMode::AcceptedThenSuccess => Ok(RoleRunOutcome {
+                handoff: Some(handoff),
+                artifact: Some(artifact),
+                runtime_configuration: configuration,
+                final_response: RETAINED_RESPONSE.into(),
+            }),
+            AdversarialRetentionMode::AcceptedThenCrash => {
+                self.started.wait().await;
+                std::future::pending().await
+            }
+            AdversarialRetentionMode::AcceptedThenFailure => {
+                let mut failure =
+                    TypedFailure::permanent("runtime.original_failure", "ordinary role failure");
+                failure.evidence_mut().configuration = configuration;
+                failure.evidence_mut().final_response = RETAINED_RESPONSE.into();
+                Err(failure)
+            }
+            AdversarialRetentionMode::RefusedBeforeHandoff
+            | AdversarialRetentionMode::RejectedThenFailure => unreachable!(),
+        }
+    }
+}
+
+#[async_trait]
+impl RoleRunner for CompletedOverflowFailureRunner {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        lionclaw::testing::prepare_test_workspace(&request).await?;
+        std::fs::create_dir_all(role_effect_dir(&request).join("handoff")).unwrap();
+        exceed_runtime_retention_limit(&request);
+        let configuration = retained_runtime_configuration();
+        request
+            .confirm_turn_observed(RoleTurnObservation::Completed {
+                final_response: PayloadRef::inline(RETAINED_RESPONSE),
+                runtime_configuration: configuration.clone(),
+            })
+            .await?;
+        let mut failure =
+            TypedFailure::permanent("runtime.original_failure", "ordinary post-turn failure");
+        failure.evidence_mut().configuration = configuration;
+        failure.evidence_mut().final_response = RETAINED_RESPONSE.into();
+        Err(failure)
     }
 }
 
@@ -434,6 +635,37 @@ impl EffectCleaner for CountingCleaner {
 }
 
 #[async_trait]
+impl EffectCleaner for ArtifactDiscardCleaner {
+    async fn quiesce(&self, _request: &EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
+        Ok(())
+    }
+
+    async fn cleanup(&self, request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
+        let exact_effect_dir = effect_dir(&request);
+        lionclaw::workspace::remove_dir(&exact_effect_dir)
+            .await
+            .map_err(|error| EffectCleanupFailure {
+                resource: EffectResource::EffectDirectory,
+                detail: error.to_string(),
+            })?;
+        if request.discard_artifact {
+            lionclaw::workspace::discard_worker_result(
+                &request.workspace_dir,
+                request.mission_id.as_str(),
+                &request.effect_id,
+            )
+            .await
+            .map_err(|error| EffectCleanupFailure {
+                resource: EffectResource::WriterRef,
+                detail: error.to_string(),
+            })?;
+        }
+        self.calls.lock().unwrap().push(request);
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl EffectCleaner for DurableFoldCleaner {
     async fn quiesce(&self, _request: &EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
         Ok(())
@@ -630,6 +862,18 @@ async fn create_approved_mission(
         .unwrap();
     approve_plan(engine, &mission_id).await;
     mission_id
+}
+
+fn adversarial_retention_runner(
+    mode: AdversarialRetentionMode,
+    started: Arc<Barrier>,
+    calls: Arc<AtomicUsize>,
+) -> Arc<dyn RoleRunner> {
+    Arc::new(AdversarialRetentionRunner {
+        mode,
+        started,
+        calls,
+    })
 }
 
 #[tokio::test]
@@ -1033,6 +1277,529 @@ async fn completed_writer_turn_without_handoff_recovers_as_same_conversation_che
             .expect("mission state"),
         state
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_handoff_is_refused_before_recording_over_limit_state() {
+    let dir = test_repository();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cleaner = Arc::new(ArtifactDiscardCleaner::default());
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let engine = Engine::new(
+        store.clone(),
+        test_mission_type(),
+        "codex".to_string(),
+        "test-image".to_string(),
+        EngineServices::new(
+            adversarial_retention_runner(
+                AdversarialRetentionMode::RefusedBeforeHandoff,
+                Arc::new(Barrier::new(1)),
+                calls.clone(),
+            ),
+            Arc::new(MockOracleRunner::exiting(0)),
+            cleaner.clone(),
+            Arc::new(MockClock::default()),
+        ),
+    );
+    let mission_id = create_approved_mission(&engine, dir.path()).await;
+
+    let outcome = engine.advance(&mission_id).await.unwrap();
+
+    assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.state.current_sha, BASE_SHA);
+    let receipt = outcome
+        .state
+        .role_attempt_receipts
+        .values()
+        .find(|receipt| receipt.failure().is_some())
+        .expect("retained-state failure receipt");
+    assert_eq!(
+        receipt.failure().unwrap().evidence().code.as_deref(),
+        Some("runtime.native_state_limit")
+    );
+    assert!(receipt.handoff.is_none());
+    assert!(!mission_ref_exists(
+        dir.path(),
+        &mission_id,
+        &receipt.effect_id
+    ));
+    {
+        let cleanup = cleaner.calls.lock().unwrap();
+        assert_eq!(cleanup.len(), 1);
+        assert!(cleanup[0].discard_artifact);
+    }
+    let events = store.load(&mission_id).await.unwrap();
+    assert!(events.iter().all(|event| !matches!(
+        &event.event,
+        MissionEvent::RoleHandoffObserved {
+            effect_id,
+            observation: RoleHandoffObservation::Accepted { .. },
+        } if effect_id == &receipt.effect_id
+    )));
+    assert_eq!(fold(events).unwrap(), outcome.state);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleanup_backstop_discards_artifact_after_noncompliant_post_ack_growth() {
+    let dir = test_repository();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cleaner = Arc::new(ArtifactDiscardCleaner::default());
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let engine = Engine::new(
+        store.clone(),
+        test_mission_type(),
+        "codex".to_string(),
+        "test-image".to_string(),
+        EngineServices::new(
+            adversarial_retention_runner(
+                AdversarialRetentionMode::AcceptedThenSuccess,
+                Arc::new(Barrier::new(1)),
+                calls.clone(),
+            ),
+            Arc::new(MockOracleRunner::exiting(0)),
+            cleaner.clone(),
+            Arc::new(MockClock::default()),
+        ),
+    );
+    let mission_id = create_approved_mission(&engine, dir.path()).await;
+    let snapshot = store.rebuild_cursors(&mission_id, 10).await.unwrap();
+
+    let outcome = engine.advance(&mission_id).await.unwrap();
+
+    assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.state.current_sha, BASE_SHA);
+    let receipt = outcome
+        .state
+        .role_attempt_receipts
+        .values()
+        .find(|receipt| receipt.failure().is_some())
+        .expect("retained-state failure receipt");
+    assert_eq!(
+        receipt.failure().unwrap().evidence().code.as_deref(),
+        Some("runtime.native_state_limit")
+    );
+    assert_eq!(
+        receipt.accepted_report(),
+        Some(&PayloadRef::inline(RETAINED_REPORT))
+    );
+    assert!(!mission_ref_exists(
+        dir.path(),
+        &mission_id,
+        &receipt.effect_id
+    ));
+    {
+        let cleanup = cleaner.calls.lock().unwrap();
+        assert_eq!(cleanup.len(), 1);
+        assert!(cleanup[0].discard_artifact);
+    }
+    let events = store.load(&mission_id).await.unwrap();
+    assert_eq!(fold(events).unwrap(), outcome.state);
+    assert!(snapshot.head < outcome.state.head);
+    assert_eq!(
+        store
+            .load_state_snapshotted(&mission_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        outcome.state
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_after_accepted_handoff_recovers_limit_and_discards_artifact() {
+    let dir = test_repository();
+    let started = Arc::new(Barrier::new(2));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cleaner = Arc::new(ArtifactDiscardCleaner::default());
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(Engine::new(
+        store.clone(),
+        test_mission_type(),
+        "codex".to_string(),
+        "test-image".to_string(),
+        EngineServices::new(
+            adversarial_retention_runner(
+                AdversarialRetentionMode::AcceptedThenCrash,
+                started.clone(),
+                calls.clone(),
+            ),
+            Arc::new(MockOracleRunner::exiting(0)),
+            cleaner.clone(),
+            Arc::new(MockClock::default()),
+        ),
+    ));
+    let mission_id = create_approved_mission(&engine, dir.path()).await;
+    let snapshot = store.rebuild_cursors(&mission_id, 10).await.unwrap();
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let mission_id = mission_id.clone();
+        async move { engine.advance(&mission_id).await }
+    });
+    started.wait().await;
+    let active = store.require_state(&mission_id).await.unwrap();
+    let (effect_id, receipt) = active
+        .role_attempt_receipts
+        .iter()
+        .find(|(_, receipt)| receipt.accepted_report().is_some())
+        .expect("accepted handoff before injected crash");
+    let effect_id = effect_id.clone();
+    assert_eq!(
+        receipt.accepted_report(),
+        Some(&PayloadRef::inline(RETAINED_REPORT))
+    );
+    assert!(mission_ref_exists(dir.path(), &mission_id, &effect_id));
+    driver.abort();
+    assert!(driver.await.unwrap_err().is_cancelled());
+
+    let recovered = engine.advance(&mission_id).await.unwrap();
+
+    assert_eq!(recovered.disposition, MissionDisposition::Parked);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "role must not rerun");
+    assert_eq!(recovered.state.current_sha, BASE_SHA);
+    let receipt = recovered
+        .state
+        .role_attempt_receipts
+        .get(&effect_id)
+        .expect("recovered attempt receipt");
+    assert_eq!(
+        receipt.failure().unwrap().evidence().code.as_deref(),
+        Some("runtime.native_state_limit")
+    );
+    assert_eq!(
+        receipt.accepted_report(),
+        Some(&PayloadRef::inline(RETAINED_REPORT))
+    );
+    assert!(!mission_ref_exists(dir.path(), &mission_id, &effect_id));
+    {
+        let cleanup = cleaner.calls.lock().unwrap();
+        assert_eq!(cleanup.len(), 1);
+        assert!(cleanup[0].discard_artifact);
+    }
+    let events = store.load(&mission_id).await.unwrap();
+    assert_eq!(fold(events).unwrap(), recovered.state);
+    assert!(snapshot.head < recovered.state.head);
+    assert_eq!(
+        store
+            .load_state_snapshotted(&mission_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        recovered.state
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handoff_rejection_and_ordinary_failure_outrank_retention_backstop() {
+    for (mode, expected_code, expected_handoff) in [
+        (
+            AdversarialRetentionMode::AcceptedThenFailure,
+            "runtime.original_failure",
+            "accepted",
+        ),
+        (
+            AdversarialRetentionMode::RejectedThenFailure,
+            "handoff.schema",
+            "rejected",
+        ),
+    ] {
+        let dir = test_repository();
+        let cleaner = Arc::new(ArtifactDiscardCleaner::default());
+        let store = MissionStore::open(dir.path()).await.unwrap();
+        let engine = Engine::new(
+            store.clone(),
+            test_mission_type(),
+            "codex".to_string(),
+            "test-image".to_string(),
+            EngineServices::new(
+                adversarial_retention_runner(
+                    mode,
+                    Arc::new(Barrier::new(1)),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+                Arc::new(MockOracleRunner::exiting(0)),
+                cleaner.clone(),
+                Arc::new(MockClock::default()),
+            ),
+        );
+        let mission_id = create_approved_mission(&engine, dir.path()).await;
+
+        let outcome = engine.advance(&mission_id).await.unwrap();
+
+        let receipt = outcome
+            .state
+            .role_attempt_receipts
+            .values()
+            .find(|receipt| receipt.failure().is_some())
+            .expect("settled failure receipt");
+        assert_eq!(
+            receipt.failure().unwrap().evidence().code.as_deref(),
+            Some(expected_code)
+        );
+        match expected_handoff {
+            "accepted" => assert!(receipt.accepted_report().is_some()),
+            "rejected" => assert!(receipt.rejection().is_some()),
+            _ => unreachable!(),
+        }
+        assert_eq!(outcome.state.current_sha, BASE_SHA);
+        assert!(!mission_ref_exists(
+            dir.path(),
+            &mission_id,
+            &receipt.effect_id
+        ));
+        {
+            let cleanup = cleaner.calls.lock().unwrap();
+            assert!(!cleanup.is_empty());
+            assert!(cleanup.iter().all(|request| request.discard_artifact));
+        }
+        assert_eq!(
+            fold(store.load(&mission_id).await.unwrap()).unwrap(),
+            outcome.state
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_turn_with_oversized_retained_state_recovers_as_typed_failure() {
+    let dir = test_repository();
+    let started = Arc::new(Barrier::new(2));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let cleaner = Arc::new(DurableFoldCleaner {
+        store: store.clone(),
+        expected: ExpectedHandoff::Absent,
+        deletions: AtomicUsize::new(0),
+        after_first_deletion: None,
+    });
+    let engine = Arc::new(Engine::new(
+        store.clone(),
+        test_mission_type(),
+        "codex".to_string(),
+        "test-image".to_string(),
+        EngineServices::new(
+            Arc::new(RetainedStateOverflowRunner {
+                started: started.clone(),
+                calls: calls.clone(),
+            }),
+            Arc::new(MockOracleRunner::exiting(0)),
+            cleaner.clone(),
+            Arc::new(MockClock::default()),
+        ),
+    ));
+    let mission_id = create_approved_mission(&engine, dir.path()).await;
+    let snapshot = store
+        .rebuild_cursors(&mission_id, 10)
+        .await
+        .expect("seed approved-state snapshot");
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let mission_id = mission_id.clone();
+        async move { engine.advance(&mission_id).await }
+    });
+    started.wait().await;
+    let active = store.require_state(&mission_id).await.unwrap();
+    let (effect_id, _) = active.inflight.iter().next().expect("active writer");
+    let effect_id = effect_id.clone();
+    assert_durable_turn_precedes_handoff(&store, &mission_id, &effect_id, &active).await;
+    driver.abort();
+    assert!(driver.await.unwrap_err().is_cancelled());
+
+    let recovered = engine
+        .advance(&mission_id)
+        .await
+        .expect("recover retained-state limit failure");
+    assert_eq!(recovered.disposition, MissionDisposition::Parked);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "role must not rerun");
+    assert_eq!(cleaner.deletions.load(Ordering::SeqCst), 1);
+    let receipt = recovered
+        .state
+        .role_attempt_receipts
+        .get(&effect_id)
+        .expect("settled retained-state receipt");
+    let failure = receipt.failure().expect("typed retained-state failure");
+    assert_eq!(
+        failure.evidence().code.as_deref(),
+        Some("runtime.native_state_limit")
+    );
+    assert!(failure.detail().contains("fixed product limit"));
+    assert!(receipt.handoff.is_none());
+    assert_eq!(
+        receipt.turn,
+        Some(RoleTurnObservation::Completed {
+            final_response: PayloadRef::inline(RETAINED_RESPONSE),
+            runtime_configuration: RuntimeConfigurationEvidence {
+                requested_model: Some(RETAINED_MODEL.into()),
+                applied_model: Some(RETAINED_MODEL.into()),
+                ..Default::default()
+            },
+        })
+    );
+
+    let events = store.load(&mission_id).await.unwrap();
+    assert!(events.iter().all(|event| !matches!(
+        &event.event,
+        MissionEvent::RoleHandoffObserved {
+            effect_id: observed, ..
+        } if observed == &effect_id
+    )));
+    assert_eq!(fold(events).unwrap(), recovered.state);
+    assert!(snapshot.head < recovered.state.head);
+    assert_eq!(
+        store
+            .load_state_snapshotted(&mission_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        recovered.state
+    );
+
+    let json = std::process::Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+        .args(["mission", "status", mission_id.as_str(), "--json", "--repo"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let projected = json["role_attempt_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| receipt["effect_id"] == effect_id.as_str())
+        .unwrap();
+    assert_eq!(projected["turn"]["outcome"], "completed");
+    assert_eq!(
+        projected["turn"]["final_response"]["content"],
+        RETAINED_RESPONSE
+    );
+    assert_eq!(
+        projected["disposition"]["failure"]["evidence"]["code"],
+        "runtime.native_state_limit"
+    );
+    assert_ne!(projected["handoff"]["outcome"], "accepted");
+    let human = std::process::Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+        .args(["mission", "status", mission_id.as_str(), "--repo"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("runtime.native_state_limit"));
+    assert!(human.contains(RETAINED_RESPONSE));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_abort_outranks_recovered_retained_state_failure() {
+    let dir = test_repository();
+    let started = Arc::new(Barrier::new(2));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let engine = Arc::new(Engine::new(
+        store.clone(),
+        test_mission_type(),
+        "codex".to_string(),
+        "test-image".to_string(),
+        EngineServices::new(
+            Arc::new(RetainedStateOverflowRunner {
+                started: started.clone(),
+                calls: calls.clone(),
+            }),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    ));
+    let mission_id = create_approved_mission(&engine, dir.path()).await;
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let mission_id = mission_id.clone();
+        async move { engine.advance(&mission_id).await }
+    });
+    started.wait().await;
+    let active = store.require_state(&mission_id).await.unwrap();
+    let (effect_id, _) = active.inflight.iter().next().expect("active writer");
+    let effect_id = effect_id.clone();
+    driver.abort();
+    assert!(driver.await.unwrap_err().is_cancelled());
+    engine
+        .abort(&mission_id, "operator abort after completed turn")
+        .await
+        .unwrap();
+
+    let recovered = engine.advance(&mission_id).await.unwrap();
+    assert!(matches!(
+        recovered.state.phase,
+        MissionPhase::Aborted { .. }
+    ));
+    let receipt = recovered
+        .state
+        .role_attempt_receipts
+        .get(&effect_id)
+        .unwrap();
+    assert!(matches!(
+        receipt.failure(),
+        Some(TypedFailure::OperatorAborted { .. })
+    ));
+    assert_eq!(
+        receipt
+            .effective_runtime_configuration()
+            .and_then(|configuration| configuration.applied_model.as_deref()),
+        Some(RETAINED_MODEL)
+    );
+    assert_eq!(
+        receipt.turn,
+        Some(RoleTurnObservation::Completed {
+            final_response: PayloadRef::inline(RETAINED_RESPONSE),
+            runtime_configuration: RuntimeConfigurationEvidence {
+                requested_model: Some(RETAINED_MODEL.into()),
+                applied_model: Some(RETAINED_MODEL.into()),
+                ..Default::default()
+            },
+        })
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ordinary_role_failure_outranks_cleanup_retained_state_finding() {
+    let dir = test_repository();
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let engine = Engine::new(
+        store.clone(),
+        test_mission_type(),
+        "codex".to_string(),
+        "test-image".to_string(),
+        EngineServices::new(
+            Arc::new(CompletedOverflowFailureRunner),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    );
+    let mission_id = create_approved_mission(&engine, dir.path()).await;
+
+    let outcome = engine.advance(&mission_id).await.unwrap();
+    let receipt = outcome
+        .state
+        .role_attempt_receipts
+        .values()
+        .find(|receipt| receipt.failure().is_some())
+        .expect("ordinary failed role receipt");
+    assert_eq!(
+        receipt.failure().unwrap().evidence().code.as_deref(),
+        Some("runtime.original_failure")
+    );
+    assert_eq!(
+        receipt
+            .effective_runtime_configuration()
+            .and_then(|configuration| configuration.applied_model.as_deref()),
+        Some(RETAINED_MODEL)
+    );
+    assert!(matches!(
+        &receipt.turn,
+        Some(RoleTurnObservation::Completed { final_response, .. })
+            if final_response == &PayloadRef::inline(RETAINED_RESPONSE)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -31,15 +31,18 @@
 )]
 
 use std::{
+    collections::BTreeSet,
     ffi::{OsStr, OsString},
     fs::{File, Metadata, Permissions},
     io::{Read, Write},
+    os::unix::ffi::OsStringExt,
     path::{Component, Path, PathBuf},
 };
 
 use anyhow::{anyhow, Context, Result};
 use rustix::{
-    fs::{fchmod, openat, renameat, unlinkat, AtFlags, Mode, OFlags},
+    fd::{AsFd, BorrowedFd, OwnedFd},
+    fs::{fchmod, fstat, openat, renameat, unlinkat, AtFlags, Dir, FileType, Mode, OFlags},
     io::Errno,
 };
 use tracing::warn;
@@ -53,6 +56,75 @@ pub enum BoundedRead {
     Contents(Vec<u8>),
     TooLarge,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataTreeLimits {
+    pub max_bytes: u64,
+    pub max_entries: usize,
+    pub max_depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetadataTreeUsage {
+    pub bytes: u64,
+    pub entries: usize,
+    pub max_depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataTreeLimit {
+    Bytes,
+    Entries,
+    Depth,
+}
+
+impl std::fmt::Display for MetadataTreeLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Bytes => "byte",
+            Self::Entries => "entry",
+            Self::Depth => "depth",
+        };
+        formatter.write_str(name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataTreeLimitExceeded {
+    pub limit: MetadataTreeLimit,
+    pub observed: u64,
+    pub maximum: u64,
+}
+
+impl std::fmt::Display for MetadataTreeLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "metadata tree exceeds the {} limit: observed {}, maximum {}",
+            self.limit, self.observed, self.maximum
+        )
+    }
+}
+
+impl std::error::Error for MetadataTreeLimitExceeded {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImmediateDirectoryLimitExceeded {
+    pub observed_at_least: usize,
+    pub maximum: usize,
+}
+
+impl std::fmt::Display for ImmediateDirectoryLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "immediate-directory limit exceeded: observed at least {}, maximum {}",
+            self.observed_at_least, self.maximum
+        )
+    }
+}
+
+impl std::error::Error for ImmediateDirectoryLimitExceeded {}
 
 /// A directory reached from an explicit trusted anchor without following any
 /// symlink below that anchor.
@@ -251,6 +323,193 @@ impl RootedDirectory {
         remove_file_if_exists(&parent, &self.path, file_name, label)
     }
 
+    /// Account for a directory tree without following links or opening file
+    /// contents.
+    ///
+    /// File bytes are logical regular-file lengths. Entries count every
+    /// regular file and directory below the root; the root itself is depth
+    /// zero and is not an entry.
+    ///
+    /// The caller must exclude writers for the duration of this operation when
+    /// it needs a stable accounting point. Descriptor identity checks reject
+    /// directory path replacement observed during traversal; they cannot make
+    /// concurrent entry addition, removal, or file growth into an atomic
+    /// snapshot.
+    pub fn account_metadata(
+        &self,
+        limits: MetadataTreeLimits,
+        label: &str,
+    ) -> Result<MetadataTreeUsage> {
+        let Some(root) = self.open_existing()? else {
+            return Ok(MetadataTreeUsage::default());
+        };
+        let mut stack = vec![MetadataFrame::root(root, self.path.clone(), label)?];
+        let mut usage = MetadataTreeUsage::default();
+
+        while let Some(frame) = stack.last_mut() {
+            let entry = frame.entries.next().transpose().with_context(|| {
+                format!(
+                    "failed to enumerate {label} directory '{}'",
+                    frame.display.display()
+                )
+            })?;
+            let Some(entry) = entry else {
+                revalidate_completed_frame(&stack, self, label)?;
+                stack.truncate(stack.len() - 1);
+                continue;
+            };
+            let name_bytes = entry.file_name().to_bytes();
+            if matches!(name_bytes, b"." | b"..") {
+                continue;
+            }
+            let name = OsString::from_vec(name_bytes.to_vec());
+
+            usage.entries = usage.entries.checked_add(1).ok_or_else(|| {
+                metadata_limit_error(MetadataTreeLimit::Entries, u64::MAX, limits.max_entries)
+            })?;
+            if usage.entries > limits.max_entries {
+                return Err(metadata_limit_error(
+                    MetadataTreeLimit::Entries,
+                    usize_as_u64(usage.entries),
+                    limits.max_entries,
+                ));
+            }
+
+            let Some(frame) = stack.last() else {
+                return Err(anyhow!(
+                    "{label} metadata traversal lost its open directory authority"
+                ));
+            };
+            let entry_depth = frame.depth.checked_add(1).ok_or_else(|| {
+                metadata_limit_error(MetadataTreeLimit::Depth, u64::MAX, limits.max_depth)
+            })?;
+            if entry_depth > limits.max_depth {
+                return Err(metadata_limit_error(
+                    MetadataTreeLimit::Depth,
+                    usize_as_u64(entry_depth),
+                    limits.max_depth,
+                ));
+            }
+            usage.max_depth = usage.max_depth.max(entry_depth);
+            let display = frame.display.join(&name);
+            let parent = frame.directory_fd(label)?;
+
+            match inspect_metadata_entry(parent, &name, &display, label)? {
+                AccountedEntry::RegularFile(bytes) => {
+                    usage.bytes = usage.bytes.checked_add(bytes).ok_or_else(|| {
+                        anyhow!(MetadataTreeLimitExceeded {
+                            limit: MetadataTreeLimit::Bytes,
+                            observed: u64::MAX,
+                            maximum: limits.max_bytes,
+                        })
+                    })?;
+                    if usage.bytes > limits.max_bytes {
+                        return Err(anyhow!(MetadataTreeLimitExceeded {
+                            limit: MetadataTreeLimit::Bytes,
+                            observed: usage.bytes,
+                            maximum: limits.max_bytes,
+                        }));
+                    }
+                }
+                AccountedEntry::Directory(directory) => {
+                    stack.push(MetadataFrame::child(
+                        name,
+                        directory,
+                        display,
+                        entry_depth,
+                        label,
+                    )?);
+                }
+            }
+        }
+
+        Ok(usage)
+    }
+
+    /// Return the names of immediate child directories under this exact root.
+    ///
+    /// Every child must be a real directory. The bounded result is suitable
+    /// for validating a host-owned namespace such as retained runtime
+    /// profiles without reading anything stored within those directories. The
+    /// caller must exclude writers when it needs a stable namespace count.
+    pub fn immediate_directory_names(
+        &self,
+        max_entries: usize,
+        label: &str,
+    ) -> Result<BTreeSet<OsString>> {
+        let Some(root) = self.open_existing()? else {
+            return Ok(BTreeSet::new());
+        };
+        let mut entries = Dir::new(root).with_context(|| {
+            format!(
+                "failed to enumerate {label} directory '{}'",
+                self.path.display()
+            )
+        })?;
+        let mut names = BTreeSet::new();
+        let mut opened = Vec::new();
+
+        while let Some(entry) = entries.next() {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to enumerate {label} directory '{}'",
+                    self.path.display()
+                )
+            })?;
+            let name_bytes = entry.file_name().to_bytes();
+            if matches!(name_bytes, b"." | b"..") {
+                continue;
+            }
+            let name = OsString::from_vec(name_bytes.to_vec());
+            if names.len() >= max_entries {
+                return Err(anyhow!(ImmediateDirectoryLimitExceeded {
+                    observed_at_least: max_entries.saturating_add(1),
+                    maximum: max_entries,
+                })
+                .context(format!(
+                    "{label} '{}' exceeds the immediate-directory limit",
+                    self.path.display()
+                )));
+            }
+            let display = self.path.join(&name);
+            let directory = open_directory_entry(
+                entries.fd().map_err(|error| {
+                    anyhow!(
+                        "failed to retain {label} directory authority '{}': {error}",
+                        self.path.display()
+                    )
+                })?,
+                &name,
+                &display,
+                label,
+            )?;
+            let _inserted = names.insert(name.clone());
+            opened.push((name, directory));
+        }
+
+        for (name, directory) in opened {
+            revalidate_named_directory(
+                entries.fd().map_err(|error| {
+                    anyhow!(
+                        "failed to retain {label} directory authority '{}': {error}",
+                        self.path.display()
+                    )
+                })?,
+                &name,
+                &directory,
+                &self.path.join(&name),
+                label,
+            )?;
+        }
+        self.revalidate_open_directory(entries.fd().map_err(|error| {
+            anyhow!(
+                "failed to retain {label} directory authority '{}': {error}",
+                self.path.display()
+            )
+        })?)?;
+        Ok(names)
+    }
+
     fn open_required(&self) -> Result<File> {
         self.open_existing()?.ok_or_else(|| {
             anyhow!(
@@ -303,6 +562,245 @@ impl RootedDirectory {
         }
         Ok(Some(directory))
     }
+
+    fn revalidate_open_directory(&self, opened: impl AsFd) -> Result<()> {
+        let Some(current) = self.open_existing()? else {
+            return Err(anyhow!(
+                "durable directory '{}' changed during metadata accounting",
+                self.path.display()
+            ));
+        };
+        ensure_same_directory(opened, &current, &self.path)
+    }
+}
+
+#[derive(Debug)]
+enum AccountedEntry {
+    RegularFile(u64),
+    Directory(File),
+}
+
+struct MetadataFrame {
+    name: Option<OsString>,
+    display: PathBuf,
+    depth: usize,
+    entries: Dir,
+}
+
+impl MetadataFrame {
+    fn root(directory: File, display: PathBuf, label: &str) -> Result<Self> {
+        let entries = Dir::new(directory).with_context(|| {
+            format!(
+                "failed to enumerate {label} directory '{}'",
+                display.display()
+            )
+        })?;
+        Ok(Self {
+            name: None,
+            display,
+            depth: 0,
+            entries,
+        })
+    }
+
+    fn child(
+        name: OsString,
+        directory: File,
+        display: PathBuf,
+        depth: usize,
+        label: &str,
+    ) -> Result<Self> {
+        let entries = Dir::new(directory).with_context(|| {
+            format!(
+                "failed to enumerate {label} directory '{}'",
+                display.display()
+            )
+        })?;
+        Ok(Self {
+            name: Some(name),
+            display,
+            depth,
+            entries,
+        })
+    }
+
+    fn directory_fd(&self, label: &str) -> Result<BorrowedFd<'_>> {
+        self.entries.fd().map_err(|error| {
+            anyhow!(
+                "failed to retain {label} directory authority '{}': {error}",
+                self.display.display()
+            )
+        })
+    }
+}
+
+fn revalidate_completed_frame(
+    frames: &[MetadataFrame],
+    root: &RootedDirectory,
+    label: &str,
+) -> Result<()> {
+    let Some((completed, parents)) = frames.split_last() else {
+        return Err(anyhow!(
+            "{label} metadata traversal lost its open directory authority"
+        ));
+    };
+    let completed_fd = completed.directory_fd(label)?;
+    let Some(parent) = parents.last() else {
+        return root.revalidate_open_directory(completed_fd);
+    };
+    let Some(name) = completed.name.as_deref() else {
+        return Err(anyhow!(
+            "{label} metadata traversal lost its child directory identity"
+        ));
+    };
+    revalidate_named_directory(
+        parent.directory_fd(label)?,
+        name,
+        completed_fd,
+        &completed.display,
+        label,
+    )
+}
+
+fn inspect_metadata_entry(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    display: &Path,
+    label: &str,
+) -> Result<AccountedEntry> {
+    let authority = open_metadata_entry(parent, name, display, label)?;
+    let metadata = fstat(&authority)
+        .with_context(|| format!("failed to inspect {label} entry '{}'", display.display()))?;
+    let file_type = FileType::from_raw_mode(metadata.st_mode);
+    if file_type.is_dir() {
+        return readable_directory_from_authority(&authority, display, label)
+            .map(AccountedEntry::Directory);
+    }
+    if file_type.is_file() {
+        let bytes = u64::try_from(metadata.st_size)
+            .map_err(|_| anyhow!("{label} entry '{}' has an invalid size", display.display()))?;
+        return Ok(AccountedEntry::RegularFile(bytes));
+    }
+    Err(unsafe_metadata_entry(label, display))
+}
+
+fn open_metadata_entry(
+    parent: impl AsFd,
+    name: &OsStr,
+    display: &Path,
+    label: &str,
+) -> Result<OwnedFd> {
+    openat(
+        parent,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        Errno::NOENT => anyhow!(
+            "{label} entry '{}' changed during metadata accounting",
+            display.display()
+        ),
+        _ => anyhow!(
+            "failed to open {label} metadata entry '{}': {error}",
+            display.display()
+        ),
+    })
+}
+
+fn open_directory_entry(
+    parent: impl AsFd,
+    name: &OsStr,
+    display: &Path,
+    label: &str,
+) -> Result<File> {
+    let authority = open_metadata_entry(parent, name, display, label)?;
+    let metadata = fstat(&authority).with_context(|| {
+        format!(
+            "failed to inspect {label} directory '{}'",
+            display.display()
+        )
+    })?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_dir() {
+        return Err(anyhow!(
+            "{label} entry '{}' must be a real directory",
+            display.display()
+        ));
+    }
+    readable_directory_from_authority(&authority, display, label)
+}
+
+fn readable_directory_from_authority(
+    authority: impl AsFd,
+    display: &Path,
+    label: &str,
+) -> Result<File> {
+    let directory = openat(authority.as_fd(), ".", directory_flags(), Mode::empty())
+        .map(File::from)
+        .map_err(|error| {
+            anyhow!(
+                "failed to open {label} directory '{}': {error}",
+                display.display()
+            )
+        })?;
+    ensure_same_directory(authority, &directory, display)?;
+    Ok(directory)
+}
+
+fn revalidate_named_directory(
+    parent: impl AsFd,
+    name: &OsStr,
+    opened: impl AsFd,
+    display: &Path,
+    label: &str,
+) -> Result<()> {
+    let current = open_directory_entry(parent, name, display, label)?;
+    ensure_same_directory(opened, &current, display)
+}
+
+fn ensure_same_directory(opened: impl AsFd, current: impl AsFd, display: &Path) -> Result<()> {
+    let opened = fstat(opened).with_context(|| {
+        format!(
+            "failed to inspect open directory authority '{}'",
+            display.display()
+        )
+    })?;
+    let current = fstat(current).with_context(|| {
+        format!(
+            "failed to inspect current directory authority '{}'",
+            display.display()
+        )
+    })?;
+    if !FileType::from_raw_mode(opened.st_mode).is_dir()
+        || !FileType::from_raw_mode(current.st_mode).is_dir()
+        || opened.st_dev != current.st_dev
+        || opened.st_ino != current.st_ino
+    {
+        return Err(anyhow!(
+            "durable directory '{}' changed during metadata accounting",
+            display.display()
+        ));
+    }
+    Ok(())
+}
+
+fn unsafe_metadata_entry(label: &str, display: &Path) -> anyhow::Error {
+    anyhow!(
+        "{label} entry '{}' must be a regular file or directory",
+        display.display()
+    )
+}
+
+fn metadata_limit_error(limit: MetadataTreeLimit, observed: u64, maximum: usize) -> anyhow::Error {
+    anyhow!(MetadataTreeLimitExceeded {
+        limit,
+        observed,
+        maximum: usize_as_u64(maximum),
+    })
+}
+
+fn usize_as_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn read_open_file_bounded(
@@ -841,5 +1339,189 @@ mod tests {
             .to_string()
             .contains("cannot be a symlink"));
         assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn metadata_accounting_enforces_each_exact_tree_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = rooted(&root);
+        std::fs::create_dir_all(directory.path().join("one")).unwrap();
+        std::fs::write(directory.path().join("root-file"), b"123").unwrap();
+        std::fs::write(directory.path().join("one/child-file"), b"45").unwrap();
+
+        let exact = MetadataTreeLimits {
+            max_bytes: 5,
+            max_entries: 3,
+            max_depth: 2,
+        };
+        assert_eq!(
+            directory
+                .account_metadata(exact, "runtime profile")
+                .unwrap(),
+            MetadataTreeUsage {
+                bytes: 5,
+                entries: 3,
+                max_depth: 2,
+            }
+        );
+
+        for (limits, dimension, maximum) in [
+            (
+                MetadataTreeLimits {
+                    max_bytes: 4,
+                    max_entries: 10,
+                    max_depth: 10,
+                },
+                MetadataTreeLimit::Bytes,
+                4,
+            ),
+            (
+                MetadataTreeLimits {
+                    max_bytes: 10,
+                    max_entries: 2,
+                    max_depth: 10,
+                },
+                MetadataTreeLimit::Entries,
+                2,
+            ),
+            (
+                MetadataTreeLimits {
+                    max_bytes: 10,
+                    max_entries: 10,
+                    max_depth: 1,
+                },
+                MetadataTreeLimit::Depth,
+                1,
+            ),
+        ] {
+            let error = directory
+                .account_metadata(limits, "runtime profile")
+                .unwrap_err();
+            let error = error.downcast_ref::<MetadataTreeLimitExceeded>().unwrap();
+            assert_eq!(error.limit, dimension);
+            assert_eq!(error.observed, maximum + 1);
+            assert_eq!(error.maximum, maximum);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_accounting_rejects_links_and_nonregular_entries() {
+        use std::os::unix::fs::symlink;
+
+        for entry in ["symlink", "fifo"] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = rooted(&root);
+            std::fs::create_dir_all(directory.path()).unwrap();
+            match entry {
+                "symlink" => symlink(root.path(), directory.path().join(entry)).unwrap(),
+                "fifo" => rustix::fs::mkfifoat(
+                    rustix::fs::CWD,
+                    directory.path().join(entry),
+                    Mode::RUSR | Mode::WUSR,
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+
+            let error = directory
+                .account_metadata(
+                    MetadataTreeLimits {
+                        max_bytes: 100,
+                        max_entries: 100,
+                        max_depth: 100,
+                    },
+                    "runtime profile",
+                )
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("must be a regular file or directory"),
+                "{entry}: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_descriptor_keeps_the_opened_type_across_a_path_swap() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = rooted(&root);
+        std::fs::create_dir_all(directory.path()).unwrap();
+        let entry = directory.path().join("entry");
+        std::fs::write(&entry, b"12345").unwrap();
+        let parent = directory.open_existing().unwrap().unwrap();
+        let authority =
+            open_metadata_entry(&parent, OsStr::new("entry"), &entry, "runtime profile").unwrap();
+
+        std::fs::rename(&entry, directory.path().join("old-entry")).unwrap();
+        rustix::fs::mkfifoat(rustix::fs::CWD, &entry, Mode::RUSR | Mode::WUSR).unwrap();
+
+        let metadata = fstat(&authority).unwrap();
+        assert!(FileType::from_raw_mode(metadata.st_mode).is_file());
+        assert_eq!(metadata.st_size, 5);
+        assert!(inspect_metadata_entry(
+            parent.as_fd(),
+            OsStr::new("entry"),
+            &entry,
+            "runtime profile"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("must be a regular file or directory"));
+    }
+
+    #[test]
+    fn root_identity_check_rejects_replacement_as_defense_in_depth() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = rooted(&root);
+        std::fs::create_dir_all(directory.path()).unwrap();
+        let opened = directory.open_existing().unwrap().unwrap();
+        let old = directory.path().with_extension("old");
+        std::fs::rename(directory.path(), &old).unwrap();
+        std::fs::create_dir(directory.path()).unwrap();
+
+        let error = directory.revalidate_open_directory(&opened).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed during metadata accounting"));
+    }
+
+    #[test]
+    fn immediate_directory_names_are_bounded_and_authoritative() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = rooted(&root);
+        assert_eq!(
+            directory
+                .immediate_directory_names(2, "runtime profiles")
+                .unwrap(),
+            BTreeSet::new()
+        );
+        std::fs::create_dir_all(directory.path().join("a")).unwrap();
+        std::fs::create_dir(directory.path().join("b")).unwrap();
+
+        assert_eq!(
+            directory
+                .immediate_directory_names(2, "runtime profiles")
+                .unwrap(),
+            [OsString::from("a"), OsString::from("b")]
+                .into_iter()
+                .collect()
+        );
+        let error = directory
+            .immediate_directory_names(1, "runtime profiles")
+            .unwrap_err();
+        let limit = error
+            .downcast_ref::<ImmediateDirectoryLimitExceeded>()
+            .unwrap();
+        assert_eq!((limit.observed_at_least, limit.maximum), (2, 1));
+
+        std::fs::write(directory.path().join("not-a-directory"), b"x").unwrap();
+        assert!(directory
+            .immediate_directory_names(3, "runtime profiles")
+            .unwrap_err()
+            .to_string()
+            .contains("must be a real directory"));
     }
 }

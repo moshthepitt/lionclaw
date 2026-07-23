@@ -737,6 +737,111 @@ impl RuntimeDriverProvider for NativeProvider {
     }
 }
 
+struct RetentionLimitTransport {
+    launches: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl RuntimeAdapter for RetentionLimitTransport {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "retention-limit".into(),
+            version: "1".into(),
+            healthy: true,
+        }
+    }
+
+    fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> anyhow::Result<RuntimeSessionHandle> {
+        *self.launches.lock().unwrap() += 1;
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: input.session_id.to_string(),
+        })
+    }
+
+    fn native_session_observation(
+        &self,
+        _handle: &RuntimeSessionHandle,
+    ) -> anyhow::Result<Option<RuntimeNativeSessionObservation>> {
+        Ok(Some(RuntimeNativeSessionObservation::Reconstructed {
+            state: RuntimeNativeStateAvailability::Reopenable,
+        }))
+    }
+
+    async fn turn(
+        &self,
+        execution: TurnExecution,
+        journal: lionclaw_runtime_api::RuntimeTurnJournalSender,
+    ) -> anyhow::Result<TurnResult> {
+        let runtime_state = execution
+            .context
+            .runtime_state
+            .as_ref()
+            .expect("production retained runtime state");
+        let conversation = runtime_state
+            .control_path()
+            .parent()
+            .expect("conversation resource root");
+        let oversized = std::fs::File::create(conversation.join("runtime/oversized-native-state"))?;
+        oversized.set_len(512 * 1024 * 1024 + 1)?;
+        let configuration = lionclaw_runtime_api::AppliedRuntimeConfiguration {
+            requested_model: Some("retention-requested".into()),
+            applied_model: Some("retention-applied".into()),
+            model_confirmation: Some(lionclaw::model::RuntimeConfigurationConfirmation::Observed),
+            ..Default::default()
+        };
+        journal
+            .send(lionclaw_runtime_api::TurnEvent::canonical(
+                lionclaw_runtime_api::RuntimeEvent::Configuration {
+                    configuration: configuration.clone(),
+                },
+            ))
+            .await?;
+        journal
+            .send(lionclaw_runtime_api::TurnEvent::canonical(
+                lionclaw_runtime_api::RuntimeEvent::MessageDelta {
+                    lane: lionclaw_runtime_api::RuntimeMessageLane::Answer,
+                    text: "retained-state response".into(),
+                },
+            ))
+            .await?;
+        Ok(TurnResult {
+            final_response: "retained-state response".into(),
+            configuration,
+        })
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> anyhow::Result<RuntimeCancellation> {
+        Ok(RuntimeCancellation::Acknowledged)
+    }
+
+    fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct RetentionLimitProvider {
+    launches: Arc<Mutex<usize>>,
+}
+
+impl RuntimeDriverProvider for RetentionLimitProvider {
+    fn driver(&self) -> &'static str {
+        "codex"
+    }
+
+    fn create_adapter(&self, _config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
+        Arc::new(RetentionLimitTransport {
+            launches: self.launches.clone(),
+        })
+    }
+}
+
 struct ExternalOracleTransport {
     calls: Arc<Mutex<Vec<(String, String)>>>,
 }
@@ -934,6 +1039,223 @@ async fn initialize_repo(repo: &Path) -> String {
     git(repo, &["add", "base.txt"]).unwrap();
     git(repo, &["commit", "-q", "-m", "base"]).unwrap();
     workspace::head_sha(repo).await.unwrap()
+}
+
+#[tokio::test]
+async fn production_retained_state_limit_preserves_turn_and_refuses_handoff() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    initialize_repo(&repo).await;
+    let fake_oci = temp.path().join("external-oci-transport");
+    std::fs::write(
+        &fake_oci,
+        "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profiles = RuntimeProfiles::from_toml(
+        &format!(
+            r#"[runtimes.codex]
+driver = "codex"
+command = "external-codex"
+model = "retention-requested"
+native-resume = true
+confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
+"#,
+            fake_oci.display()
+        ),
+        temp.path(),
+    )
+    .unwrap();
+    let mission_type = temp.path().join("mission-type");
+    materialize_mission_type(&mission_type);
+    let launches = Arc::new(Mutex::new(0));
+    let transports = cli::MissionTransports::external(
+        profiles,
+        RuntimeDriverRegistry::new([Arc::new(RetentionLimitProvider {
+            launches: launches.clone(),
+        }) as Arc<dyn RuntimeDriverProvider>]),
+        RuntimeAuthRegistry::empty(),
+        Arc::new(ExternalOracleTransport {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "start",
+            "--type",
+            mission_type.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--objective",
+            "prove retained runtime state settlement",
+            "--runtime",
+            "codex",
+        ])
+        .unwrap(),
+        transports.clone(),
+    )
+    .await
+    .unwrap();
+    let store = MissionStore::open(&repo).await.unwrap();
+    let mission_id = store.list_missions().await.unwrap().pop().unwrap();
+    let proposal_path = temp.path().join("retention-plan.json");
+    std::fs::write(
+        &proposal_path,
+        serde_json::to_vec(&PlanProposal {
+            base_revision: 0,
+            requirement_changes: Vec::new(),
+            assertion_supersessions: Vec::new(),
+            plan: plan(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for command in [
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "plan",
+            "propose",
+            mission_id.as_str(),
+            "--file",
+            proposal_path.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            mission_id.as_str(),
+            "plan_proposal:mission",
+            "approve",
+            "--justification",
+            "approve retained-state production proof",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    ] {
+        cli::run_with_transports(command, transports.clone())
+            .await
+            .unwrap();
+    }
+    cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "driver",
+            mission_id.as_str(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--handshake",
+            temp.path().join("retention-driver.ready").to_str().unwrap(),
+        ])
+        .unwrap(),
+        transports,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(*launches.lock().unwrap(), 1);
+    let parked = store.require_state(&mission_id).await.unwrap();
+    assert!(parked.inflight.is_empty());
+    let receipt = parked
+        .role_attempt_receipts
+        .values()
+        .find(|receipt| {
+            receipt.failure().is_some_and(|failure| {
+                failure.evidence().code.as_deref() == Some("runtime.native_state_limit")
+            })
+        })
+        .expect("production retained-state failure receipt");
+    let effect_id = receipt.effect_id.clone();
+    assert!(parked.parked_effects.contains_key(&effect_id));
+    assert!(receipt.handoff.is_none());
+    assert_eq!(
+        receipt
+            .effective_runtime_configuration()
+            .and_then(|configuration| configuration.applied_model.as_deref()),
+        Some("retention-applied")
+    );
+    assert!(matches!(
+        &receipt.turn,
+        Some(lionclaw::model::RoleTurnObservation::Completed {
+            final_response,
+            ..
+        }) if store.blobs().resolve(final_response).unwrap() == "retained-state response"
+    ));
+    let events = store.load(&mission_id).await.unwrap();
+    assert!(events.iter().all(|event| !matches!(
+        &event.event,
+        MissionEvent::RoleHandoffObserved {
+            effect_id: observed, ..
+        } if observed == &effect_id
+    )));
+    assert_eq!(fold(events).unwrap(), parked);
+
+    let status_json: serde_json::Value = serde_json::from_str(&stdout(cli_output(
+        &repo,
+        &["mission", "status", mission_id.as_str(), "--json"],
+    )))
+    .unwrap();
+    let projected = status_json["role_attempt_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|receipt| receipt["effect_id"] == effect_id.as_str())
+        .unwrap();
+    assert_eq!(
+        projected["disposition"]["failure"]["evidence"]["code"],
+        "runtime.native_state_limit"
+    );
+    assert_eq!(
+        projected["turn"]["final_response"]["content"],
+        "retained-state response"
+    );
+    assert_ne!(projected["handoff"]["outcome"], "accepted");
+    let human = stdout(cli_output(
+        &repo,
+        &["mission", "status", mission_id.as_str()],
+    ));
+    assert!(human.contains("runtime.native_state_limit"));
+    assert!(human.contains("retained-state response"));
+
+    let snapshot_head = store.snapshot_meta(&mission_id).await.unwrap().unwrap().0;
+    cli::run(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "abort",
+            mission_id.as_str(),
+            "--reason",
+            "complete snapshot-tail retention proof",
+            "--repo",
+            repo.to_str().unwrap(),
+        ])
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let events = store.load(&mission_id).await.unwrap();
+    let replayed = fold(events).unwrap();
+    assert!(snapshot_head < replayed.head);
+    assert_eq!(
+        store
+            .load_state_snapshotted(&mission_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        replayed
+    );
+    assert_eq!(
+        store.rebuild_cursors(&mission_id, 9_000_000).await.unwrap(),
+        replayed
+    );
 }
 
 #[tokio::test]

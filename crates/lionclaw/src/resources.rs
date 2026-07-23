@@ -10,7 +10,9 @@ use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 
-use lionclaw_durable_fs::RootedDirectory;
+use lionclaw_durable_fs::{
+    MetadataTreeLimit, MetadataTreeLimitExceeded, MetadataTreeLimits, RootedDirectory,
+};
 use rustix::fs::{chmodat, fchmod, mkdirat, open, openat, unlinkat, AtFlags, Dir, Mode, OFlags};
 use rustix::io::Errno;
 
@@ -137,6 +139,29 @@ pub(crate) struct RoleStateDirs {
     session_control: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeRetentionUsage {
+    pub(crate) bytes: u64,
+    pub(crate) entries: usize,
+    pub(crate) max_depth: usize,
+    pub(crate) profiles: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeRetentionPolicy {
+    tree: MetadataTreeLimits,
+    max_profiles: usize,
+}
+
+const RUNTIME_RETENTION_POLICY: RuntimeRetentionPolicy = RuntimeRetentionPolicy {
+    tree: MetadataTreeLimits {
+        max_bytes: 512 * 1024 * 1024,
+        max_entries: 100_000,
+        max_depth: 128,
+    },
+    max_profiles: 8,
+};
+
 impl RoleStateDirs {
     fn new(state_dir: PathBuf, root: &Path) -> Self {
         Self {
@@ -174,6 +199,154 @@ impl RoleStateDirs {
     pub(crate) fn runtime_profile(&self, profile_key: &str) -> anyhow::Result<RuntimeProfileDirs> {
         RuntimeProfileDirs::new(self.clone(), profile_key)
     }
+
+    /// Admit one retained native-state profile under the fixed product policy.
+    ///
+    /// This is a metadata-only check. It neither reads runtime-owned contents
+    /// nor deletes retained state.
+    pub(crate) fn admit_runtime_profile(
+        &self,
+        profile_key: &str,
+    ) -> anyhow::Result<RuntimeRetentionUsage> {
+        self.assess_runtime_retention_with_profile(Some(profile_key))
+    }
+
+    pub(crate) async fn admit_runtime_profile_async(
+        &self,
+        profile_key: String,
+    ) -> anyhow::Result<RuntimeRetentionUsage> {
+        account_runtime_retention(self.clone(), Some(profile_key)).await
+    }
+
+    /// Account all retained writable runtime state under the fixed product
+    /// policy. `/runtime` and host-owned session control are one combined
+    /// budget; profile count is the exact immediate directory namespace.
+    pub(crate) fn assess_runtime_retention(&self) -> anyhow::Result<RuntimeRetentionUsage> {
+        self.assess_runtime_retention_with_profile(None)
+    }
+
+    pub(crate) async fn assess_runtime_retention_async(
+        &self,
+    ) -> anyhow::Result<RuntimeRetentionUsage> {
+        account_runtime_retention(self.clone(), None).await
+    }
+
+    fn assess_runtime_retention_with_profile(
+        &self,
+        prospective_profile: Option<&str>,
+    ) -> anyhow::Result<RuntimeRetentionUsage> {
+        let policy = RUNTIME_RETENTION_POLICY;
+        let runtime = RootedDirectory::new(self.state_dir.clone(), self.runtime.clone())?
+            .account_metadata(policy.tree, "retained role runtime state")?;
+        let session_control =
+            RootedDirectory::new(self.state_dir.clone(), self.session_control.clone())?
+                .account_metadata(policy.tree, "retained runtime session control")?;
+        let profiles_root = RootedDirectory::new(
+            self.state_dir.clone(),
+            self.session_control.join("profiles"),
+        )?;
+        let profiles = profiles_root
+            .immediate_directory_names(policy.max_profiles, "retained runtime profiles")?;
+        let profile_count = profiles.len()
+            + usize::from(
+                prospective_profile.is_some_and(|profile| !profiles.contains(OsStr::new(profile))),
+            );
+        if profile_count > policy.max_profiles {
+            return Err(anyhow::anyhow!(
+                "retained runtime profile limit exceeded: observed {}, maximum {}",
+                profile_count,
+                policy.max_profiles
+            ));
+        }
+
+        let usage = RuntimeRetentionUsage {
+            bytes: runtime
+                .bytes
+                .checked_add(session_control.bytes)
+                .ok_or_else(|| {
+                    runtime_retention_limit_error(
+                        MetadataTreeLimit::Bytes,
+                        u64::MAX,
+                        policy.tree.max_bytes,
+                    )
+                })?,
+            entries: runtime
+                .entries
+                .checked_add(session_control.entries)
+                .ok_or_else(|| {
+                    runtime_retention_limit_error(
+                        MetadataTreeLimit::Entries,
+                        u64::MAX,
+                        policy.tree.max_entries as u64,
+                    )
+                })?,
+            max_depth: runtime.max_depth.max(session_control.max_depth),
+            profiles: profile_count,
+        };
+        enforce_runtime_retention_usage(usage, policy)?;
+        Ok(usage)
+    }
+}
+
+async fn account_runtime_retention(
+    role_state: RoleStateDirs,
+    prospective_profile: Option<String>,
+) -> anyhow::Result<RuntimeRetentionUsage> {
+    tokio::task::spawn_blocking(move || match prospective_profile {
+        Some(profile) => role_state.admit_runtime_profile(&profile),
+        None => role_state.assess_runtime_retention(),
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("retained runtime accounting task failed: {error}"))?
+}
+
+fn enforce_runtime_retention_usage(
+    usage: RuntimeRetentionUsage,
+    policy: RuntimeRetentionPolicy,
+) -> anyhow::Result<()> {
+    if usage.bytes > policy.tree.max_bytes {
+        return Err(runtime_retention_limit_error(
+            MetadataTreeLimit::Bytes,
+            usage.bytes,
+            policy.tree.max_bytes,
+        ));
+    }
+    if usage.entries > policy.tree.max_entries {
+        return Err(runtime_retention_limit_error(
+            MetadataTreeLimit::Entries,
+            usage.entries as u64,
+            policy.tree.max_entries as u64,
+        ));
+    }
+    if usage.max_depth > policy.tree.max_depth {
+        return Err(runtime_retention_limit_error(
+            MetadataTreeLimit::Depth,
+            usage.max_depth as u64,
+            policy.tree.max_depth as u64,
+        ));
+    }
+    Ok(())
+}
+
+fn runtime_retention_limit_error(
+    limit: MetadataTreeLimit,
+    observed: u64,
+    maximum: u64,
+) -> anyhow::Error {
+    anyhow::anyhow!(MetadataTreeLimitExceeded {
+        limit,
+        observed,
+        maximum,
+    })
+}
+
+pub(crate) fn runtime_retention_failure(
+    error: anyhow::Error,
+) -> lionclaw_runtime_api::TypedFailure {
+    lionclaw_runtime_api::TypedFailure::permanent(
+        "runtime.native_state_limit",
+        format!("retained runtime state violates the fixed product limit: {error:#}"),
+    )
 }
 
 /// Retained runtime-owned state for one exact role-state and compatible runtime
@@ -806,6 +979,104 @@ mod tests {
         ] {
             assert!(role_state.runtime_profile(key).is_err(), "accepted {key}");
         }
+    }
+
+    #[test]
+    fn runtime_retention_combines_roots_at_the_exact_byte_boundary() {
+        let state = tempfile::tempdir().unwrap();
+        let mission = MissionId::for_creation("/workspace", "runtime-retention-bytes", 1);
+        let conversation = ConversationId::parse("f".repeat(64)).unwrap();
+        let role_state = MissionDirs::new(state.path(), &mission)
+            .conversation(&conversation)
+            .role_state()
+            .clone();
+        role_state.prepare().unwrap();
+        let runtime = std::fs::File::create(role_state.runtime().join("runtime-state")).unwrap();
+        runtime.set_len(256 * 1024 * 1024).unwrap();
+        let control =
+            std::fs::File::create(role_state.session_control_root().join("control-state")).unwrap();
+        control.set_len(256 * 1024 * 1024).unwrap();
+
+        let exact = role_state.assess_runtime_retention().unwrap();
+        assert_eq!(exact.bytes, RUNTIME_RETENTION_POLICY.tree.max_bytes);
+        assert_eq!(exact.entries, 2);
+        assert_eq!(exact.profiles, 0);
+
+        control.set_len(256 * 1024 * 1024 + 1).unwrap();
+        let error = role_state
+            .assess_runtime_retention()
+            .expect_err("combined retained roots must not exceed the fixed byte limit");
+        let exceeded = error.downcast_ref::<MetadataTreeLimitExceeded>().unwrap();
+        assert_eq!(exceeded.limit, MetadataTreeLimit::Bytes);
+        assert_eq!(
+            exceeded.observed,
+            RUNTIME_RETENTION_POLICY.tree.max_bytes + 1
+        );
+    }
+
+    #[test]
+    fn runtime_retention_admits_at_most_eight_profile_directories() {
+        let state = tempfile::tempdir().unwrap();
+        let mission = MissionId::for_creation("/workspace", "runtime-retention-profiles", 1);
+        let conversation = ConversationId::parse("f".repeat(64)).unwrap();
+        let role_state = MissionDirs::new(state.path(), &mission)
+            .conversation(&conversation)
+            .role_state()
+            .clone();
+        role_state.prepare().unwrap();
+        for index in 0..RUNTIME_RETENTION_POLICY.max_profiles {
+            let key = format!("{index:064x}");
+            role_state.runtime_profile(&key).unwrap().prepare().unwrap();
+        }
+        let existing = format!("{:064x}", RUNTIME_RETENTION_POLICY.max_profiles - 1);
+        assert_eq!(
+            role_state
+                .admit_runtime_profile(&existing)
+                .unwrap()
+                .profiles,
+            RUNTIME_RETENTION_POLICY.max_profiles
+        );
+
+        let ninth = format!("{:064x}", RUNTIME_RETENTION_POLICY.max_profiles);
+        let error = role_state
+            .admit_runtime_profile(&ninth)
+            .expect_err("a ninth retained profile must be refused before creation");
+        assert!(error.to_string().contains("profile limit exceeded"));
+        assert!(!role_state
+            .session_control_root()
+            .join("profiles")
+            .join(ninth)
+            .exists());
+    }
+
+    #[test]
+    fn runtime_retention_rejects_unsafe_metadata_without_following_it() {
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("credential"), "preserve").unwrap();
+        let mission = MissionId::for_creation("/workspace", "runtime-retention-unsafe", 1);
+        let conversation = ConversationId::parse("f".repeat(64)).unwrap();
+        let role_state = MissionDirs::new(state.path(), &mission)
+            .conversation(&conversation)
+            .role_state()
+            .clone();
+        role_state.prepare().unwrap();
+        symlink(outside.path(), role_state.runtime().join("escape")).unwrap();
+
+        let error = role_state
+            .assess_runtime_retention()
+            .expect_err("retained runtime accounting must reject symlinks");
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("symlink")
+                || detail.contains("unsupported")
+                || detail.contains("must be a regular file or directory"),
+            "{detail}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("credential")).unwrap(),
+            "preserve"
+        );
     }
 
     #[test]
