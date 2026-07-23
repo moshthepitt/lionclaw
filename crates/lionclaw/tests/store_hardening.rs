@@ -10,8 +10,8 @@ use common::{
 use lionclaw::model::{
     apply, fold, ControlAction, ConversationId, ConversationLifecycle, ConversationRecipient,
     Handoff, MissionEvent, MissionState, OutputSemantics, ParkedEffect, PayloadRef, RoleName,
-    RoleRunRequestIdentity, RoleRunSuccess, RuntimeConfigurationEvidence, TaskId, TaskNamespace,
-    TaskStatus, TypedFailure, REDUCER_VERSION,
+    RoleRunRequestIdentity, RoleRunSuccess, RoleTurnObservation, RuntimeConfigurationEvidence,
+    TaskId, TaskNamespace, TaskStatus, TypedFailure, REDUCER_VERSION,
 };
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -31,7 +31,9 @@ fn role_request(state: &MissionState) -> NewEvent {
             previous: state.tasks.get(&task_id),
             required_base: BASE_SHA,
             lifecycle_generation: state.role_lifecycle_generation(TaskNamespace::Execution),
-            max_attempts: state.config.recovery.max_attempts,
+            retrying_failure: state
+                .task_automatic_retry_remaining(TaskNamespace::Execution, &task_id),
+            output: OutputSemantics::ProducesArtifact,
         },
     );
     let attempt_no = state
@@ -95,7 +97,9 @@ fn execution_role_request(
             previous: state.tasks.get(&task_id),
             required_base: &state.current_sha,
             lifecycle_generation: state.role_lifecycle_generation(TaskNamespace::Execution),
-            max_attempts: state.config.recovery.max_attempts,
+            retrying_failure: state
+                .task_automatic_retry_remaining(TaskNamespace::Execution, &task_id),
+            output,
         },
     );
     let attempt_no = state
@@ -1107,7 +1111,7 @@ async fn workspace_recreation_authority_is_store_replay_and_snapshot_tail_safe()
         .store()
         .rebuild_cursors(&mission_id, 60)
         .await
-        .expect("snapshot reducer 33");
+        .expect("snapshot at the current reducer");
     set_snapshot_reducer(dir.path(), &mission_id, REDUCER_VERSION - 1).await;
     fault_append_events(
         dir.path(),
@@ -1337,6 +1341,19 @@ async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
             runtime_configuration: RuntimeConfigurationEvidence::default(),
         }),
     });
+    let writer_turn_observed = NewEvent::new(MissionEvent::RoleTurnObserved {
+        effect_id: writer_effect.clone(),
+        observation: RoleTurnObservation::Completed {
+            final_response: PayloadRef::inline("writer complete"),
+            runtime_configuration: RuntimeConfigurationEvidence::default(),
+        },
+    });
+    let writer_report_observed = NewEvent::new(MissionEvent::RoleHandoffObserved {
+        effect_id: writer_effect.clone(),
+        observation: lionclaw::model::RoleHandoffObservation::Accepted {
+            report: PayloadRef::inline("writer complete"),
+        },
+    });
     let writer_prepared = NewEvent::new(MissionEvent::TaskWorkspacePrepared {
         task_id: writer_identity.task_id.clone(),
         effect_id: writer_effect.clone(),
@@ -1347,7 +1364,13 @@ async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
         dir.path(),
         &mission_id,
         initial.head,
-        &[writer_request, writer_prepared, writer_completion],
+        &[
+            writer_request,
+            writer_prepared,
+            writer_turn_observed,
+            writer_report_observed,
+            writer_completion,
+        ],
         40,
     )
     .await;
@@ -1403,16 +1426,25 @@ async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
         dir.path(),
         &mission_id,
         requested.head,
-        &[NewEvent::new(MissionEvent::RoleRunCompleted {
-            effect_id: verdict_effect.clone(),
-            request: Box::new(verdict_identity),
-            outcome: Ok(RoleRunSuccess {
-                handoff: None,
-                artifact: None,
-                final_response: final_response.clone(),
-                runtime_configuration: runtime_configuration.clone(),
+        &[
+            NewEvent::new(MissionEvent::RoleTurnObserved {
+                effect_id: verdict_effect.clone(),
+                observation: RoleTurnObservation::Completed {
+                    final_response: final_response.clone(),
+                    runtime_configuration: runtime_configuration.clone(),
+                },
             }),
-        })],
+            NewEvent::new(MissionEvent::RoleRunCompleted {
+                effect_id: verdict_effect.clone(),
+                request: Box::new(verdict_identity),
+                outcome: Ok(RoleRunSuccess {
+                    handoff: None,
+                    artifact: None,
+                    final_response: final_response.clone(),
+                    runtime_configuration: runtime_configuration.clone(),
+                }),
+            }),
+        ],
         42,
     )
     .await;
@@ -1453,13 +1485,16 @@ async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
 
     let review = &live.tasks[&TaskId::new("review").unwrap()];
     assert_eq!(review.status, TaskStatus::Failed);
+    let receipt = live
+        .task_last_role_attempt(TaskNamespace::Execution, &TaskId::new("review").unwrap())
+        .expect("failed verdict receipt");
     assert!(matches!(
-        review.last_failure,
+        receipt.failure(),
         Some(TypedFailure::InvalidOutput { .. })
     ));
     assert_eq!(
-        review.last_runtime_configuration,
-        Some(runtime_configuration)
+        receipt.runtime_configuration.as_ref(),
+        Some(&runtime_configuration)
     );
     let conversation = &live.conversations[&conversation_id];
     assert_eq!(

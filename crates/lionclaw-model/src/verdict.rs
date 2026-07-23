@@ -140,7 +140,7 @@ pub fn classify_finish(state: &MissionState) -> FinishClass {
     }
     let mut all_authoritative_pass = true;
     let mut all_green = true;
-    for assertion in state.contract.values() {
+    for (assertion_id, assertion) in &state.contract {
         let fresh = assertion
             .last_authoritative
             .as_ref()
@@ -154,7 +154,7 @@ pub fn classify_finish(state: &MissionState) -> FinishClass {
             }
             None => {
                 all_authoritative_pass = false;
-                if assertion.advisory != AdvisoryStatus::Passed {
+                if state.advisory_status(assertion_id) != AdvisoryStatus::Passed {
                     all_green = false;
                 }
             }

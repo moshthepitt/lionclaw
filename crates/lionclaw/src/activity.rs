@@ -289,17 +289,10 @@ pub async fn publish_observed(
                     .iter()
                     .find(|prior| prior.effect_id == effect_id.as_str())
             });
-            let configuration = match effect {
-                InflightEffect::RoleRun {
-                    runtime_configuration,
-                    ..
-                }
-                | InflightEffect::TerminalReview {
-                    runtime_configuration,
-                    ..
-                } => runtime_configuration.as_ref(),
-                InflightEffect::OracleRun { .. } => None,
-            };
+            let configuration = state
+                .role_attempt_receipts
+                .get(effect_id)
+                .and_then(crate::model::RoleAttemptReceipt::effective_runtime_configuration);
             let not_before_ms = effect.not_before_ms();
             let scheduled = now_ms < not_before_ms;
             EffectActivity {
@@ -1113,7 +1106,6 @@ mod tests {
                 message_boundary: active.head.saturating_sub(1),
                 presented_messages: vec![],
                 workspace_preparation: crate::model::WorkspacePreparation::Preserve,
-                runtime_configuration: None,
                 requested_at_ms: 0,
                 not_before_ms: 0,
                 deadline_ms: 1,

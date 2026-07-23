@@ -1028,6 +1028,7 @@ async fn cmd_plan_show(args: PlanShowArgs) -> Result<()> {
                 "requirements": plan.requirements,
                 "assertions": bindings,
                 "tasks": plan.tasks,
+                "planning_input": planning_input_json(&state, store.blobs())?,
             })
         );
     } else {
@@ -1047,6 +1048,7 @@ async fn cmd_plan_show(args: PlanShowArgs) -> Result<()> {
             println!("  {} -> {}\n    {}", a.id, oracle, a.prose);
         }
         println!("  ({} tasks)", plan.tasks.len());
+        print_planning_input(store.blobs(), &state, "")?;
     }
     Ok(())
 }
@@ -1112,6 +1114,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         /// says so in both formats, never "owed".
         waived: bool,
         verdict: Option<serde_json::Value>,
+        advisory_results: Vec<serde_json::Value>,
     }
     let mut rows = Vec::new();
     for (aid, a) in &state.contract {
@@ -1144,6 +1147,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 .as_ref()
                 .is_some_and(|o| state.waived_oracles.contains(o)),
             verdict,
+            advisory_results: assertion_advisory_json(state, aid, a, store.blobs(), true),
         });
     }
     let uncovered: Vec<&str> = state
@@ -1154,11 +1158,10 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         .collect();
 
     if args.json {
-        use crate::model::ReviewOutcome;
         // Gated together with the summary: a config-less mission has no
         // review, whatever a hostile log writer recorded — the three review
         // fields must never contradict each other.
-        let review = review_summary(state);
+        let review = review_summary(state, store.blobs());
         let (review_gaps, review_report, review_acceptance) = if review.is_null() {
             (
                 serde_json::Value::Null,
@@ -1169,12 +1172,31 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             // Gaps and the reviewer's report belong to the verdict; a stale
             // verdict describes a superseded tree, so only a FRESH one is
             // serialized (the summary's verdict/fresh fields say why).
-            let (gaps, report) = match &state.terminal_review.outcome {
-                Some(ReviewOutcome::Verdict(v)) if v.is_fresh_at(state.deliverable_head()) => (
-                    serde_json::to_value(&v.gaps)?,
-                    serde_json::Value::String(store.blobs().resolve(&v.report)?),
-                ),
-                _ => (serde_json::Value::Null, serde_json::Value::Null),
+            let (gaps, report) = if let Some((receipt, judged_sha, _, gaps)) =
+                terminal_review_verdict(state)
+            {
+                if judged_sha == state.deliverable_head() {
+                    (
+                        serde_json::to_value(gaps)?,
+                        crate::evidence::role_attempt_receipt_json(store.blobs(), state, receipt),
+                    )
+                } else {
+                    (serde_json::Value::Null, serde_json::Value::Null)
+                }
+            } else {
+                (
+                    serde_json::Value::Null,
+                    state.terminal_review.outcome.as_ref().map_or(
+                        serde_json::Value::Null,
+                        |outcome| {
+                            crate::evidence::role_attempt_reference_json(
+                                store.blobs(),
+                                state,
+                                outcome.effect_id(),
+                            )
+                        },
+                    ),
+                )
             };
             let accepted = state
                 .terminal_review
@@ -1207,33 +1229,46 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "next_actions": view.next_actions(),
                 "tasks": state.tasks.iter().map(|(id, task)| {
                     task_runtime_json(
+                        state,
+                        crate::model::TaskNamespace::Execution,
                         id,
                         task,
                         workspace_observations.get(id),
+                        store.blobs(),
                     )
                 }).collect::<Result<Vec<_>>>()?,
                 "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
-                    task_runtime_json(id, task, None)
+                    task_runtime_json(
+                        state,
+                        crate::model::TaskNamespace::Planning,
+                        id,
+                        task,
+                        None,
+                        store.blobs(),
+                    )
                 }).collect::<Result<Vec<_>>>()?,
                 "parked_effects": parked_effect_views(state),
                 "conversations": conversation_views(state, &store)?,
                 "unavailable_references": state.unavailable_references,
+                "role_attempt_receipts": role_attempt_receipts_json(state, store.blobs()),
                 "assertions": rows.iter().map(|row| serde_json::json!({
                     "id": row.id,
                     "oracle": row.oracle,
                     "waived": row.waived,
                     "verdict": row.verdict,
+                    "advisory_results": row.advisory_results,
                 })).collect::<Vec<_>>(),
                 "not_covered_by_an_oracle": uncovered,
+                "superseded_assertions": superseded_assertions_json(state, store.blobs()),
                 "waived_oracles": state.waived_oracles.iter().map(|o| o.as_str()).collect::<Vec<_>>(),
                 "acknowledged_gates": state.acknowledged_gates.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
                 "oracle_failures": state.oracle_failures,
                 "terminal_review": review,
                 "terminal_review_gaps": review_gaps,
-                "terminal_review_report": review_report,
+                "terminal_review_receipt": review_report,
                 "terminal_review_acceptance": review_acceptance,
                 "attention": state.open_attention.values().map(|item| {
-                    attention_json(store.blobs(), item)
+                    attention_json(store.blobs(), state, item)
                 }).collect::<Result<Vec<_>>>()?,
                 "cleanup_failure": cleanup_failure_json(state),
             })
@@ -1277,39 +1312,32 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         view.disposition.slug()
     );
     for (task_id, task) in &state.tasks {
-        if let Some(failure) = &task.last_failure {
-            print_typed_failure(failure, &format!("  task {task_id} failure: "));
-        }
-        if let Some(configuration) = &task.last_runtime_configuration {
-            println!(
-                "  task {task_id}: model {:?} -> {:?}, mode {:?} -> {:?}",
-                configuration.requested_model,
-                configuration.applied_model,
-                configuration.requested_mode,
-                configuration.applied_mode,
-            );
-        }
+        print_task_outcome(
+            store.blobs(),
+            state,
+            crate::model::TaskNamespace::Execution,
+            task_id,
+            task,
+            &format!("  task {task_id}"),
+        );
     }
     print_task_workspace_observations(state, "  ", &workspace_observations);
     print_workspace_control_state(state, "  ");
     print_parked_controls(state, "  ");
     for (task_id, task) in &state.planning.tasks {
-        if let Some(failure) = &task.last_failure {
-            print_typed_failure(failure, &format!("  planning task {task_id} failure: "));
-        }
-        if let Some(configuration) = &task.last_runtime_configuration {
-            println!(
-                "  planning task {task_id}: model {:?} -> {:?}, mode {:?} -> {:?}",
-                configuration.requested_model,
-                configuration.applied_model,
-                configuration.requested_mode,
-                configuration.applied_mode,
-            );
-        }
+        print_task_outcome(
+            store.blobs(),
+            state,
+            crate::model::TaskNamespace::Planning,
+            task_id,
+            task,
+            &format!("  planning task {task_id}"),
+        );
     }
     print_conversations(state, &store, "  ")?;
     print_unavailable_references(state, "  ");
-    print_non_task_failures(state);
+    print_non_task_failures(store.blobs(), state);
+    print_role_attempt_receipts(store.blobs(), state, "  ");
     if let Some(failure) = &state.cleanup_failure {
         println!(
             "  cleanup: blocked for effect {} ({:?}): {}",
@@ -1318,7 +1346,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             failure.failure.detail()
         );
     }
-    if let Some(line) = review_line(state) {
+    if let Some(line) = review_line(state, store.blobs()) {
         println!("  {line}");
         if let Some(a) = &state.terminal_review.accepted {
             println!(
@@ -1333,9 +1361,9 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 },
             );
         }
-        if let Some(crate::model::ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome {
-            if v.is_fresh_at(state.deliverable_head()) {
-                for gap in &v.gaps {
+        if let Some((receipt, judged_sha, _, gaps)) = terminal_review_verdict(state) {
+            if judged_sha == state.deliverable_head() {
+                for gap in gaps {
                     println!(
                         "    [{}] {}{}",
                         gap.severity.slug(),
@@ -1354,7 +1382,10 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 // The reviewer's own account — the requirement map and what
                 // it observed — is the receipt's primary review evidence.
                 println!("    reviewer's report:");
-                for line in store.blobs().resolve(&v.report)?.lines() {
+                for line in
+                    crate::evidence::render_role_attempt_receipt(store.blobs(), state, receipt)
+                        .lines()
+                {
                     println!("      {line}");
                 }
             } else {
@@ -1362,8 +1393,8 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 // them like fresh ones.
                 println!(
                     "    (a superseded verdict at {} recorded {} gap(s); see 'mission log')",
-                    short_hex(&v.judged_sha),
-                    v.gaps.len()
+                    short_hex(judged_sha),
+                    gaps.len()
                 );
             }
         }
@@ -1424,6 +1455,21 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             None if row.oracle.is_some() => println!("    {id}: (oracle owed, not yet run)"),
             None => println!("    {id}: advisory only — no oracle can prove this"),
         }
+        for advisory in &row.advisory_results {
+            println!(
+                "      validator {}: {}",
+                advisory["task_id"].as_str().unwrap_or("?"),
+                match advisory["passed"].as_bool() {
+                    Some(true) => "PASS",
+                    Some(false) => "FAIL",
+                    None => "UNAVAILABLE",
+                }
+            );
+            println!(
+                "        exact handoff effect: {}",
+                advisory["effect_id"].as_str().unwrap_or("?")
+            );
+        }
     }
     if !uncovered.is_empty() {
         println!(
@@ -1431,6 +1477,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             uncovered.join(", ")
         );
     }
+    print_superseded_assertions(state, store.blobs(), "  ");
     if !state.acknowledged_gates.is_empty() {
         println!(
             "\n  gates a human confirmed or accepted: {}",
@@ -1445,7 +1492,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     if !state.open_attention.is_empty() {
         println!("\n  attention:");
         for item in state.open_attention.values() {
-            print_attention(store.blobs(), item, "    ")?;
+            print_attention(store.blobs(), state, item, "    ")?;
         }
     }
     if !matches!(view.disposition, MissionDisposition::Terminal) {
@@ -1959,7 +2006,7 @@ async fn cmd_advance(
     // summary already applies the freshness law, so a stale verdict from a
     // superseded head never triggers a false note here.
     if matches!(state.phase, MissionPhase::Done { .. }) {
-        let summary = review_summary(state);
+        let summary = review_summary(state, engine.store().blobs());
         let blocking = summary["gaps"]["blocking"].as_u64().unwrap_or(0);
         let total = blocking
             + summary["gaps"]["major"].as_u64().unwrap_or(0)
@@ -2061,7 +2108,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 failure.failure.detail()
             );
         }
-        if let Some(line) = review_line(state) {
+        if let Some(line) = review_line(state, store.blobs()) {
             println!("{line}");
         }
         for (id, assertion) in &state.contract {
@@ -2074,14 +2121,34 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
         }
         for (id, task) in &state.planning.tasks {
             if task.status != crate::model::TaskStatus::Pending {
-                println!(
-                    "  planning {id}: status={:?} runtime={:?}",
-                    task.status, task.last_runtime_configuration
-                );
+                println!("  planning {id}: status={:?}", task.status);
             }
         }
         print_conversations(state, &store, "  ")?;
         print_unavailable_references(state, "  ");
+        for (task_id, task) in &state.tasks {
+            print_task_outcome(
+                store.blobs(),
+                state,
+                crate::model::TaskNamespace::Execution,
+                task_id,
+                task,
+                &format!("  task {task_id}"),
+            );
+        }
+        for (task_id, task) in &state.planning.tasks {
+            print_task_outcome(
+                store.blobs(),
+                state,
+                crate::model::TaskNamespace::Planning,
+                task_id,
+                task,
+                &format!("  planning task {task_id}"),
+            );
+        }
+        print_non_task_failures(store.blobs(), state);
+        print_role_attempt_receipts(store.blobs(), state, "  ");
+        print_superseded_assertions(state, store.blobs(), "  ");
         print_task_workspace_observations(state, "  ", &workspace_observations);
         print_workspace_control_state(state, "  ");
         if view.disposition == MissionDisposition::Running {
@@ -2101,7 +2168,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
         }
         print_planning_input(store.blobs(), state, "")?;
         for item in state.open_attention.values() {
-            print_attention(store.blobs(), item, "  ")?;
+            print_attention(store.blobs(), state, item, "  ")?;
         }
         println!("next: {}", view.next_actions().join(" | "));
     }
@@ -2570,16 +2637,10 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
                     state.open_attention.len()
                 );
                 for item in state.open_attention.values() {
-                    print_attention(blobs, item, "  ")?;
-                }
-                for (task_id, task) in &state.tasks {
-                    if let Some(failure) = &task.last_failure {
-                        print_typed_failure(failure, &format!("  task {task_id} failure: "));
-                    }
+                    print_attention(blobs, state, item, "  ")?;
                 }
                 print_conversations(state, store, "  ")?;
                 print_task_workspace_observations(state, "  ", &workspace_observations);
-                print_non_task_failures(state);
             }
             MissionDisposition::Running => {
                 println!("mission {mission_id}: running under another driver")
@@ -2608,30 +2669,41 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
             }
             MissionDisposition::Terminal => {
                 println!("mission {mission_id}: {}", phase_slug(&state.phase));
-                if let Some(line) = review_line(state) {
+                if let Some(line) = review_line(state, blobs) {
                     println!("  {line}");
                 }
             }
             MissionDisposition::Ready => println!("mission {mission_id}: ready to advance"),
         }
+        for (task_id, task) in &state.tasks {
+            print_task_outcome(
+                blobs,
+                state,
+                crate::model::TaskNamespace::Execution,
+                task_id,
+                task,
+                &format!("  task {task_id}"),
+            );
+        }
+        for (task_id, task) in &state.planning.tasks {
+            print_task_outcome(
+                blobs,
+                state,
+                crate::model::TaskNamespace::Planning,
+                task_id,
+                task,
+                &format!("  planning task {task_id}"),
+            );
+        }
+        print_non_task_failures(blobs, state);
+        print_role_attempt_receipts(blobs, state, "  ");
+        if matches!(view.disposition, MissionDisposition::Terminal) {
+            print_terminal_review_receipt(blobs, state, "  ");
+        }
         print_workspace_control_state(state, "  ");
         print_parked_controls(state, "  ");
         print_unavailable_references(state, "  ");
-        if !state.superseded_assertions.is_empty() {
-            println!("  superseded assertions:");
-            for superseded in &state.superseded_assertions {
-                let replacements = superseded
-                    .replacement_ids
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                println!(
-                    "    {} at revision {} -> [{}]",
-                    superseded.assertion.id, superseded.superseded_at_revision, replacements
-                );
-            }
-        }
+        print_superseded_assertions(state, blobs, "  ");
     }
     Ok(())
 }
@@ -2692,56 +2764,185 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         "objective": state.objective,
         "conversations": conversation_views(state, store)?,
         "unavailable_references": state.unavailable_references,
+        "role_attempt_receipts": role_attempt_receipts_json(state, blobs),
         "tasks": state.tasks.iter().map(|(id, task)| {
             task_runtime_json(
+                state,
+                crate::model::TaskNamespace::Execution,
                 id,
                 task,
                 workspace_observations.get(id),
+                blobs,
             )
         }).collect::<Result<Vec<_>>>()?,
         "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
             task_runtime_json(
+                state,
+                crate::model::TaskNamespace::Planning,
                 id,
                 task,
                 Some(&crate::activity::WorkspaceObservation::NotApplicable),
+                blobs,
             )
         }).collect::<Result<Vec<_>>>()?,
         "planning_input": planning_input_json(state, blobs)?,
         "contract": state.contract.iter().map(|(id, assertion)| {
             serde_json::json!({
                 "id": id.as_str(),
-                "advisory": assertion.advisory.slug(),
+                "advisory": state.advisory_status(id).slug(),
+                "advisory_results": assertion_advisory_json(
+                    state,
+                    id,
+                    assertion,
+                    blobs,
+                    true,
+                ),
                 "authoritative_pass": assertion
                     .last_authoritative
                     .as_ref()
                     .map(|verdict| verdict.passed()),
             })
         }).collect::<Vec<_>>(),
-        "superseded_assertions": state.superseded_assertions.iter().map(|entry| {
+        "superseded_assertions": superseded_assertions_json(state, blobs),
+        "attention": state.open_attention.values().map(|item| {
+            attention_json(blobs, state, item)
+        }).collect::<Result<Vec<_>>>()?,
+        "cleanup_failure": cleanup_failure_json(state),
+        "oracle_failures": state.oracle_failures,
+        "parked_effects": parked_effect_views(state),
+        "terminal_review": review_summary(state, blobs),
+        "terminal_review_receipt": terminal_review_receipt_json(state, blobs),
+    }))
+}
+
+fn assertion_advisory_json(
+    state: &crate::model::MissionState,
+    assertion_id: &crate::model::AssertionId,
+    assertion: &crate::model::AssertionState,
+    blobs: &BlobStore,
+    require_current: bool,
+) -> Vec<serde_json::Value> {
+    assertion
+        .last_advisory
+        .iter()
+        .map(|(task_id, effect_id)| {
+            let resolved = if require_current {
+                state.advisory_receipt(assertion_id, task_id, effect_id)
+            } else {
+                let receipt = state.role_attempt_receipts.get(effect_id);
+                receipt.and_then(|receipt| {
+                    let crate::model::RoleEffectSource::Task {
+                        request,
+                        authorized_targets,
+                        ..
+                    } = &receipt.source
+                    else {
+                        return None;
+                    };
+                    if &request.task_id != task_id
+                        || request.output != crate::model::OutputSemantics::EmitsVerdict
+                        || !authorized_targets.contains(assertion_id)
+                    {
+                        return None;
+                    }
+                    let crate::model::SettledHandoff::Validate { items, .. } =
+                        receipt.settled_handoff()?
+                    else {
+                        return None;
+                    };
+                    items
+                        .iter()
+                        .find(|item| &item.item_id == assertion_id)
+                        .map(|item| (receipt, item.passed))
+                })
+            };
+            serde_json::json!({
+                "task_id": task_id.as_str(),
+                "effect_id": effect_id.as_str(),
+                "passed": resolved.map(|(_, passed)| passed),
+                "receipt": crate::evidence::resolved_role_attempt_reference_json(
+                    blobs,
+                    state,
+                    effect_id,
+                    resolved.map(|(receipt, _)| receipt),
+                ),
+            })
+        })
+        .collect()
+}
+
+fn superseded_assertions_json(
+    state: &crate::model::MissionState,
+    blobs: &BlobStore,
+) -> Vec<serde_json::Value> {
+    state
+        .superseded_assertions
+        .iter()
+        .map(|entry| {
             serde_json::json!({
                 "id": entry.assertion.id.as_str(),
                 "prose": entry.assertion.prose,
                 "replacement_ids": entry.replacement_ids.iter()
                     .map(|id| id.as_str()).collect::<Vec<_>>(),
                 "superseded_at_revision": entry.superseded_at_revision,
+                "advisory_results": assertion_advisory_json(
+                    state,
+                    &entry.assertion.id,
+                    &entry.state,
+                    blobs,
+                    false,
+                ),
                 "authoritative_pass": entry.state.last_authoritative.as_ref()
                     .map(|verdict| verdict.passed()),
             })
-        }).collect::<Vec<_>>(),
-        "attention": state.open_attention.values().map(|item| {
-            attention_json(blobs, item)
-        }).collect::<Result<Vec<_>>>()?,
-        "cleanup_failure": cleanup_failure_json(state),
-        "oracle_failures": state.oracle_failures,
-        "parked_effects": parked_effect_views(state),
-        "terminal_review": review_summary(state),
-    }))
+        })
+        .collect()
+}
+
+fn print_superseded_assertions(
+    state: &crate::model::MissionState,
+    blobs: &BlobStore,
+    indent: &str,
+) {
+    if state.superseded_assertions.is_empty() {
+        return;
+    }
+    println!("{indent}superseded assertions:");
+    for entry in &state.superseded_assertions {
+        let replacements = entry
+            .replacement_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "{indent}  {} at revision {} -> [{}]",
+            entry.assertion.id, entry.superseded_at_revision, replacements
+        );
+        for advisory in
+            assertion_advisory_json(state, &entry.assertion.id, &entry.state, blobs, false)
+        {
+            println!(
+                "{indent}    validator {}: {} effect={} [SUPERSEDED]",
+                advisory["task_id"].as_str().unwrap_or("?"),
+                match advisory["passed"].as_bool() {
+                    Some(true) => "PASS",
+                    Some(false) => "FAIL",
+                    None => "UNAVAILABLE",
+                },
+                advisory["effect_id"].as_str().unwrap_or("?"),
+            );
+        }
+    }
 }
 
 fn task_runtime_json(
+    state: &crate::model::MissionState,
+    namespace: crate::model::TaskNamespace,
     id: &crate::model::TaskId,
     task: &crate::model::TaskRuntimeState,
     workspace_observation: Option<&crate::activity::WorkspaceObservation>,
+    blobs: &BlobStore,
 ) -> Result<serde_json::Value> {
     let assignment = task.role_assignment.as_ref();
     let workspace = task.workspace_provenance.as_ref();
@@ -2761,9 +2962,68 @@ fn task_runtime_json(
         "pending_workspace_recreation": task.pending_workspace_recreation.as_ref()
             .map(|effect_id| effect_id.as_str()),
         "workspace_observation": workspace_observation,
-        "runtime_configuration": task.last_runtime_configuration,
-        "failure": task.last_failure,
+        "outcome": task.last_outcome.as_ref().map(|outcome| {
+            task_outcome_json(state, namespace, id, blobs, outcome)
+        }),
     }))
+}
+
+fn task_outcome_json(
+    state: &crate::model::MissionState,
+    namespace: crate::model::TaskNamespace,
+    task_id: &crate::model::TaskId,
+    blobs: &BlobStore,
+    outcome: &crate::model::TaskAttemptOutcome,
+) -> serde_json::Value {
+    let effect_id = outcome.effect_id();
+    let kind = match outcome {
+        crate::model::TaskAttemptOutcome::Accepted { .. } => "accepted",
+        crate::model::TaskAttemptOutcome::Failed { .. } => "failed",
+    };
+    let receipt = state
+        .task_last_role_attempt(namespace, task_id)
+        .filter(|receipt| &receipt.effect_id == effect_id);
+    serde_json::json!({
+        "kind": kind,
+        "effect_id": effect_id.as_str(),
+        "receipt": crate::evidence::resolved_role_attempt_reference_json(
+            blobs,
+            state,
+            effect_id,
+            receipt,
+        ),
+    })
+}
+
+fn print_task_outcome(
+    blobs: &BlobStore,
+    state: &crate::model::MissionState,
+    namespace: crate::model::TaskNamespace,
+    task_id: &crate::model::TaskId,
+    task: &crate::model::TaskRuntimeState,
+    label: &str,
+) {
+    let Some(outcome) = &task.last_outcome else {
+        return;
+    };
+    let kind = match outcome {
+        crate::model::TaskAttemptOutcome::Accepted { .. } => "accepted",
+        crate::model::TaskAttemptOutcome::Failed { .. } => "failed",
+    };
+    println!("{label} {kind} role attempt {}:", outcome.effect_id());
+    let receipt = state
+        .task_last_role_attempt(namespace, task_id)
+        .filter(|receipt| receipt.effect_id == *outcome.effect_id());
+    for line in crate::evidence::render_resolved_role_attempt_reference(
+        blobs,
+        state,
+        outcome.effect_id(),
+        receipt,
+    )
+    .lines()
+    {
+        println!("    {line}");
+    }
 }
 
 fn parked_legal_controls(
@@ -2872,6 +3132,20 @@ fn conversation_views(
                 "final_response": conversation.final_response.as_ref()
                     .map(|response| store.blobs().resolve(response))
                     .transpose()?,
+                "role_attempts": state.role_attempt_receipts.values()
+                    .filter(|receipt| matches!(
+                        &receipt.source,
+                        crate::model::RoleEffectSource::Task {
+                            request,
+                            ..
+                        } if &request.conversation_id == id
+                    ))
+                    .map(|receipt| crate::evidence::role_attempt_receipt_json(
+                        store.blobs(),
+                        state,
+                        receipt,
+                    ))
+                    .collect::<Vec<_>>(),
                 "queued_messages": conversation.queued,
                 "consumed_through": conversation.consumed_through,
                 "active_message_boundary": conversation.active_delivery.as_ref().map(|delivery| delivery.message_boundary),
@@ -2953,6 +3227,30 @@ fn print_unavailable_references(state: &crate::model::MissionState, indent: &str
     }
 }
 
+fn role_attempt_receipts_json(
+    state: &crate::model::MissionState,
+    blobs: &BlobStore,
+) -> Vec<serde_json::Value> {
+    state
+        .role_attempt_receipts
+        .values()
+        .map(|receipt| crate::evidence::role_attempt_receipt_json(blobs, state, receipt))
+        .collect()
+}
+
+fn print_role_attempt_receipts(
+    blobs: &BlobStore,
+    state: &crate::model::MissionState,
+    indent: &str,
+) {
+    for receipt in state.role_attempt_receipts.values() {
+        println!("{indent}role attempt receipt:");
+        for line in crate::evidence::render_role_attempt_receipt(blobs, state, receipt).lines() {
+            println!("{indent}  {line}");
+        }
+    }
+}
+
 fn planning_input_json(
     state: &crate::model::MissionState,
     blobs: &BlobStore,
@@ -2971,17 +3269,11 @@ fn planning_input_json(
             "kind": "failure_evidence",
             "summary": feedback.summary,
             "justification": feedback.justification,
-            "failure": feedback.failure.as_ref().map(|failure| serde_json::json!({
-                "kind": failure.category(),
-                "code": failure.evidence().code,
-                "detail": failure.detail(),
-            })),
-            "evidence": feedback.evidence.as_ref()
-                .map(|evidence| crate::evidence::evidence_json(blobs, evidence))
-                .transpose()?,
-            "details": feedback.details.as_ref()
-                .map(|details| blobs.resolve(details).map(|text| crate::evidence::excerpt(&text)))
-                .transpose()?,
+            "evidence": crate::evidence::decision_evidence_json(
+                blobs,
+                state,
+                &feedback.evidence,
+            )?,
         }),
         None => serde_json::Value::Null,
     };
@@ -3017,7 +3309,7 @@ fn print_planning_input(
         }
         Some(crate::model::PlanningRefinement::FailureEvidence(feedback)) => {
             println!("{indent}  failure evidence:");
-            for line in crate::evidence::render_feedback(blobs, feedback)?.lines() {
+            for line in crate::evidence::render_feedback(blobs, state, feedback)?.lines() {
                 println!("{indent}    {line}");
             }
         }
@@ -3042,50 +3334,69 @@ fn cleanup_failure_json(state: &crate::model::MissionState) -> serde_json::Value
 }
 
 fn print_typed_failure(failure: &lionclaw_runtime_api::TypedFailure, prefix: &str) {
-    let evidence = failure.evidence();
-    println!("{prefix}{}: {}", failure.category(), evidence.detail);
-    if let Some(code) = &evidence.code {
-        println!("    code: {code}");
-    }
-    if let Some(reason) = &evidence.stop_reason {
-        println!("    stop reason: {reason}");
-    }
-    if let Some(code) = evidence.exit_code {
-        println!("    exit code: {code}");
-    }
-    if !evidence.stderr.is_empty() {
-        println!("    stderr: {}", evidence.stderr);
-    }
-    if !evidence.final_response.is_empty() {
-        println!("    final response: {}", evidence.final_response);
-    }
-    let configuration = &evidence.configuration;
-    if configuration.requested_model.is_some()
-        || configuration.applied_model.is_some()
-        || configuration.requested_mode.is_some()
-        || configuration.applied_mode.is_some()
-    {
-        println!(
-            "    runtime configuration: model {:?} -> {:?}, mode {:?} -> {:?}",
-            configuration.requested_model,
-            configuration.applied_model,
-            configuration.requested_mode,
-            configuration.applied_mode,
-        );
+    let rendered = crate::evidence::render_typed_failure(failure);
+    for (index, line) in rendered.lines().enumerate() {
+        if index == 0 {
+            println!("{prefix}{line}");
+        } else {
+            println!("    {line}");
+        }
     }
 }
 
-fn print_non_task_failures(state: &crate::model::MissionState) {
+fn print_non_task_failures(blobs: &BlobStore, state: &crate::model::MissionState) {
     for (oracle, failure) in &state.oracle_failures {
         print_typed_failure(failure, &format!("  oracle {oracle} failure: "));
     }
-    if let Some(crate::model::ReviewOutcome::Failed { failure }) = &state.terminal_review.outcome {
-        print_typed_failure(failure, "  terminal review failure: ");
+    if let Some(crate::model::ReviewOutcome::Failed { effect_id }) = &state.terminal_review.outcome
+    {
+        if let Some(receipt) = state.role_attempt_receipts.get(effect_id) {
+            if let Some(failure) = receipt.failure() {
+                print_typed_failure(failure, "  terminal review failure: ");
+            }
+            println!("  terminal review receipt:");
+            for line in crate::evidence::render_role_attempt_receipt(blobs, state, receipt).lines()
+            {
+                println!("    {line}");
+            }
+        } else {
+            println!("  terminal review failure receipt unavailable: {effect_id}");
+        }
+    }
+}
+
+fn terminal_review_receipt_json(
+    state: &crate::model::MissionState,
+    blobs: &BlobStore,
+) -> serde_json::Value {
+    state
+        .terminal_review
+        .outcome
+        .as_ref()
+        .map_or(serde_json::Value::Null, |outcome| {
+            crate::evidence::role_attempt_reference_json(blobs, state, outcome.effect_id())
+        })
+}
+
+fn print_terminal_review_receipt(
+    blobs: &BlobStore,
+    state: &crate::model::MissionState,
+    indent: &str,
+) {
+    if let Some(outcome) = state.terminal_review.outcome.as_ref() {
+        println!("{indent}terminal review receipt:");
+        for line in
+            crate::evidence::render_role_attempt_reference(blobs, state, outcome.effect_id())
+                .lines()
+        {
+            println!("{indent}  {line}");
+        }
     }
 }
 
 fn attention_json(
     blobs: &BlobStore,
+    state: &crate::model::MissionState,
     item: &crate::model::AttentionItem,
 ) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
@@ -3093,26 +3404,17 @@ fn attention_json(
         "kind": item.kind.slug(),
         "report": item.report,
         "assertion_ids": item.assertion_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
-        "failure": item.failure.as_ref().map(|failure| serde_json::json!({
-            "kind": failure.category(),
-            "code": failure.evidence().code,
-            "detail": failure.detail(),
-        })),
         "actions": crate::model::decision::allowed_actions(item.kind)
             .iter()
             .map(crate::model::DecisionAction::slug)
             .collect::<Vec<_>>(),
-        "evidence": item.evidence.as_ref()
-            .map(|evidence| crate::evidence::evidence_json(blobs, evidence))
-            .transpose()?,
-        "details": item.details.as_ref()
-            .map(|details| blobs.resolve(details).map(|text| crate::evidence::excerpt(&text)))
-            .transpose()?,
+        "evidence": crate::evidence::decision_evidence_json(blobs, state, &item.evidence)?,
     }))
 }
 
 fn print_attention(
     blobs: &BlobStore,
+    state: &crate::model::MissionState,
     item: &crate::model::AttentionItem,
     indent: &str,
 ) -> Result<()> {
@@ -3123,15 +3425,10 @@ fn print_attention(
         .collect::<Vec<_>>()
         .join(" | ");
     println!("{indent}  actions: {actions}");
-    if let Some(evidence) = &item.evidence {
-        for line in crate::evidence::render_evidence(blobs, evidence)?.lines() {
+    let evidence = crate::evidence::render_decision_evidence(blobs, state, &item.evidence)?;
+    if !evidence.is_empty() {
+        for line in evidence.lines() {
             println!("{indent}  {line}");
-        }
-    }
-    if let Some(details) = &item.details {
-        println!("{indent}  detailed report:");
-        for line in crate::evidence::excerpt(&blobs.resolve(details)?).lines() {
-            println!("{indent}    {line}");
         }
     }
     Ok(())
@@ -3149,7 +3446,30 @@ fn phase_slug(phase: &MissionPhase) -> String {
 /// The terminal-review summary — ONE source of truth behind the advance
 /// banner, `status`, `report`, and every `--json` output. `Null` when the
 /// mission declares no review.
-fn review_summary(state: &crate::model::MissionState) -> serde_json::Value {
+fn terminal_review_verdict(
+    state: &crate::model::MissionState,
+) -> Option<(
+    &crate::model::RoleAttemptReceipt,
+    &str,
+    bool,
+    &[crate::model::Gap],
+)> {
+    let crate::model::ReviewOutcome::Verdict { effect_id } =
+        state.terminal_review.outcome.as_ref()?
+    else {
+        return None;
+    };
+    let receipt = state.role_attempt_receipts.get(effect_id)?;
+    let crate::model::RoleEffectSource::TerminalReview { judged_sha, .. } = &receipt.source else {
+        return None;
+    };
+    let crate::model::SettledHandoff::Review { passed, gaps } = receipt.settled_handoff()? else {
+        return None;
+    };
+    Some((receipt, judged_sha, *passed, gaps))
+}
+
+fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serde_json::Value {
     use crate::model::{AttentionKind, GapSeverity, ReviewOutcome};
     let Some(config) = &state.config.terminal_review else {
         return serde_json::Value::Null;
@@ -3167,34 +3487,40 @@ fn review_summary(state: &crate::model::MissionState) -> serde_json::Value {
         )
     });
     let waived = tr.waived_at(state.deliverable_head());
-    let (verdict, judged_sha, fresh, counts, acknowledged) = match &tr.outcome {
-        Some(ReviewOutcome::Verdict(v)) => {
-            let count = |s: GapSeverity| v.gaps.iter().filter(|g| g.severity == s).count();
-            let is_fresh = v.is_fresh_at(state.deliverable_head());
+    let (verdict, judged_sha, fresh, counts, acknowledged) =
+        if let Some((_, judged_sha, passed, gaps)) = terminal_review_verdict(state) {
+            let count =
+                |severity: GapSeverity| gaps.iter().filter(|gap| gap.severity == severity).count();
+            let is_fresh = judged_sha == state.deliverable_head();
+            let blocking = !passed || gaps.iter().any(|gap| gap.severity == GapSeverity::Blocking);
             let kind = if !is_fresh && done {
                 "skipped"
-            } else if v.blocking() {
+            } else if blocking {
                 "gaps"
             } else {
                 "clean"
             };
             (
                 kind,
-                Some(v.judged_sha.clone()),
+                Some(judged_sha.to_string()),
                 Some(is_fresh),
                 Some(serde_json::json!({
                     "blocking": count(GapSeverity::Blocking),
                     "major": count(GapSeverity::Major),
                     "minor": count(GapSeverity::Minor),
                 })),
-                tr.acknowledges(v),
+                tr.acknowledges_sha(judged_sha),
             )
-        }
-        Some(ReviewOutcome::Failed { .. }) => ("failed", None, None, None, false),
-        None if waived => ("waived", None, None, None, false),
-        None if done || proof_failed => ("skipped", None, None, None, false),
-        None => ("owed", None, None, None, false),
-    };
+        } else {
+            match &tr.outcome {
+                Some(ReviewOutcome::Verdict { .. }) | Some(ReviewOutcome::Failed { .. }) => {
+                    ("failed", None, None, None, false)
+                }
+                None if waived => ("waived", None, None, None, false),
+                None if done || proof_failed => ("skipped", None, None, None, false),
+                None => ("owed", None, None, None, false),
+            }
+        };
     serde_json::json!({
         "role": config.role.as_str(),
         "verdict": verdict,
@@ -3204,17 +3530,19 @@ fn review_summary(state: &crate::model::MissionState) -> serde_json::Value {
         "acknowledged": acknowledged,
         "waived": waived,
         "attempts": tr.attempts,
-        "failure": match &tr.outcome {
-            Some(ReviewOutcome::Failed { failure }) => serde_json::to_value(failure).ok(),
-            _ => None,
+        "failure_receipt": match &tr.outcome {
+            Some(ReviewOutcome::Failed { effect_id }) => {
+                crate::evidence::role_attempt_reference_json(blobs, state, effect_id)
+            }
+            _ => serde_json::Value::Null,
         },
     })
 }
 
 /// The one-line human rendering of `review_summary`; `None` when the mission
 /// declares no review.
-fn review_line(state: &crate::model::MissionState) -> Option<String> {
-    let summary = review_summary(state);
+fn review_line(state: &crate::model::MissionState, blobs: &BlobStore) -> Option<String> {
+    let summary = review_summary(state, blobs);
     if summary.is_null() {
         return None;
     }
@@ -3806,6 +4134,19 @@ mod tests {
                 base_sha: "base".into(),
                 assignment_epoch: 1,
             },
+            MissionEvent::RoleTurnObserved {
+                effect_id: review_role_effect(),
+                observation: crate::model::RoleTurnObservation::Completed {
+                    final_response: PayloadRef::inline("done"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
+                },
+            },
+            MissionEvent::RoleHandoffObserved {
+                effect_id: review_role_effect(),
+                observation: crate::model::RoleHandoffObservation::Accepted {
+                    report: PayloadRef::inline("done"),
+                },
+            },
             MissionEvent::RoleRunCompleted {
                 effect_id: review_role_effect(),
                 request: Box::new(crate::model::RoleRunRequestIdentity {
@@ -3868,20 +4209,42 @@ mod tests {
                     attempt_no,
                     effect_id,
                     judged_sha,
-                    ..
-                } => events.push(MissionEvent::TerminalReviewRequested {
-                    attempt_no: *attempt_no,
-                    effect_id: effect_id.clone(),
-                    role: RoleName::new("gap-reviewer").unwrap(),
-                    runtime: "codex".into(),
-                    prompt: PayloadRef::inline("review prompt"),
-                    judged_sha: judged_sha.clone(),
-                    nonce: "test-nonce".into(),
-                    requested_at_ms: 0,
-                    not_before_ms: 0,
-                    deadline_ms: 100_000,
-                    budget_deadline_ms: 100_000,
-                }),
+                    outcome,
+                } => {
+                    events.push(MissionEvent::TerminalReviewRequested {
+                        attempt_no: *attempt_no,
+                        effect_id: effect_id.clone(),
+                        role: RoleName::new("gap-reviewer").unwrap(),
+                        runtime: "codex".into(),
+                        prompt: PayloadRef::inline("review prompt"),
+                        judged_sha: judged_sha.clone(),
+                        nonce: "test-nonce".into(),
+                        requested_at_ms: 0,
+                        not_before_ms: 0,
+                        deadline_ms: 100_000,
+                        budget_deadline_ms: 100_000,
+                    });
+                    events.push(MissionEvent::RoleTurnObserved {
+                        effect_id: effect_id.clone(),
+                        observation: match outcome {
+                            Ok(success) => crate::model::RoleTurnObservation::Completed {
+                                final_response: success.final_response.clone(),
+                                runtime_configuration: success.runtime_configuration.clone(),
+                            },
+                            Err(failure) => crate::model::RoleTurnObservation::Failed {
+                                failure: failure.clone(),
+                            },
+                        },
+                    });
+                    if let Ok(success) = outcome {
+                        events.push(MissionEvent::RoleHandoffObserved {
+                            effect_id: effect_id.clone(),
+                            observation: crate::model::RoleHandoffObservation::Accepted {
+                                report: success.report.clone(),
+                            },
+                        });
+                    }
+                }
                 _ => {}
             }
             events.push(event);
@@ -3927,10 +4290,12 @@ mod tests {
         // and the engine deliberately never dispatches the reviewer — the
         // review remains deliberately skipped rather than "owed".
         let state = review_state(vec![oracle_completed(1)]);
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().join("blobs"));
         assert!(matches!(state.phase, MissionPhase::AttentionNeeded));
-        let summary = review_summary(&state);
+        let summary = review_summary(&state, &blobs);
         assert_eq!(summary["verdict"], serde_json::json!("skipped"));
-        let line = review_line(&state).expect("line");
+        let line = review_line(&state, &blobs).expect("line");
         assert!(line.contains("skipped"), "got: {line}");
         assert!(!line.contains("not yet judged"), "got: {line}");
     }
@@ -3960,18 +4325,24 @@ mod tests {
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let blobs = BlobStore::new(temp.path().join("blobs"));
-        let json = attention_json(&blobs, item).unwrap();
+        let json = attention_json(&blobs, &state, item).unwrap();
 
-        assert_eq!(json["evidence"]["stdout"], "ordinary output");
-        assert_eq!(json["evidence"]["stderr"], "the actual diagnostic");
+        assert_eq!(json["evidence"]["evidence"]["stdout"], "ordinary output");
+        assert_eq!(
+            json["evidence"]["evidence"]["stderr"],
+            "the actual diagnostic"
+        );
         assert_eq!(json["actions"][1], "repair");
     }
 
     #[tokio::test]
     async fn mission_view_json_carries_one_disposition_and_action_projection() {
         use crate::model::{
-            AssertionId, PayloadRef, RoleName, RuntimeConfigurationEvidence, Task, TaskId,
-            TaskKind, TaskRoleAssignment, TaskRuntimeState, TaskStatus, TaskWorkspaceProvenance,
+            AssertionId, ConversationId, OutputSemantics, PayloadRef, RoleAttemptDisposition,
+            RoleAttemptReceipt, RoleEffectSource, RoleName, RolePromptTemplate,
+            RoleRunRequestIdentity, RuntimeConfigurationEvidence, Task, TaskAttemptOutcome, TaskId,
+            TaskKind, TaskNamespace, TaskRoleAssignment, TaskRuntimeState, TaskStatus,
+            TaskWorkspaceProvenance, WorkspacePreparation,
         };
 
         let mut state = review_state(vec![oracle_completed(1)]);
@@ -3992,16 +4363,63 @@ mod tests {
                         depends_on: vec![],
                     }),
             );
+        let planner_id = TaskId::new("planner").unwrap();
+        let planner_role = RoleName::new("planner").unwrap();
+        let planner_prompt_hash = "7".repeat(64);
+        let planner_effect = crate::model::EffectId::for_role_request(
+            TaskNamespace::Planning,
+            &state.mission_id,
+            &planner_id,
+            1,
+            1,
+            &planner_prompt_hash,
+        );
         state.planning.tasks.insert(
-            TaskId::new("planner").unwrap(),
+            planner_id.clone(),
             TaskRuntimeState {
                 status: TaskStatus::Failed,
                 attempts: 1,
                 consecutive_failures: 1,
-                last_report: None,
-                last_failure: None,
+                last_outcome: Some(TaskAttemptOutcome::Failed {
+                    effect_id: planner_effect.clone(),
+                }),
                 feedback: Vec::new(),
-                last_runtime_configuration: Some(RuntimeConfigurationEvidence {
+                role_assignment: None,
+                workspace_provenance: None,
+                pending_workspace_recreation: None,
+            },
+        );
+        state.role_attempt_receipts.insert(
+            planner_effect.clone(),
+            RoleAttemptReceipt {
+                effect_id: planner_effect,
+                source: RoleEffectSource::Task {
+                    request: Box::new(RoleRunRequestIdentity {
+                        conversation_id: ConversationId::for_role_instance(
+                            &state.mission_id,
+                            TaskNamespace::Planning,
+                            &planner_id,
+                            &planner_role,
+                            1,
+                        ),
+                        namespace: TaskNamespace::Planning,
+                        task_id: planner_id,
+                        attempt_no: 1,
+                        assignment_epoch: 1,
+                        role: planner_role,
+                        output: OutputSemantics::ProducesReport,
+                        runtime: "codex".into(),
+                        prompt_template: RolePromptTemplate::Planning,
+                        prompt_hash: planner_prompt_hash,
+                        base_sha: "base".into(),
+                        workspace_preparation: WorkspacePreparation::Preserve,
+                        message_boundary: 0,
+                        presented_messages: Vec::new(),
+                    }),
+                    plan_revision: state.revision,
+                    authorized_targets: Vec::new(),
+                },
+                runtime_configuration: Some(RuntimeConfigurationEvidence {
                     requested_model: Some("requested".into()),
                     applied_model: Some("applied".into()),
                     model_confirmation: Some(
@@ -4013,9 +4431,14 @@ mod tests {
                         lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
                     ),
                 }),
-                role_assignment: None,
-                workspace_provenance: None,
-                pending_workspace_recreation: None,
+                turn: None,
+                handoff: None,
+                disposition: RoleAttemptDisposition::Failed {
+                    failure: crate::model::TypedFailure::permanent(
+                        "planner.failed",
+                        "planner stopped after applying runtime configuration",
+                    ),
+                },
             },
         );
         state.tasks.insert(
@@ -4024,10 +4447,8 @@ mod tests {
                 status: TaskStatus::Failed,
                 attempts: 1,
                 consecutive_failures: 1,
-                last_report: None,
-                last_failure: None,
+                last_outcome: None,
                 feedback: Vec::new(),
-                last_runtime_configuration: None,
                 role_assignment: None,
                 workspace_provenance: None,
                 pending_workspace_recreation: None,
@@ -4039,10 +4460,8 @@ mod tests {
                 status: TaskStatus::Failed,
                 attempts: 1,
                 consecutive_failures: 1,
-                last_report: None,
-                last_failure: None,
+                last_outcome: None,
                 feedback: Vec::new(),
-                last_runtime_configuration: None,
                 role_assignment: None,
                 workspace_provenance: None,
                 pending_workspace_recreation: None,
@@ -4306,7 +4725,8 @@ mod tests {
             .unwrap()
             .contains("observer index"));
         assert_eq!(
-            json["planning_tasks"][0]["runtime_configuration"]["applied_model"],
+            json["planning_tasks"][0]["outcome"]["receipt"]["effective_runtime_configuration"]
+                ["applied_model"],
             "applied"
         );
         assert!(json["planning_tasks"][0].get("final_response").is_none());
@@ -4501,7 +4921,10 @@ mod tests {
 
     #[tokio::test]
     async fn mission_view_json_projects_complete_manual_replanning_input() {
-        use crate::model::{FailureEvidence, FailureFeedback, PlanningRefinement};
+        use crate::model::{
+            FailureFeedback, PlanningRefinement, RoleAttemptDisposition, RoleAttemptReceipt,
+            RoleEffectSource,
+        };
 
         let mut state = review_state(vec![]);
         state.planning_base_revision = Some(1);
@@ -4534,29 +4957,302 @@ mod tests {
         );
 
         let mut state = view.state;
+        let effect_id = terminal_review_effect();
+        state.role_attempt_receipts.insert(
+            effect_id.clone(),
+            RoleAttemptReceipt {
+                effect_id: effect_id.clone(),
+                source: RoleEffectSource::TerminalReview {
+                    attempt_no: 1,
+                    role: crate::model::RoleName::new("gap-reviewer").unwrap(),
+                    judged_sha: "h1".into(),
+                },
+                runtime_configuration: None,
+                turn: None,
+                handoff: Some(crate::model::RoleHandoffObservation::Accepted {
+                    report: crate::model::PayloadRef::inline("review detail"),
+                }),
+                disposition: RoleAttemptDisposition::Succeeded {
+                    handoff: Some(crate::model::SettledHandoff::Review {
+                        passed: false,
+                        gaps: Vec::new(),
+                    }),
+                    artifact: None,
+                },
+            },
+        );
         state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(Box::new(
             FailureFeedback {
                 summary: "oracle failed".to_string(),
-                failure: None,
-                evidence: Some(FailureEvidence {
-                    exit_code: 1,
-                    exit_signal: None,
-                    stdout: crate::model::PayloadRef::inline("ordinary output"),
-                    stderr: crate::model::PayloadRef::inline("actual diagnostic"),
-                }),
-                details: Some(crate::model::PayloadRef::inline("review detail")),
+                evidence: crate::model::DecisionEvidence::RoleAttempts {
+                    effect_ids: vec![effect_id],
+                },
                 justification: "repair this".to_string(),
             },
         )));
         let json = planning_input_json(&state, store.blobs()).unwrap();
         assert_eq!(json["refinement"]["kind"], "failure_evidence");
-        assert_eq!(json["refinement"]["evidence"]["stdout"], "ordinary output");
         assert_eq!(
-            json["refinement"]["evidence"]["stderr"],
-            "actual diagnostic"
+            json["refinement"]["evidence"]["receipts"][0]["handoff"]["content"],
+            "review detail"
         );
-        assert_eq!(json["refinement"]["details"], "review detail");
+        assert_eq!(
+            json["refinement"]["evidence"]["receipts"][0]["source"]["kind"],
+            "terminal_review"
+        );
         assert_eq!(json["refinement"]["justification"], "repair this");
+    }
+
+    #[test]
+    fn advisory_projection_uses_the_folded_exact_receipt() {
+        use crate::model::{
+            ConversationId, OutputSemantics, RoleAttemptDisposition, RoleAttemptReceipt,
+            RoleEffectSource, RoleHandoffObservation, RoleName, RolePromptTemplate,
+            RoleRunRequestIdentity, SettledHandoff, Task, TaskAttemptOutcome, TaskId, TaskKind,
+            TaskNamespace, TaskRuntimeState, TaskStatus, ValidationItem, WorkspacePreparation,
+        };
+
+        let mut state = review_state(vec![]);
+        let task_id = TaskId::new("validator").unwrap();
+        let assertion_id = state.contract.keys().next().unwrap().clone();
+        let effect_id = crate::model::EffectId::parse("2".repeat(64)).unwrap();
+        let role = RoleName::new("validator").unwrap();
+        let conversation_id = ConversationId::for_role_instance(
+            &state.mission_id,
+            TaskNamespace::Execution,
+            &task_id,
+            &role,
+            1,
+        );
+        state.plan.as_mut().unwrap().tasks.push(Task {
+            id: task_id.clone(),
+            kind: TaskKind::Validate,
+            body: "validate".into(),
+            targets: vec![assertion_id.clone()],
+            role: Some(role.clone()),
+            depends_on: Vec::new(),
+        });
+        let receipt = RoleAttemptReceipt {
+            effect_id: effect_id.clone(),
+            source: RoleEffectSource::Task {
+                request: Box::new(RoleRunRequestIdentity {
+                    conversation_id,
+                    namespace: TaskNamespace::Execution,
+                    task_id: task_id.clone(),
+                    attempt_no: 1,
+                    assignment_epoch: 1,
+                    role,
+                    output: OutputSemantics::EmitsVerdict,
+                    runtime: "codex".into(),
+                    prompt_template: RolePromptTemplate::Execution,
+                    prompt_hash: "3".repeat(64),
+                    base_sha: state.deliverable_head().into(),
+                    workspace_preparation: WorkspacePreparation::Preserve,
+                    message_boundary: 0,
+                    presented_messages: Vec::new(),
+                }),
+                plan_revision: state.revision,
+                authorized_targets: vec![assertion_id.clone()],
+            },
+            runtime_configuration: None,
+            turn: None,
+            handoff: Some(RoleHandoffObservation::Accepted {
+                report: crate::model::PayloadRef::inline("checked assertion A"),
+            }),
+            disposition: RoleAttemptDisposition::Succeeded {
+                handoff: Some(SettledHandoff::Validate {
+                    items: vec![ValidationItem {
+                        item_id: assertion_id.clone(),
+                        passed: true,
+                    }],
+                    passed: true,
+                    request_attention: false,
+                }),
+                artifact: None,
+            },
+        };
+        state
+            .role_attempt_receipts
+            .insert(effect_id.clone(), receipt);
+        let mut stale = state.role_attempt_receipts[&effect_id].clone();
+        let stale_prompt_hash = "4".repeat(64);
+        let stale_effect = crate::model::EffectId::for_role_request(
+            TaskNamespace::Execution,
+            &state.mission_id,
+            &task_id,
+            2,
+            1,
+            &stale_prompt_hash,
+        );
+        stale.effect_id = stale_effect.clone();
+        let RoleEffectSource::Task { request, .. } = &mut stale.source else {
+            unreachable!();
+        };
+        request.attempt_no = 2;
+        request.prompt_hash = stale_prompt_hash;
+        state
+            .role_attempt_receipts
+            .insert(stale_effect.clone(), stale);
+        let mut retired = state.role_attempt_receipts[&stale_effect].clone();
+        let retired_prompt_hash = "5".repeat(64);
+        let retired_effect = crate::model::EffectId::for_role_request(
+            TaskNamespace::Execution,
+            &state.mission_id,
+            &task_id,
+            3,
+            1,
+            &retired_prompt_hash,
+        );
+        retired.effect_id = retired_effect.clone();
+        retired.disposition = RoleAttemptDisposition::Retired;
+        let RoleEffectSource::Task { request, .. } = &mut retired.source else {
+            unreachable!();
+        };
+        request.attempt_no = 3;
+        request.prompt_hash = retired_prompt_hash;
+        state
+            .role_attempt_receipts
+            .insert(retired_effect.clone(), retired);
+        state.tasks.insert(
+            task_id.clone(),
+            TaskRuntimeState {
+                status: TaskStatus::Cleared,
+                attempts: 1,
+                consecutive_failures: 0,
+                last_outcome: Some(TaskAttemptOutcome::Accepted {
+                    effect_id: effect_id.clone(),
+                }),
+                feedback: Vec::new(),
+                role_assignment: None,
+                workspace_provenance: None,
+                pending_workspace_recreation: None,
+            },
+        );
+        state
+            .contract
+            .get_mut(&assertion_id)
+            .unwrap()
+            .last_advisory
+            .insert(task_id.clone(), effect_id.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().to_path_buf());
+
+        let results = assertion_advisory_json(
+            &state,
+            &assertion_id,
+            state.contract.get(&assertion_id).unwrap(),
+            &blobs,
+            true,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["task_id"], task_id.as_str());
+        assert_eq!(results[0]["passed"], true);
+        assert_eq!(results[0]["receipt"]["handoff"]["outcome"], "accepted");
+        assert_eq!(results[0]["receipt"]["effect_id"], effect_id.as_str());
+        assert_eq!(
+            results[0]["receipt"]["handoff"]["content"],
+            "checked assertion A"
+        );
+        assert_eq!(
+            results[0]["receipt"]["source"]["request"]["output"],
+            "emits-verdict"
+        );
+        let receipts = role_attempt_receipts_json(&state, &blobs);
+        assert_eq!(receipts.len(), 4);
+        let receipt = receipts
+            .iter()
+            .find(|receipt| receipt["effect_id"] == effect_id.as_str())
+            .unwrap();
+        assert_eq!(receipt["authority"], "current");
+        assert_eq!(receipt["generation"], "current");
+        assert_eq!(receipt["handoff"]["content"], "checked assertion A");
+        let stale = receipts
+            .iter()
+            .find(|receipt| receipt["effect_id"] == stale_effect.as_str())
+            .unwrap();
+        assert_eq!(stale["authority"], "historical");
+        assert_eq!(stale["generation"], "current");
+        let retired = receipts
+            .iter()
+            .find(|receipt| receipt["effect_id"] == retired_effect.as_str())
+            .unwrap();
+        assert_eq!(retired["authority"], "historical");
+        assert_eq!(retired["generation"], "superseded");
+
+        let task = task_outcome_json(
+            &state,
+            TaskNamespace::Execution,
+            &task_id,
+            &blobs,
+            state.tasks[&task_id].last_outcome.as_ref().unwrap(),
+        );
+        let feedback = crate::model::FailureFeedback {
+            summary: "repair".into(),
+            evidence: crate::model::DecisionEvidence::RoleAttempts {
+                effect_ids: vec![effect_id.clone()],
+            },
+            justification: "use exact evidence".into(),
+        };
+        state.planning_input.refinement = Some(crate::model::PlanningRefinement::FailureEvidence(
+            Box::new(feedback),
+        ));
+        let refinement = planning_input_json(&state, &blobs).unwrap();
+        let attention_item = crate::model::AttentionItem {
+            id: "node_failed:validator".into(),
+            kind: crate::model::AttentionKind::NodeFailed,
+            task_id: Some(task_id.clone()),
+            oracle: None,
+            assertion_ids: Vec::new(),
+            evidence: crate::model::DecisionEvidence::RoleAttempts {
+                effect_ids: vec![effect_id.clone()],
+            },
+            report: "validator failed".into(),
+        };
+        let attention = attention_json(&blobs, &state, &attention_item).unwrap();
+        for projected in [
+            receipt,
+            &task["receipt"],
+            &refinement["refinement"]["evidence"]["receipts"][0],
+            &attention["evidence"]["receipts"][0],
+        ] {
+            assert_eq!(projected["authority"], "current");
+            assert_eq!(projected["generation"], "current");
+        }
+
+        let missing = crate::model::EffectId::parse("9".repeat(64)).unwrap();
+        let corrupted = crate::model::DecisionEvidence::RoleAttempts {
+            effect_ids: vec![missing],
+        };
+        let corrupted_json =
+            crate::evidence::decision_evidence_json(&blobs, &state, &corrupted).unwrap();
+        assert_eq!(corrupted_json["receipts"][0]["authority"], "unavailable");
+        assert_eq!(corrupted_json["receipts"][0]["generation"], "unavailable");
+        assert!(corrupted_json["receipts"][0]["source"].is_null());
+        assert!(corrupted_json["receipts"][0]["disposition"].is_null());
+        let corrupted_human =
+            crate::evidence::render_decision_evidence(&blobs, &state, &corrupted).unwrap();
+        assert!(corrupted_human.contains("authority: unavailable"));
+        assert!(!corrupted_human.contains("authority: current"));
+
+        let missing = crate::model::EffectId::parse("8".repeat(64)).unwrap();
+        state.terminal_review.outcome = Some(crate::model::ReviewOutcome::Failed {
+            effect_id: missing.clone(),
+        });
+        let terminal = terminal_review_receipt_json(&state, &blobs);
+        assert_eq!(terminal["effect_id"], missing.as_str());
+        assert_eq!(terminal["authority"], "unavailable");
+        assert_eq!(terminal["generation"], "unavailable");
+        assert!(terminal["source"].is_null());
+        assert!(terminal["disposition"].is_null());
+        let summary = review_summary(&state, &blobs);
+        assert_eq!(summary["failure_receipt"]["effect_id"], missing.as_str());
+        assert_eq!(summary["failure_receipt"]["authority"], "unavailable");
+        let terminal_human =
+            crate::evidence::render_role_attempt_reference(&blobs, &state, &missing);
+        assert!(terminal_human.contains(&format!("effect: {missing}")));
+        assert!(terminal_human.contains("authority: unavailable"));
+        assert!(terminal_human.contains("generation: unavailable"));
+        assert!(terminal_human.contains("disposition: unavailable"));
     }
 
     #[test]
@@ -4588,8 +5284,10 @@ mod tests {
                 }),
             },
         ]);
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().join("blobs"));
         assert!(matches!(state.phase, MissionPhase::AttentionNeeded));
-        let line = review_line(&state).expect("line");
+        let line = review_line(&state, &blobs).expect("line");
         assert!(line.contains("FAILED the product"), "got: {line}");
         assert!(!line.contains("0 blocking"), "got: {line}");
     }
@@ -4614,8 +5312,10 @@ mod tests {
                 reason: "give up".into(),
             },
         ]);
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().join("blobs"));
         assert!(matches!(state.phase, MissionPhase::Aborted { .. }));
-        let line = review_line(&state).expect("line");
+        let line = review_line(&state, &blobs).expect("line");
         assert!(line.contains("before the mission ended"), "got: {line}");
         assert!(!line.contains("retry"), "got: {line}");
 
@@ -4623,7 +5323,7 @@ mod tests {
         let state = review_state(vec![MissionEvent::MissionAborted {
             reason: "operator stop".into(),
         }]);
-        let line = review_line(&state).expect("line");
+        let line = review_line(&state, &blobs).expect("line");
         assert!(line.contains("the mission was aborted"), "got: {line}");
         assert!(!line.contains("not yet judged"), "got: {line}");
     }
@@ -4649,8 +5349,10 @@ mod tests {
                 }),
             },
         ]);
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().join("blobs"));
         assert!(matches!(state.phase, MissionPhase::AttentionNeeded));
-        let line = review_line(&state).expect("line");
+        let line = review_line(&state, &blobs).expect("line");
         assert!(line.contains("FAILED the product"), "got: {line}");
         assert!(!line.contains("0 blocking"), "got: {line}");
     }

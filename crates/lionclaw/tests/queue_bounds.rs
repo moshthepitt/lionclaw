@@ -15,8 +15,9 @@ use lionclaw::cli::{self, Cli};
 use lionclaw::engine::{ConversationQueueFull, Engine, EngineServices};
 use lionclaw::model::{
     fold, Assertion, AssertionId, ConversationLifecycle, ConversationRecipient, Handoff,
-    MissionEvent, OracleName, OutputSemantics, PayloadRef, Plan, RoleName, Task, TaskId, TaskKind,
-    TaskStatus, ValidationItem, MAX_QUEUED_MESSAGES_PER_CONVERSATION, REDUCER_VERSION,
+    MissionEvent, OracleName, OutputSemantics, PayloadRef, Plan, RoleHandoffObservation, RoleName,
+    RoleTurnObservation, RuntimeConfigurationEvidence, Task, TaskId, TaskKind, TaskStatus,
+    ValidationItem, MAX_QUEUED_MESSAGES_PER_CONVERSATION, REDUCER_VERSION,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest, RoleRunner};
 use lionclaw::store::{AppendError, MissionStore, NewEvent};
@@ -55,32 +56,58 @@ impl RoleRunner for GatedRoleRunner {
             self.entered.add_permits(1);
             self.release.acquire().await.unwrap().forget();
         }
-        Ok(match request.role.output {
-            OutputSemantics::EmitsVerdict => RoleRunOutcome {
-                handoff: Some(Handoff::Validate {
-                    done: true,
-                    report: PayloadRef::inline("queue boundary reviewed"),
-                    items: vec![ValidationItem {
-                        item_id: AssertionId::new("QUEUE-BOUND").unwrap(),
+        match request.role.output {
+            OutputSemantics::EmitsVerdict => {
+                let report = PayloadRef::inline("queue boundary reviewed");
+                let runtime_configuration = RuntimeConfigurationEvidence::default();
+                let final_response = "queue boundary reviewed";
+                request
+                    .confirm_turn_observed(RoleTurnObservation::Completed {
+                        final_response: PayloadRef::inline(final_response),
+                        runtime_configuration: runtime_configuration.clone(),
+                    })
+                    .await?;
+                request
+                    .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                        report: report.clone(),
+                    })
+                    .await?;
+                Ok(RoleRunOutcome {
+                    handoff: Some(Handoff::Validate {
+                        done: true,
+                        report,
+                        items: vec![ValidationItem {
+                            item_id: AssertionId::new("QUEUE-BOUND").unwrap(),
+                            passed: true,
+                        }],
                         passed: true,
-                    }],
-                    passed: true,
-                    request_attention: false,
-                }),
-                artifact: None,
-                runtime_configuration: Default::default(),
-                final_response: "queue boundary reviewed".into(),
-            },
-            OutputSemantics::ProducesArtifact | OutputSemantics::ProducesReport => RoleRunOutcome {
-                handoff: None,
-                artifact: None,
-                runtime_configuration: Default::default(),
-                final_response: "question".into(),
-            },
+                        request_attention: false,
+                    }),
+                    artifact: None,
+                    runtime_configuration,
+                    final_response: final_response.into(),
+                })
+            }
+            OutputSemantics::ProducesArtifact | OutputSemantics::ProducesReport => {
+                let runtime_configuration = RuntimeConfigurationEvidence::default();
+                let final_response = "question";
+                request
+                    .confirm_turn_observed(RoleTurnObservation::Completed {
+                        final_response: PayloadRef::inline(final_response),
+                        runtime_configuration: runtime_configuration.clone(),
+                    })
+                    .await?;
+                Ok(RoleRunOutcome {
+                    handoff: None,
+                    artifact: None,
+                    runtime_configuration,
+                    final_response: final_response.into(),
+                })
+            }
             OutputSemantics::ProposesPlan | OutputSemantics::EmitsGapVerdict => {
                 panic!("unexpected role output in queue-bound proof")
             }
-        })
+        }
     }
 }
 

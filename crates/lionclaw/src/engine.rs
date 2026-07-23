@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use lionclaw_runtime_api::TypedFailure;
 use sha2::{Digest, Sha256};
 
@@ -22,6 +22,7 @@ use crate::model::{
     MissionEvent, MissionId, MissionPhase, MissionState, OracleDispatchIntent, OracleRunSuccess,
     PayloadRef, PlanProposal, ProposalError, RoleDispatchIntent, RoleRunSuccess, StepDecision,
     TaskId, TaskNamespace, TerminalReviewDispatchIntent, TerminalReviewSuccess,
+    MAX_ROLE_REPORT_BYTES,
 };
 use crate::ports::{
     ArtifactCapture, Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl,
@@ -32,7 +33,6 @@ use crate::prompt::{
     PlanningPromptRefinement, TerminalReviewPromptContext, TurnContext,
 };
 use crate::resources::MissionDirs;
-use crate::runner::MAX_HANDOFF_REPORT_BYTES;
 use crate::store::{AppendError, MissionStore, NewEvent};
 
 pub struct Engine {
@@ -215,17 +215,23 @@ impl MissionView {
             self.state
                 .parked_continue_is_legal(effect_id, crate::model::ContinueMode::RecreateWorkspace)
         });
-        let continue_action = can_preserve
-            .then_some("mission continue")
-            .or_else(|| can_recreate.then_some("mission continue --recreate"));
+        let continue_actions = [
+            can_preserve.then_some("mission continue"),
+            can_recreate.then_some("mission continue --recreate"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         let mut actions = match self.disposition {
             MissionDisposition::Ready => vec!["mission advance"],
             MissionDisposition::Running => vec!["mission status"],
             MissionDisposition::AwaitingLead if can_send => vec!["mission send"],
             MissionDisposition::AwaitingLead => Vec::new(),
             MissionDisposition::AwaitingPlan => vec!["mission plan propose"],
-            MissionDisposition::Parked if continue_action.is_some() => {
-                vec![continue_action.expect("checked above"), "mission decide"]
+            MissionDisposition::Parked if !continue_actions.is_empty() => {
+                let mut actions = continue_actions.clone();
+                actions.push("mission decide");
+                actions
             }
             MissionDisposition::Parked => vec!["mission decide"],
             MissionDisposition::CleanupBlocked => vec!["mission advance", "mission log"],
@@ -240,9 +246,7 @@ impl MissionView {
             }
         };
         if self.disposition == MissionDisposition::AwaitingLead {
-            if let Some(action) = continue_action {
-                actions.push(action);
-            }
+            actions.extend(continue_actions);
         }
         if self.disposition == MissionDisposition::AwaitingLead && can_decide {
             actions.push("mission decide");
@@ -689,19 +693,41 @@ impl Engine {
     async fn recover_interrupted(&self, mission_id: &MissionId) -> Result<bool> {
         loop {
             let state = self.load_state(mission_id).await?;
-            let Some((effect_id, effect)) = state.inflight.iter().next() else {
+            let Some((effect_id, _)) = state.inflight.iter().next() else {
                 return Ok(true);
             };
-            if !self.cleanup_effect(&state, effect_id, true).await? {
+            let Some(()) = self.cleanup_effect(&state, effect_id, true).await? else {
                 return Ok(false);
+            };
+            let current = self.load_state(mission_id).await?;
+            let Some(effect) = current.inflight.get(effect_id) else {
+                continue;
+            };
+            if let Some(outcome) = recovered_completed_turn_without_handoff(
+                effect_id,
+                effect,
+                current.role_attempt_receipts.get(effect_id),
+            ) {
+                if self
+                    .append_outcome(&current.mission_id, effect_id, outcome, true)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                continue;
             }
+            let failure = current
+                .role_attempt_receipts
+                .get(effect_id)
+                .and_then(crate::model::RoleAttemptReceipt::rejection)
+                .cloned()
+                .unwrap_or_else(interrupted_failure);
+            let failure =
+                self.recover_role_failure(current.role_attempt_receipts.get(effect_id), failure);
+            let outcome = failed_outcome(effect_id, effect, failure);
             if self
-                .append_outcome(
-                    &state.mission_id,
-                    effect_id,
-                    interrupted_outcome(effect_id, effect),
-                    true,
-                )
+                .append_outcome(&current.mission_id, effect_id, outcome, true)
                 .await?
                 .is_none()
             {
@@ -734,7 +760,11 @@ impl Engine {
                 return Ok(true);
             };
             if let MissionPhase::Aborted { reason } = &current.phase {
-                if !self.cleanup_effect(&current, effect_id, true).await? {
+                if self
+                    .cleanup_effect(&current, effect_id, true)
+                    .await?
+                    .is_none()
+                {
                     return Ok(false);
                 }
                 if self
@@ -752,7 +782,11 @@ impl Engine {
                 return Ok(true);
             }
             if let Some(reason) = current.stop_requests.get(effect_id) {
-                if !self.cleanup_effect(&current, effect_id, true).await? {
+                if self
+                    .cleanup_effect(&current, effect_id, true)
+                    .await?
+                    .is_none()
+                {
                     return Ok(false);
                 }
                 if self
@@ -876,9 +910,10 @@ impl Engine {
             outcome.event,
             MissionEvent::RoleRunCompleted { outcome: Ok(_), .. }
         );
-        if !self
+        if self
             .cleanup_effect(state, effect_id, discard_artifact)
             .await?
+            .is_none()
         {
             return Ok(false);
         }
@@ -923,7 +958,7 @@ impl Engine {
         state: &MissionState,
         effect_id: &EffectId,
         discard_artifact: bool,
-    ) -> Result<bool> {
+    ) -> Result<Option<()>> {
         let request = EffectCleanupRequest {
             mission_id: state.mission_id.clone(),
             effect_id: effect_id.clone(),
@@ -931,19 +966,100 @@ impl Engine {
             state_dir: self.store.lionclaw_dir().to_path_buf(),
             discard_artifact,
         };
-        match self.effect_cleaner.cleanup(request).await {
-            Ok(()) => Ok(true),
+        if let Err(error) = self.effect_cleaner.quiesce(&request).await {
+            self.record_cleanup_failure(state, effect_id, error).await?;
+            return Ok(None);
+        }
+        // Evidence recovery composes store replay, bounded handoff parsing,
+        // and a durable append. Keep that complete operation behind one heap
+        // boundary so the sequential driver future retains a bounded stack.
+        match Box::pin(self.recover_retained_role_handoff(&state.mission_id, effect_id)).await {
+            Ok(()) => {}
             Err(error) => {
-                let event = NewEvent::new(MissionEvent::EffectCleanupFailed {
-                    effect_id: effect_id.clone(),
-                    resource: error.resource,
-                    failure: TypedFailure::permanent("cleanup.infrastructure", error.detail),
-                });
-                self.append_fact(&state.mission_id, state.head, event)
-                    .await?;
-                Ok(false)
+                self.record_cleanup_failure(
+                    state,
+                    effect_id,
+                    crate::ports::EffectCleanupFailure {
+                        resource: crate::model::EffectResource::EffectDirectory,
+                        detail: format!(
+                            "failed to persist retained role handoff before destructive cleanup: {error:#}"
+                        ),
+                    },
+                )
+                .await?;
+                return Ok(None);
             }
         }
+        match self.effect_cleaner.cleanup(request).await {
+            Ok(()) => Ok(Some(())),
+            Err(error) => {
+                self.record_cleanup_failure(state, effect_id, error).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn recover_retained_role_handoff(
+        &self,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+    ) -> Result<()> {
+        let state = self.load_state(mission_id).await?;
+        let Some(effect) = state.inflight.get(effect_id) else {
+            return Ok(());
+        };
+        let Some(receipt) = state.role_attempt_receipts.get(effect_id) else {
+            return Ok(());
+        };
+        if receipt.handoff.is_some() {
+            return Ok(());
+        }
+        // A handoff file alone is not role evidence. The adapter must first
+        // durably establish the completed turn that produced it; otherwise a
+        // crash between file creation and turn observation would make the
+        // handoff event fold-inert and wedge cleanup forever.
+        if !matches!(
+            receipt.turn.as_ref(),
+            Some(crate::model::RoleTurnObservation::Completed { .. })
+        ) {
+            return Ok(());
+        }
+        let Some(output) = role_output_semantics(effect) else {
+            return Ok(());
+        };
+        let handoff_dir = MissionDirs::new(self.store.lionclaw_dir(), mission_id)
+            .effect(effect_id)
+            .role()
+            .handoff()
+            .to_path_buf();
+        let observation = match crate::runner::read_retained_handoff(&handoff_dir, output) {
+            Ok(Some(handoff)) => crate::model::RoleHandoffObservation::Accepted {
+                report: handoff.report().clone(),
+            },
+            Ok(None) => return Ok(()),
+            Err(failure) => crate::model::RoleHandoffObservation::Rejected { failure },
+        };
+        self.record_role_handoff(mission_id, effect_id, observation)
+            .await?;
+        Ok(())
+    }
+
+    async fn record_cleanup_failure(
+        &self,
+        state: &MissionState,
+        effect_id: &EffectId,
+        error: crate::ports::EffectCleanupFailure,
+    ) -> Result<()> {
+        self.append_fact(
+            &state.mission_id,
+            state.head,
+            NewEvent::new(MissionEvent::EffectCleanupFailed {
+                effect_id: effect_id.clone(),
+                resource: error.resource,
+                failure: TypedFailure::permanent("cleanup.infrastructure", error.detail),
+            }),
+        )
+        .await
     }
 
     async fn append_outcome(
@@ -961,7 +1077,11 @@ impl Engine {
             if let Some(failure) = settlement_failure(&state, effect_id, &outcome) {
                 outcome = failed_outcome(effect_id, effect, failure);
                 if !artifact_discarded {
-                    if !self.cleanup_effect(&state, effect_id, true).await? {
+                    if self
+                        .cleanup_effect(&state, effect_id, true)
+                        .await?
+                        .is_none()
+                    {
                         return Ok(None);
                     }
                     artifact_discarded = true;
@@ -1034,17 +1154,28 @@ impl Engine {
     ) -> Result<std::result::Result<crate::ports::RoleRunOutcome, TypedFailure>> {
         let run = self.role_runner.run(request);
         tokio::pin!(run);
+        // Durable role updates traverse the store and replay path. Box that
+        // bounded side branch so it does not inflate every driver stack frame.
         loop {
             tokio::select! {
                 result = &mut run => {
+                    let result = result
+                        .map(crate::ports::RoleRunOutcome::projected)
+                        .map_err(TypedFailure::projected);
                     while let Ok(update) = updates.try_recv() {
-                        self.record_role_update(state, effect_id, update).await?;
+                        Box::pin(self.record_role_update(state, effect_id, update)).await?;
                     }
+                    Box::pin(self.validate_role_handoff_observation(
+                        &state.mission_id,
+                        effect_id,
+                        &result,
+                    ))
+                    .await?;
                     return Ok(result);
                 }
                 update = updates.recv() => {
                     if let Some(update) = update {
-                        self.record_role_update(state, effect_id, update).await?;
+                        Box::pin(self.record_role_update(state, effect_id, update)).await?;
                     }
                 }
             }
@@ -1099,26 +1230,272 @@ impl Engine {
                 let _ = acknowledge.send(acknowledgement);
                 result
             }
-            RoleRunUpdate::RuntimeConfigured(configuration) => {
+            RoleRunUpdate::HandoffObserved {
+                observation,
+                acknowledge,
+            } => {
+                let result = self
+                    .record_role_handoff(&state.mission_id, effect_id, observation)
+                    .await;
+                let acknowledgement = match &result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                let _ = acknowledge.send(acknowledgement);
+                result
+            }
+            RoleRunUpdate::TurnObserved {
+                observation,
+                acknowledge,
+            } => {
+                let result = self
+                    .record_role_turn(&state.mission_id, effect_id, observation)
+                    .await;
+                let acknowledgement = match &result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                let _ = acknowledge.send(acknowledgement);
+                result
+            }
+            RoleRunUpdate::RuntimeConfigured {
+                configuration,
+                acknowledge,
+            } => {
                 let configuration = configuration.projected();
-                self.append_fact(
-                    &state.mission_id,
-                    state.head,
-                    NewEvent::new(MissionEvent::EffectRuntimeConfigured {
-                        effect_id: effect_id.clone(),
-                        configuration: crate::model::RuntimeConfigurationEvidence {
-                            requested_model: configuration.requested_model,
-                            applied_model: configuration.applied_model,
-                            model_confirmation: configuration.model_confirmation,
-                            requested_mode: configuration.requested_mode,
-                            applied_mode: configuration.applied_mode,
-                            mode_confirmation: configuration.mode_confirmation,
-                        },
-                    }),
-                )
-                .await
+                let result = self
+                    .append_fact(
+                        &state.mission_id,
+                        state.head,
+                        NewEvent::new(MissionEvent::EffectRuntimeConfigured {
+                            effect_id: effect_id.clone(),
+                            configuration: crate::model::RuntimeConfigurationEvidence {
+                                requested_model: configuration.requested_model,
+                                applied_model: configuration.applied_model,
+                                model_confirmation: configuration.model_confirmation,
+                                requested_mode: configuration.requested_mode,
+                                applied_mode: configuration.applied_mode,
+                                mode_confirmation: configuration.mode_confirmation,
+                            },
+                        }),
+                    )
+                    .await;
+                let acknowledgement = match &result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                let _ = acknowledge.send(acknowledgement);
+                result
             }
         }
+    }
+
+    async fn record_role_turn(
+        &self,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+        observation: crate::model::RoleTurnObservation,
+    ) -> Result<()> {
+        let observation = match observation {
+            crate::model::RoleTurnObservation::Completed {
+                final_response,
+                runtime_configuration,
+            } => crate::model::RoleTurnObservation::Completed {
+                final_response: self.externalize_role_payload(final_response)?,
+                runtime_configuration: runtime_configuration.projected(),
+            },
+            crate::model::RoleTurnObservation::Failed { failure } => {
+                crate::model::RoleTurnObservation::Failed {
+                    failure: failure.projected(),
+                }
+            }
+        };
+        let state = self.load_state(mission_id).await?;
+        let receipt = state
+            .role_attempt_receipts
+            .get(effect_id)
+            .context("role turn observation has no active attempt receipt")?;
+        if let Some(observed) = &receipt.turn {
+            if observed == &observation {
+                return Ok(());
+            }
+            bail!("active effect attempted to replace its durably observed role turn");
+        }
+        self.append_fact(
+            mission_id,
+            state.head,
+            NewEvent::new(MissionEvent::RoleTurnObserved {
+                effect_id: effect_id.clone(),
+                observation: observation.clone(),
+            }),
+        )
+        .await?;
+        let reloaded = self.load_state(mission_id).await?;
+        let observed = reloaded
+            .role_attempt_receipts
+            .get(effect_id)
+            .and_then(|receipt| receipt.turn.as_ref())
+            .context("durable role turn observation did not bind to the active effect")?;
+        if observed != &observation {
+            bail!("durable role turn observation differs from the exact adapter turn");
+        }
+        Ok(())
+    }
+
+    async fn record_role_handoff(
+        &self,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+        observation: crate::model::RoleHandoffObservation,
+    ) -> Result<()> {
+        let observation = match observation {
+            crate::model::RoleHandoffObservation::Accepted { report } => {
+                crate::model::RoleHandoffObservation::Accepted {
+                    report: self.externalize_handoff_report(report)?,
+                }
+            }
+            crate::model::RoleHandoffObservation::Rejected { failure }
+                if failure.is_invalid_output() =>
+            {
+                crate::model::RoleHandoffObservation::Rejected {
+                    failure: canonical_handoff_failure(failure),
+                }
+            }
+            crate::model::RoleHandoffObservation::Rejected { .. } => {
+                bail!("only typed invalid output may reject a role handoff")
+            }
+        };
+        let state = self.load_state(mission_id).await?;
+        let receipt = state
+            .role_attempt_receipts
+            .get(effect_id)
+            .context("role handoff observation has no active attempt receipt")?;
+        if let Some(observed) = &receipt.handoff {
+            if observed == &observation {
+                return Ok(());
+            }
+            bail!("active effect attempted to replace its durably observed role handoff");
+        }
+        self.append_fact(
+            mission_id,
+            state.head,
+            NewEvent::new(MissionEvent::RoleHandoffObserved {
+                effect_id: effect_id.clone(),
+                observation: observation.clone(),
+            }),
+        )
+        .await?;
+        let reloaded = self.load_state(mission_id).await?;
+        let observed = reloaded
+            .role_attempt_receipts
+            .get(effect_id)
+            .and_then(|receipt| receipt.handoff.as_ref())
+            .context("durable handoff observation did not bind to the active effect")?;
+        if observed != &observation {
+            bail!("durable handoff observation differs from the exact role handoff");
+        }
+        Ok(())
+    }
+
+    async fn validate_role_handoff_observation(
+        &self,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+        result: &std::result::Result<crate::ports::RoleRunOutcome, TypedFailure>,
+    ) -> Result<()> {
+        let state = self.load_state(mission_id).await?;
+        let receipt = state
+            .role_attempt_receipts
+            .get(effect_id)
+            .context("role runner result has no fold-authoritative attempt receipt")?;
+        match (result, &receipt.turn) {
+            (
+                Ok(outcome),
+                Some(crate::model::RoleTurnObservation::Completed {
+                    final_response,
+                    runtime_configuration,
+                }),
+            ) => {
+                let expected_response = self
+                    .externalize_role_payload(PayloadRef::inline(outcome.final_response.clone()))?;
+                if final_response != &expected_response
+                    || runtime_configuration != &outcome.runtime_configuration
+                {
+                    bail!("role runner result differs from its durable turn observation");
+                }
+            }
+            (Ok(_), _) => {
+                bail!("role runner returned success without a durable completed-turn observation")
+            }
+            (
+                Err(failure),
+                Some(crate::model::RoleTurnObservation::Failed { failure: observed }),
+            ) if observed != &failure.clone().projected() => {
+                bail!("role runner failure differs from its durable failed-turn observation")
+            }
+            (
+                Err(failure),
+                Some(crate::model::RoleTurnObservation::Completed {
+                    final_response,
+                    runtime_configuration,
+                }),
+            ) => {
+                if failure.evidence().configuration != *runtime_configuration
+                    || (!failure.evidence().final_response.is_empty()
+                        && self.externalize_role_payload(PayloadRef::inline(
+                            failure.evidence().final_response.clone(),
+                        ))? != *final_response)
+                {
+                    bail!("post-turn role failure discarded durable turn evidence");
+                }
+            }
+            (Err(_), Some(crate::model::RoleTurnObservation::Failed { .. })) => {}
+            (Err(failure), None)
+                if failure.evidence().final_response.is_empty()
+                    && failure.evidence().configuration
+                        == crate::model::RuntimeConfigurationEvidence::default() => {}
+            (Err(_), None) => {
+                bail!("role runner returned post-turn evidence without a durable turn observation")
+            }
+        }
+        let observed = receipt.handoff.as_ref();
+        match result {
+            Ok(outcome) => match &outcome.handoff {
+                Some(handoff) => {
+                    let expected = self.externalize_handoff_report(handoff.report().clone())?;
+                    let actual = match observed {
+                        Some(crate::model::RoleHandoffObservation::Accepted { report }) => {
+                            Some(report)
+                        }
+                        Some(crate::model::RoleHandoffObservation::Rejected { .. }) | None => None,
+                    }
+                    .context(
+                        "role runner returned a handoff without durable accepted observation",
+                    )?;
+                    if actual != &expected {
+                        bail!(
+                            "role runner returned a handoff different from its durable observation"
+                        );
+                    }
+                }
+                None if observed.is_some() => {
+                    bail!("role runner returned no handoff after durably observing one")
+                }
+                None => {}
+            },
+            Err(failure) => {
+                if let Some(crate::model::RoleHandoffObservation::Rejected { failure: rejected }) =
+                    observed
+                {
+                    if rejected != &canonical_handoff_failure(failure.clone()) {
+                        bail!(
+                            "role runner failure differs from its durable rejected-handoff observation"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Append events, treating a `Conflict`/`Duplicate` as an idempotent no-op.
@@ -1220,11 +1597,11 @@ impl Engine {
         let request = effect
             .role_request_identity()
             .expect("matched role-run effect");
-        let completed = |outcome| {
+        let completed = |outcome: Result<crate::model::RoleRunSuccess, TypedFailure>| {
             NewEvent::new(MissionEvent::RoleRunCompleted {
                 effect_id: effect_id.clone(),
                 request: Box::new(request.clone()),
-                outcome,
+                outcome: outcome.map_err(without_role_turn_evidence),
             })
         };
         if let Err(reason) = state.active_role_conversation(effect_id) {
@@ -1417,7 +1794,7 @@ impl Engine {
             bail!("execute_oracle_run called with a non-oracle effect");
         };
         let attempt_no = *attempt_no;
-        let completed = |outcome| {
+        let completed = |outcome: Result<crate::model::OracleRunSuccess, TypedFailure>| {
             NewEvent::new(MissionEvent::OracleRunCompleted {
                 assertion_ids: assertion_ids.to_vec(),
                 oracle: oracle.clone(),
@@ -1503,12 +1880,12 @@ impl Engine {
             bail!("execute_terminal_review called with a non-review effect");
         };
         let attempt_no = *attempt_no;
-        let completed = |outcome| {
+        let completed = |outcome: Result<crate::model::TerminalReviewSuccess, TypedFailure>| {
             NewEvent::new(MissionEvent::TerminalReviewCompleted {
                 attempt_no,
                 effect_id: effect_id.clone(),
                 judged_sha: judged_sha.clone(),
-                outcome,
+                outcome: outcome.map_err(without_role_turn_evidence),
             })
         };
         let Some(role) = self.mission_type.roles.get(role_name) else {
@@ -1647,42 +2024,98 @@ impl Engine {
         .with_settlement_evidence(settlement_evidence))
     }
 
-    /// Resolve the `last_report` blobs of a task's dependencies (in either era's
-    /// task map) — the upstream context threaded into a role's prompt.
+    /// Resolve the exact outcomes made deliverable by cleared dependencies.
+    /// A lead-accepted failure remains explicitly failed while retaining its
+    /// observed handoff evidence.
     fn resolve_upstream_reports(
         &self,
-        tasks: &std::collections::BTreeMap<crate::model::TaskId, crate::model::TaskRuntimeState>,
+        state: &MissionState,
+        namespace: TaskNamespace,
         depends_on: &[crate::model::TaskId],
     ) -> Result<Vec<String>> {
         const MAX_UPSTREAM_REPORT_BYTES: usize =
-            crate::model::MAX_TASK_DEPENDENCIES * MAX_HANDOFF_REPORT_BYTES;
+            crate::model::MAX_TASK_DEPENDENCIES * MAX_ROLE_REPORT_BYTES;
         let mut reports = Vec::new();
         let mut remaining = MAX_UPSTREAM_REPORT_BYTES;
         for dep in depends_on {
-            if let Some(report) = tasks.get(dep).and_then(|t| t.last_report.as_ref()) {
-                let resolved = self
-                    .store
-                    .blobs()
-                    .resolve_bounded(report, remaining)
-                    .context("accepted upstream reports exceeded their aggregate prompt budget")?;
-                remaining -= resolved.len();
-                reports.push(resolved);
+            let Some(outcome) = state
+                .tasks_in(namespace)
+                .get(dep)
+                .and_then(crate::model::TaskRuntimeState::cleared_outcome)
+            else {
+                continue;
+            };
+            let receipt = state
+                .role_attempt_receipts
+                .get(outcome.effect_id())
+                .context("cleared dependency points to a missing role-attempt receipt")?;
+            let (prefix, report) = match outcome {
+                crate::model::TaskAttemptOutcome::Accepted { .. } => (
+                    String::new(),
+                    Some(receipt.accepted_report().context(
+                        "accepted dependency outcome does not contain an accepted handoff",
+                    )?),
+                ),
+                crate::model::TaskAttemptOutcome::Failed { .. } => {
+                    let failure = receipt
+                        .failure()
+                        .context("failed dependency receipt has no failure")?;
+                    (
+                        format!(
+                            "Lead accepted failed dependency '{dep}' ({}): {}",
+                            failure.category(),
+                            failure.detail()
+                        ),
+                        receipt.accepted_report(),
+                    )
+                }
+            };
+            if prefix.len() > remaining {
+                bail!("accepted upstream outcomes exceeded their aggregate prompt budget");
             }
+            remaining -= prefix.len();
+            let Some(report) = report else {
+                reports.push(prefix);
+                continue;
+            };
+            let resolved = self
+                .store
+                .blobs()
+                .resolve_bounded(report, remaining)
+                .context("accepted upstream reports exceeded their aggregate prompt budget")?;
+            remaining -= resolved.len();
+            reports.push(if prefix.is_empty() {
+                resolved
+            } else {
+                format!("{prefix}\nRetained handoff report:\n{resolved}")
+            });
         }
         Ok(reports)
     }
 
-    fn resolve_task_feedback(&self, task: &crate::model::TaskRuntimeState) -> Result<Vec<String>> {
+    fn resolve_task_feedback(
+        &self,
+        state: &MissionState,
+        namespace: TaskNamespace,
+        task_id: &TaskId,
+    ) -> Result<Vec<String>> {
         let mut feedback = Vec::new();
-        if let Some(failure) = &task.last_failure {
+        if let Some(failure) = state.task_last_failure(namespace, task_id) {
             feedback.push(format!(
                 "Previous attempt failed ({}): {}",
                 failure.category(),
                 failure.detail()
             ));
         }
+        let Some(task) = state.tasks_in(namespace).get(task_id) else {
+            return Ok(feedback);
+        };
         for item in &task.feedback {
-            feedback.push(crate::evidence::render_feedback(self.store.blobs(), item)?);
+            feedback.push(crate::evidence::render_feedback(
+                self.store.blobs(),
+                state,
+                item,
+            )?);
         }
         Ok(feedback)
     }
@@ -1709,11 +2142,15 @@ impl Engine {
             .iter()
             .find(|t| t.id == intent.task_id)
             .context("dispatched task not in plan")?;
-        let upstream_reports = self.resolve_upstream_reports(&state.tasks, &task.depends_on)?;
+        let upstream_reports = if role.output == crate::model::OutputSemantics::EmitsVerdict {
+            Vec::new()
+        } else {
+            self.resolve_upstream_reports(state, TaskNamespace::Execution, &task.depends_on)?
+        };
         let mut feedback = state
             .tasks
-            .get(&task.id)
-            .map(|runtime| self.resolve_task_feedback(runtime))
+            .contains_key(&task.id)
+            .then(|| self.resolve_task_feedback(state, TaskNamespace::Execution, &task.id))
             .transpose()?
             .unwrap_or_default();
         feedback.extend_from_slice(dialogue);
@@ -1760,12 +2197,12 @@ impl Engine {
             .find(|t| t.id == intent.task_id)
             .context("dispatched planning task not in the DAG")?;
         let upstream_reports =
-            self.resolve_upstream_reports(&state.planning.tasks, &task.depends_on)?;
+            self.resolve_upstream_reports(state, TaskNamespace::Planning, &task.depends_on)?;
         let mut task_feedback = state
             .planning
             .tasks
-            .get(&task.id)
-            .map(|runtime| self.resolve_task_feedback(runtime))
+            .contains_key(&task.id)
+            .then(|| self.resolve_task_feedback(state, TaskNamespace::Planning, &task.id))
             .transpose()?
             .unwrap_or_default();
         task_feedback.extend_from_slice(dialogue);
@@ -1805,7 +2242,7 @@ impl Engine {
             }
             Some(crate::model::PlanningRefinement::FailureEvidence(feedback)) => {
                 Some(PlanningPromptRefinement::FailureEvidence(
-                    crate::evidence::render_feedback(self.store.blobs(), feedback)?,
+                    crate::evidence::render_feedback(self.store.blobs(), state, feedback)?,
                 ))
             }
             None => None,
@@ -1829,6 +2266,11 @@ impl Engine {
             .roles
             .get(&intent.role)
             .with_context(|| format!("role '{}' missing from the mission type", intent.role))?;
+        ensure!(
+            role.output == intent.output,
+            "folded output contract for role '{}' differs from the pinned mission type",
+            intent.role
+        );
         // Planning and execution assemble prompts and namespace effect IDs
         // separately, so a planning report can never reach an execution judge and
         // a planning effect can never collide with an execution one.
@@ -1841,7 +2283,9 @@ impl Engine {
                 previous: state.tasks_in(intent.namespace).get(&intent.task_id),
                 required_base: &intent.base_sha,
                 lifecycle_generation: state.role_lifecycle_generation(intent.namespace),
-                max_attempts: state.config.recovery.max_attempts,
+                retrying_failure: state
+                    .task_automatic_retry_remaining(intent.namespace, &intent.task_id),
+                output: intent.output,
             },
         );
         let conversation_id = assignment.conversation_id.clone();
@@ -1919,10 +2363,7 @@ impl Engine {
         let requested_at_ms = self.clock.now_ms();
         let not_before_ms = retry_not_before(
             requested_at_ms,
-            state
-                .tasks_in(intent.namespace)
-                .get(&intent.task_id)
-                .and_then(|task| task.last_failure.as_ref()),
+            state.task_last_failure(intent.namespace, &intent.task_id),
         );
         let initial_secs = role
             .timeout_secs
@@ -1934,12 +2375,12 @@ impl Engine {
             attempt_no: intent.attempt_no,
             effect_id,
             role: intent.role,
-            output: role.output,
+            output: intent.output,
             runtime: role
                 .runtime
                 .clone()
                 .unwrap_or_else(|| state.runtime.clone()),
-            prompt_template: crate::model::role_prompt_template(intent.namespace, role.output)
+            prompt_template: crate::model::role_prompt_template(intent.namespace, intent.output)
                 .context("role output has no valid prompt template in this namespace")?,
             prompt_hash: prompt_hash.clone(),
             base_sha,
@@ -2018,7 +2459,10 @@ impl Engine {
             .externalize(PayloadRef::inline(prompt_text))?;
         let requested_at_ms = self.clock.now_ms();
         let previous_failure = match state.terminal_review.outcome.as_ref() {
-            Some(crate::model::ReviewOutcome::Failed { failure }) => Some(failure),
+            Some(crate::model::ReviewOutcome::Failed { effect_id }) => state
+                .role_attempt_receipts
+                .get(effect_id)
+                .and_then(crate::model::RoleAttemptReceipt::failure),
             _ => None,
         };
         let not_before_ms = retry_not_before(requested_at_ms, previous_failure);
@@ -2141,11 +2585,11 @@ impl Engine {
 
     fn externalize_handoff_report(&self, payload: PayloadRef) -> Result<PayloadRef, TypedFailure> {
         if let PayloadRef::Inline { text } = &payload {
-            if text.len() > MAX_HANDOFF_REPORT_BYTES {
+            if text.len() > MAX_ROLE_REPORT_BYTES {
                 return Err(TypedFailure::invalid(
                     "handoff.report_too_large",
                     format!(
-                        "handoff report is {} bytes; the limit is {MAX_HANDOFF_REPORT_BYTES}",
+                        "handoff report is {} bytes; the limit is {MAX_ROLE_REPORT_BYTES}",
                         text.len()
                     ),
                 ));
@@ -2168,33 +2612,111 @@ impl Engine {
             )
         })
     }
+
+    fn recover_role_failure(
+        &self,
+        receipt: Option<&crate::model::RoleAttemptReceipt>,
+        mut fallback: TypedFailure,
+    ) -> TypedFailure {
+        let Some(receipt) = receipt else {
+            return fallback;
+        };
+        match &receipt.turn {
+            Some(crate::model::RoleTurnObservation::Failed { failure }) => failure.clone(),
+            Some(crate::model::RoleTurnObservation::Completed {
+                final_response,
+                runtime_configuration: _,
+            }) => {
+                let runtime_configuration = receipt
+                    .effective_runtime_configuration()
+                    .cloned()
+                    .unwrap_or_default();
+                match self.store.blobs().resolve(final_response) {
+                    Ok(response) => {
+                        let evidence = fallback.evidence_mut();
+                        evidence.configuration = runtime_configuration.clone();
+                        evidence.final_response = response;
+                    }
+                    Err(error) => {
+                        let prior = fallback.detail().to_string();
+                        fallback = TypedFailure::permanent(
+                            "role.turn_evidence",
+                            format!(
+                                "durable role response could not be resolved during recovery: {error}; prior outcome: {prior}"
+                            ),
+                        );
+                        fallback.evidence_mut().configuration = runtime_configuration;
+                    }
+                }
+                fallback.projected()
+            }
+            None => {
+                if let Some(configuration) = receipt.effective_runtime_configuration() {
+                    fallback.evidence_mut().configuration = configuration.clone();
+                }
+                fallback.projected()
+            }
+        }
+    }
 }
 
-fn interrupted_outcome(effect_id: &EffectId, effect: &InflightEffect) -> NewEvent {
+fn interrupted_failure() -> TypedFailure {
     let mut evidence = lionclaw_runtime_api::TypedFailureEvidence::new(
         Some("driver.interrupted".to_string()),
         "the previous mission driver exited before recording an outcome; its resources were cleaned and the effect was not replayed",
     );
     evidence.stop_reason = Some("mission driver exited".into());
-    match effect {
-        InflightEffect::RoleRun {
-            runtime_configuration,
-            ..
-        }
-        | InflightEffect::TerminalReview {
-            runtime_configuration,
-            ..
-        } => {
-            if let Some(configuration) = runtime_configuration {
-                evidence.configuration = runtime_configuration_evidence(configuration);
-            }
-        }
-        InflightEffect::OracleRun { .. } => {}
-    }
-    let failure = TypedFailure::Interrupted {
+    TypedFailure::Interrupted {
         evidence: Box::new(evidence),
+    }
+}
+
+fn role_output_semantics(effect: &InflightEffect) -> Option<crate::model::OutputSemantics> {
+    match effect {
+        InflightEffect::RoleRun { output, .. } => Some(*output),
+        InflightEffect::TerminalReview { .. } => {
+            Some(crate::model::OutputSemantics::EmitsGapVerdict)
+        }
+        InflightEffect::OracleRun { .. } => None,
+    }
+}
+
+/// A durable completed turn is authoritative even when the driver exited
+/// before it observed a handoff. Reconstruct the same output-contract result
+/// live execution would have produced: dialogue roles checkpoint successfully,
+/// while mandatory judgment roles enter typed invalid-output rework.
+fn recovered_completed_turn_without_handoff(
+    effect_id: &EffectId,
+    effect: &InflightEffect,
+    receipt: Option<&crate::model::RoleAttemptReceipt>,
+) -> Option<NewEvent> {
+    let receipt = receipt?;
+    if receipt.handoff.is_some() {
+        return None;
+    }
+    let crate::model::RoleTurnObservation::Completed {
+        final_response,
+        runtime_configuration: _,
+    } = receipt.turn.as_ref()?
+    else {
+        return None;
     };
-    failed_outcome(effect_id, effect, failure)
+    let output = role_output_semantics(effect)?;
+    if let Some(failure) = missing_handoff_failure(output) {
+        return Some(failed_outcome(effect_id, effect, failure));
+    }
+    let request = effect.role_request_identity()?;
+    let runtime_configuration = receipt.effective_runtime_configuration()?.clone();
+    Some(NewEvent::new(MissionEvent::RoleRunCompleted {
+        effect_id: effect_id.clone(),
+        request: Box::new(request),
+        outcome: Ok(RoleRunSuccess {
+            handoff: None,
+            artifact: None,
+            final_response: final_response.clone(),
+            runtime_configuration: runtime_configuration.clone(),
+        }),
+    }))
 }
 
 fn failed_outcome(
@@ -2210,7 +2732,7 @@ fn failed_outcome(
                     .role_request_identity()
                     .expect("matched role-run effect"),
             ),
-            outcome: Err(failure),
+            outcome: Err(without_role_turn_evidence(failure)),
         },
         InflightEffect::OracleRun {
             assertion_ids,
@@ -2234,7 +2756,7 @@ fn failed_outcome(
             attempt_no: *attempt_no,
             effect_id: effect_id.clone(),
             judged_sha: judged_sha.clone(),
-            outcome: Err(failure),
+            outcome: Err(without_role_turn_evidence(failure)),
         },
     })
 }
@@ -2791,6 +3313,18 @@ fn retry_not_before(now_ms: i64, failure: Option<&TypedFailure>) -> i64 {
         .max(now_ms)
 }
 
+fn canonical_handoff_failure(mut failure: TypedFailure) -> TypedFailure {
+    failure = without_role_turn_evidence(failure);
+    failure
+}
+
+fn without_role_turn_evidence(mut failure: TypedFailure) -> TypedFailure {
+    failure = failure.projected();
+    failure.evidence_mut().final_response.clear();
+    failure.evidence_mut().configuration = crate::model::RuntimeConfigurationEvidence::default();
+    failure
+}
+
 /// Checkpoint selection is pure: recorded state policy plus the just-produced
 /// outcome. The driver only performs the returned action.
 fn checkpoint_after(
@@ -2875,7 +3409,7 @@ fn validated_role_success(
 ) -> std::result::Result<crate::ports::RoleRunOutcome, TypedFailure> {
     let outcome = outcome.projected();
     if let Some(handoff) = &outcome.handoff {
-        if let Err(failure) = crate::runner::validate_handoff(handoff) {
+        if let Err(failure) = crate::runner::validate_handoff(handoff, output) {
             return Err(with_role_outcome_evidence(failure, &outcome));
         }
     }
@@ -2904,12 +3438,8 @@ fn validated_role_success(
                 &outcome,
             ));
         }
-    } else if output.requires_handoff() {
-        return Err(invalid_role_outcome(
-            "handoff.missing",
-            "this output contract requires a typed handoff",
-            &outcome,
-        ));
+    } else if let Some(failure) = missing_handoff_failure(output) {
+        return Err(with_role_outcome_evidence(failure, &outcome));
     } else if outcome.artifact.is_some() {
         return Err(invalid_role_outcome(
             "role.success_contract",
@@ -2918,6 +3448,15 @@ fn validated_role_success(
         ));
     }
     Ok(outcome)
+}
+
+fn missing_handoff_failure(output: crate::model::OutputSemantics) -> Option<TypedFailure> {
+    output.requires_handoff().then(|| {
+        TypedFailure::invalid(
+            "handoff.missing",
+            "this output contract requires a typed handoff",
+        )
+    })
 }
 
 fn invalid_role_outcome(
@@ -3063,10 +3602,8 @@ mod assignment_tests {
             status,
             attempts: epoch,
             consecutive_failures: 0,
-            last_report: None,
-            last_failure: None,
+            last_outcome: None,
             feedback: Vec::new(),
-            last_runtime_configuration: None,
             role_assignment: Some(crate::model::TaskRoleAssignment {
                 base_sha: base.to_string(),
                 assignment_epoch: epoch,
@@ -3091,7 +3628,7 @@ mod assignment_tests {
     #[test]
     fn fresh_assignment_rebases_only_when_the_required_deliverable_moved() {
         assert_eq!(
-            resolve_task_assignment(None, "h1", 1, 3),
+            resolve_task_assignment(None, "h1", 1, false),
             (
                 "h1".into(),
                 1,
@@ -3100,7 +3637,7 @@ mod assignment_tests {
         );
         let pending = task(TaskStatus::Pending, "h1", 1);
         assert_eq!(
-            resolve_task_assignment(Some(&pending), "h2", 1, 3),
+            resolve_task_assignment(Some(&pending), "h2", 1, false),
             (
                 "h2".into(),
                 2,
@@ -3108,7 +3645,7 @@ mod assignment_tests {
             )
         );
         assert_eq!(
-            resolve_task_assignment(Some(&pending), "h1", 1, 3),
+            resolve_task_assignment(Some(&pending), "h1", 1, false),
             ("h1".into(), 1, crate::model::WorkspacePreparation::Preserve,)
         );
     }
@@ -3117,13 +3654,8 @@ mod assignment_tests {
     fn retry_retains_the_original_workspace_base_and_epoch() {
         let mut failed = task(TaskStatus::Failed, "h1", 4);
         failed.consecutive_failures = 1;
-        failed.last_failure = Some(TypedFailure::transient(
-            "runtime.fixture",
-            "driver died",
-            None,
-        ));
         assert_eq!(
-            resolve_task_assignment(Some(&failed), "h2", 1, 3),
+            resolve_task_assignment(Some(&failed), "h2", 1, true),
             ("h1".into(), 4, crate::model::WorkspacePreparation::Preserve,)
         );
     }

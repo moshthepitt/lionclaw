@@ -16,8 +16,9 @@ use common::{
 };
 use lionclaw::engine::{MissionDisposition, MissionView, TERMINAL_REVIEW_TASK_TAG as REVIEW_TAG};
 use lionclaw::model::{
-    BlobRef, DecisionAction, FinishClass, Gap, Handoff, MissionEvent, MissionPhase, PayloadRef,
-    ReviewAcceptanceKind, ReviewOutcome, RoleResourceLifetime, Task, TaskKind,
+    BlobRef, DecisionAction, FinishClass, Gap, GapSeverity, Handoff, MissionEvent, MissionPhase,
+    MissionState, PayloadRef, ReviewAcceptanceKind, RoleAttemptReceipt, RoleEffectSource,
+    RoleResourceLifetime, SettledHandoff, Task, TaskKind,
 };
 use lionclaw::ports::{CapturedArtifact, RoleRunOutcome, RoleRunRequest};
 use lionclaw::testing::{review_verdict, MockOracleRunner, MockRoleRunner};
@@ -33,6 +34,29 @@ fn assert_terminal(view: &MissionView) {
         MissionDisposition::Terminal,
         "got {view:?}"
     );
+}
+
+fn terminal_review_receipt(state: &MissionState) -> &RoleAttemptReceipt {
+    state
+        .terminal_review_receipt()
+        .expect("fold-authoritative terminal-review receipt")
+}
+
+fn terminal_review_failure(state: &MissionState) -> &TypedFailure {
+    terminal_review_receipt(state)
+        .failure()
+        .expect("failed terminal-review receipt")
+}
+
+fn terminal_review_verdict(state: &MissionState) -> (&RoleAttemptReceipt, &str, bool, &[Gap]) {
+    let receipt = terminal_review_receipt(state);
+    let RoleEffectSource::TerminalReview { judged_sha, .. } = &receipt.source else {
+        panic!("terminal-review outcome has task provenance")
+    };
+    let Some(SettledHandoff::Review { passed, gaps }) = receipt.settled_handoff() else {
+        panic!("terminal-review verdict has no settled review handoff")
+    };
+    (receipt, judged_sha, *passed, gaps)
 }
 
 fn work_outcome(request: &RoleRunRequest, head_sha: &str) -> RoleRunOutcome {
@@ -145,12 +169,11 @@ async fn a_clean_review_closes_verified_with_no_park() {
     // Exactly one reviewer run, judged at the final commit, recorded fresh.
     assert_eq!(review_calls(&h).len(), 1);
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    let Some(ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome else {
-        panic!("verdict recorded");
-    };
-    assert_eq!(v.judged_sha, HEAD_SHA);
-    assert!(v.is_fresh_at(&state.current_sha));
-    assert!(!v.blocking());
+    let (_, judged_sha, passed, gaps) = terminal_review_verdict(&state);
+    assert_eq!(judged_sha, HEAD_SHA);
+    assert_eq!(judged_sha, state.current_sha);
+    assert!(passed);
+    assert!(!gaps.iter().any(|gap| gap.severity == GapSeverity::Blocking));
 }
 
 #[tokio::test]
@@ -283,9 +306,8 @@ async fn terminal_review_uses_the_shared_role_output_boundary() {
                     let Some(Handoff::Review { report, .. }) = &mut outcome.handoff else {
                         unreachable!("review_verdict returns a review handoff")
                     };
-                    *report = PayloadRef::inline(
-                        "x".repeat(lionclaw::runner::MAX_HANDOFF_REPORT_BYTES + 1),
-                    );
+                    *report =
+                        PayloadRef::inline("x".repeat(lionclaw::model::MAX_ROLE_REPORT_BYTES + 1));
                 }
                 Fault::OversizedGaps => {
                     let Some(Handoff::Review { gaps, .. }) = &mut outcome.handoff else {
@@ -313,15 +335,7 @@ async fn terminal_review_uses_the_shared_role_output_boundary() {
 
         let view = h.engine.advance(&mission_id).await.expect("advance");
         assert_eq!(view.disposition, MissionDisposition::Parked);
-        let ReviewOutcome::Failed { failure } = view
-            .state
-            .terminal_review
-            .outcome
-            .as_ref()
-            .expect("failed terminal review")
-        else {
-            panic!("invalid alternate-runner output must not mint a verdict")
-        };
+        let failure = terminal_review_failure(&view.state);
         assert_eq!(failure.evidence().code.as_deref(), Some(expected_code));
     }
 }
@@ -473,7 +487,16 @@ async fn revising_terminal_gaps_carries_the_review_report_into_planning() {
         panic!("terminal review revise must carry structured failure evidence");
     };
     assert_eq!(feedback.justification, "repair the observed behavior");
-    let details = feedback.details.as_ref().expect("review report reference");
+    let lionclaw::model::DecisionEvidence::RoleAttempts { effect_ids } = &feedback.evidence else {
+        panic!("terminal review feedback must retain exact role receipt identities");
+    };
+    let effect_id = effect_ids.first().expect("review receipt evidence");
+    let details = state
+        .role_attempt_receipts
+        .get(effect_id)
+        .expect("referenced terminal-review receipt")
+        .accepted_report()
+        .expect("accepted terminal-review report");
     assert_eq!(
         h.engine.store().blobs().resolve(details).unwrap(),
         "requirement map + observations"
@@ -538,10 +561,8 @@ async fn a_revision_resumes_work_and_re_reviews_at_the_new_head() {
     assert_ne!(calls[0].1, calls[1].1);
     assert_eq!(h.role_runner.max_invocations_per_key(), 1);
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    let Some(ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome else {
-        panic!("verdict recorded");
-    };
-    assert_eq!(v.judged_sha, state.current_sha);
+    let (_, judged_sha, _, _) = terminal_review_verdict(&state);
+    assert_eq!(judged_sha, state.current_sha);
     assert_ne!(state.current_sha, first_head);
     assert!(
         lionclaw::workspace::is_ancestor(dir.path(), &first_head, &state.current_sha)
@@ -622,16 +643,7 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
     let attention = parked(&outcome);
     assert_eq!(attention[0].id, "terminal_review_failed:mission");
     assert!(attention[0].report.contains("nonce mismatch"));
-    let failure = outcome
-        .state
-        .terminal_review
-        .outcome
-        .as_ref()
-        .and_then(|outcome| match outcome {
-            ReviewOutcome::Failed { failure } => Some(failure),
-            ReviewOutcome::Verdict(_) => None,
-        })
-        .expect("failed review evidence");
+    let failure = terminal_review_failure(&outcome.state);
     assert_eq!(
         failure.evidence().final_response,
         "review analysis before the forged verdict"
@@ -666,9 +678,7 @@ async fn a_crashed_review_is_interrupted_without_rerunning_the_llm() {
     assert_eq!(outcome.disposition, MissionDisposition::Parked);
     let state = h.engine.load_state(&mission_id).await.expect("state");
     assert!(state.inflight.is_empty());
-    let Some(ReviewOutcome::Failed { failure }) = &state.terminal_review.outcome else {
-        panic!("interrupted failure recorded");
-    };
+    let failure = terminal_review_failure(&state);
     assert_eq!(failure.category(), "interrupted");
     assert_eq!(
         h.role_runner
@@ -852,10 +862,8 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
     // ran at the new head and its verdict is on record.
     assert_eq!(review_calls(&h).len(), 2, "the stale waiver must re-review");
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    let Some(ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome else {
-        panic!("verdict recorded after the waiver staled");
-    };
-    assert_eq!(v.judged_sha, state.current_sha);
+    let (_, judged_sha, _, _) = terminal_review_verdict(&state);
+    assert_eq!(judged_sha, state.current_sha);
     assert_ne!(state.current_sha, waived_head);
     assert!(
         lionclaw::workspace::is_ancestor(dir.path(), &waived_head, &state.current_sha)
@@ -929,7 +937,7 @@ async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
 #[tokio::test]
 async fn an_ordinary_validator_handoff_cannot_seal_the_terminal_review() {
     // The production parser binds this role to the dedicated review schema.
-    // Keep the engine fail-closed even when a mock bypasses that parser.
+    // Alternate runners use the same closed handoff boundary.
     let dir = tempfile::tempdir().expect("tempdir");
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == REVIEW_TAG {
@@ -953,17 +961,6 @@ async fn an_ordinary_validator_handoff_cannot_seal_the_terminal_review() {
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
     assert_eq!(attention[0].id, "terminal_review_failed:mission");
-    let ReviewOutcome::Failed { failure } = outcome
-        .state
-        .terminal_review
-        .outcome
-        .as_ref()
-        .expect("failed terminal review")
-    else {
-        panic!("ordinary validator output must not mint a terminal verdict")
-    };
-    assert_eq!(
-        failure.evidence().code.as_deref(),
-        Some("role.success_contract")
-    );
+    let failure = terminal_review_failure(&outcome.state);
+    assert_eq!(failure.evidence().code.as_deref(), Some("handoff.schema"));
 }

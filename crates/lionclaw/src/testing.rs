@@ -21,6 +21,10 @@ pub struct NoopEffectCleaner;
 
 #[async_trait]
 impl EffectCleaner for NoopEffectCleaner {
+    async fn quiesce(&self, _request: &EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
+        Ok(())
+    }
+
     async fn cleanup(&self, _request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
         Ok(())
     }
@@ -179,7 +183,51 @@ impl RoleRunner for MockRoleRunner {
         {
             prepare_test_workspace(&request).await?;
         }
-        let mut outcome = (self.script)(&request)?;
+        let mut outcome = match (self.script)(&request) {
+            Ok(outcome) => {
+                let outcome = outcome.projected();
+                request
+                    .confirm_turn_observed(crate::model::RoleTurnObservation::Completed {
+                        final_response: crate::model::PayloadRef::inline(
+                            outcome.final_response.clone(),
+                        ),
+                        runtime_configuration: outcome.runtime_configuration.clone(),
+                    })
+                    .await?;
+                outcome
+            }
+            Err(failure) => {
+                let failure = failure.projected();
+                request
+                    .confirm_turn_observed(crate::model::RoleTurnObservation::Failed {
+                        failure: failure.clone(),
+                    })
+                    .await?;
+                return Err(failure);
+            }
+        };
+        if let Some(handoff) = &outcome.handoff {
+            match crate::runner::validate_handoff(handoff, request.role.output) {
+                Ok(()) => {
+                    request
+                        .confirm_handoff_observed(crate::model::RoleHandoffObservation::Accepted {
+                            report: handoff.report().clone(),
+                        })
+                        .await?;
+                }
+                Err(mut failure) => {
+                    failure.evidence_mut().final_response = outcome.final_response.clone();
+                    failure.evidence_mut().configuration = outcome.runtime_configuration.clone();
+                    let failure = failure.projected();
+                    request
+                        .confirm_handoff_observed(crate::model::RoleHandoffObservation::Rejected {
+                            failure: failure.clone(),
+                        })
+                        .await?;
+                    return Err(failure);
+                }
+            }
+        }
         if let Some(test_request) = outcome
             .artifact
             .as_ref()
@@ -240,5 +288,192 @@ impl OracleRunner for MockOracleRunner {
             .expect("lock")
             .push((request.oracle.to_string(), request.judged_sha.clone()));
         (self.script)(&request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+
+    use tokio::sync::{mpsc, watch};
+
+    use super::*;
+    use crate::mission_type::RoleDefinition;
+    use crate::model::{
+        EffectId, MissionId, OutputSemantics, RoleHandoffObservation, RoleName, TaskNamespace,
+        WorkspacePreparation,
+    };
+    use crate::ports::{ExecutionControl, RoleRunUpdate};
+
+    fn role_request(
+        updates: mpsc::Sender<RoleRunUpdate>,
+        output: OutputSemantics,
+    ) -> RoleRunRequest {
+        let (_, control) = watch::channel(ExecutionControl::RunUntil(i64::MAX));
+        let (activity, _) = watch::channel(None);
+        RoleRunRequest {
+            mission_id: MissionId::for_creation("/workspace", "mock-handoff-boundary", 1),
+            namespace: TaskNamespace::Execution,
+            task_id: TaskId::new("review").unwrap(),
+            attempt_no: 1,
+            effect_id: EffectId::for_parts(&["mock-handoff-boundary"]),
+            role: RoleDefinition {
+                name: RoleName::new("reviewer").unwrap(),
+                output,
+                runtime: None,
+                timeout_secs: None,
+                network: false,
+                secrets: false,
+                skills: Vec::new(),
+                prompt_body: String::new(),
+            },
+            environment: BTreeMap::new(),
+            runtime: "mock".into(),
+            skills: Vec::new(),
+            prompt: String::new(),
+            base_sha: "0123456789abcdef".into(),
+            assignment_epoch: 1,
+            workspace_preparation: WorkspacePreparation::Preserve,
+            deadline_ms: i64::MAX,
+            control,
+            updates,
+            activity,
+            workspace_dir: PathBuf::from("/workspace"),
+            state_dir: PathBuf::from("/state"),
+            artifact_capture: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_runner_acknowledges_only_valid_exact_handoffs() {
+        let accepted = Handoff::Validate {
+            done: true,
+            report: PayloadRef::inline("validated"),
+            items: Vec::new(),
+            passed: true,
+            request_attention: false,
+        };
+        let runner = Arc::new(MockRoleRunner::new(Box::new({
+            let accepted = accepted.clone();
+            move |_| {
+                Ok(RoleRunOutcome {
+                    handoff: Some(accepted.clone()),
+                    artifact: None,
+                    runtime_configuration: Default::default(),
+                    final_response: "validated".into(),
+                })
+            }
+        })));
+        let (updates, mut receiver) = mpsc::channel(1);
+        let run = tokio::spawn({
+            let runner = runner.clone();
+            async move {
+                runner
+                    .run(role_request(updates, OutputSemantics::EmitsVerdict))
+                    .await
+            }
+        });
+
+        let RoleRunUpdate::TurnObserved {
+            observation,
+            acknowledge,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected turn observation")
+        };
+        assert_eq!(
+            observation,
+            crate::model::RoleTurnObservation::Completed {
+                final_response: PayloadRef::inline("validated"),
+                runtime_configuration: Default::default(),
+            }
+        );
+        assert!(!run.is_finished());
+        acknowledge.send(Ok(())).unwrap();
+
+        let RoleRunUpdate::HandoffObserved {
+            observation,
+            acknowledge,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected handoff observation")
+        };
+        assert_eq!(
+            observation,
+            RoleHandoffObservation::Accepted {
+                report: accepted.report().clone()
+            }
+        );
+        assert!(!run.is_finished());
+        acknowledge.send(Ok(())).unwrap();
+        assert_eq!(run.await.unwrap().unwrap().handoff, Some(accepted));
+    }
+
+    #[tokio::test]
+    async fn mock_runner_durably_rejects_invalid_handoff_with_exact_outcome_evidence() {
+        let runner = Arc::new(MockRoleRunner::new(Box::new(|_| {
+            Ok(RoleRunOutcome {
+                handoff: Some(Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("wrong contract"),
+                    request_attention: false,
+                }),
+                artifact: None,
+                runtime_configuration: crate::model::RuntimeConfigurationEvidence {
+                    applied_model: Some("mock-model".into()),
+                    ..Default::default()
+                },
+                final_response: "wrong contract response".into(),
+            })
+        })));
+        let (updates, mut receiver) = mpsc::channel(1);
+        let run = tokio::spawn({
+            let runner = runner.clone();
+            async move {
+                runner
+                    .run(role_request(updates, OutputSemantics::EmitsVerdict))
+                    .await
+            }
+        });
+
+        let RoleRunUpdate::TurnObserved {
+            observation,
+            acknowledge,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected turn observation")
+        };
+        assert_eq!(
+            observation,
+            crate::model::RoleTurnObservation::Completed {
+                final_response: PayloadRef::inline("wrong contract response"),
+                runtime_configuration: crate::model::RuntimeConfigurationEvidence {
+                    applied_model: Some("mock-model".into()),
+                    ..Default::default()
+                },
+            }
+        );
+        assert!(!run.is_finished());
+        acknowledge.send(Ok(())).unwrap();
+
+        let RoleRunUpdate::HandoffObserved {
+            observation,
+            acknowledge,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected handoff observation")
+        };
+        let RoleHandoffObservation::Rejected { failure } = observation else {
+            panic!("invalid handoff must not be accepted")
+        };
+        assert_eq!(failure.evidence().code.as_deref(), Some("handoff.schema"));
+        assert_eq!(failure.evidence().final_response, "wrong contract response");
+        assert_eq!(
+            failure.evidence().configuration.applied_model.as_deref(),
+            Some("mock-model")
+        );
+        assert!(!run.is_finished());
+        acknowledge.send(Ok(())).unwrap();
+        assert_eq!(run.await.unwrap().unwrap_err(), failure);
     }
 }

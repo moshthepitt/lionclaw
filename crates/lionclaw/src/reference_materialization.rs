@@ -385,14 +385,16 @@ fn parked_failure<'a>(
     effect_id: &crate::model::EffectId,
 ) -> Option<&'a TypedFailure> {
     match state.parked_effects.get(effect_id)? {
-        ParkedEffect::RoleRun { namespace, task_id } => state
-            .tasks_in(*namespace)
-            .get(task_id)
-            .and_then(|task| task.last_failure.as_ref()),
+        ParkedEffect::RoleRun { namespace, task_id } => {
+            state.task_last_failure(*namespace, task_id)
+        }
         ParkedEffect::OracleRun { oracle } => state.oracle_failures.get(oracle),
         ParkedEffect::TerminalReview => match state.terminal_review.outcome.as_ref()? {
-            ReviewOutcome::Failed { failure } => Some(failure),
-            ReviewOutcome::Verdict(_) => None,
+            ReviewOutcome::Failed { effect_id } => state
+                .role_attempt_receipts
+                .get(effect_id)
+                .and_then(crate::model::RoleAttemptReceipt::failure),
+            ReviewOutcome::Verdict { .. } => None,
         },
     }
 }

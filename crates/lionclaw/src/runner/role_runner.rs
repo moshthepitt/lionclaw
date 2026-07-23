@@ -24,7 +24,7 @@ use crate::authority::{
     compile_authority, compile_role_plan, AuthorityCeiling, MissionMounts, RolePlanRequest,
 };
 use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig, RuntimeProfiles};
-use crate::model::{OutputSemantics, RoleResourceLifetime};
+use crate::model::{OutputSemantics, RoleHandoffObservation, RoleResourceLifetime};
 use crate::ports::{ExecutionControl, RoleRunOutcome, RoleRunRequest, RoleRunner};
 use crate::resources::MissionDirs;
 
@@ -635,19 +635,65 @@ impl RoleRunner for OciRoleRunner {
         // live. Setup and capture use the same engine control, but are simply
         // dropped: child processes are kill-on-drop and retained conversation
         // state stays outside disposable effect resources.
-        let (applied, final_response) = self
+        let turn = self
             .run_turn(&profile, &request, plan, runtime_state, auth)
-            .await?;
+            .await;
+        let (applied, final_response) = match turn {
+            Ok((applied, final_response)) => {
+                let configuration = role_runtime_configuration(&applied);
+                request
+                    .confirm_turn_observed(crate::model::RoleTurnObservation::Completed {
+                        final_response: crate::model::PayloadRef::inline(final_response.clone()),
+                        runtime_configuration: configuration,
+                    })
+                    .await
+                    .map_err(|mut failure| {
+                        failure.evidence_mut().configuration = applied.clone();
+                        failure.evidence_mut().final_response = final_response.clone();
+                        failure
+                    })?;
+                (applied, final_response)
+            }
+            Err(failure) => {
+                let observation = request
+                    .confirm_turn_observed(crate::model::RoleTurnObservation::Failed {
+                        failure: failure.clone(),
+                    })
+                    .await;
+                return match observation {
+                    Ok(()) => Err(failure),
+                    Err(observation_failure) => Err(observation_failure.projected()),
+                };
+            }
+        };
         let cancellation_configuration = applied.clone();
         let cancellation_response = final_response.clone();
         let finish = async {
-            let handoff = read_optional_handoff(dirs.handoff(), request.role.output).map_err(
-                |mut failure| {
+            let handoff = match read_optional_handoff(dirs.handoff(), request.role.output) {
+                Ok(handoff) => handoff,
+                Err(mut failure) => {
                     failure.evidence_mut().final_response = final_response.clone();
                     failure.evidence_mut().configuration = applied.clone();
-                    failure
-                },
-            )?;
+                    request
+                        .confirm_handoff_observed(RoleHandoffObservation::Rejected {
+                            failure: failure.clone(),
+                        })
+                        .await?;
+                    return Err(failure);
+                }
+            };
+            if let Some(handoff) = handoff.as_ref() {
+                request
+                    .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                        report: handoff.report().clone(),
+                    })
+                    .await
+                    .map_err(|mut failure| {
+                        failure.evidence_mut().final_response = final_response.clone();
+                        failure.evidence_mut().configuration = applied.clone();
+                        failure
+                    })?;
+            }
             // A writer may pause for lead input without handing off. Such a
             // dialogue checkpoint publishes neither an artifact nor capture
             // authority; the same conversation workspace remains available
@@ -683,14 +729,7 @@ impl RoleRunner for OciRoleRunner {
             Ok(RoleRunOutcome {
                 handoff,
                 artifact,
-                runtime_configuration: crate::model::RuntimeConfigurationEvidence {
-                    requested_model: applied.requested_model,
-                    applied_model: applied.applied_model,
-                    model_confirmation: applied.model_confirmation,
-                    requested_mode: applied.requested_mode,
-                    applied_mode: applied.applied_mode,
-                    mode_confirmation: applied.mode_confirmation,
-                },
+                runtime_configuration: role_runtime_configuration(&applied),
                 final_response,
             })
         };
@@ -1164,7 +1203,28 @@ async fn execute_turn_attempt(
         }
     };
     drop(turn);
-    (result, drain.await.unwrap_or_default())
+    match drain.await {
+        Ok(Ok(final_response)) => (result, final_response),
+        Ok(Err(mut journal_failure)) => {
+            if let Err(turn_failure) = &result {
+                let evidence = journal_failure.evidence_mut();
+                if evidence.final_response.is_empty() {
+                    evidence
+                        .final_response
+                        .clone_from(&turn_failure.evidence().final_response);
+                }
+                evidence.configuration = turn_failure.evidence().configuration.clone();
+            }
+            (Err(journal_failure), String::new())
+        }
+        Err(error) => (
+            Err(TypedFailure::permanent(
+                "runtime.journal",
+                format!("runtime journal observer failed: {error}"),
+            )),
+            String::new(),
+        ),
+    }
 }
 
 fn recovery_failure(first: &TypedFailure, stage: &str, error: &anyhow::Error) -> TypedFailure {
@@ -1226,20 +1286,40 @@ async fn drain_runtime_journal(
         Option<(crate::model::EffectId, lionclaw_runtime_api::TurnEvent)>,
     >,
     effect_id: crate::model::EffectId,
-) -> String {
+) -> Result<String, TypedFailure> {
     let mut final_response = String::new();
+    let mut durable_failure = None;
     while let Some(event) = journal.recv().await {
         lionclaw_runtime_api::observe_final_response(&mut final_response, event.event());
         if let lionclaw_runtime_api::RuntimeEvent::Configuration { configuration } = event.event() {
-            let _ = updates
-                .send(crate::ports::RoleRunUpdate::RuntimeConfigured(
-                    configuration.clone(),
-                ))
-                .await;
+            let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+            let update = crate::ports::RoleRunUpdate::RuntimeConfigured {
+                configuration: configuration.clone(),
+                acknowledge,
+            };
+            let result = match updates.send(update).await {
+                Ok(()) => acknowledged.await.map_err(|_| {
+                    "kernel closed before acknowledging runtime configuration".to_string()
+                }),
+                Err(_) => Err("kernel role update receiver closed during runtime turn".to_string()),
+            }
+            .and_then(|result| result);
+            if let Err(detail) = result {
+                durable_failure.get_or_insert_with(|| {
+                    TypedFailure::permanent("runtime.configuration_observation", detail)
+                });
+            }
         }
         activity.send_replace(Some((effect_id.clone(), event)));
     }
-    final_response.trim_end().to_string()
+    let final_response = final_response.trim_end().to_string();
+    match durable_failure {
+        Some(mut failure) => {
+            failure.evidence_mut().final_response = final_response;
+            Err(failure)
+        }
+        None => Ok(final_response),
+    }
 }
 
 fn project_turn_failure(
@@ -1254,6 +1334,19 @@ fn project_turn_failure(
         evidence.final_response = fallback_final_response.to_string();
     }
     failure.projected()
+}
+
+fn role_runtime_configuration(
+    applied: &lionclaw_runtime_api::AppliedRuntimeConfiguration,
+) -> crate::model::RuntimeConfigurationEvidence {
+    crate::model::RuntimeConfigurationEvidence {
+        requested_model: applied.requested_model.clone(),
+        applied_model: applied.applied_model.clone(),
+        model_confirmation: applied.model_confirmation,
+        requested_mode: applied.requested_mode.clone(),
+        applied_mode: applied.applied_mode.clone(),
+        mode_confirmation: applied.mode_confirmation,
+    }
 }
 
 fn validate_completed_turn(
@@ -1889,10 +1982,15 @@ mod tests {
         let drain_observations = observations.clone();
         let drain_observer = tokio::spawn(async move {
             while let Some(update) = updates_rx.recv().await {
-                if let crate::ports::RoleRunUpdate::RuntimeConfigured(configuration) = update {
+                if let crate::ports::RoleRunUpdate::RuntimeConfigured {
+                    configuration,
+                    acknowledge,
+                } = update
+                {
                     if let Some(observation) = configuration.requested_model {
                         drain_observations.lock().unwrap().drained.push(observation);
                     }
+                    let _ = acknowledge.send(Ok(()));
                 }
             }
         });
@@ -3086,7 +3184,8 @@ mod tests {
             activity,
             crate::model::EffectId::for_parts(&["test", "forced-response"]),
         )
-        .await;
+        .await
+        .expect("journal drain succeeds");
 
         assert_eq!(response, "partial response before forced stop");
     }

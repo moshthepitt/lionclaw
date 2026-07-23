@@ -5,8 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::event::{
-    EffectResource, Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef,
-    RuntimeConfigurationEvidence,
+    EffectResource, MissionConfig, MissionTypeRef, PayloadRef, RuntimeConfigurationEvidence,
 };
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{Assertion, Plan, PlanProposal};
@@ -199,6 +198,219 @@ impl TaskAddress {
     }
 }
 
+/// Exact folded provenance and lifecycle evidence for one role attempt.
+///
+/// The fold creates one receipt from the matching active request, then only
+/// advances its observation and disposition. Tasks, advisories, reviews, and
+/// operator projections retain the effect ID and resolve this record rather
+/// than copying evidence into mutable "latest" slots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleAttemptReceipt {
+    pub effect_id: super::EffectId,
+    pub source: RoleEffectSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_configuration: Option<RuntimeConfigurationEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<super::RoleTurnObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<super::RoleHandoffObservation>,
+    pub disposition: RoleAttemptDisposition,
+}
+
+/// Whether current folded state still uses a role attempt as evidence.
+///
+/// This is deliberately distinct from the role generation's lifecycle: a
+/// superseded generation can remain the current evidence for replanning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleAttemptEvidenceUse {
+    Current,
+    Historical,
+}
+
+impl RoleAttemptEvidenceUse {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Historical => "historical",
+        }
+    }
+}
+
+/// Whether the role attempt belongs to the mission's current contract
+/// generation or to a retired/superseded generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleAttemptGeneration {
+    Current,
+    Superseded,
+}
+
+impl RoleAttemptGeneration {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleAttemptAuthority {
+    pub evidence_use: RoleAttemptEvidenceUse,
+    pub generation: RoleAttemptGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoleEffectSource {
+    Task {
+        request: Box<super::RoleRunRequestIdentity>,
+        plan_revision: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        authorized_targets: Vec<AssertionId>,
+    },
+    TerminalReview {
+        attempt_no: u32,
+        role: RoleName,
+        judged_sha: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoleAttemptDisposition {
+    Active,
+    Retired,
+    Succeeded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff: Option<SettledHandoff>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<super::ArtifactOutcome>,
+    },
+    Failed {
+        failure: TypedFailure,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SettledHandoff {
+    Work {
+        request_attention: bool,
+    },
+    Validate {
+        items: Vec<super::ValidationItem>,
+        passed: bool,
+        request_attention: bool,
+    },
+    Review {
+        passed: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gaps: Vec<super::Gap>,
+    },
+    Plan {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposal: Option<PlanProposal>,
+        request_attention: bool,
+    },
+}
+
+impl SettledHandoff {
+    pub fn from_handoff(handoff: &super::Handoff) -> Self {
+        match handoff {
+            super::Handoff::Work {
+                request_attention, ..
+            } => Self::Work {
+                request_attention: *request_attention,
+            },
+            super::Handoff::Validate {
+                items,
+                passed,
+                request_attention,
+                ..
+            } => Self::Validate {
+                items: items.clone(),
+                passed: *passed,
+                request_attention: *request_attention,
+            },
+            super::Handoff::Review { passed, gaps, .. } => Self::Review {
+                passed: *passed,
+                gaps: gaps.clone(),
+            },
+            super::Handoff::Plan {
+                proposal,
+                request_attention,
+                ..
+            } => Self::Plan {
+                proposal: proposal.clone(),
+                request_attention: *request_attention,
+            },
+        }
+    }
+}
+
+impl RoleAttemptReceipt {
+    /// Canonical folded runtime configuration for this attempt.
+    ///
+    /// `EffectRuntimeConfigured` grows this progressive evidence and a durable
+    /// turn observation reconciles its final value. The configuration nested
+    /// in `RoleTurnObservation` remains the exact raw observation used by fold
+    /// validation; consumers must use this accessor instead of choosing
+    /// between the progressive and raw forms.
+    pub fn effective_runtime_configuration(&self) -> Option<&RuntimeConfigurationEvidence> {
+        self.runtime_configuration.as_ref()
+    }
+
+    pub fn accepted_report(&self) -> Option<&PayloadRef> {
+        match &self.handoff {
+            Some(super::RoleHandoffObservation::Accepted { report }) => Some(report),
+            Some(super::RoleHandoffObservation::Rejected { .. }) | None => None,
+        }
+    }
+
+    pub fn rejection(&self) -> Option<&TypedFailure> {
+        match &self.handoff {
+            Some(super::RoleHandoffObservation::Rejected { failure }) => Some(failure),
+            Some(super::RoleHandoffObservation::Accepted { .. }) | None => None,
+        }
+    }
+
+    pub fn failure(&self) -> Option<&TypedFailure> {
+        match &self.disposition {
+            RoleAttemptDisposition::Failed { failure } => Some(failure),
+            RoleAttemptDisposition::Active
+            | RoleAttemptDisposition::Retired
+            | RoleAttemptDisposition::Succeeded { .. } => None,
+        }
+    }
+
+    pub fn settled_handoff(&self) -> Option<&SettledHandoff> {
+        match &self.disposition {
+            RoleAttemptDisposition::Succeeded { handoff, .. } => handoff.as_ref(),
+            RoleAttemptDisposition::Active
+            | RoleAttemptDisposition::Retired
+            | RoleAttemptDisposition::Failed { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TaskAttemptOutcome {
+    Accepted { effect_id: super::EffectId },
+    Failed { effect_id: super::EffectId },
+}
+
+impl TaskAttemptOutcome {
+    pub const fn effect_id(&self) -> &super::EffectId {
+        match self {
+            Self::Accepted { effect_id } | Self::Failed { effect_id } => effect_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRuntimeState {
     pub status: TaskStatus,
@@ -207,16 +419,13 @@ pub struct TaskRuntimeState {
     /// Failures since the last successful outcome or explicit recovery
     /// decision. This, not the dispatch identity, bounds automatic recovery.
     pub consecutive_failures: u32,
-    /// The latest handoff report, for threading into downstream prompts.
-    #[serde(default)]
-    pub last_report: Option<PayloadRef>,
-    #[serde(default)]
-    pub last_failure: Option<TypedFailure>,
+    /// The latest settled attempt. Accepted report authority and failed
+    /// evidence are mutually exclusive by construction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<TaskAttemptOutcome>,
     /// Engine-routed repair feedback for this task's next attempt.
     #[serde(default)]
     pub feedback: Vec<FailureFeedback>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_runtime_configuration: Option<RuntimeConfigurationEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_assignment: Option<TaskRoleAssignment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,10 +464,8 @@ pub fn resolve_task_assignment(
     previous: Option<&TaskRuntimeState>,
     required_base: &str,
     lifecycle_generation: u32,
-    max_attempts: u32,
+    retrying_failure: bool,
 ) -> (String, u32, super::WorkspacePreparation) {
-    let retrying_failure =
-        previous.is_some_and(|task| task.automatic_retry_remaining(max_attempts));
     let previous_assignment = previous.and_then(|task| task.role_assignment.as_ref());
     let base_sha = if retrying_failure {
         previous_assignment
@@ -309,7 +516,8 @@ pub struct RoleAssignmentContext<'a> {
     pub previous: Option<&'a TaskRuntimeState>,
     pub required_base: &'a str,
     pub lifecycle_generation: u32,
-    pub max_attempts: u32,
+    pub retrying_failure: bool,
+    pub output: super::OutputSemantics,
 }
 
 pub fn resolve_role_assignment(
@@ -319,12 +527,17 @@ pub fn resolve_role_assignment(
     role: &RoleName,
     context: RoleAssignmentContext<'_>,
 ) -> RoleAssignment {
-    let (base_sha, generation, workspace_preparation) = resolve_task_assignment(
+    let (base_sha, generation, proposed_workspace_preparation) = resolve_task_assignment(
         context.previous,
         context.required_base,
         context.lifecycle_generation,
-        context.max_attempts,
+        context.retrying_failure,
     );
+    let workspace_preparation = if context.output == super::OutputSemantics::ProducesArtifact {
+        proposed_workspace_preparation
+    } else {
+        super::WorkspacePreparation::Preserve
+    };
     RoleAssignment {
         conversation_id: super::ConversationId::for_role_instance(
             mission_id, namespace, task_id, role, generation,
@@ -336,13 +549,13 @@ pub fn resolve_role_assignment(
 }
 
 impl TaskRuntimeState {
-    pub fn automatic_retry_remaining(&self, max_attempts: u32) -> bool {
-        self.status == TaskStatus::Failed
-            && self.consecutive_failures < max_attempts
-            && self
-                .last_failure
-                .as_ref()
-                .is_some_and(|failure| failure.is_transient() || failure.is_invalid_output())
+    /// The exact outcome made deliverable by task clearance. This includes a
+    /// failed attempt explicitly accepted by the lead; callers must preserve
+    /// that failure classification rather than presenting it as success.
+    pub fn cleared_outcome(&self) -> Option<&TaskAttemptOutcome> {
+        (self.status == TaskStatus::Cleared)
+            .then_some(self.last_outcome.as_ref())
+            .flatten()
     }
 }
 
@@ -354,15 +567,41 @@ pub struct FailureEvidence {
     pub stderr: PayloadRef,
 }
 
+/// Exact evidence behind an operator decision or replanning input.
+///
+/// Role-derived facts retain only receipt identities and resolve their content
+/// through `MissionState::role_attempt_receipts`. Oracle failures are not role
+/// attempts and retain their own typed payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DecisionEvidence {
+    None,
+    RoleAttempts { effect_ids: Vec<super::EffectId> },
+    OracleRuntimeFailure { failure: TypedFailure },
+    OracleVerdict { evidence: FailureEvidence },
+}
+
+impl DecisionEvidence {
+    pub fn from_role_attempts(effect_ids: Vec<super::EffectId>) -> Self {
+        if effect_ids.is_empty() {
+            Self::None
+        } else {
+            Self::RoleAttempts { effect_ids }
+        }
+    }
+
+    pub fn role_attempts(&self) -> &[super::EffectId] {
+        match self {
+            Self::RoleAttempts { effect_ids } => effect_ids,
+            Self::None | Self::OracleRuntimeFailure { .. } | Self::OracleVerdict { .. } => &[],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureFeedback {
     pub summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure: Option<TypedFailure>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<FailureEvidence>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub details: Option<PayloadRef>,
+    pub evidence: DecisionEvidence,
     pub justification: String,
 }
 
@@ -421,9 +660,8 @@ impl AdvisoryStatus {
 pub struct AssertionState {
     /// The engine-run oracle binding, if any (copied from the plan).
     pub oracle: Option<OracleName>,
-    pub advisory: AdvisoryStatus,
-    /// Last verdict per validator task (gate evaluation input).
-    pub last_advisory: BTreeMap<TaskId, bool>,
+    /// Last evidence-bearing verdict per validator task (gate input).
+    pub last_advisory: BTreeMap<TaskId, super::EffectId>,
     /// Only the fold can mint this, and only from `OracleRunCompleted`.
     pub last_authoritative: Option<AuthoritativeVerdict>,
 }
@@ -479,9 +717,9 @@ impl TerminalReviewState {
 
     /// Whether this verdict's blocking gaps were acknowledged (the
     /// acknowledgment is keyed to the verdict's own sha).
-    pub fn acknowledges(&self, verdict: &TerminalReviewVerdict) -> bool {
+    pub fn acknowledges_sha(&self, judged_sha: &str) -> bool {
         self.accepted.as_ref().is_some_and(|a| {
-            a.kind == ReviewAcceptanceKind::AcknowledgedGaps && a.judged_sha == verdict.judged_sha
+            a.kind == ReviewAcceptanceKind::AcknowledgedGaps && a.judged_sha == judged_sha
         })
     }
 }
@@ -489,13 +727,23 @@ impl TerminalReviewState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ReviewOutcome {
-    Verdict(TerminalReviewVerdict),
+    Verdict {
+        effect_id: super::EffectId,
+    },
     /// The reviewer failed to run or hand off a verdict (infrastructure),
     /// until a decision clears it. Prevents a broken reviewer from
     /// re-requesting forever (mirrors `oracle_failures`).
     Failed {
-        failure: TypedFailure,
+        effect_id: super::EffectId,
     },
+}
+
+impl ReviewOutcome {
+    pub const fn effect_id(&self) -> &super::EffectId {
+        match self {
+            Self::Verdict { effect_id } | Self::Failed { effect_id } => effect_id,
+        }
+    }
 }
 
 /// Exact failed effect generation that may be reopened by `continue`.
@@ -573,33 +821,6 @@ impl ReviewAcceptanceKind {
 /// A terminal reviewer's verdict. Plain public data — deliberately NOT an
 /// `AuthoritativeVerdict` (private-field mint, `verdict.rs`): this verdict
 /// is advisory, mints nothing, and gates closure only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TerminalReviewVerdict {
-    pub judged_sha: String,
-    pub passed: bool,
-    #[serde(default)]
-    pub gaps: Vec<Gap>,
-    pub report: PayloadRef,
-}
-
-impl TerminalReviewVerdict {
-    /// Same freshness law as `AuthoritativeVerdict::is_fresh_at`.
-    pub fn is_fresh_at(&self, current_sha: &str) -> bool {
-        self.judged_sha == current_sha
-    }
-
-    /// Fail-closed: a blocking gap dominates the reviewer's own summary bit,
-    /// and a fail with no structured gaps still blocks (the report is the
-    /// evidence). Closure is clean iff passed AND no blocking gap.
-    pub fn blocking(&self) -> bool {
-        !self.passed
-            || self
-                .gaps
-                .iter()
-                .any(|g| g.severity == GapSeverity::Blocking)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionKind {
@@ -656,12 +877,7 @@ pub struct AttentionItem {
     pub oracle: Option<OracleName>,
     #[serde(default)]
     pub assertion_ids: Vec<AssertionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure: Option<TypedFailure>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<FailureEvidence>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub details: Option<PayloadRef>,
+    pub evidence: DecisionEvidence,
     pub report: String,
 }
 
@@ -685,7 +901,6 @@ pub enum InflightEffect {
         message_boundary: u64,
         presented_messages: Vec<u64>,
         workspace_preparation: super::WorkspacePreparation,
-        runtime_configuration: Option<super::RuntimeConfigurationEvidence>,
         requested_at_ms: i64,
         not_before_ms: i64,
         deadline_ms: i64,
@@ -711,7 +926,6 @@ pub enum InflightEffect {
         /// Carried from the event so the runner's handoff-forgery check
         /// still has its expected token after a crash/resume.
         nonce: String,
-        runtime_configuration: Option<super::RuntimeConfigurationEvidence>,
         requested_at_ms: i64,
         not_before_ms: i64,
         deadline_ms: i64,
@@ -721,6 +935,43 @@ pub enum InflightEffect {
 }
 
 impl InflightEffect {
+    /// Bind one receipt to the exact active request that produced it. The fold
+    /// supplies plan revision and validator targets from authoritative state;
+    /// events cannot choose any provenance field.
+    pub fn role_attempt_receipt(
+        &self,
+        effect_id: &super::EffectId,
+        plan_revision: u32,
+        authorized_targets: Vec<AssertionId>,
+    ) -> Option<RoleAttemptReceipt> {
+        let source = match self {
+            Self::RoleRun { .. } => RoleEffectSource::Task {
+                request: Box::new(self.role_request_identity()?),
+                plan_revision,
+                authorized_targets,
+            },
+            Self::TerminalReview {
+                attempt_no,
+                role,
+                judged_sha,
+                ..
+            } => RoleEffectSource::TerminalReview {
+                attempt_no: *attempt_no,
+                role: role.clone(),
+                judged_sha: judged_sha.clone(),
+            },
+            Self::OracleRun { .. } => return None,
+        };
+        Some(RoleAttemptReceipt {
+            effect_id: effect_id.clone(),
+            source,
+            runtime_configuration: None,
+            turn: None,
+            handoff: None,
+            disposition: RoleAttemptDisposition::Active,
+        })
+    }
+
     pub fn role_request_identity(&self) -> Option<super::RoleRunRequestIdentity> {
         let Self::RoleRun {
             conversation_id,
@@ -796,20 +1047,6 @@ impl InflightEffect {
         }
     }
 
-    pub fn runtime_configuration(&self) -> Option<&super::RuntimeConfigurationEvidence> {
-        match self {
-            Self::RoleRun {
-                runtime_configuration,
-                ..
-            }
-            | Self::TerminalReview {
-                runtime_configuration,
-                ..
-            } => runtime_configuration.as_ref(),
-            Self::OracleRun { .. } => None,
-        }
-    }
-
     /// Build the inflight entry for a `…Requested` event.
     pub fn from_request(
         event: &super::event::MissionEvent,
@@ -854,7 +1091,6 @@ impl InflightEffect {
                     message_boundary: *message_boundary,
                     presented_messages: presented_messages.clone(),
                     workspace_preparation: workspace_preparation.clone(),
-                    runtime_configuration: None,
                     requested_at_ms: *requested_at_ms,
                     not_before_ms: *not_before_ms,
                     deadline_ms: *deadline_ms,
@@ -905,7 +1141,6 @@ impl InflightEffect {
                     prompt: prompt.clone(),
                     judged_sha: judged_sha.clone(),
                     nonce: nonce.clone(),
-                    runtime_configuration: None,
                     requested_at_ms: *requested_at_ms,
                     not_before_ms: *not_before_ms,
                     deadline_ms: *deadline_ms,
@@ -921,6 +1156,8 @@ impl InflightEffect {
             | MissionEvent::MessageReferenceUnavailable { .. }
             | MissionEvent::TaskWorkspacePrepared { .. }
             | MissionEvent::EffectRuntimeConfigured { .. }
+            | MissionEvent::RoleTurnObserved { .. }
+            | MissionEvent::RoleHandoffObserved { .. }
             | MissionEvent::RoleRunCompleted { .. }
             | MissionEvent::OracleRunCompleted { .. }
             | MissionEvent::TerminalReviewCompleted { .. }
@@ -1020,6 +1257,11 @@ pub struct MissionState {
     /// Per-oracle dispatch counter (attempt numbering).
     pub oracle_attempts: BTreeMap<OracleName, u32>,
     pub inflight: BTreeMap<super::EffectId, InflightEffect>,
+    /// One append-only, fold-owned receipt for every role effect. Mutable task,
+    /// advisory, review, attention, and feedback state retains only effect IDs
+    /// and resolves evidence through this map.
+    #[serde(default)]
+    pub role_attempt_receipts: BTreeMap<super::EffectId, RoleAttemptReceipt>,
     /// Mission-private dialogue authority, keyed by stable role-instance id.
     #[serde(default)]
     pub conversations: BTreeMap<super::ConversationId, ConversationState>,
@@ -1081,6 +1323,228 @@ pub struct MissionState {
 }
 
 impl MissionState {
+    /// Classify one folded role receipt for every projection surface.
+    ///
+    /// Evidence use and generation lifecycle are orthogonal. For example, a
+    /// failed execution generation can be superseded while its exact receipt
+    /// remains the current input to replanning.
+    pub fn role_attempt_authority(&self, receipt: &RoleAttemptReceipt) -> RoleAttemptAuthority {
+        let effect_id = &receipt.effect_id;
+        let superseded_assertion = self
+            .superseded_assertions
+            .iter()
+            .any(|entry| entry.state.last_advisory.values().any(|id| id == effect_id));
+        let superseded_task = match &receipt.source {
+            RoleEffectSource::Task {
+                request,
+                plan_revision,
+                ..
+            } => {
+                *plan_revision < self.revision
+                    || self
+                        .tasks_in(request.namespace)
+                        .get(&request.task_id)
+                        .is_some_and(|task| {
+                            task.status == TaskStatus::Superseded
+                                && task
+                                    .last_outcome
+                                    .as_ref()
+                                    .is_some_and(|outcome| outcome.effect_id() == effect_id)
+                        })
+            }
+            RoleEffectSource::TerminalReview { .. } => false,
+        };
+        let generation = if receipt.disposition == RoleAttemptDisposition::Retired
+            || superseded_assertion
+            || superseded_task
+        {
+            RoleAttemptGeneration::Superseded
+        } else {
+            RoleAttemptGeneration::Current
+        };
+
+        let current_task = match &receipt.source {
+            RoleEffectSource::Task { request, .. } => self
+                .tasks_in(request.namespace)
+                .get(&request.task_id)
+                .and_then(|task| task.last_outcome.as_ref())
+                .is_some_and(|outcome| outcome.effect_id() == effect_id),
+            RoleEffectSource::TerminalReview { .. } => false,
+        };
+        let current_advisory = self.contract.iter().any(|(assertion_id, assertion)| {
+            assertion.last_advisory.iter().any(|(validator, id)| {
+                id == effect_id && self.advisory_receipt(assertion_id, validator, id).is_some()
+            })
+        });
+        let current_review = match (
+            &self.terminal_review.outcome,
+            &receipt.source,
+            receipt.settled_handoff(),
+        ) {
+            (
+                Some(ReviewOutcome::Verdict { effect_id: current }),
+                RoleEffectSource::TerminalReview { judged_sha, .. },
+                Some(SettledHandoff::Review { .. }),
+            ) => current == effect_id && judged_sha == self.deliverable_head(),
+            (
+                Some(ReviewOutcome::Failed { effect_id: current }),
+                RoleEffectSource::TerminalReview { .. },
+                _,
+            ) => current == effect_id,
+            _ => false,
+        };
+        let current_feedback = self
+            .planning_input
+            .refinement
+            .as_ref()
+            .and_then(|refinement| match refinement {
+                PlanningRefinement::FailureEvidence(feedback) => Some(feedback),
+                PlanningRefinement::Guidance(_) => None,
+            })
+            .is_some_and(|feedback| feedback.evidence.role_attempts().contains(effect_id));
+        let current_attention = self
+            .open_attention
+            .values()
+            .any(|item| item.evidence.role_attempts().contains(effect_id));
+        let inflight = self.inflight.contains_key(effect_id)
+            && receipt.disposition == RoleAttemptDisposition::Active;
+        let evidence_use = if current_task
+            || current_advisory
+            || current_review
+            || current_feedback
+            || current_attention
+            || inflight
+        {
+            RoleAttemptEvidenceUse::Current
+        } else {
+            RoleAttemptEvidenceUse::Historical
+        };
+
+        RoleAttemptAuthority {
+            evidence_use,
+            generation,
+        }
+    }
+
+    pub fn task_last_role_attempt(
+        &self,
+        namespace: super::TaskNamespace,
+        task_id: &TaskId,
+    ) -> Option<&RoleAttemptReceipt> {
+        let effect_id = self
+            .tasks_in(namespace)
+            .get(task_id)?
+            .last_outcome
+            .as_ref()?
+            .effect_id();
+        let receipt = self.role_attempt_receipts.get(effect_id)?;
+        matches!(
+            &receipt.source,
+            RoleEffectSource::Task {
+                request,
+                ..
+            } if request.namespace == namespace && &request.task_id == task_id
+        )
+        .then_some(receipt)
+    }
+
+    pub fn task_last_failure(
+        &self,
+        namespace: super::TaskNamespace,
+        task_id: &TaskId,
+    ) -> Option<&TypedFailure> {
+        self.task_last_role_attempt(namespace, task_id)?.failure()
+    }
+
+    pub fn task_automatic_retry_remaining(
+        &self,
+        namespace: super::TaskNamespace,
+        task_id: &TaskId,
+    ) -> bool {
+        let Some(task) = self.tasks_in(namespace).get(task_id) else {
+            return false;
+        };
+        task.status == TaskStatus::Failed
+            && task.consecutive_failures < self.config.recovery.max_attempts
+            && self
+                .task_last_failure(namespace, task_id)
+                .is_some_and(|failure| failure.is_transient() || failure.is_invalid_output())
+    }
+
+    pub fn advisory_receipt(
+        &self,
+        assertion_id: &AssertionId,
+        validator: &TaskId,
+        effect_id: &super::EffectId,
+    ) -> Option<(&RoleAttemptReceipt, bool)> {
+        let receipt = self.role_attempt_receipts.get(effect_id)?;
+        let RoleEffectSource::Task {
+            request,
+            plan_revision,
+            authorized_targets,
+        } = &receipt.source
+        else {
+            return None;
+        };
+        if request.namespace != super::TaskNamespace::Execution
+            || &request.task_id != validator
+            || request.output != super::OutputSemantics::EmitsVerdict
+            || !authorized_targets.contains(assertion_id)
+        {
+            return None;
+        }
+        let plan = self.plan.as_ref()?;
+        let planned = plan.tasks.iter().find(|task| &task.id == validator)?;
+        let task = self.tasks.get(validator)?;
+        if planned.kind != super::TaskKind::Validate
+            || !planned.targets.contains(assertion_id)
+            || task.status != TaskStatus::Cleared
+            || !matches!(
+                task.last_outcome.as_ref(),
+                Some(TaskAttemptOutcome::Accepted { effect_id: current }) if current == effect_id
+            )
+            || planned.role.as_ref() != Some(&request.role)
+            || authorized_targets != &planned.targets
+            || *plan_revision != self.revision
+            || request.base_sha != self.deliverable_head()
+        {
+            return None;
+        }
+        let SettledHandoff::Validate { items, .. } = receipt.settled_handoff()? else {
+            return None;
+        };
+        items
+            .iter()
+            .find(|item| &item.item_id == assertion_id)
+            .map(|item| (receipt, item.passed))
+    }
+
+    pub fn advisory_status(&self, assertion_id: &AssertionId) -> AdvisoryStatus {
+        let Some(assertion) = self.contract.get(assertion_id) else {
+            return AdvisoryStatus::Pending;
+        };
+        let mut saw_failure = false;
+        for (validator, effect_id) in &assertion.last_advisory {
+            match self.advisory_receipt(assertion_id, validator, effect_id) {
+                Some((_, true)) => return AdvisoryStatus::Passed,
+                Some((_, false)) => saw_failure = true,
+                None => {}
+            }
+        }
+        if saw_failure {
+            AdvisoryStatus::Failed
+        } else {
+            AdvisoryStatus::Pending
+        }
+    }
+
+    pub fn terminal_review_receipt(&self) -> Option<&RoleAttemptReceipt> {
+        self.terminal_review
+            .outcome
+            .as_ref()
+            .and_then(|outcome| self.role_attempt_receipts.get(outcome.effect_id()))
+    }
+
     /// Closed role contract shared by request folding, dispatch, and live
     /// workspace observation.
     pub fn role_dispatch_contract_matches(
@@ -1685,7 +2149,7 @@ impl MissionState {
 #[cfg(test)]
 mod slug_tests {
     use super::*;
-    use crate::{FinishClass, OutputSemantics, StopBar};
+    use crate::{FinishClass, GapSeverity, OutputSemantics, StopBar};
 
     /// Every `slug()` must equal the enum's serde repr — the single source that
     /// keeps the CLI, the fold's attention ids, and the wire format from
@@ -1775,5 +2239,54 @@ mod slug_tests {
         ] {
             assert_slug(&p, p.slug());
         }
+    }
+
+    #[test]
+    fn only_artifact_outputs_receive_workspace_preparation_authority() {
+        let mission_id = MissionId::from_digest_prefix("assignment-authority");
+        let task_id = TaskId::new("role-task").unwrap();
+        let role = RoleName::new("role").unwrap();
+        for output in [
+            OutputSemantics::ProducesReport,
+            OutputSemantics::EmitsVerdict,
+            OutputSemantics::EmitsGapVerdict,
+            OutputSemantics::ProposesPlan,
+        ] {
+            let assignment = resolve_role_assignment(
+                &mission_id,
+                crate::TaskNamespace::Execution,
+                &task_id,
+                &role,
+                RoleAssignmentContext {
+                    previous: None,
+                    required_base: "base",
+                    lifecycle_generation: 1,
+                    retrying_failure: false,
+                    output,
+                },
+            );
+            assert_eq!(
+                assignment.workspace_preparation,
+                crate::WorkspacePreparation::Preserve,
+                "{output:?}"
+            );
+        }
+        let writer = resolve_role_assignment(
+            &mission_id,
+            crate::TaskNamespace::Execution,
+            &task_id,
+            &role,
+            RoleAssignmentContext {
+                previous: None,
+                required_base: "base",
+                lifecycle_generation: 1,
+                retrying_failure: false,
+                output: OutputSemantics::ProducesArtifact,
+            },
+        );
+        assert_eq!(
+            writer.workspace_preparation,
+            crate::WorkspacePreparation::ResetForAssignment
+        );
     }
 }

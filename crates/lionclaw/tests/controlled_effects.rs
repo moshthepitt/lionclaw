@@ -15,8 +15,8 @@ use lionclaw::engine::{
 };
 use lionclaw::model::{
     fold, Assertion, AssertionId, ControlAction, DeliveryMarker, Handoff, MessageReference,
-    MissionPhase, OracleName, PayloadRef, RuntimeConfigurationEvidence, TaskStatus,
-    REDUCER_VERSION,
+    MissionPhase, OracleName, PayloadRef, RoleHandoffObservation, RoleTurnObservation,
+    RuntimeConfigurationEvidence, TaskId, TaskNamespace, TaskStatus, REDUCER_VERSION,
 };
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, OracleOutcome,
@@ -24,8 +24,8 @@ use lionclaw::ports::{
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{
-    capture_prepared_test_artifact, capture_test_artifact, prepare_test_workspace, MockClock,
-    MockOracleRunner, NoopEffectCleaner,
+    capture_prepared_test_artifact, prepare_test_workspace, MockClock, MockOracleRunner,
+    NoopEffectCleaner,
 };
 use lionclaw_runtime_api::{RuntimeEvent, TurnEvent, TypedFailure, TypedFailureEvidence};
 use tokio::sync::{Barrier, Notify};
@@ -103,6 +103,30 @@ impl lionclaw::ports::Clock for ControlledDeadlineClock {
     }
 }
 
+async fn confirm_completed_turn(
+    request: &RoleRunRequest,
+    final_response: &str,
+    configuration: &RuntimeConfigurationEvidence,
+) -> Result<(), TypedFailure> {
+    request
+        .confirm_turn_observed(RoleTurnObservation::Completed {
+            final_response: PayloadRef::inline(final_response),
+            runtime_configuration: configuration.clone(),
+        })
+        .await
+}
+
+async fn confirm_failed_turn(
+    request: &RoleRunRequest,
+    failure: &TypedFailure,
+) -> Result<(), TypedFailure> {
+    request
+        .confirm_turn_observed(RoleTurnObservation::Failed {
+            failure: failure.clone(),
+        })
+        .await
+}
+
 #[async_trait]
 impl RoleRunner for SettlementRaceRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
@@ -121,24 +145,36 @@ impl RoleRunner for SettlementRaceRunner {
         };
         match self.outcome {
             SettlementRaceOutcome::Success => {
+                let report = PayloadRef::inline("race success");
+                let final_response = "success response retained";
+                confirm_completed_turn(&request, final_response, &configuration).await?;
+                request
+                    .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                        report: report.clone(),
+                    })
+                    .await?;
                 let artifact = capture_prepared_test_artifact(&request, HEAD_SHA).await?;
                 Ok(RoleRunOutcome {
                     handoff: Some(Handoff::Work {
                         done: true,
-                        report: PayloadRef::inline("race success"),
+                        report,
                         request_attention: false,
                     }),
                     artifact: Some(artifact),
                     runtime_configuration: configuration,
-                    final_response: "success response retained".into(),
+                    final_response: final_response.into(),
                 })
             }
-            SettlementRaceOutcome::Question => Ok(RoleRunOutcome {
-                handoff: None,
-                artifact: None,
-                runtime_configuration: configuration,
-                final_response: "Which exact target should I use?".into(),
-            }),
+            SettlementRaceOutcome::Question => {
+                let final_response = "Which exact target should I use?";
+                confirm_completed_turn(&request, final_response, &configuration).await?;
+                Ok(RoleRunOutcome {
+                    handoff: None,
+                    artifact: None,
+                    runtime_configuration: configuration,
+                    final_response: final_response.into(),
+                })
+            }
             SettlementRaceOutcome::Failure | SettlementRaceOutcome::InvalidOutput => {
                 let mut evidence = TypedFailureEvidence::new(
                     Some(
@@ -168,17 +204,17 @@ impl RoleRunner for SettlementRaceRunner {
                 }
                 .into();
                 evidence.configuration = configuration;
-                Err(
-                    if matches!(self.outcome, SettlementRaceOutcome::InvalidOutput) {
-                        TypedFailure::InvalidOutput {
-                            evidence: Box::new(evidence),
-                        }
-                    } else {
-                        TypedFailure::PermanentRuntime {
-                            evidence: Box::new(evidence),
-                        }
-                    },
-                )
+                let failure = if matches!(self.outcome, SettlementRaceOutcome::InvalidOutput) {
+                    TypedFailure::InvalidOutput {
+                        evidence: Box::new(evidence),
+                    }
+                } else {
+                    TypedFailure::PermanentRuntime {
+                        evidence: Box::new(evidence),
+                    }
+                };
+                confirm_failed_turn(&request, &failure).await?;
+                Err(failure)
             }
         }
     }
@@ -255,6 +291,10 @@ struct SettlementCleaner {
 
 #[async_trait]
 impl EffectCleaner for SettlementCleaner {
+    async fn quiesce(&self, _request: &EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
+        Ok(())
+    }
+
     async fn cleanup(&self, request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
         let first = {
             let mut discards = self.discards.lock().unwrap();
@@ -310,15 +350,24 @@ impl RoleRunner for DeadlineRunner {
 impl RoleRunner for SleepingRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
-        let artifact = capture_test_artifact(&request, HEAD_SHA).await?;
+        prepare_test_workspace(&request).await?;
+        let report = PayloadRef::inline("worked beyond initial deadline");
+        let configuration = RuntimeConfigurationEvidence::default();
+        confirm_completed_turn(&request, "", &configuration).await?;
+        request
+            .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                report: report.clone(),
+            })
+            .await?;
+        let artifact = capture_prepared_test_artifact(&request, HEAD_SHA).await?;
         Ok(RoleRunOutcome {
             handoff: Some(Handoff::Work {
                 done: true,
-                report: PayloadRef::inline("worked beyond initial deadline"),
+                report,
                 request_attention: false,
             }),
             artifact: Some(artifact),
-            runtime_configuration: Default::default(),
+            runtime_configuration: configuration,
             final_response: String::new(),
         })
     }
@@ -328,15 +377,24 @@ impl RoleRunner for SleepingRunner {
 impl RoleRunner for ArtifactlessWriter {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         prepare_test_workspace(&request).await?;
+        let report = PayloadRef::inline("the requested work was already satisfied");
+        let configuration = RuntimeConfigurationEvidence::default();
+        let final_response = "no repository change was needed";
+        confirm_completed_turn(&request, final_response, &configuration).await?;
+        request
+            .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                report: report.clone(),
+            })
+            .await?;
         Ok(RoleRunOutcome {
             handoff: Some(Handoff::Work {
                 done: true,
-                report: PayloadRef::inline("the requested work was already satisfied"),
+                report,
                 request_attention: false,
             }),
             artifact: None,
-            runtime_configuration: Default::default(),
-            final_response: "no repository change was needed".into(),
+            runtime_configuration: configuration,
+            final_response: final_response.into(),
         })
     }
 }
@@ -375,16 +433,26 @@ impl RoleRunner for ControlledRunner {
                 request.control.changed().await.unwrap();
             }
         }
-        let artifact = capture_test_artifact(&request, HEAD_SHA).await?;
+        prepare_test_workspace(&request).await?;
+        let report = PayloadRef::inline("continued in the same task workspace");
+        let configuration = RuntimeConfigurationEvidence::default();
+        let final_response = "completed after continue";
+        confirm_completed_turn(&request, final_response, &configuration).await?;
+        request
+            .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                report: report.clone(),
+            })
+            .await?;
+        let artifact = capture_prepared_test_artifact(&request, HEAD_SHA).await?;
         Ok(RoleRunOutcome {
             handoff: Some(Handoff::Work {
                 done: true,
-                report: PayloadRef::inline("continued in the same task workspace"),
+                report,
                 request_attention: false,
             }),
             artifact: Some(artifact),
-            runtime_configuration: Default::default(),
-            final_response: "completed after continue".into(),
+            runtime_configuration: configuration,
+            final_response: final_response.into(),
         })
     }
 }
@@ -395,15 +463,24 @@ impl RoleRunner for RawSuccessAfterStopRunner {
         self.started.wait().await;
         loop {
             if matches!(request.control.borrow().clone(), ExecutionControl::Stop(_)) {
+                let report = PayloadRef::inline("raw success report");
+                let configuration = RuntimeConfigurationEvidence::default();
+                let final_response = "raw success response";
+                confirm_completed_turn(&request, final_response, &configuration).await?;
+                request
+                    .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                        report: report.clone(),
+                    })
+                    .await?;
                 return Ok(RoleRunOutcome {
                     handoff: Some(Handoff::Work {
                         done: true,
-                        report: PayloadRef::inline("raw success report"),
+                        report,
                         request_attention: false,
                     }),
                     artifact: None,
-                    runtime_configuration: Default::default(),
-                    final_response: "raw success response".into(),
+                    runtime_configuration: configuration,
+                    final_response: final_response.into(),
                 });
             }
             request.control.changed().await.unwrap();
@@ -672,12 +749,7 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
     assert_eq!(
         parked
             .state
-            .tasks
-            .values()
-            .next()
-            .unwrap()
-            .last_failure
-            .as_ref()
+            .task_last_failure(TaskNamespace::Execution, &TaskId::new("fix").unwrap())
             .unwrap()
             .category(),
         "operator_stopped"
@@ -917,12 +989,7 @@ async fn durable_stop_wins_the_outcome_append_race_and_discards_the_candidate() 
     assert_eq!(parked.disposition, MissionDisposition::Parked);
     let failure = parked
         .state
-        .tasks
-        .values()
-        .next()
-        .unwrap()
-        .last_failure
-        .as_ref()
+        .task_last_failure(TaskNamespace::Execution, &TaskId::new("fix").unwrap())
         .unwrap();
     assert!(matches!(failure, TypedFailure::OperatorStopped { .. }));
     assert_eq!(
@@ -1176,12 +1243,7 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
                 "arrived beyond the observed delivery boundary"
             );
             let failure = live
-                .tasks
-                .values()
-                .next()
-                .unwrap()
-                .last_failure
-                .as_ref()
+                .task_last_failure(TaskNamespace::Execution, &TaskId::new("fix").unwrap())
                 .unwrap();
             assert!(matches!(
                 (cancellation, failure),

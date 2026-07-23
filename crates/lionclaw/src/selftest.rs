@@ -28,7 +28,7 @@ use crate::model::{
     Assertion, AssertionId, DecisionAction, EffectId, FinishClass, Gap, GapSeverity, Handoff,
     MissionEvent, MissionId, MissionPhase, OracleName, PayloadRef, Plan, PlanProposal,
     ProposalError, Requirement, RequirementDisposition, RequirementId, RequirementKind,
-    ReviewAcceptanceKind, RoleName, Task, TaskId, TaskKind, TaskStatus,
+    ReviewAcceptanceKind, RoleHandoffObservation, RoleName, Task, TaskId, TaskKind, TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
@@ -57,10 +57,17 @@ impl RoleRunner for NoopRoleRunner {
         prepare_scripted_writer(&request)
             .await
             .map_err(|error| TypedFailure::permanent("selftest.runner", format!("{error:#}")))?;
+        let report = PayloadRef::inline("self-test noop worker");
+        confirm_scripted_turn(&request, "self-test noop worker").await?;
+        request
+            .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                report: report.clone(),
+            })
+            .await?;
         Ok(RoleRunOutcome {
             handoff: Some(Handoff::Work {
                 done: true,
-                report: PayloadRef::inline("self-test noop worker"),
+                report,
                 request_attention: false,
             }),
             artifact: None,
@@ -81,6 +88,10 @@ struct ScriptedEffectCleaner;
 
 #[async_trait]
 impl EffectCleaner for ScriptedEffectCleaner {
+    async fn quiesce(&self, _request: &EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
+        Ok(())
+    }
+
     async fn cleanup(&self, _request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
         Ok(())
     }
@@ -90,10 +101,17 @@ impl EffectCleaner for ScriptedEffectCleaner {
 impl RoleRunner for ReviewParkRoleRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         if request.task_id.as_str() == crate::engine::TERMINAL_REVIEW_TASK_TAG {
+            let report = PayloadRef::inline("self-test scripted review");
+            confirm_scripted_turn(&request, "self-test scripted review").await?;
+            request
+                .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                    report: report.clone(),
+                })
+                .await?;
             Ok(RoleRunOutcome {
                 handoff: Some(Handoff::Review {
                     done: true,
-                    report: PayloadRef::inline("self-test scripted review"),
+                    report,
                     passed: false,
                     gaps: vec![Gap {
                         id: Some("GAP-1".to_string()),
@@ -115,10 +133,17 @@ impl RoleRunner for ReviewParkRoleRunner {
             prepare_scripted_writer(&request).await.map_err(|error| {
                 TypedFailure::permanent("selftest.runner", format!("{error:#}"))
             })?;
+            let report = PayloadRef::inline("self-test worker");
+            confirm_scripted_turn(&request, "self-test worker").await?;
+            request
+                .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                    report: report.clone(),
+                })
+                .await?;
             Ok(RoleRunOutcome {
                 handoff: Some(Handoff::Work {
                     done: true,
-                    report: PayloadRef::inline("self-test worker"),
+                    report,
                     request_attention: false,
                 }),
                 artifact: None,
@@ -547,11 +572,18 @@ impl ScriptedRoleRunner {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
+        let report = PayloadRef::inline("self-test scripted fix");
+        confirm_scripted_turn(&request, "self-test scripted fix").await?;
+        request
+            .confirm_handoff_observed(RoleHandoffObservation::Accepted {
+                report: report.clone(),
+            })
+            .await?;
         let artifact = capture.capture().await?;
         Ok(RoleRunOutcome {
             handoff: Some(Handoff::Work {
                 done: true,
-                report: PayloadRef::inline("self-test scripted fix"),
+                report,
                 request_attention: false,
             }),
             artifact: Some(artifact),
@@ -576,6 +608,18 @@ async fn prepare_scripted_writer(request: &RoleRunRequest) -> Result<std::path::
         .await
         .map_err(|failure| anyhow::anyhow!(failure.detail().to_string()))?;
     Ok(checkout)
+}
+
+async fn confirm_scripted_turn(
+    request: &RoleRunRequest,
+    final_response: &str,
+) -> Result<(), TypedFailure> {
+    request
+        .confirm_turn_observed(crate::model::RoleTurnObservation::Completed {
+            final_response: PayloadRef::inline(final_response),
+            runtime_configuration: Default::default(),
+        })
+        .await
 }
 
 /// Run a shell command in a real container under a compiled role plan. Shared

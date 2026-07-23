@@ -49,6 +49,7 @@ pub struct RoleDispatchIntent {
     pub namespace: TaskNamespace,
     pub task_id: TaskId,
     pub role: RoleName,
+    pub output: super::OutputSemantics,
     pub attempt_no: u32,
     pub body: String,
     pub targets: Vec<AssertionId>,
@@ -114,12 +115,7 @@ fn step_planning(state: &MissionState) -> StepDecision {
         return StepDecision::Idle;
     }
     let status_of = |id: &TaskId| state.planning.tasks.get(id).map(|task| task.status);
-    let retryable =
-        |id: &TaskId| {
-            state.planning.tasks.get(id).is_some_and(|task| {
-                task.automatic_retry_remaining(state.config.recovery.max_attempts)
-            })
-        };
+    let retryable = |id: &TaskId| state.task_automatic_retry_remaining(TaskNamespace::Planning, id);
     let Some(task) = state
         .config
         .planning
@@ -134,6 +130,7 @@ fn step_planning(state: &MissionState) -> StepDecision {
         namespace: TaskNamespace::Planning,
         task_id: task.id.clone(),
         role: task.role.clone(),
+        output: task.output,
         attempt_no,
         body: task.body.clone(),
         // Planning has no contract; its roles are read-only at the base commit.
@@ -193,12 +190,8 @@ fn step_running(state: &MissionState) -> StepDecision {
     // judge) dispatches once no work is runnable. Gates are never
     // "runnable" — their status is fold-derived (see `derive_gates`).
     let status_of = |id: &TaskId| state.tasks.get(id).map(|task| task.status);
-    let retryable = |id: &TaskId| {
-        state
-            .tasks
-            .get(id)
-            .is_some_and(|task| task.automatic_retry_remaining(state.config.recovery.max_attempts))
-    };
+    let retryable =
+        |id: &TaskId| state.task_automatic_retry_remaining(TaskNamespace::Execution, id);
     let runnable = |kind: TaskKind| {
         plan.tasks.iter().find(move |task| {
             task.kind == kind && is_runnable(&task.id, &task.depends_on, &status_of, &retryable)
@@ -211,13 +204,18 @@ fn step_running(state: &MissionState) -> StepDecision {
     };
     if let Some(task) = next {
         let attempt_no = state.tasks.get(&task.id).map_or(0, |t| t.attempts) + 1;
+        let role = task
+            .role
+            .clone()
+            .expect("plan validation guarantees work/validate tasks carry a role");
+        let Some(output) = state.config.plan_inventory.roles.get(&role).copied() else {
+            return StepDecision::Idle;
+        };
         return StepDecision::DispatchRole(RoleDispatchIntent {
             namespace: TaskNamespace::Execution,
             task_id: task.id.clone(),
-            role: task
-                .role
-                .clone()
-                .expect("plan validation guarantees work/validate tasks carry a role"),
+            role,
+            output,
             attempt_no,
             body: task.body.clone(),
             targets: task.targets.clone(),
@@ -265,13 +263,18 @@ fn step_running(state: &MissionState) -> StepDecision {
     // review without a fresh verdict at the current head dispatches the
     // closing reviewer. A parked failure never re-dispatches (attention parks
     // first; the guard mirrors the failed-oracle skip above).
-    let review_retryable = matches!(
-        &state.terminal_review.outcome,
-        Some(ReviewOutcome::Failed { failure })
-            if failure.automatically_retryable()
-                && state.terminal_review.consecutive_failures
-                    < state.config.recovery.max_attempts
-    );
+    let review_retryable = match &state.terminal_review.outcome {
+        Some(ReviewOutcome::Failed { effect_id }) => state
+            .role_attempt_receipts
+            .get(effect_id)
+            .and_then(crate::RoleAttemptReceipt::failure)
+            .is_some_and(|failure| {
+                failure.automatically_retryable()
+                    && state.terminal_review.consecutive_failures
+                        < state.config.recovery.max_attempts
+            }),
+        Some(ReviewOutcome::Verdict { .. }) | None => false,
+    };
     if terminal_review_outstanding(state)
         && (!matches!(
             state.terminal_review.outcome,
@@ -531,7 +534,9 @@ mod tests {
             assignment_epoch: 1,
             message_boundary: 0,
             presented_messages: vec![],
-            workspace_preparation: if attempt_no == 1 {
+            workspace_preparation: if attempt_no == 1
+                && output == crate::OutputSemantics::ProducesArtifact
+            {
                 crate::WorkspacePreparation::ResetForAssignment
             } else {
                 crate::WorkspacePreparation::Preserve
@@ -682,6 +687,63 @@ mod tests {
     /// test steps is one the real fold produced.
     fn fold_log(events: Vec<MissionEvent>) -> MissionState {
         let events = events.into_iter().flat_map(|event| {
+            let turn_observation = match &event {
+                MissionEvent::RoleRunCompleted {
+                    effect_id, outcome, ..
+                } => Some(MissionEvent::RoleTurnObserved {
+                    effect_id: effect_id.clone(),
+                    observation: match outcome {
+                        Ok(success) => crate::RoleTurnObservation::Completed {
+                            final_response: success.final_response.clone(),
+                            runtime_configuration: success.runtime_configuration.clone(),
+                        },
+                        Err(failure) => crate::RoleTurnObservation::Failed {
+                            failure: failure.clone(),
+                        },
+                    },
+                }),
+                MissionEvent::TerminalReviewCompleted {
+                    effect_id, outcome, ..
+                } => Some(MissionEvent::RoleTurnObserved {
+                    effect_id: effect_id.clone(),
+                    observation: match outcome {
+                        Ok(success) => crate::RoleTurnObservation::Completed {
+                            final_response: success.final_response.clone(),
+                            runtime_configuration: success.runtime_configuration.clone(),
+                        },
+                        Err(failure) => crate::RoleTurnObservation::Failed {
+                            failure: failure.clone(),
+                        },
+                    },
+                }),
+                _ => None,
+            };
+            let report_observation = match &event {
+                MissionEvent::RoleRunCompleted {
+                    effect_id,
+                    outcome: Ok(success),
+                    ..
+                } => success
+                    .handoff
+                    .as_ref()
+                    .map(|handoff| MissionEvent::RoleHandoffObserved {
+                        effect_id: effect_id.clone(),
+                        observation: crate::RoleHandoffObservation::Accepted {
+                            report: handoff.report().clone(),
+                        },
+                    }),
+                MissionEvent::TerminalReviewCompleted {
+                    effect_id,
+                    outcome: Ok(success),
+                    ..
+                } => Some(MissionEvent::RoleHandoffObserved {
+                    effect_id: effect_id.clone(),
+                    observation: crate::RoleHandoffObservation::Accepted {
+                        report: success.report.clone(),
+                    },
+                }),
+                _ => None,
+            };
             let preparation = match &event {
                 MissionEvent::RoleRunRequested {
                     task_id,
@@ -706,7 +768,12 @@ mod tests {
                     requirement_changes: vec![],
                 }
             });
-            std::iter::once(event).chain(preparation).chain(approve)
+            turn_observation
+                .into_iter()
+                .chain(report_observation)
+                .chain(std::iter::once(event))
+                .chain(preparation)
+                .chain(approve)
         });
         let mut role_boundaries = std::collections::BTreeMap::new();
         fold(events.enumerate().map(|(i, mut event)| {
@@ -1075,6 +1142,7 @@ mod tests {
                 namespace: TaskNamespace::Execution,
                 task_id: tid("w2"),
                 role: rname("implementer"),
+                output: crate::OutputSemantics::ProducesArtifact,
                 attempt_no: 1,
                 body: "produce it".to_string(),
                 targets: vec![aid("A1")],

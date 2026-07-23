@@ -5,7 +5,9 @@
 
 use std::path::Path;
 
-use crate::model::{Gap, Handoff, OutputSemantics, PayloadRef, PlanProposal, ValidationItem};
+use crate::model::{
+    Gap, Handoff, OutputSemantics, PayloadRef, PlanProposal, ValidationItem, MAX_ROLE_REPORT_BYTES,
+};
 use lionclaw_runtime_api::TypedFailure;
 use serde::{Deserialize, Serialize};
 
@@ -114,10 +116,6 @@ pub fn expected_schema(output: OutputSemantics) -> &'static str {
 /// can't OOM the host by writing a huge file into the rw handoff mount.
 const MAX_HANDOFF_BYTES: u64 = 4 * 1024 * 1024;
 
-/// With the model's fan-in bound, accepted reports compose to at most 4 MiB
-/// of upstream narrative in any one prompt.
-pub const MAX_HANDOFF_REPORT_BYTES: usize = 256 * 1024;
-
 /// Typed gaps land inline in the event log (only `PayloadRef`s externalize
 /// to blobs), so cap them well under the file cap.
 const MAX_GAPS_BYTES: usize = 256 * 1024;
@@ -187,6 +185,20 @@ pub fn read_optional_handoff(
     }
 }
 
+/// Inspect a handoff left by an interrupted driver. Absence means the role
+/// never reached the handoff boundary; any object that does exist is validated
+/// exactly like a live completion so malformed evidence is not erased.
+pub(crate) fn read_retained_handoff(
+    dir: &Path,
+    output: OutputSemantics,
+) -> Result<Option<Handoff>, TypedFailure> {
+    let path = dir.join("handoff.json");
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => read_handoff(dir, output).map(Some),
+    }
+}
+
 fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, TypedFailure> {
     let invalid = |detail: String| TypedFailure::invalid("handoff.schema", detail);
     let mut value: serde_json::Value =
@@ -207,19 +219,16 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, TypedFai
     let handoff: Handoff = serde_json::from_value::<AgentHandoff>(value)
         .map(Handoff::from)
         .map_err(|err| invalid(format!("handoff does not match '{expected}': {err}")))?;
-    validate_handoff(&handoff)?;
-    // The schema string and the payload tag must agree with the role's output.
-    if !handoff.matches_output(output) {
-        return Err(invalid(format!(
-            "handoff type does not match this role's output semantics ({output:?})"
-        )));
-    }
+    validate_handoff(&handoff, output)?;
     Ok(handoff)
 }
 
 /// Validate the complete bounded role-output document regardless of whether
 /// it came from the production wire parser or another `RoleRunner`.
-pub(crate) fn validate_handoff(handoff: &Handoff) -> Result<(), TypedFailure> {
+pub(crate) fn validate_handoff(
+    handoff: &Handoff,
+    output: OutputSemantics,
+) -> Result<(), TypedFailure> {
     let invalid = |detail: String| TypedFailure::invalid("handoff.schema", detail);
     if bounded_serialized_len(handoff, MAX_HANDOFF_BYTES as usize)
         .map_err(|err| invalid(format!("handoff is not serializable: {err}")))?
@@ -230,16 +239,10 @@ pub(crate) fn validate_handoff(handoff: &Handoff) -> Result<(), TypedFailure> {
             format!("handoff exceeds {MAX_HANDOFF_BYTES} bytes"),
         ));
     }
-    if let PayloadRef::Inline { text: report } = handoff.report() {
-        if report.len() > MAX_HANDOFF_REPORT_BYTES {
-            return Err(TypedFailure::invalid(
-                "handoff.report_too_large",
-                format!(
-                    "handoff report is {} bytes; the limit is {MAX_HANDOFF_REPORT_BYTES}",
-                    report.len()
-                ),
-            ));
-        }
+    if !handoff.matches_output(output) {
+        return Err(invalid(format!(
+            "handoff type does not match this role's output semantics ({output:?})"
+        )));
     }
     if let Handoff::Review { gaps, .. } = &handoff {
         if bounded_serialized_len(gaps, MAX_GAPS_BYTES)
@@ -269,6 +272,24 @@ pub(crate) fn validate_handoff(handoff: &Handoff) -> Result<(), TypedFailure> {
                 }
             }
         }
+    }
+    match handoff.report() {
+        PayloadRef::Inline { text: report } if report.len() > MAX_ROLE_REPORT_BYTES => {
+            return Err(TypedFailure::invalid(
+                "handoff.report_too_large",
+                format!(
+                    "handoff report is {} bytes; the limit is {MAX_ROLE_REPORT_BYTES}",
+                    report.len()
+                ),
+            ));
+        }
+        PayloadRef::Blob(_) => {
+            return Err(TypedFailure::invalid(
+                "handoff.payload_ref",
+                "role output must provide inline text; only the engine may mint blob references",
+            ));
+        }
+        PayloadRef::Inline { .. } => {}
     }
     Ok(())
 }
@@ -324,7 +345,7 @@ mod tests {
     use serde::ser::SerializeSeq;
 
     use super::*;
-    use crate::model::PayloadRef;
+    use crate::model::{BlobRef, PayloadRef};
 
     #[test]
     fn absent_handoff_is_an_ordinary_checkpoint_but_present_invalid_data_is_not() {
@@ -362,6 +383,20 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_recovery_distinguishes_absence_from_malformed_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            read_retained_handoff(dir.path(), OutputSemantics::EmitsVerdict).unwrap(),
+            None
+        );
+
+        std::fs::write(dir.path().join("handoff.json"), "not json").expect("write invalid handoff");
+        let failure = read_retained_handoff(dir.path(), OutputSemantics::EmitsVerdict)
+            .expect_err("present malformed evidence must survive recovery");
+        assert_eq!(failure.evidence().code.as_deref(), Some("handoff.schema"));
+    }
+
+    #[test]
     fn oversized_handoff_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let big = format!(
@@ -377,7 +412,7 @@ mod tests {
     fn oversized_report_is_rejected_as_invalid_output() {
         let raw = format!(
             r#"{{"schema":"{WORK_HANDOFF_SCHEMA}","type":"work","done":true,"report":"{}","request_attention":false}}"#,
-            "x".repeat(MAX_HANDOFF_REPORT_BYTES + 1)
+            "x".repeat(MAX_ROLE_REPORT_BYTES + 1)
         );
         let error = parse_handoff(&raw, OutputSemantics::ProducesArtifact)
             .expect_err("a report cannot exceed the aggregate prompt budget");
@@ -385,6 +420,36 @@ mod tests {
         assert_eq!(
             error.evidence().code.as_deref(),
             Some("handoff.report_too_large")
+        );
+    }
+
+    #[test]
+    fn alternate_runners_use_the_same_closed_output_contract_as_the_wire_parser() {
+        let wrong_type = Handoff::Validate {
+            done: true,
+            report: PayloadRef::inline("not a work handoff"),
+            items: Vec::new(),
+            passed: true,
+            request_attention: false,
+        };
+        let failure = validate_handoff(&wrong_type, OutputSemantics::ProducesArtifact)
+            .expect_err("a runner cannot bypass the output contract");
+        assert_eq!(failure.evidence().code.as_deref(), Some("handoff.schema"));
+
+        let runner_minted_blob = Handoff::Work {
+            done: true,
+            report: PayloadRef::Blob(BlobRef {
+                algo: "sha256".into(),
+                hex: "a".repeat(64),
+                len: 1,
+            }),
+            request_attention: false,
+        };
+        let failure = validate_handoff(&runner_minted_blob, OutputSemantics::ProducesArtifact)
+            .expect_err("only the engine may mint report blob references");
+        assert_eq!(
+            failure.evidence().code.as_deref(),
+            Some("handoff.payload_ref")
         );
     }
 

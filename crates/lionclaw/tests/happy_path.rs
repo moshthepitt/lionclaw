@@ -18,7 +18,7 @@ use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::PreparedInput;
 use lionclaw::model::{
     Assertion, AssertionId, FinishClass, InputName, MissionPhase, OracleName, OutputSemantics,
-    PlanningDag, PlanningTask, RoleName, TaskId, TaskStatus,
+    PlanningDag, PlanningTask, RoleName, TaskId, TaskNamespace, TaskStatus,
 };
 use lionclaw::testing::{MockClock, NoopEffectCleaner};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -375,7 +375,8 @@ async fn durable_role_outcomes_bound_adapter_configuration_evidence() {
                 runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
                     applied_model: Some(oversized.clone()),
                     ..Default::default()
-                },
+                }
+                .projected(),
                 final_response: "done".into(),
             })
         })),
@@ -399,11 +400,10 @@ async fn durable_role_outcomes_bound_adapter_configuration_evidence() {
     h.engine.advance(&mission_id).await.expect("advance");
 
     let state = h.engine.load_state(&mission_id).await.expect("state");
+    let task_id = state.tasks.keys().next().expect("task");
     let applied_model = state
-        .tasks
-        .values()
-        .next()
-        .and_then(|task| task.last_runtime_configuration.as_ref())
+        .task_last_role_attempt(TaskNamespace::Execution, task_id)
+        .and_then(|receipt| receipt.runtime_configuration.as_ref())
         .and_then(|configuration| configuration.applied_model.as_ref())
         .expect("applied model evidence");
     assert!(applied_model.len() <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT);
@@ -546,7 +546,11 @@ async fn failing_oracle_never_reports_verified() {
     assert_eq!(attention.len(), 1);
     assert_eq!(attention[0].id, "oracle_verdict_failed:cargo-test");
     assert_eq!(attention[0].assertion_ids[0].as_str(), "TESTS-PASS");
-    assert_eq!(attention[0].evidence.as_ref().unwrap().exit_code, 1);
+    assert!(matches!(
+        &attention[0].evidence,
+        lionclaw::model::DecisionEvidence::OracleVerdict { evidence }
+            if evidence.exit_code == 1
+    ));
     let state = h.engine.load_state(&mission_id).await.expect("state");
     let verdict = state
         .contract
@@ -647,14 +651,10 @@ async fn role_runner_cannot_inject_a_durable_blob_reference() {
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     assert_eq!(outcome.disposition, MissionDisposition::Parked);
     assert_eq!(outcome.state.current_sha, BASE_SHA);
+    let task_id = outcome.state.tasks.keys().next().unwrap();
     let failure = outcome
         .state
-        .tasks
-        .values()
-        .next()
-        .unwrap()
-        .last_failure
-        .as_ref()
+        .task_last_failure(TaskNamespace::Execution, task_id)
         .unwrap();
     assert_eq!(
         failure.evidence().code.as_deref(),
@@ -673,7 +673,7 @@ async fn role_runner_oversized_report_is_a_durable_invalid_output() {
                 handoff: Some(lionclaw::model::Handoff::Work {
                     done: true,
                     report: lionclaw::model::PayloadRef::inline(
-                        "x".repeat(lionclaw::runner::MAX_HANDOFF_REPORT_BYTES + 1),
+                        "x".repeat(lionclaw::model::MAX_ROLE_REPORT_BYTES + 1),
                     ),
                     request_attention: false,
                 }),
@@ -706,14 +706,10 @@ async fn role_runner_oversized_report_is_a_durable_invalid_output() {
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     assert_eq!(outcome.disposition, MissionDisposition::Parked);
     assert_eq!(outcome.state.current_sha, BASE_SHA);
+    let task_id = outcome.state.tasks.keys().next().unwrap();
     let failure = outcome
         .state
-        .tasks
-        .values()
-        .next()
-        .unwrap()
-        .last_failure
-        .as_ref()
+        .task_last_failure(TaskNamespace::Execution, task_id)
         .unwrap();
     assert_eq!(
         failure.evidence().code.as_deref(),

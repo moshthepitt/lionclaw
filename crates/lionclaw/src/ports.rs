@@ -16,7 +16,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
 use crate::model::{
     EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
-    RuntimeConfigurationEvidence, TaskId, TaskNamespace,
+    RoleHandoffObservation, RoleTurnObservation, RuntimeConfigurationEvidence, TaskId,
+    TaskNamespace,
 };
 pub use crate::workspace::{ArtifactCapture, CapturedArtifact};
 
@@ -66,6 +67,33 @@ pub struct RoleRunRequest {
 }
 
 impl RoleRunRequest {
+    async fn confirm_update(
+        &self,
+        code: &'static str,
+        subject: &'static str,
+        make_update: impl FnOnce(oneshot::Sender<Result<(), String>>) -> RoleRunUpdate,
+    ) -> Result<(), TypedFailure> {
+        let (acknowledge, acknowledged) = oneshot::channel();
+        self.updates
+            .send(make_update(acknowledge))
+            .await
+            .map_err(|_| {
+                TypedFailure::permanent(
+                    code,
+                    format!("kernel role update receiver closed before {subject}"),
+                )
+            })?;
+        acknowledged
+            .await
+            .map_err(|_| {
+                TypedFailure::permanent(
+                    code,
+                    format!("kernel closed before acknowledging {subject}"),
+                )
+            })?
+            .map_err(|detail| TypedFailure::permanent(code, detail))
+    }
+
     /// Block writer launch until the engine durably accepts and reloads the
     /// exact workspace preparation fact.
     pub async fn confirm_workspace_prepared(&self) -> Result<(), TypedFailure> {
@@ -75,29 +103,50 @@ impl RoleRunRequest {
                 "only an artifact-producing role may prepare a retained workspace",
             ));
         }
-        let (acknowledge, acknowledged) = oneshot::channel();
-        self.updates
-            .send(RoleRunUpdate::WorkspacePrepared {
+        self.confirm_update(
+            "workspace.preparation",
+            "workspace preparation",
+            |acknowledge| RoleRunUpdate::WorkspacePrepared {
                 base_sha: self.base_sha.clone(),
                 assignment_epoch: self.assignment_epoch,
                 acknowledge,
-            })
-            .await
-            .map_err(|_| {
-                TypedFailure::permanent(
-                    "workspace.preparation",
-                    "kernel role update receiver closed before workspace preparation",
-                )
-            })?;
-        acknowledged
-            .await
-            .map_err(|_| {
-                TypedFailure::permanent(
-                    "workspace.preparation",
-                    "kernel closed before acknowledging workspace preparation",
-                )
-            })?
-            .map_err(|detail| TypedFailure::permanent("workspace.preparation", detail))
+            },
+        )
+        .await
+    }
+
+    /// Block role completion until the engine durably records and reloads the
+    /// accepted or rejected handoff for this exact effect.
+    pub async fn confirm_handoff_observed(
+        &self,
+        observation: RoleHandoffObservation,
+    ) -> Result<(), TypedFailure> {
+        self.confirm_update(
+            "role.handoff_observation",
+            "durable handoff observation",
+            |acknowledge| RoleRunUpdate::HandoffObserved {
+                observation,
+                acknowledge,
+            },
+        )
+        .await
+    }
+
+    /// Block further effect processing until the engine durably records and
+    /// reloads the adapter's complete turn result for this exact effect.
+    pub async fn confirm_turn_observed(
+        &self,
+        observation: RoleTurnObservation,
+    ) -> Result<(), TypedFailure> {
+        self.confirm_update(
+            "role.turn_observation",
+            "durable role turn observation",
+            |acknowledge| RoleRunUpdate::TurnObserved {
+                observation,
+                acknowledge,
+            },
+        )
+        .await
     }
 }
 
@@ -108,7 +157,18 @@ pub enum RoleRunUpdate {
         assignment_epoch: u32,
         acknowledge: oneshot::Sender<Result<(), String>>,
     },
-    RuntimeConfigured(lionclaw_runtime_api::AppliedRuntimeConfiguration),
+    HandoffObserved {
+        observation: RoleHandoffObservation,
+        acknowledge: oneshot::Sender<Result<(), String>>,
+    },
+    TurnObserved {
+        observation: RoleTurnObservation,
+        acknowledge: oneshot::Sender<Result<(), String>>,
+    },
+    RuntimeConfigured {
+        configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration,
+        acknowledge: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +244,11 @@ pub struct EffectCleanupFailure {
 
 #[async_trait]
 pub trait EffectCleaner: Send + Sync {
+    /// Stop the exact effect process while preserving every resource from
+    /// which durable outcome evidence may still need to be recovered.
+    async fn quiesce(&self, request: &EffectCleanupRequest) -> Result<(), EffectCleanupFailure>;
+
+    /// Remove disposable effect resources after evidence recovery is durable.
     async fn cleanup(&self, request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure>;
 }
 
@@ -225,5 +290,75 @@ impl Clock for SystemClock {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mission_type::RoleDefinition;
+    use crate::model::{OutputSemantics, RoleName, WorkspacePreparation};
+
+    fn role_request(updates: mpsc::Sender<RoleRunUpdate>) -> RoleRunRequest {
+        let (_, control) = watch::channel(ExecutionControl::RunUntil(i64::MAX));
+        let (activity, _) = watch::channel(None);
+        RoleRunRequest {
+            mission_id: MissionId::for_creation("/workspace", "report-observation", 1),
+            namespace: TaskNamespace::Execution,
+            task_id: TaskId::new("review").unwrap(),
+            attempt_no: 1,
+            effect_id: EffectId::for_parts(&["report-observation"]),
+            role: RoleDefinition {
+                name: RoleName::new("reviewer").unwrap(),
+                output: OutputSemantics::EmitsVerdict,
+                runtime: None,
+                timeout_secs: None,
+                network: false,
+                secrets: false,
+                skills: Vec::new(),
+                prompt_body: String::new(),
+            },
+            environment: BTreeMap::new(),
+            runtime: "codex".into(),
+            skills: Vec::new(),
+            prompt: String::new(),
+            base_sha: "0123456789abcdef".into(),
+            assignment_epoch: 1,
+            workspace_preparation: WorkspacePreparation::Preserve,
+            deadline_ms: i64::MAX,
+            control,
+            updates,
+            activity,
+            workspace_dir: PathBuf::from("/workspace"),
+            state_dir: PathBuf::from("/state"),
+            artifact_capture: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn report_observation_waits_for_durable_acknowledgement() {
+        let (updates, mut receiver) = mpsc::channel(1);
+        let observation = RoleHandoffObservation::Accepted {
+            report: crate::model::PayloadRef::inline("authoritative review evidence"),
+        };
+        let confirmation = tokio::spawn({
+            let request = role_request(updates);
+            let observation = observation.clone();
+            async move { request.confirm_handoff_observed(observation).await }
+        });
+
+        let update = receiver.recv().await.unwrap();
+        let RoleRunUpdate::HandoffObserved {
+            observation: observed,
+            acknowledge,
+        } = update
+        else {
+            panic!("expected a report observation")
+        };
+        assert_eq!(observed, observation);
+        assert!(!confirmation.is_finished());
+
+        acknowledge.send(Ok(())).unwrap();
+        confirmation.await.unwrap().unwrap();
     }
 }

@@ -5,8 +5,8 @@ mod common;
 use common::{approve_plan, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::{MissionDisposition, MissionView};
 use lionclaw::model::{
-    apply, fold, step, AssertionSupersession, DecisionAction, EventEnvelope, MissionEvent,
-    MissionPhase, PlanProposal, StepDecision, VersionStamps, SCHEMA_VERSION,
+    apply, fold, step, AssertionSupersession, ContinueMode, DecisionAction, EventEnvelope,
+    MissionEvent, MissionPhase, PlanProposal, StepDecision, VersionStamps, SCHEMA_VERSION,
 };
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 use lionclaw_runtime_api::TypedFailure;
@@ -52,11 +52,14 @@ fn assert_advertised_actions_are_legal(view: &MissionView) {
             "mission plan propose" => {
                 assert_eq!(view.disposition, MissionDisposition::AwaitingPlan)
             }
-            "mission continue" => assert!(view
+            "mission continue" => assert!(view.state.parked_effects.keys().any(|effect_id| view
                 .state
-                .parked_effects
-                .keys()
-                .any(|effect_id| view.state.parked_effect_is_continuable(effect_id))),
+                .parked_continue_is_legal(effect_id, ContinueMode::Preserve))),
+            "mission continue --recreate" => {
+                assert!(view.state.parked_effects.keys().any(|effect_id| view
+                    .state
+                    .parked_continue_is_legal(effect_id, ContinueMode::RecreateWorkspace)))
+            }
             "mission decide" => assert!(!view.state.open_attention.is_empty()),
             "mission abort" => assert!(!view.state.phase.is_terminal()),
             "mission log" => assert_eq!(view.disposition, MissionDisposition::CleanupBlocked),
@@ -314,8 +317,8 @@ async fn every_historical_wedge_seed_has_a_replay_safe_exit() {
         .find(|item| item.kind == lionclaw::model::AttentionKind::NodeFailed)
         .unwrap();
     assert!(matches!(
-        item.failure,
-        Some(TypedFailure::PermanentRuntime { .. })
+        item.evidence,
+        lionclaw::model::DecisionEvidence::RoleAttempts { .. }
     ));
     failed
         .engine
@@ -335,7 +338,10 @@ async fn every_historical_wedge_seed_has_a_replay_safe_exit() {
     assert!(matches!(
         replanning_state.planning_input.refinement,
         Some(lionclaw::model::PlanningRefinement::FailureEvidence(ref feedback))
-            if matches!(feedback.failure, Some(TypedFailure::PermanentRuntime { .. }))
+            if matches!(
+                feedback.evidence,
+                lionclaw::model::DecisionEvidence::RoleAttempts { .. }
+            )
     ));
     let replanning_events = failed.engine.store().load(&failed_id).await.unwrap();
 

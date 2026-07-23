@@ -337,6 +337,12 @@ async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) 
             discard_artifact: false,
         };
         async move {
+            cleaner.quiesce(&cleanup).await.unwrap_or_else(|error| {
+                panic!(
+                    "exact effect quiesce failed in preserved root '{}': {error:?}",
+                    proof_root.display()
+                )
+            });
             cleaner.cleanup(cleanup).await.unwrap_or_else(|error| {
                 panic!(
                     "exact effect cleanup failed in preserved root '{}': {error:?}",

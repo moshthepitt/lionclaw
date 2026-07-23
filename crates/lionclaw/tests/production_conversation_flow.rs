@@ -938,7 +938,7 @@ async fn initialize_repo(repo: &Path) -> String {
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (22, 33));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (23, 34));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -2132,7 +2132,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .iter()
         .all(|message| { message.marker == lionclaw::model::DeliveryMarker::Undeliverable }));
     assert!(retired.planning.tasks[&TaskId::new("planner").unwrap()]
-        .last_report
+        .last_outcome
         .is_none());
     assert!(retired.conversation_legal_actions(&retired_id).is_empty());
     assert!(retired
@@ -3369,13 +3369,17 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         )))
         .unwrap();
         assert_eq!(
-            launch_status["tasks"][0]["failure"]["evidence"]["code"],
+            launch_status["tasks"][0]["outcome"]["receipt"]["disposition"]["failure"]["evidence"]
+                ["code"],
             "kernel.launch"
         );
-        assert!(launch_status["tasks"][0]["failure"]["evidence"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("test codex auth setup refused launch"));
+        assert!(
+            launch_status["tasks"][0]["outcome"]["receipt"]["disposition"]["failure"]["evidence"]
+                ["detail"]
+                .as_str()
+                .unwrap()
+                .contains("test codex auth setup refused launch")
+        );
         assert_ne!(
             projected_conversation(&launch_status, &conversation_id)["lifecycle"],
             "awaiting_lead"

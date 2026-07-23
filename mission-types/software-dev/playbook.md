@@ -64,6 +64,15 @@ assertion when proposed — a reviewer can never stand in for an oracle here; it
 adds depth on top of one. Do not weaken a test to make an oracle pass; the
 reviewer is instructed to catch exactly that.
 
+## Handoff evidence
+
+Every completed role handoff carries a bounded narrative report. LionClaw binds
+that report to the exact role effect and records it before disposable effect
+resources are removed. The report remains visible with accepted work, failed
+attempts, cancellation, and terminal review outcomes. Missing, malformed, or
+mismatched handoffs never gain report or verdict authority; their typed failure
+evidence remains visible instead.
+
 ## The terminal review (engine-owned; not yours to plan)
 
 After every work task settles and every oracle verdict is fresh at the final

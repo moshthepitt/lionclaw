@@ -218,6 +218,19 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                 base_sha: BASE_SHA.to_string(),
                 assignment_epoch: 1,
             }),
+            NewEvent::new(MissionEvent::RoleTurnObserved {
+                effect_id: role_effect.clone(),
+                observation: lionclaw::model::RoleTurnObservation::Completed {
+                    final_response: PayloadRef::inline("done"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
+                },
+            }),
+            NewEvent::new(MissionEvent::RoleHandoffObserved {
+                effect_id: role_effect.clone(),
+                observation: lionclaw::model::RoleHandoffObservation::Accepted {
+                    report: PayloadRef::inline("done"),
+                },
+            }),
             NewEvent::new(MissionEvent::RoleRunCompleted {
                 effect_id: role_effect,
                 request: Box::new(lionclaw::model::RoleRunRequestIdentity {

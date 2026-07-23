@@ -10,7 +10,8 @@ use common::{
 use lionclaw::engine::{record_control, MissionDisposition};
 use lionclaw::model::{
     Assertion, AssertionId, ControlAction, DecisionAction, Handoff, MissionEvent, MissionPhase,
-    OracleName, OutputSemantics, PayloadRef, RoleName, TaskNamespace,
+    OracleName, OutputSemantics, PayloadRef, RoleAttemptDisposition, RoleEffectSource,
+    RoleHandoffObservation, RoleName, RoleTurnObservation, SettledHandoff, TaskNamespace,
 };
 use lionclaw::ports::{CapturedArtifact, OracleOutcome, RoleRunOutcome};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -205,10 +206,75 @@ async fn invalid_handoff_is_reworked_automatically_with_exact_feedback() {
     let calls = h.role_runner.calls.lock().unwrap();
     assert_eq!(calls.iter().map(|call| call.1).collect::<Vec<_>>(), [1, 2]);
     assert_ne!(calls[0].2, calls[1].2);
+
+    let task_id = lionclaw::model::TaskId::new("fix").unwrap();
+    let mut receipts = outcome
+        .state
+        .role_attempt_receipts
+        .values()
+        .filter_map(|receipt| match &receipt.source {
+            RoleEffectSource::Task { request, .. }
+                if request.namespace == TaskNamespace::Execution && request.task_id == task_id =>
+            {
+                Some((request.attempt_no, receipt))
+            }
+            RoleEffectSource::Task { .. } | RoleEffectSource::TerminalReview { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    receipts.sort_by_key(|(attempt_no, _)| *attempt_no);
+    assert_eq!(receipts.len(), 2);
+    assert_ne!(receipts[0].1.effect_id, receipts[1].1.effect_id);
+
+    let first = receipts[0].1;
+    assert!(matches!(
+        &first.turn,
+        Some(RoleTurnObservation::Completed {
+            final_response,
+            runtime_configuration,
+        }) if final_response == &PayloadRef::inline("")
+            && runtime_configuration == &Default::default()
+    ));
+    assert!(matches!(
+        &first.handoff,
+        Some(RoleHandoffObservation::Accepted { report })
+            if report == &PayloadRef::inline("unfinished")
+    ));
+    let RoleAttemptDisposition::Failed { failure } = &first.disposition else {
+        panic!("attempt 1 must retain its invalid-output disposition");
+    };
+    assert_eq!(
+        failure.evidence().code.as_deref(),
+        Some("role.success_contract")
+    );
+    assert_eq!(failure.detail(), "role reported done=false");
+
+    let second = receipts[1].1;
+    assert!(matches!(
+        &second.turn,
+        Some(RoleTurnObservation::Completed {
+            final_response,
+            runtime_configuration,
+        }) if final_response == &PayloadRef::inline("")
+            && runtime_configuration == &Default::default()
+    ));
+    assert!(matches!(
+        &second.handoff,
+        Some(RoleHandoffObservation::Accepted { report })
+            if report == &PayloadRef::inline("completed")
+    ));
+    assert!(matches!(
+        &second.disposition,
+        RoleAttemptDisposition::Succeeded {
+            handoff: Some(SettledHandoff::Work {
+                request_attention: false,
+            }),
+            artifact: Some(artifact),
+        } if artifact.base_sha == BASE_SHA && artifact.head_sha == HEAD_SHA
+    ));
 }
 
 #[tokio::test]
-async fn wrong_handoff_schema_is_recorded_as_invalid_and_reworked() {
+async fn wrong_handoff_type_is_recorded_as_invalid_and_reworked() {
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let captured = prompts.clone();
@@ -258,7 +324,7 @@ async fn wrong_handoff_schema_is_recorded_as_invalid_and_reworked() {
     {
         let prompts = prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
-        assert!(prompts[1].contains("does not match the effect output contract"));
+        assert!(prompts[1].contains("handoff type does not match this role's output semantics"));
     }
     let events = h.engine.store().load(&id).await.unwrap();
     assert!(events.iter().any(|event| matches!(
@@ -405,15 +471,11 @@ async fn a_scheduled_transient_retry_can_be_stopped_before_runtime_launch() {
     let parked = driver.await.unwrap();
     assert_eq!(parked.disposition, MissionDisposition::Parked);
     assert_eq!(*attempts.lock().unwrap(), 1);
+    let task_id = parked.state.tasks.keys().next().unwrap();
     assert_eq!(
         parked
             .state
-            .tasks
-            .values()
-            .next()
-            .unwrap()
-            .last_failure
-            .as_ref()
+            .task_last_failure(TaskNamespace::Execution, task_id)
             .unwrap()
             .category(),
         "operator_stopped"

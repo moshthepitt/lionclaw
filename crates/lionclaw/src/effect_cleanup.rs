@@ -16,6 +16,18 @@ impl LocalEffectCleaner {
 
 #[async_trait]
 impl EffectCleaner for LocalEffectCleaner {
+    async fn quiesce(&self, request: &EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
+        lionclaw_confinement::remove_oci_container(
+            &self.oci_engine,
+            &request.effect_id.resource_name(),
+        )
+        .await
+        .map_err(|error| EffectCleanupFailure {
+            resource: EffectResource::Container,
+            detail: error.to_string(),
+        })
+    }
+
     async fn cleanup(&self, request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
         let resource_name = request.effect_id.resource_name();
         let effect_dir =
@@ -23,11 +35,6 @@ impl EffectCleaner for LocalEffectCleaner {
                 .effect(&request.effect_id);
         let mut failures = Vec::new();
 
-        if let Err(error) =
-            lionclaw_confinement::remove_oci_container(&self.oci_engine, &resource_name).await
-        {
-            failures.push((EffectResource::Container, error.to_string()));
-        }
         if let Err(error) =
             lionclaw_confinement::remove_oci_secret(&self.oci_engine, &resource_name).await
         {
@@ -82,7 +89,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_is_exact_idempotent_and_preserves_published_state() {
+    async fn quiesce_then_cleanup_is_exact_idempotent_and_preserves_published_state() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -152,8 +159,10 @@ mod tests {
             discard_artifact: true,
         };
 
+        cleaner.quiesce(&request).await.unwrap();
         cleaner.cleanup(request.clone()).await.unwrap();
-        cleaner.cleanup(request).await.unwrap();
+        cleaner.quiesce(&request).await.unwrap();
+        cleaner.cleanup(request.clone()).await.unwrap();
         assert!(!effect_dir.exists());
         assert_eq!(
             std::fs::read_to_string(conversation.work().join("uncommitted")).unwrap(),
@@ -178,16 +187,15 @@ mod tests {
             .status
             .success());
         std::fs::create_dir_all(&effect_dir).unwrap();
-        cleaner
-            .cleanup(EffectCleanupRequest {
-                mission_id,
-                effect_id: effect_id.clone(),
-                workspace_dir: repo.clone(),
-                state_dir,
-                discard_artifact: false,
-            })
-            .await
-            .unwrap();
+        let request = EffectCleanupRequest {
+            mission_id,
+            effect_id: effect_id.clone(),
+            workspace_dir: repo.clone(),
+            state_dir,
+            discard_artifact: false,
+        };
+        cleaner.quiesce(&request).await.unwrap();
+        cleaner.cleanup(request).await.unwrap();
         assert!(
             git(&repo, &["show-ref", "--verify", "--quiet", &effect_ref])
                 .await
@@ -249,18 +257,58 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&engine, permissions).unwrap();
         let cleaner = LocalEffectCleaner::new(engine.to_string_lossy().into_owned());
-        cleaner
-            .cleanup(EffectCleanupRequest {
-                mission_id,
-                effect_id,
-                workspace_dir: repo,
-                state_dir,
-                discard_artifact: false,
-            })
-            .await
-            .unwrap();
+        let request = EffectCleanupRequest {
+            mission_id,
+            effect_id,
+            workspace_dir: repo,
+            state_dir,
+            discard_artifact: false,
+        };
+        cleaner.quiesce(&request).await.unwrap();
+        cleaner.cleanup(request).await.unwrap();
 
         assert!(!role_effect.root().exists());
         assert!(!mission_dirs.root().join("conversations").exists());
+    }
+
+    #[tokio::test]
+    async fn failed_quiesce_preserves_all_evidence_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = dir.path().join("repo");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        std::fs::create_dir(&state_dir).unwrap();
+        assert!(git(&workspace_dir, &["init", "-q"]).await.status.success());
+
+        let mission_id = MissionId::parse("mabc123def456").unwrap();
+        let effect_id = EffectId::for_parts(&["quiesce", "failure"]);
+        let effect_dir =
+            crate::resources::MissionDirs::new(&state_dir, &mission_id).effect(&effect_id);
+        effect_dir.role().prepare().unwrap();
+        std::fs::write(effect_dir.role().handoff().join("handoff.json"), "evidence").unwrap();
+
+        let engine = dir.path().join("fake-oci");
+        std::fs::write(&engine, "#!/bin/sh\nexit 17\n").unwrap();
+        let mut permissions = std::fs::metadata(&engine).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&engine, permissions).unwrap();
+
+        let request = EffectCleanupRequest {
+            mission_id,
+            effect_id,
+            workspace_dir,
+            state_dir,
+            discard_artifact: false,
+        };
+        let failure = LocalEffectCleaner::new(engine.to_string_lossy().into_owned())
+            .quiesce(&request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(failure.resource, EffectResource::Container);
+        assert_eq!(
+            std::fs::read_to_string(effect_dir.role().handoff().join("handoff.json")).unwrap(),
+            "evidence"
+        );
     }
 }

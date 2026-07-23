@@ -16,7 +16,8 @@ use lionclaw::mission_type::{MissionType, MissionTypeDefinition, RoleDefinition,
 use lionclaw::model::{
     Assertion, AssertionId, AttentionKind, ConversationLifecycle, DecisionAction, Handoff,
     MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal,
-    PlanningDag, PlanningRefinement, PlanningTask, RoleName, StopBar, Task, TaskKind, TaskStatus,
+    PlanningDag, PlanningRefinement, PlanningTask, RoleAttemptDisposition, RoleEffectSource,
+    RoleName, StopBar, Task, TaskKind, TaskStatus,
 };
 use lionclaw::ports::{CapturedArtifact, RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -392,8 +393,7 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
     );
     for runtime in state.planning.tasks.values() {
         assert_eq!(runtime.status, TaskStatus::Pending);
-        assert!(runtime.last_report.is_none());
-        assert!(runtime.last_failure.is_none());
+        assert!(runtime.last_outcome.is_none());
         assert!(runtime.feedback.is_empty());
     }
 
@@ -653,7 +653,7 @@ async fn ratification_revisions_are_unbounded_and_keep_only_the_newest_input() {
         assert!(state.proposal.is_none());
         assert_eq!(state.planning_base_revision, Some(0));
         assert!(state.planning.tasks.values().all(|runtime| {
-            runtime.status == TaskStatus::Pending && runtime.last_report.is_none()
+            runtime.status == TaskStatus::Pending && runtime.last_outcome.is_none()
         }));
     }
 
@@ -864,10 +864,10 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
         .find(|a| a.kind == AttentionKind::NodeFailed)
         .expect("a failed planning node raises NodeFailed, not a wedge");
     assert_eq!(node_failed.task_id.as_ref(), Some(&tid("strategist")));
-    assert!(
-        node_failed.failure.is_some(),
-        "typed failure evidence is exact"
-    );
+    assert!(matches!(
+        node_failed.evidence,
+        lionclaw::model::DecisionEvidence::RoleAttempts { .. }
+    ));
     let failed_generation = state.planning_generation;
 
     // Retry re-pends the planning node (a fresh attempt would re-dispatch it).
@@ -893,6 +893,25 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
         .values()
         .find(|a| a.kind == AttentionKind::NodeFailed)
         .expect("retrying the deterministic fixture fails again");
+    let failed_effect = state.planning.tasks[&tid("strategist")]
+        .last_outcome
+        .as_ref()
+        .expect("failed planning attempt")
+        .effect_id()
+        .clone();
+    let failed_receipt = state.role_attempt_receipts[&failed_effect].clone();
+    assert!(matches!(
+        &failed_receipt.source,
+        RoleEffectSource::Task { request, .. }
+            if request.namespace == lionclaw::model::TaskNamespace::Planning
+                && request.task_id == tid("strategist")
+    ));
+    assert!(matches!(
+        &failed_receipt.disposition,
+        RoleAttemptDisposition::Failed { failure }
+            if failure.evidence().code.as_deref() == Some("runtime.fixture")
+                && failure.detail() == "crashed mid-planning"
+    ));
     engine
         .decide(
             &id,
@@ -908,10 +927,24 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
         state.planning.tasks[&tid("strategist")].status,
         TaskStatus::Pending
     );
+    assert!(
+        state.planning.tasks[&tid("strategist")]
+            .last_outcome
+            .is_none(),
+        "the new generation has no inherited actionable outcome"
+    );
+    assert_eq!(
+        state.role_attempt_receipts.get(&failed_effect),
+        Some(&failed_receipt),
+        "generation reset retains the exact old receipt as addressable evidence"
+    );
     assert!(matches!(
         state.planning_input.refinement.as_ref(),
         Some(PlanningRefinement::FailureEvidence(feedback))
-            if feedback.failure.is_some()
+            if matches!(
+                feedback.evidence,
+                lionclaw::model::DecisionEvidence::RoleAttempts { .. }
+            )
                 && feedback.justification == "replace the failed planning approach"
     ));
 }

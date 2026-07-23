@@ -20,15 +20,18 @@ use super::plan::{OutputSemantics, PlanInventory, PlanProposal, PlanningDag};
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
 
-/// Version 22 records typed workspace preparation and explicit continue modes.
-/// Unreleased older logs intentionally fail loudly.
-pub const SCHEMA_VERSION: u32 = 22;
+/// Version 23 records complete role-turn and accepted/rejected handoff
+/// observations before effect cleanup. Unreleased older logs intentionally
+/// fail loudly rather than invent role-attempt provenance.
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_MESSAGE_RECIPIENTS: usize = 64;
 pub const MAX_MESSAGE_REFERENCES: usize = 32;
+/// Maximum narrative evidence retained from one role handoff.
+pub const MAX_ROLE_REPORT_BYTES: usize = 256 * 1024;
 /// Maximum retained message records in one conversation generation. At the
 /// current body and expansion bounds this keeps queued dialogue below the same
 /// aggregate scale as the existing 16-way upstream-context ceiling.
@@ -154,12 +157,43 @@ pub struct BlobRef {
 }
 
 /// Payload data: inline for small values, blob reference above the
-/// externalization threshold (enforced by the store at append time).
+/// engine-owned externalization threshold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PayloadRef {
     Inline { text: String },
     Blob(BlobRef),
+}
+
+/// The bounded handoff fact observed at the exact role-effect boundary.
+///
+/// Provenance is deliberately absent here: the fold derives it from the
+/// matching inflight effect so event authors cannot choose a conversation,
+/// role, task, generation, contract, or judged head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoleHandoffObservation {
+    Accepted { report: PayloadRef },
+    Rejected { failure: TypedFailure },
+}
+
+/// The complete runtime turn result observed by the host before handoff
+/// parsing, artifact capture, or disposable effect cleanup.
+///
+/// Provenance is deliberately absent for the same reason as
+/// `RoleHandoffObservation`: the fold binds this fact to the exact active role
+/// effect. Recording failures as well as successes preserves useful response
+/// and configuration evidence without treating either as task settlement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoleTurnObservation {
+    Completed {
+        final_response: PayloadRef,
+        runtime_configuration: RuntimeConfigurationEvidence,
+    },
+    Failed {
+        failure: TypedFailure,
+    },
 }
 
 impl PayloadRef {
@@ -704,6 +738,19 @@ pub enum MissionEvent {
         effect_id: super::EffectId,
         configuration: RuntimeConfigurationEvidence,
     },
+    /// The role adapter's complete turn result was durably observed. This fact
+    /// does not settle the role effect or grant handoff authority.
+    RoleTurnObserved {
+        effect_id: super::EffectId,
+        observation: RoleTurnObservation,
+    },
+    /// A role handoff was accepted or rejected for an exact active effect.
+    /// This fact preserves evidence before cleanup; it does not settle the run
+    /// or grant task/verdict authority.
+    RoleHandoffObserved {
+        effect_id: super::EffectId,
+        observation: RoleHandoffObservation,
+    },
     RoleRunCompleted {
         effect_id: super::EffectId,
         request: Box<RoleRunRequestIdentity>,
@@ -759,7 +806,7 @@ pub enum MissionEvent {
         effect_id: super::EffectId,
         judged_sha: String,
         /// The reviewer's own summary bit. A blocking gap dominates it
-        /// (fail-closed) — see `TerminalReviewVerdict::blocking`.
+        /// when the fold settles the receipt.
         outcome: Result<TerminalReviewSuccess, TypedFailure>,
     },
     /// A durable control for one exact effect generation.
@@ -892,6 +939,8 @@ impl MissionEvent {
             Self::MessageReferenceUnavailable { .. } => "message_reference_unavailable",
             Self::TaskWorkspacePrepared { .. } => "task_workspace_prepared",
             Self::EffectRuntimeConfigured { .. } => "effect_runtime_configured",
+            Self::RoleTurnObserved { .. } => "role_turn_observed",
+            Self::RoleHandoffObserved { .. } => "role_handoff_observed",
             Self::RoleRunCompleted { .. } => "role_run_completed",
             Self::OracleRunRequested { .. } => "oracle_run_requested",
             Self::OracleRunCompleted { .. } => "oracle_run_completed",
@@ -927,6 +976,8 @@ impl MissionEvent {
             | Self::MessageReferenceUnavailable { .. }
             | Self::TaskWorkspacePrepared { .. }
             | Self::EffectRuntimeConfigured { .. }
+            | Self::RoleTurnObserved { .. }
+            | Self::RoleHandoffObserved { .. }
             | Self::ControlRequested { .. }
             | Self::EffectDeadlineReached { .. }
             | Self::MissionAborted { .. }
@@ -992,20 +1043,6 @@ impl MissionEvent {
                 },
                 Err(failure) => failure.evidence().clone(),
             }),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn outcome_final_response(&self) -> Option<&PayloadRef> {
-        match self {
-            Self::RoleRunCompleted {
-                outcome: Ok(success),
-                ..
-            } => Some(&success.final_response),
-            Self::TerminalReviewCompleted {
-                outcome: Ok(success),
-                ..
-            } => Some(&success.final_response),
             _ => None,
         }
     }
@@ -1196,6 +1233,63 @@ mod compat_tests {
             assert!(
                 serde_json::from_value::<MissionEvent>(missing).is_err(),
                 "missing {field} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn role_observations_have_strict_effect_bound_wire_shapes() {
+        let effect_id = crate::EffectId::for_parts(&["test", "observation"]);
+        let turn = MissionEvent::RoleTurnObserved {
+            effect_id: effect_id.clone(),
+            observation: RoleTurnObservation::Completed {
+                final_response: PayloadRef::inline("done"),
+                runtime_configuration: RuntimeConfigurationEvidence::default(),
+            },
+        };
+        let handoff = MissionEvent::RoleHandoffObserved {
+            effect_id: effect_id.clone(),
+            observation: RoleHandoffObservation::Accepted {
+                report: PayloadRef::inline("evidence"),
+            },
+        };
+
+        for event in [turn, handoff] {
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(json["effect_id"], effect_id.as_str());
+            assert!(
+                json.get("conversation_id").is_none()
+                    && json.get("task_id").is_none()
+                    && json.get("role").is_none(),
+                "observation provenance must come only from the matching request"
+            );
+            assert_eq!(serde_json::from_value::<MissionEvent>(json).unwrap(), event);
+        }
+
+        for raw in [
+            serde_json::json!({
+                "type": "role_turn_observed",
+                "effect_id": effect_id,
+                "observation": {
+                    "outcome": "completed",
+                    "final_response": {"kind": "inline", "text": "done"},
+                    "runtime_configuration": {},
+                    "conversation_id": "forged"
+                }
+            }),
+            serde_json::json!({
+                "type": "role_handoff_observed",
+                "effect_id": crate::EffectId::for_parts(&["test", "observation"]),
+                "observation": {
+                    "outcome": "accepted",
+                    "report": {"kind": "inline", "text": "evidence"},
+                    "role": "forged"
+                }
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<MissionEvent>(raw).is_err(),
+                "observation payloads must reject caller-selected provenance"
             );
         }
     }

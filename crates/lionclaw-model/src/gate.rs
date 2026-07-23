@@ -25,6 +25,9 @@ pub enum GateResult {
 /// Evaluate a gate given the current advisory state. `gate` must be a gate
 /// task in the plan.
 pub fn evaluate_gate(state: &MissionState, plan: &Plan, gate_id: &TaskId) -> GateResult {
+    if state.plan.as_ref() != Some(plan) {
+        return blocked("gate plan is not the active mission plan".into());
+    }
     let by_id: BTreeMap<&TaskId, &super::plan::Task> =
         plan.tasks.iter().map(|t| (&t.id, t)).collect();
     let Some(gate) = by_id.get(gate_id) else {
@@ -50,7 +53,8 @@ pub fn evaluate_gate(state: &MissionState, plan: &Plan, gate_id: &TaskId) -> Gat
         let all_pass = covering.iter().all(|v| {
             advisory
                 .and_then(|verdicts| verdicts.get(*v))
-                .copied()
+                .and_then(|effect_id| state.advisory_receipt(target, v, effect_id))
+                .map(|(_, passed)| passed)
                 .unwrap_or(false) // never-reported counts as fail
         });
         if !all_pass {
@@ -109,7 +113,7 @@ mod tests {
     use crate::plan::{
         Assertion, PlanInventory, Requirement, RequirementDisposition, RequirementKind, Task,
     };
-    use crate::MissionConfig;
+    use crate::{AdvisoryStatus, MissionConfig};
 
     const TEST_PROMPT_HASH: &str =
         "148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940";
@@ -152,7 +156,11 @@ mod tests {
             prompt_hash: prompt.content_sha256().unwrap(),
             prompt_template: crate::RolePromptTemplate::Execution,
             base_sha: "s0".into(),
-            workspace_preparation: crate::WorkspacePreparation::ResetForAssignment,
+            workspace_preparation: if output == crate::OutputSemantics::ProducesArtifact {
+                crate::WorkspacePreparation::ResetForAssignment
+            } else {
+                crate::WorkspacePreparation::Preserve
+            },
             message_boundary,
             presented_messages: vec![],
         })
@@ -276,9 +284,10 @@ mod tests {
                 },
             ),
         ];
-        let mut seq = 4;
+        let mut seq: u64 = 4;
         for task in plan.tasks.iter().filter(|task| task.kind == TaskKind::Work) {
             let effect_id = role_effect(&mission_id, &task.id);
+            let message_boundary = seq.saturating_sub(1);
             events.push(env(
                 &mission_id,
                 seq,
@@ -301,13 +310,25 @@ mod tests {
                     prompt_hash: PayloadRef::inline("p").content_sha256().unwrap(),
                     base_sha: "s0".into(),
                     assignment_epoch: 1,
-                    message_boundary: seq.saturating_sub(1),
+                    message_boundary,
                     presented_messages: vec![],
                     workspace_preparation: crate::WorkspacePreparation::ResetForAssignment,
                     requested_at_ms: 0,
                     not_before_ms: 0,
                     deadline_ms: 100_000,
                     budget_deadline_ms: 100_000,
+                },
+            ));
+            seq += 1;
+            events.push(env(
+                &mission_id,
+                seq,
+                MissionEvent::RoleTurnObserved {
+                    effect_id: effect_id.clone(),
+                    observation: crate::RoleTurnObservation::Completed {
+                        final_response: PayloadRef::inline("done"),
+                        runtime_configuration: crate::RuntimeConfigurationEvidence::default(),
+                    },
                 },
             ));
             seq += 1;
@@ -325,6 +346,17 @@ mod tests {
             events.push(env(
                 &mission_id,
                 seq,
+                MissionEvent::RoleHandoffObserved {
+                    effect_id: effect_id.clone(),
+                    observation: crate::RoleHandoffObservation::Accepted {
+                        report: PayloadRef::inline("done"),
+                    },
+                },
+            ));
+            seq += 1;
+            events.push(env(
+                &mission_id,
+                seq,
                 MissionEvent::RoleRunCompleted {
                     effect_id,
                     request: test_role_identity(
@@ -332,7 +364,7 @@ mod tests {
                         &task.id,
                         "implementer",
                         crate::OutputSemantics::ProducesArtifact,
-                        seq - 3,
+                        message_boundary,
                     ),
                     outcome: Ok(crate::RoleRunSuccess {
                         handoff: Some(Handoff::Work {
@@ -349,6 +381,7 @@ mod tests {
             seq += 1;
         }
         for (validator, items) in verdicts {
+            let message_boundary = seq.saturating_sub(1);
             events.push(env(
                 &mission_id,
                 seq,
@@ -371,13 +404,36 @@ mod tests {
                     prompt_hash: PayloadRef::inline("p").content_sha256().unwrap(),
                     base_sha: "s0".into(),
                     assignment_epoch: 1,
-                    message_boundary: seq.saturating_sub(1),
+                    message_boundary,
                     presented_messages: vec![],
-                    workspace_preparation: crate::WorkspacePreparation::ResetForAssignment,
+                    workspace_preparation: crate::WorkspacePreparation::Preserve,
                     requested_at_ms: 0,
                     not_before_ms: 0,
                     deadline_ms: 100_000,
                     budget_deadline_ms: 100_000,
+                },
+            ));
+            seq += 1;
+            events.push(env(
+                &mission_id,
+                seq,
+                MissionEvent::RoleTurnObserved {
+                    effect_id: role_effect(&mission_id, &tid(validator)),
+                    observation: crate::RoleTurnObservation::Completed {
+                        final_response: PayloadRef::inline("reviewed"),
+                        runtime_configuration: crate::RuntimeConfigurationEvidence::default(),
+                    },
+                },
+            ));
+            seq += 1;
+            events.push(env(
+                &mission_id,
+                seq,
+                MissionEvent::RoleHandoffObserved {
+                    effect_id: role_effect(&mission_id, &tid(validator)),
+                    observation: crate::RoleHandoffObservation::Accepted {
+                        report: PayloadRef::inline("r"),
+                    },
                 },
             ));
             seq += 1;
@@ -391,7 +447,7 @@ mod tests {
                         &tid(validator),
                         "reviewer",
                         crate::OutputSemantics::EmitsVerdict,
-                        seq - 2,
+                        message_boundary,
                     ),
                     outcome: Ok(crate::RoleRunSuccess {
                         handoff: Some(Handoff::Validate {
@@ -473,8 +529,10 @@ mod tests {
 
     #[test]
     fn uncovered_target_blocks() {
-        // Gate targets A and B, but only A has a covering validator.
-        let plan = plan_with(
+        // Start from a valid folded plan, then adversarially corrupt the
+        // active plan so the evaluator's defensive uncovered-target branch is
+        // exercised independently of plan-authoring validation.
+        let valid_plan = plan_with(
             vec![
                 Assertion {
                     id: aid("AA"),
@@ -490,11 +548,18 @@ mod tests {
             vec![
                 work("wa", &["AA"]),
                 work("wb", &["BB"]),
-                validate("v", &["AA"], &["wa"]),
+                validate("v", &["AA", "BB"], &["wa", "wb"]),
                 gate("g", &["AA", "BB"], &["v"]),
             ],
         );
-        let state = state_with_verdicts(plan.clone(), &[("v", &[("AA", true)])]);
+        let mut state = state_with_verdicts(valid_plan, &[("v", &[("AA", true), ("BB", true)])]);
+        let mut plan = state.plan.clone().expect("accepted plan");
+        plan.tasks
+            .iter_mut()
+            .find(|task| task.id == tid("v"))
+            .expect("validator")
+            .targets = vec![aid("AA")];
+        state.plan = Some(plan.clone());
         let result = evaluate_gate(&state, &plan, &tid("g"));
         assert!(matches!(&result, GateResult::Blocked { reason } if reason.contains("BB")));
     }
@@ -550,5 +615,118 @@ mod tests {
             evaluate_gate(&dissent, &plan, &tid("g")),
             GateResult::Blocked { .. }
         ));
+    }
+
+    #[test]
+    fn retained_prior_revision_receipt_cannot_clear_current_gate_or_finish() {
+        let plan = plan_with(
+            vec![Assertion {
+                id: aid("AA"),
+                prose: "a".into(),
+                oracle: Some(OracleName::new("tests").unwrap()),
+            }],
+            vec![
+                work("w", &["AA"]),
+                validate("v", &["AA"], &["w"]),
+                gate("g", &["AA"], &["v"]),
+            ],
+        );
+        let mut state = state_with_verdicts(plan.clone(), &[("v", &[("AA", true)])]);
+        assert_eq!(evaluate_gate(&state, &plan, &tid("g")), GateResult::Cleared);
+        assert_eq!(
+            crate::classify_finish(&state),
+            crate::FinishClass::InternallyConsistent
+        );
+
+        // The receipt is intentionally retained, but a replacement plan
+        // revision cannot inherit its acceptance authority.
+        state.revision += 1;
+
+        assert!(matches!(
+            evaluate_gate(&state, &plan, &tid("g")),
+            GateResult::Blocked { .. }
+        ));
+        assert_eq!(state.advisory_status(&aid("AA")), AdvisoryStatus::Pending);
+        assert_eq!(
+            crate::classify_finish(&state),
+            crate::FinishClass::Unverified
+        );
+    }
+
+    #[test]
+    fn wrong_validator_receipt_cannot_satisfy_another_validator_slot() {
+        let plan = plan_with(
+            vec![Assertion {
+                id: aid("AA"),
+                prose: "a".into(),
+                oracle: Some(OracleName::new("tests").unwrap()),
+            }],
+            vec![
+                work("w", &["AA"]),
+                validate("v1", &["AA"], &["w"]),
+                validate("v2", &["AA"], &["w"]),
+                gate("g", &["AA"], &["v1", "v2"]),
+            ],
+        );
+        let mut state = state_with_verdicts(
+            plan.clone(),
+            &[("v1", &[("AA", true)]), ("v2", &[("AA", true)])],
+        );
+        let wrong_effect = state.contract[&aid("AA")].last_advisory[&tid("v2")].clone();
+        let advisory = &mut state.contract.get_mut(&aid("AA")).unwrap().last_advisory;
+        advisory.remove(&tid("v2"));
+        advisory.insert(tid("v1"), wrong_effect);
+
+        assert!(matches!(
+            evaluate_gate(&state, &plan, &tid("g")),
+            GateResult::Blocked { .. }
+        ));
+        assert_eq!(state.advisory_status(&aid("AA")), AdvisoryStatus::Pending);
+        assert_eq!(
+            crate::classify_finish(&state),
+            crate::FinishClass::Unverified
+        );
+    }
+
+    #[test]
+    fn gate_and_finish_derive_the_verdict_from_exact_receipt_items() {
+        let plan = plan_with(
+            vec![Assertion {
+                id: aid("AA"),
+                prose: "a".into(),
+                oracle: Some(OracleName::new("tests").unwrap()),
+            }],
+            vec![
+                work("w", &["AA"]),
+                validate("v", &["AA"], &["w"]),
+                gate("g", &["AA"], &["v"]),
+            ],
+        );
+        let mut state = state_with_verdicts(plan.clone(), &[("v", &[("AA", true)])]);
+        let effect_id = state.contract[&aid("AA")].last_advisory[&tid("v")].clone();
+        let receipt = state
+            .role_attempt_receipts
+            .get_mut(&effect_id)
+            .expect("validator receipt");
+        let crate::RoleAttemptDisposition::Succeeded {
+            handoff: Some(crate::SettledHandoff::Validate { items, .. }),
+            ..
+        } = &mut receipt.disposition
+        else {
+            panic!("settled validator receipt");
+        };
+        // Leave the aggregate pass bit untouched: each assertion is governed
+        // by its own exact item, never by a convenient role-wide summary.
+        items[0].passed = false;
+
+        assert!(matches!(
+            evaluate_gate(&state, &plan, &tid("g")),
+            GateResult::Blocked { .. }
+        ));
+        assert_eq!(state.advisory_status(&aid("AA")), AdvisoryStatus::Failed);
+        assert_eq!(
+            crate::classify_finish(&state),
+            crate::FinishClass::Unverified
+        );
     }
 }
