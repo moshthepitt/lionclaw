@@ -387,6 +387,11 @@ fn prepare_oci_process_launch_with_runtime_auth(
         args.push(tmpfs.argument().to_string());
     }
 
+    for device in &request.plan.devices {
+        args.push("--device".to_string());
+        args.push(device.clone());
+    }
+
     let environment = merged_environment(&request.plan.environment, &request.program.environment);
 
     match (&request.runtime_secrets_mount, runtime_secret_name) {
@@ -1262,6 +1267,18 @@ mod tests {
         assert_keep_id_with_host_user(&invocation.args);
     }
 
+    #[test]
+    fn compiled_devices_become_explicit_oci_device_arguments() {
+        let mut request = sample_execution_request();
+        request.plan.devices.insert("/dev/dri".to_string());
+
+        let launch = prepare_oci_process_launch(&request, None).expect("prepare");
+        assert!(launch
+            .args
+            .windows(2)
+            .any(|pair| { pair == ["--device".to_string(), "/dev/dri".to_string()] }));
+    }
+
     #[cfg(unix)]
     #[test]
     fn install_policy_system_root_posture_uses_root_identity_args() {
@@ -1938,6 +1955,7 @@ esac
                 },
             ],
             mount_runtime_secrets: true,
+            devices: Default::default(),
             escape_classes: Default::default(),
             limits: ExecutionLimits {
                 memory_limit: Some("4g".to_string()),

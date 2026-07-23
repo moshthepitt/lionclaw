@@ -42,12 +42,45 @@ scenario_fix_bug() {
         local mid; mid="$(mission_json start --type software-dev --repo "$repo" \
             --objective "Fix the off-by-one in overlaps() so all tests pass. Do not weaken any test." \
             | python3 -c 'import sys,json;print(json.load(sys.stdin)["mission_id"])')"
-        cat > "$repo/plan.json" <<JSON
-{ "base_revision": 0, "plan": {
-  "requirements": [ { "id": "CORRECT-OVERLAPS", "kind": "capability", "prose": "closed intervals that touch overlap", "disposition": { "type": "covered", "assertion_ids": ["TESTS-PASS"] } } ],
-  "assertions": [ { "id": "TESTS-PASS", "prose": "cargo test passes at the final commit", "oracle": "cargo-test" } ],
-  "tasks": [ { "id": "fix", "kind": "work", "body": "Fix overlaps() for closed intervals so tests::touching_intervals_overlap and merge_coalesces_touching_intervals pass. Do not modify the tests.", "targets": ["TESTS-PASS"], "role": "implementer", "depends_on": [] } ] } }
-JSON
+        mission_json team show "$mid" --repo "$repo" > "$repo/team.json"
+        python3 - "$repo/team.json" "$repo/plan.json" <<'PY'
+import json, sys
+team = json.load(open(sys.argv[1]))["team"]
+team["revision"] = 1
+team["task_assignments"] = {"fix": "implementer"}
+team["judgment_assignments"] = {"TESTS-PASS": ["reviewer"]}
+proposal = {
+    "plan": {
+        "base_revision": 0,
+        "requirement_changes": [],
+        "assertion_supersessions": [],
+        "plan": {
+            "requirements": [{
+                "id": "CORRECT-OVERLAPS",
+                "kind": "capability",
+                "prose": "closed intervals that touch overlap",
+                "disposition": {
+                    "type": "covered",
+                    "assertion_ids": ["TESTS-PASS"],
+                },
+            }],
+            "assertions": [{
+                "id": "TESTS-PASS",
+                "prose": "cargo test passes at the final commit",
+                "oracle": "cargo-test",
+            }],
+            "tasks": [{
+                "id": "fix",
+                "body": "Fix overlaps() for closed intervals. Do not modify the tests.",
+                "targets": ["TESTS-PASS"],
+                "depends_on": [],
+            }],
+        },
+    },
+    "team": team,
+}
+json.dump(proposal, open(sys.argv[2], "w"))
+PY
         "$BIN" mission plan propose "$mid" --repo "$repo" --file "$repo/plan.json" >/dev/null 2>&1
         "$BIN" mission decide "$mid" plan_proposal:mission approve --repo "$repo" \
             --justification "eval approves the fixture plan" >/dev/null 2>&1
@@ -75,8 +108,8 @@ JSON
 # ships.
 
 # --- Scenario 2: planning-in-phase -> approve -> verified -----------------
-# No hand-written plan: the planning DAG (strategist -> red-team -> author)
-# proposes the contract, a human approves it, then execution verifies. The
+# No hand-written plan: the team's strategist proposes the contract and
+# complete assignments, a human approves them, then execution verifies. The
 # Plan approval is always explicit, so planning must park before any work.
 scenario_planning() {
     local pass=0

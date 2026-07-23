@@ -5,23 +5,14 @@
 //! error suppresses shape errors, and so on. A plan that fails any
 //! group produces no event — the mission never advances on an invalid plan.
 //!
-//! Divergences: contract + task list validate together (one plan);
-//! roles replace skills, and a task's role must carry compatible output
-//! semantics (an artifact role works, a verdict role validates; the read-only
-//! planning roles — report/proposal — are rejected on every execution task);
-//! assertion oracle bindings must exist in the mission-type inventory. Id charset
-//! rules are enforced by the id newtypes at every deserialization boundary, so
-//! only duplicates are checked here.
+//! The plan contains only contract and work DAG data. Role contracts,
+//! assignments, judgment panels, and closing review live in the active team
+//! snapshot and validate jointly with the plan.
 
-use super::event::StopBar;
 use super::ids::TaskId;
-#[cfg(test)]
-use super::ids::{OracleName, RoleName};
-use super::plan::{
-    OutputSemantics, Plan, PlanInventory, PlanProposal, PlanningDag, RequirementDisposition,
-    TaskKind,
-};
+use super::plan::{OutputSemantics, Plan, PlanProposal, RequirementDisposition};
 use super::state::MissionState;
+use super::{MissionConfig, MissionProposal, StopBar, TeamRevision};
 use crate::prelude::*;
 
 /// Maximum direct fan-in for one task. Role reports are independently bounded
@@ -45,8 +36,8 @@ fn err(code: &'static str, detail: impl Into<String>) -> PlanValidationError {
 
 pub fn validate_plan(
     plan: &Plan,
-    inventory: &PlanInventory,
-    stop: StopBar,
+    team: &TeamRevision,
+    config: &MissionConfig,
 ) -> Vec<PlanValidationError> {
     // Group 0: emptiness (zenith empty_contract / empty_task_list).
     if plan.assertions.is_empty() {
@@ -76,8 +67,8 @@ pub fn validate_plan(
     if !errors.is_empty() {
         return errors;
     }
-    // Group 3: per-kind shape + role/oracle inventory resolution.
-    let errors = check_shape(plan, inventory);
+    // Group 3: work shape plus team/oracle resolution.
+    let errors = check_shape(plan, team, config);
     if !errors.is_empty() {
         return errors;
     }
@@ -91,14 +82,14 @@ pub fn validate_plan(
     if !errors.is_empty() {
         return errors;
     }
-    // Group 6: coverage.
-    let errors = check_coverage(plan);
+    // Group 6: one deliverable sink and no role instance assigned to
+    // concurrently runnable work.
+    let errors = check_dispatch_topology(plan, team);
     if !errors.is_empty() {
         return errors;
     }
-    // Group 7: every gate target has an upstream validator (else the gate can
-    // never clear — reject at author time instead of parking at run time).
-    let errors = check_gate_coverage(plan);
+    // Group 7: coverage.
+    let errors = check_coverage(plan);
     if !errors.is_empty() {
         return errors;
     }
@@ -108,140 +99,71 @@ pub fn validate_plan(
     // proposal *could* bind one, so this is a
     // launch-time policy, not a permanence claim; a domain with genuinely
     // unprovable claims declares `stop = reviewed`.)
-    check_stop_bar_reachable(plan, stop)
+    check_stop_bar_reachable(plan, config.stop)
 }
 
-/// Validate a mission type's planning DAG (at load, fail-closed): unique ids,
-/// resolvable acyclic deps, every role a planning role (`ProducesReport` or the
-/// single `ProposesPlan` author), and the author is the unique sink — so the
-/// DAG fully drains into the proposer with no orphan island.
-pub fn validate_planning_dag(
-    dag: &PlanningDag,
-    inventory: &PlanInventory,
-) -> Vec<PlanValidationError> {
-    // An empty DAG is valid: it means "no in-engine planning" (the mission
-    // awaits a manually proposed plan).
-    if dag.tasks.is_empty() {
-        return Vec::new();
-    }
-    let mut ids = BTreeSet::new();
-    for t in &dag.tasks {
-        if !ids.insert(&t.id) {
-            return vec![err(
-                "duplicate_task_id",
-                format!("planning task '{}' is declared twice", t.id),
-            )];
-        }
-        if t.id.as_str() == super::ids::TERMINAL_REVIEW_TASK_TAG {
-            return vec![err(
-                "reserved_task_id",
-                format!(
-                    "planning task id '{}' is reserved for the terminal reviewer",
-                    t.id
-                ),
-            )];
-        }
-    }
-
+fn check_dispatch_topology(plan: &Plan, team: &TeamRevision) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
-    let mut proposers = 0;
-    for t in &dag.tasks {
-        errors.extend(check_dependency_list(
-            "planning task",
-            &t.id,
-            &t.depends_on,
-            &ids,
-        ));
-        let declared_output = match inventory.roles.get(&t.role) {
-            None => {
-                errors.push(err(
-                    "unknown_role",
-                    format!(
-                        "planning task '{}' names role '{}' which the mission type does not provide",
-                        t.id, t.role
-                    ),
-                ));
-                None
-            }
-            Some(declared) if *declared != t.output => {
-                errors.push(err(
-                    "role_output_mismatch",
-                    format!(
-                        "planning task '{}' records {:?}, but role '{}' declares {:?}",
-                        t.id, t.output, t.role, declared
-                    ),
-                ));
-                None
-            }
-            Some(declared) => Some(*declared),
-        };
-        match declared_output {
-            Some(OutputSemantics::ProposesPlan) => proposers += 1,
-            Some(OutputSemantics::ProducesReport) | None => {}
-            Some(other) => errors.push(err(
-                "role_output_mismatch",
-                format!(
-                    "planning role '{}' must be produces-report or proposes-plan, not {other:?}",
-                    t.role
-                ),
-            )),
-        }
-    }
-    if !errors.is_empty() {
-        return errors;
-    }
-
-    if proposers != 1 {
-        return vec![err(
-            "planning_author",
-            format!("a planning DAG must have exactly one proposes-plan author, found {proposers}"),
-        )];
-    }
-    if planning_has_cycle(dag) {
-        return vec![err(
-            "cycle_detected",
-            "the planning DAG has a dependency cycle",
-        )];
-    }
-    // The author must be the unique sink: no node depends on it, and it is the
-    // only node nothing depends on — every path drains into the proposer.
-    let has_successor: BTreeSet<&TaskId> = dag.tasks.iter().flat_map(|t| &t.depends_on).collect();
-    let sinks: Vec<_> = dag
+    let depended_on: BTreeSet<_> = plan
         .tasks
         .iter()
-        .filter(|t| !has_successor.contains(&t.id))
+        .flat_map(|task| task.depends_on.iter())
         .collect();
-    let author_is_unique_sink = sinks.len() == 1
-        && inventory.roles.get(&sinks[0].role) == Some(&OutputSemantics::ProposesPlan);
-    if !author_is_unique_sink {
-        return vec![err(
-            "planning_sink",
-            "the proposes-plan author must be the unique sink of the planning DAG \
-             (every node drains into it)",
-        )];
+    let sinks: Vec<_> = plan
+        .tasks
+        .iter()
+        .filter(|task| !depended_on.contains(&task.id))
+        .map(|task| task.id.to_string())
+        .collect();
+    if sinks.len() != 1 {
+        errors.push(err(
+            "deliverable_sink_count",
+            format!("plan must have exactly one deliverable sink; found {sinks:?}"),
+        ));
     }
-    Vec::new()
+
+    let mut by_role: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for task in &plan.tasks {
+        if let Some(role) = team.task_assignments.get(&task.id) {
+            by_role.entry(role).or_default().push(&task.id);
+        }
+    }
+    for (role, tasks) in by_role {
+        for (index, left) in tasks.iter().enumerate() {
+            for right in tasks.iter().skip(index + 1) {
+                if !depends_transitively(plan, left, right)
+                    && !depends_transitively(plan, right, left)
+                {
+                    errors.push(err(
+                        "concurrent_role_assignment",
+                        format!(
+                            "role instance '{role}' owns concurrently runnable tasks '{left}' and '{right}'"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    errors
 }
 
-fn planning_has_cycle(dag: &PlanningDag) -> bool {
-    // Kahn: repeatedly remove nodes whose deps are all removed; a remainder is a
-    // cycle.
-    let mut remaining: BTreeSet<&TaskId> = dag.tasks.iter().map(|t| &t.id).collect();
-    loop {
-        let ready: Vec<&TaskId> = dag
-            .tasks
-            .iter()
-            .filter(|t| remaining.contains(&t.id))
-            .filter(|t| t.depends_on.iter().all(|d| !remaining.contains(d)))
-            .map(|t| &t.id)
-            .collect();
-        if ready.is_empty() {
-            return !remaining.is_empty();
+fn depends_transitively(plan: &Plan, task: &TaskId, possible_ancestor: &TaskId) -> bool {
+    let tasks: BTreeMap<_, _> = plan.tasks.iter().map(|task| (&task.id, task)).collect();
+    let mut pending = vec![task];
+    let mut seen = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current) {
+            continue;
         }
-        for id in ready {
-            remaining.remove(id);
+        let Some(task) = tasks.get(current) else {
+            continue;
+        };
+        if task.depends_on.contains(possible_ancestor) {
+            return true;
         }
+        pending.extend(task.depends_on.iter());
     }
+    false
 }
 
 fn check_stop_bar_reachable(plan: &Plan, stop: StopBar) -> Vec<PlanValidationError> {
@@ -311,16 +233,70 @@ pub fn validate_plan_proposal(
     proposal: &PlanProposal,
 ) -> Result<(), ProposalError> {
     validate_plan_transition(state, proposal)?;
-    let errors = validate_plan(
-        &proposal.plan,
-        &state.config.plan_inventory,
-        state.config.stop,
-    );
+    let Some(team) = state.team.as_ref() else {
+        return Err(ProposalError::Invalid(vec![err(
+            "missing_team",
+            "mission has no accepted team revision",
+        )]));
+    };
+    let errors = validate_plan(&proposal.plan, team, &state.config);
     if errors.is_empty() {
         Ok(())
     } else {
         Err(ProposalError::Invalid(errors))
     }
+}
+
+pub fn validate_mission_proposal(
+    state: &MissionState,
+    proposal: &MissionProposal,
+) -> Result<(), ProposalError> {
+    if proposal.plan.is_none() && proposal.team.is_none() {
+        return Err(ProposalError::Immaterial);
+    }
+    if let Some(team) = &proposal.team {
+        let expected = state
+            .team
+            .as_ref()
+            .map_or(0, |current| current.revision.saturating_add(1));
+        if team.revision != expected
+            || team.validate_shape().is_err()
+            || team
+                .roles
+                .values()
+                .any(|role| !role.grants.within(&state.config.ceilings))
+        {
+            return Err(ProposalError::Invalid(vec![err(
+                "invalid_team_revision",
+                format!("proposed team must be complete revision {expected} within ceilings"),
+            )]));
+        }
+    }
+    if let Some(plan) = &proposal.plan {
+        validate_plan_transition(state, plan)?;
+    }
+    let team = proposal
+        .team
+        .as_ref()
+        .or(state.team.as_ref())
+        .ok_or_else(|| {
+            ProposalError::Invalid(vec![err(
+                "missing_team",
+                "proposal has no team revision to validate against",
+            )])
+        })?;
+    let plan = proposal
+        .plan
+        .as_ref()
+        .map(|candidate| &candidate.plan)
+        .or(state.plan.as_ref());
+    if let Some(plan) = plan {
+        let errors = validate_plan(plan, team, &state.config);
+        if !errors.is_empty() {
+            return Err(ProposalError::Invalid(errors));
+        }
+    }
+    Ok(())
 }
 
 /// Validate revision monotonicity and immutable ids before the caller checks
@@ -554,30 +530,6 @@ fn check_requirements(plan: &Plan) -> Vec<PlanValidationError> {
     }
     errors
 }
-fn check_gate_coverage(plan: &Plan) -> Vec<PlanValidationError> {
-    let by_id: BTreeMap<&TaskId, &super::plan::Task> =
-        plan.tasks.iter().map(|t| (&t.id, t)).collect();
-    let mut errors = Vec::new();
-    for gate in plan.tasks.iter().filter(|t| t.kind == TaskKind::Gate) {
-        let validators = super::gate::upstream_validators(&by_id, &gate.id);
-        for target in &gate.targets {
-            let covered = validators
-                .iter()
-                .any(|v| by_id.get(*v).is_some_and(|t| t.targets.contains(target)));
-            if !covered {
-                errors.push(err(
-                    "gate_target_uncovered",
-                    format!(
-                        "gate '{}' target '{target}' has no upstream validator; it can never clear",
-                        gate.id
-                    ),
-                ));
-            }
-        }
-    }
-    errors
-}
-
 fn check_unique_ids(plan: &Plan) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
     let mut seen_requirements = BTreeSet::new();
@@ -606,27 +558,41 @@ fn check_unique_ids(plan: &Plan) -> Vec<PlanValidationError> {
                 format!("task '{}' declared more than once", task.id),
             ));
         }
-        // The terminal reviewer's runner tag shares the attempt-dir namespace
-        // with plan tasks; a task by this name could leave crashed-attempt
-        // dirs the closing reviewer would silently reuse.
-        if task.id.as_str() == super::ids::TERMINAL_REVIEW_TASK_TAG {
-            errors.push(err(
-                "reserved_task_id",
-                format!(
-                    "task id '{}' is reserved for the terminal reviewer",
-                    task.id
-                ),
-            ));
-        }
     }
     errors
 }
 
-fn check_shape(plan: &Plan, inventory: &PlanInventory) -> Vec<PlanValidationError> {
+fn check_shape(
+    plan: &Plan,
+    team: &TeamRevision,
+    config: &MissionConfig,
+) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
+    if let Err(detail) = team.validate_shape() {
+        errors.push(err("invalid_team", detail));
+        return errors;
+    }
+    for (id, role) in &team.roles {
+        if !role.grants.within(&config.ceilings) {
+            errors.push(err(
+                "authority_exceeds_ceiling",
+                format!("role instance '{id}' requests grants outside mission ceilings"),
+            ));
+        }
+        if matches!(
+            role.output,
+            OutputSemantics::EmitsVerdict | OutputSemantics::EmitsGapVerdict
+        ) && (role.grants.secrets || role.grants.writes)
+        {
+            errors.push(err(
+                "judgment_floor",
+                format!("judgment role instance '{id}' requests secrets or writes"),
+            ));
+        }
+    }
     for assertion in &plan.assertions {
         if let Some(oracle) = &assertion.oracle {
-            if !inventory.oracles.contains(oracle) {
+            if !config.oracles.contains(oracle) {
                 errors.push(err(
                     "unknown_oracle",
                     format!(
@@ -636,79 +602,89 @@ fn check_shape(plan: &Plan, inventory: &PlanInventory) -> Vec<PlanValidationErro
                 ));
             }
         }
+        let Some(panel) = team.judgment_assignments.get(&assertion.id) else {
+            errors.push(err(
+                "missing_judgment_assignment",
+                format!(
+                    "assertion '{}' has no assigned judgment panel",
+                    assertion.id
+                ),
+            ));
+            continue;
+        };
+        if panel.is_empty() {
+            errors.push(err(
+                "empty_judgment_assignment",
+                format!("assertion '{}' has an empty judgment panel", assertion.id),
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for role_id in panel {
+            if !seen.insert(role_id) {
+                errors.push(err(
+                    "duplicate_judge",
+                    format!(
+                        "assertion '{}' repeats judgment role instance '{role_id}'",
+                        assertion.id
+                    ),
+                ));
+            }
+            match team.roles.get(role_id) {
+                Some(role) if role.output == OutputSemantics::EmitsVerdict => {}
+                Some(_) => errors.push(err(
+                    "judgment_output_mismatch",
+                    format!(
+                        "assertion '{}' assigns non-verdict role instance '{role_id}'",
+                        assertion.id
+                    ),
+                )),
+                None => errors.push(err(
+                    "unknown_judgment_role",
+                    format!(
+                        "assertion '{}' assigns unknown role instance '{role_id}'",
+                        assertion.id
+                    ),
+                )),
+            }
+        }
+    }
+    if config.requires_gap_review && team.gap_review_assignment.is_none() {
+        errors.push(err(
+            "missing_gap_reviewer",
+            "mission constitution requires a gap review assignment",
+        ));
     }
     let known: BTreeSet<_> = plan.assertions.iter().map(|a| &a.id).collect();
     for task in &plan.tasks {
-        match task.kind {
-            TaskKind::Gate => {
-                if task.role.is_some() {
-                    errors.push(err(
-                        "gate_with_role",
-                        format!("gate '{}' must not name a role", task.id),
-                    ));
-                }
-                if !task.body.is_empty() {
-                    errors.push(err(
-                        "gate_with_body",
-                        format!("gate '{}' must have an empty body", task.id),
-                    ));
-                }
-                if task.targets.is_empty() {
-                    errors.push(err(
-                        "empty_targets",
-                        format!("gate '{}' must target at least one assertion", task.id),
-                    ));
-                }
-            }
-            TaskKind::Work | TaskKind::Validate => {
-                if task.body.is_empty() {
-                    errors.push(err(
-                        "missing_body",
-                        format!("task '{}' has no body", task.id),
-                    ));
-                }
-                if task.kind == TaskKind::Validate && task.targets.is_empty() {
-                    errors.push(err(
-                        "empty_targets",
-                        format!(
-                            "validate task '{}' must target at least one assertion",
-                            task.id
-                        ),
-                    ));
-                }
-                let Some(role) = &task.role else {
-                    errors.push(err(
-                        "missing_role",
-                        format!("task '{}' names no role", task.id),
-                    ));
-                    continue;
-                };
-                let Some(output) = inventory.roles.get(role) else {
-                    errors.push(err(
-                        "unknown_role",
-                        format!(
-                            "task '{}' names role '{role}' which the mission type does not provide",
-                            task.id
-                        ),
-                    ));
-                    continue;
-                };
-                // Routing is bound to output semantics, never to names. The
-                // planning-only outputs are incompatible with *every* execution
-                // kind — this single chokepoint keeps a report/proposal role out
-                // of an executed plan (closing planning recursion and the
-                // manual-proposal hole).
-                let compatible = output.execution_task_kind() == Some(task.kind);
-                if !compatible {
-                    errors.push(err(
-                        "role_output_mismatch",
-                        format!(
-                            "task '{}' ({:?}) is incompatible with role '{role}' output semantics {:?}",
-                            task.id, task.kind, output
-                        ),
-                    ));
-                }
-            }
+        if task.body.trim().is_empty() {
+            errors.push(err(
+                "missing_body",
+                format!("task '{}' has no body", task.id),
+            ));
+        }
+        let Some(role_id) = team.task_assignments.get(&task.id) else {
+            errors.push(err(
+                "missing_task_assignment",
+                format!("task '{}' has no writer assignment", task.id),
+            ));
+            continue;
+        };
+        match team.roles.get(role_id) {
+            Some(role) if role.output == OutputSemantics::ProducesArtifact => {}
+            Some(_) => errors.push(err(
+                "task_output_mismatch",
+                format!(
+                    "task '{}' assigns non-artifact role instance '{role_id}'",
+                    task.id
+                ),
+            )),
+            None => errors.push(err(
+                "unknown_task_role",
+                format!(
+                    "task '{}' assigns unknown role instance '{role_id}'",
+                    task.id
+                ),
+            )),
         }
         for target in &task.targets {
             if !known.contains(target) {
@@ -717,6 +693,26 @@ fn check_shape(plan: &Plan, inventory: &PlanInventory) -> Vec<PlanValidationErro
                     format!("task '{}' targets unknown assertion '{target}'", task.id),
                 ));
             }
+        }
+    }
+    for task_id in team.task_assignments.keys() {
+        if !plan.tasks.iter().any(|task| &task.id == task_id) {
+            errors.push(err(
+                "assignment_unknown_task",
+                format!("team assigns unknown task '{task_id}'"),
+            ));
+        }
+    }
+    for assertion_id in team.judgment_assignments.keys() {
+        if !plan
+            .assertions
+            .iter()
+            .any(|assertion| &assertion.id == assertion_id)
+        {
+            errors.push(err(
+                "assignment_unknown_assertion",
+                format!("team assigns judgment for unknown assertion '{assertion_id}'"),
+            ));
         }
     }
     errors
@@ -823,9 +819,6 @@ fn check_coverage(plan: &Plan) -> Vec<PlanValidationError> {
     // same assertion twice in `targets` covers it once, not twice.
     let mut coverers: BTreeMap<_, BTreeSet<&TaskId>> = BTreeMap::new();
     for task in &plan.tasks {
-        if task.kind != TaskKind::Work {
-            continue;
-        }
         for target in &task.targets {
             coverers.entry(target).or_default().insert(&task.id);
         }
@@ -850,621 +843,125 @@ fn check_coverage(plan: &Plan) -> Vec<PlanValidationError> {
 }
 
 #[cfg(test)]
-mod tests {
+mod topology_tests {
     use super::*;
-    use crate::ids::{AssertionId, RequirementId};
-    use crate::plan::{Assertion, PlanningTask, Requirement, RequirementKind, Task};
+    use crate::{
+        Assertion, AssertionId, AuthorityGrants, Requirement, RequirementDisposition,
+        RequirementId, RequirementKind, RoleInstance, RoleInstanceId, Task,
+    };
 
-    fn aid(raw: &str) -> AssertionId {
-        AssertionId::new(raw).expect("valid assertion id")
-    }
-
-    fn tid(raw: &str) -> TaskId {
-        TaskId::new(raw).expect("valid task id")
-    }
-
-    fn assertion(id: &str) -> Assertion {
-        Assertion {
-            id: aid(id),
-            prose: format!("claim {id}"),
-            oracle: None,
+    fn role(id: &str, output: OutputSemantics) -> RoleInstance {
+        RoleInstance {
+            id: RoleInstanceId::new(id).unwrap(),
+            purpose: id.into(),
+            output,
+            runtime: "codex".into(),
+            instructions: id.into(),
+            skills: Vec::new(),
+            environment: BTreeMap::new(),
+            grants: AuthorityGrants::default(),
+            deadline_secs: None,
         }
     }
 
-    fn assertion_with_oracle(id: &str, oracle: &str) -> Assertion {
-        Assertion {
-            id: aid(id),
-            prose: format!("claim {id}"),
-            oracle: Some(OracleName::new(oracle).expect("valid oracle name")),
-        }
-    }
-
-    fn task(
-        id: &str,
-        kind: TaskKind,
-        role: Option<&str>,
-        body: &str,
-        targets: &[&str],
-        deps: &[&str],
-    ) -> Task {
-        Task {
-            id: tid(id),
-            kind,
-            body: body.to_string(),
-            targets: targets.iter().map(|t| aid(t)).collect(),
-            role: role.map(|r| RoleName::new(r).expect("valid role name")),
-            depends_on: deps.iter().map(|d| tid(d)).collect(),
-        }
-    }
-
-    fn work(id: &str, targets: &[&str], deps: &[&str]) -> Task {
-        task(
-            id,
-            TaskKind::Work,
-            Some("implementer"),
-            "produce it",
-            targets,
-            deps,
-        )
-    }
-
-    fn validate(id: &str, targets: &[&str], deps: &[&str]) -> Task {
-        task(
-            id,
-            TaskKind::Validate,
-            Some("checker"),
-            "check it",
-            targets,
-            deps,
-        )
-    }
-
-    fn gate(id: &str, targets: &[&str], deps: &[&str]) -> Task {
-        task(id, TaskKind::Gate, None, "", targets, deps)
-    }
-
-    fn inventory() -> PlanInventory {
-        let mut roles = BTreeMap::new();
-        roles.insert(
-            RoleName::new("implementer").expect("valid role name"),
-            OutputSemantics::ProducesArtifact,
-        );
-        roles.insert(
-            RoleName::new("checker").expect("valid role name"),
-            OutputSemantics::EmitsVerdict,
-        );
-        // Planning-only roles, for the planning-DAG and planning-role-on-an-
-        // execution-task tests.
-        roles.insert(
-            RoleName::new("reporter").expect("valid role name"),
-            OutputSemantics::ProducesReport,
-        );
-        roles.insert(
-            RoleName::new("author").expect("valid role name"),
-            OutputSemantics::ProposesPlan,
-        );
-        PlanInventory {
-            roles,
-            oracles: BTreeSet::from([OracleName::new("cargo-test").expect("valid oracle name")]),
-        }
-    }
-
-    fn plan(assertions: Vec<Assertion>, tasks: Vec<Task>) -> Plan {
-        let requirements = assertions
-            .iter()
-            .enumerate()
-            .map(|(index, assertion)| Requirement {
-                id: RequirementId::new(format!("REQ-{}", index + 1)).unwrap(),
-                kind: RequirementKind::Capability,
-                prose: format!("requirement for {}", assertion.id),
-                disposition: RequirementDisposition::Covered {
-                    assertion_ids: vec![assertion.id.clone()],
-                },
-            })
-            .collect();
+    fn contract(tasks: Vec<Task>) -> Plan {
+        let assertion = AssertionId::new("A-1").unwrap();
         Plan {
-            requirements,
-            assertions,
+            requirements: vec![Requirement {
+                id: RequirementId::new("REQ-1").unwrap(),
+                kind: RequirementKind::Capability,
+                prose: "behavior".into(),
+                disposition: RequirementDisposition::Covered {
+                    assertion_ids: vec![assertion.clone()],
+                },
+            }],
+            assertions: vec![Assertion {
+                id: assertion,
+                prose: "behavior holds".into(),
+                oracle: None,
+            }],
             tasks,
         }
     }
 
-    fn codes(plan: &Plan) -> Vec<&'static str> {
-        validate_plan(plan, &inventory(), StopBar::Reviewed)
-            .into_iter()
-            .map(|e| e.code)
-            .collect()
-    }
-
-    const CLEAN: Vec<&str> = Vec::new();
-
-    fn ptask(id: &str, role: &str, deps: &[&str]) -> PlanningTask {
-        let role = RoleName::new(role).expect("valid role name");
-        let output = inventory().roles[&role];
-        PlanningTask {
-            id: tid(id),
-            role,
-            output,
-            body: format!("do {id}"),
-            depends_on: deps.iter().map(|d| tid(d)).collect(),
-        }
-    }
-
-    fn planning_codes(tasks: Vec<PlanningTask>) -> Vec<&'static str> {
-        validate_planning_dag(&PlanningDag { tasks }, &inventory())
-            .into_iter()
-            .map(|e| e.code)
-            .collect()
-    }
-
-    // Fault-injection coverage for the planning-DAG guards unique to the loader:
-    // exactly-one-author, author-is-the-unique-sink, and cycle detection have no
-    // other test, so a fail-open regression would otherwise ship silently.
-    #[test]
-    fn planning_dag_guards() {
-        // Valid: research → author, the author the unique sink.
-        assert_eq!(
-            planning_codes(vec![
-                ptask("research", "reporter", &[]),
-                ptask("author", "author", &["research"]),
-            ]),
-            CLEAN
-        );
-
-        let mut swapped = ptask("research", "reporter", &[]);
-        swapped.output = OutputSemantics::ProposesPlan;
-        assert!(
-            planning_codes(vec![swapped, ptask("author", "author", &["research"]),])
-                .contains(&"role_output_mismatch")
-        );
-        // Empty is valid (no in-engine planning).
-        assert_eq!(planning_codes(vec![]), CLEAN);
-
-        let dependencies = (0..=MAX_TASK_DEPENDENCIES)
-            .map(|index| format!("dependency-{index}"))
-            .collect::<Vec<_>>();
-        let dependency_refs = dependencies.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut excessive_fan_in = dependencies
-            .iter()
-            .map(|id| ptask(id, "reporter", &[]))
-            .collect::<Vec<_>>();
-        excessive_fan_in.push(ptask("author", "author", &dependency_refs));
-        assert_eq!(planning_codes(excessive_fan_in), vec!["dependency_fan_in"]);
-        // Two proposers → planning_author.
-        assert_eq!(
-            planning_codes(vec![
-                ptask("a1", "author", &[]),
-                ptask("a2", "author", &["a1"]),
-            ]),
-            vec!["planning_author"]
-        );
-        // Zero proposers → planning_author.
-        assert_eq!(
-            planning_codes(vec![ptask("r", "reporter", &[])]),
-            vec!["planning_author"]
-        );
-        // A report node that doesn't drain into the author → planning_sink.
-        assert_eq!(
-            planning_codes(vec![
-                ptask("orphan", "reporter", &[]),
-                ptask("author", "author", &[]),
-            ]),
-            vec!["planning_sink"]
-        );
-        // A dependency cycle → cycle_detected.
-        assert_eq!(
-            planning_codes(vec![
-                ptask("a", "reporter", &["author"]),
-                ptask("author", "author", &["a"]),
-            ]),
-            vec!["cycle_detected"]
-        );
-        // A duplicate id → duplicate_task_id.
-        assert_eq!(
-            planning_codes(vec![
-                ptask("dup", "reporter", &[]),
-                ptask("dup", "author", &["dup"]),
-            ]),
-            vec!["duplicate_task_id"]
-        );
-        // An execution role in the planning DAG → role_output_mismatch.
-        assert_eq!(
-            planning_codes(vec![ptask("author", "implementer", &[])]),
-            vec!["role_output_mismatch"]
-        );
-        // A dependency on an unknown planning task → dep_unknown_task.
-        assert_eq!(
-            planning_codes(vec![
-                ptask("research", "reporter", &["ghost"]),
-                ptask("author", "author", &["research"]),
-            ]),
-            vec!["dep_unknown_task"]
-        );
-    }
-
-    #[test]
-    fn execution_task_dependency_fan_in_is_bounded() {
-        let dependencies = (0..=MAX_TASK_DEPENDENCIES)
-            .map(|index| format!("dependency-{index}"))
-            .collect::<Vec<_>>();
-        let dependency_refs = dependencies.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut tasks = dependencies
-            .iter()
-            .map(|id| work(id, &[], &[]))
-            .collect::<Vec<_>>();
-        tasks.push(work("consumer", &["ASSERT-A"], &dependency_refs));
-        assert!(codes(&plan(vec![assertion("ASSERT-A")], tasks)).contains(&"dependency_fan_in"));
-    }
-
-    // The check_shape chokepoint: a read-only planning role (produces-report /
-    // proposes-plan) must never masquerade as an execution worker in a proposed
-    // plan. Neither arm was exercised before.
-    #[test]
-    fn a_planning_role_on_an_execution_task_is_rejected() {
-        let work_on_reporter = plan(
-            vec![assertion_with_oracle("AA", "cargo-test")],
-            vec![task(
-                "t",
-                TaskKind::Work,
-                Some("reporter"),
-                "do",
-                &["AA"],
-                &[],
-            )],
-        );
-        assert!(codes(&work_on_reporter).contains(&"role_output_mismatch"));
-        let validate_on_author = plan(
-            vec![assertion_with_oracle("AA", "cargo-test")],
-            vec![
-                work("w", &["AA"], &[]),
-                task(
-                    "t",
-                    TaskKind::Validate,
-                    Some("author"),
-                    "check",
-                    &["AA"],
-                    &[],
-                ),
-            ],
-        );
-        assert!(codes(&validate_on_author).contains(&"role_output_mismatch"));
-    }
-
-    // A gate whose target has no upstream validator can never clear — reject it
-    // at author time (group 6) rather than parking at run time. The only
-    // fault-injection test for this guard.
-    #[test]
-    fn a_gate_over_an_assertion_with_no_validator_is_rejected() {
-        let sub = plan(
-            vec![assertion("A1")],
-            vec![work("w1", &["A1"], &[]), gate("g1", &["A1"], &["w1"])],
-        );
-        assert_eq!(codes(&sub), vec!["gate_target_uncovered"]);
-    }
-
-    #[test]
-    fn empty_contract_returned_alone() {
-        // Even with an empty task list...
-        let sub = plan(vec![], vec![]);
-        assert_eq!(codes(&sub), vec!["empty_contract"]);
-        // ...or a task list full of shape errors, only empty_contract returns.
-        let bad_gate = task(
-            "g1",
-            TaskKind::Gate,
-            Some("implementer"),
-            "body",
-            &[],
-            &["g1"],
-        );
-        let sub = plan(vec![], vec![bad_gate]);
-        assert_eq!(codes(&sub), vec!["empty_contract"]);
-    }
-
-    #[test]
-    fn empty_task_list_rejected() {
-        let sub = plan(vec![assertion("A1")], vec![]);
-        assert_eq!(codes(&sub), vec!["empty_task_list"]);
-    }
-
-    #[test]
-    fn duplicate_ids_accumulate_within_the_group() {
-        let sub = plan(
-            vec![assertion("A1"), assertion("A1")],
-            vec![work("w1", &["A1"], &[]), work("w1", &["A1"], &[])],
-        );
-        assert_eq!(
-            codes(&sub),
-            vec!["duplicate_assertion_id", "duplicate_task_id"]
-        );
-    }
-
-    #[test]
-    fn shape_errors() {
-        let cases: Vec<(&str, Plan, Vec<&str>)> = vec![
-            (
-                "gate_with_role",
-                plan(
-                    vec![assertion("A1")],
-                    vec![task(
-                        "g1",
-                        TaskKind::Gate,
-                        Some("implementer"),
-                        "",
-                        &["A1"],
-                        &[],
-                    )],
-                ),
-                vec!["gate_with_role"],
-            ),
-            (
-                "gate_with_body",
-                plan(
-                    vec![assertion("A1")],
-                    vec![task("g1", TaskKind::Gate, None, "not empty", &["A1"], &[])],
-                ),
-                vec!["gate_with_body"],
-            ),
-            (
-                "gate_empty_targets",
-                plan(vec![assertion("A1")], vec![gate("g1", &[], &[])]),
-                vec!["empty_targets"],
-            ),
-            (
-                "validate_empty_targets",
-                plan(vec![assertion("A1")], vec![validate("v1", &[], &[])]),
-                vec!["empty_targets"],
-            ),
-            (
-                "missing_body",
-                plan(
-                    vec![assertion("A1")],
-                    vec![task(
-                        "w1",
-                        TaskKind::Work,
-                        Some("implementer"),
-                        "",
-                        &["A1"],
-                        &[],
-                    )],
-                ),
-                vec!["missing_body"],
-            ),
-            (
-                "missing_role",
-                plan(
-                    vec![assertion("A1")],
-                    vec![task("w1", TaskKind::Work, None, "body", &["A1"], &[])],
-                ),
-                vec!["missing_role"],
-            ),
-            (
-                "unknown_role",
-                plan(
-                    vec![assertion("A1")],
-                    vec![task(
-                        "w1",
-                        TaskKind::Work,
-                        Some("stranger"),
-                        "body",
-                        &["A1"],
-                        &[],
-                    )],
-                ),
-                vec!["unknown_role"],
-            ),
-            (
-                "verdict_role_on_work_task",
-                plan(
-                    vec![assertion("A1")],
-                    vec![task(
-                        "w1",
-                        TaskKind::Work,
-                        Some("checker"),
-                        "body",
-                        &["A1"],
-                        &[],
-                    )],
-                ),
-                vec!["role_output_mismatch"],
-            ),
-            (
-                "artifact_role_on_validate_task",
-                plan(
-                    vec![assertion("A1")],
-                    vec![task(
-                        "v1",
-                        TaskKind::Validate,
-                        Some("implementer"),
-                        "body",
-                        &["A1"],
-                        &[],
-                    )],
-                ),
-                vec!["role_output_mismatch"],
-            ),
-            (
-                "unknown_oracle",
-                plan(
-                    vec![assertion_with_oracle("A1", "psychic")],
-                    vec![work("w1", &["A1"], &[])],
-                ),
-                vec!["unknown_oracle"],
-            ),
-            (
-                "task_targets_unknown_assertion",
-                plan(vec![assertion("A1")], vec![work("w1", &["A2"], &[])]),
-                vec!["task_targets_unknown_assertion"],
-            ),
-        ];
-        for (name, sub, expected) in cases {
-            assert_eq!(codes(&sub), expected, "case '{name}'");
-        }
-    }
-
-    #[test]
-    fn work_tasks_may_have_empty_targets() {
-        let sub = plan(
-            vec![assertion("A1")],
-            vec![work("w1", &["A1"], &[]), work("w2", &[], &["w1"])],
-        );
-        assert_eq!(codes(&sub), CLEAN);
-    }
-
-    #[test]
-    fn dependency_errors() {
-        let sub = plan(vec![assertion("A1")], vec![work("w1", &["A1"], &["w1"])]);
-        assert_eq!(codes(&sub), vec!["self_loop"]);
-
-        let sub = plan(vec![assertion("A1")], vec![work("w1", &["A1"], &["ghost"])]);
-        assert_eq!(codes(&sub), vec!["dep_unknown_task"]);
-    }
-
-    #[test]
-    fn cycles_detected() {
-        // 2-cycle.
-        let sub = plan(
-            vec![assertion("A1")],
-            vec![work("w1", &["A1"], &["w2"]), work("w2", &[], &["w1"])],
-        );
-        assert_eq!(codes(&sub), vec!["cycle_detected"]);
-
-        // 3-cycle alongside an acyclic task.
-        let sub = plan(
-            vec![assertion("A1")],
-            vec![
-                work("w0", &["A1"], &[]),
-                work("w1", &[], &["w3"]),
-                work("w2", &[], &["w1"]),
-                work("w3", &[], &["w2"]),
-            ],
-        );
-        assert_eq!(codes(&sub), vec!["cycle_detected"]);
-    }
-
-    #[test]
-    fn coverage_errors() {
-        // A validate task targeting an assertion does not count as coverage.
-        let sub = plan(
-            vec![assertion("A1"), assertion("A2")],
-            vec![work("w1", &["A1"], &[]), validate("v1", &["A2"], &[])],
-        );
-        assert_eq!(codes(&sub), vec!["uncovered_assertion"]);
-
-        // Two work coverers is one too many.
-        let sub = plan(
-            vec![assertion("A1")],
-            vec![work("w1", &["A1"], &[]), work("w2", &["A1"], &[])],
-        );
-        assert_eq!(codes(&sub), vec!["over_covered_assertion"]);
-
-        // Exactly one work coverer is the happy case.
-        let sub = plan(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
-        assert_eq!(codes(&sub), CLEAN);
-    }
-
-    #[test]
-    fn one_work_task_may_own_multiple_assertions() {
-        let sub = plan(
-            vec![assertion("A1"), assertion("A2")],
-            vec![work("w1", &["A1", "A2"], &[])],
-        );
-
-        assert_eq!(codes(&sub), CLEAN);
-    }
-
-    #[test]
-    fn groups_short_circuit_in_order() {
-        // Id duplication suppresses shape errors.
-        let bad_gate = task("g1", TaskKind::Gate, Some("implementer"), "body", &[], &[]);
-        let sub = plan(vec![assertion("A1")], vec![bad_gate.clone(), bad_gate]);
-        assert_eq!(codes(&sub), vec!["duplicate_task_id"]);
-
-        // Shape errors suppress dep errors.
-        let sub = plan(
-            vec![assertion("A1")],
-            vec![task(
-                "w1",
-                TaskKind::Work,
-                None,
-                "body",
-                &["A1"],
-                &["ghost"],
-            )],
-        );
-        assert_eq!(codes(&sub), vec!["missing_role"]);
-
-        // Dep errors suppress cycle detection.
-        let sub = plan(
-            vec![assertion("A1")],
-            vec![
-                work("w1", &["A1"], &["ghost"]),
-                work("w2", &[], &["w3"]),
-                work("w3", &[], &["w2"]),
-            ],
-        );
-        assert_eq!(codes(&sub), vec!["dep_unknown_task"]);
-
-        // Cycle detection suppresses coverage (A2 is uncovered).
-        let sub = plan(
-            vec![assertion("A1"), assertion("A2")],
-            vec![work("w1", &["A1"], &["w2"]), work("w2", &[], &["w1"])],
-        );
-        assert_eq!(codes(&sub), vec!["cycle_detected"]);
-    }
-
-    #[test]
-    fn rich_valid_plan_passes() {
-        let sub = plan(
-            vec![assertion_with_oracle("A1", "cargo-test"), assertion("A2")],
-            vec![
-                work("w1", &["A1"], &[]),
-                work("w2", &["A2"], &["w1"]),
-                validate("v1", &["A1", "A2"], &["w1", "w2"]),
-                gate("g1", &["A1", "A2"], &["v1"]),
-            ],
-        );
-        assert_eq!(codes(&sub), CLEAN);
-    }
-
-    #[test]
-    fn verified_bar_rejects_an_oracle_less_assertion() {
-        let against = |sub: &Plan| -> Vec<&'static str> {
-            validate_plan(sub, &inventory(), StopBar::Verified)
+    fn team(assignments: BTreeMap<TaskId, RoleInstanceId>) -> TeamRevision {
+        let planner = role("planner", OutputSemantics::ProposesPlan);
+        let worker = role("worker", OutputSemantics::ProducesArtifact);
+        let integrator = role("integrator", OutputSemantics::ProducesArtifact);
+        let judge = role("judge", OutputSemantics::EmitsVerdict);
+        TeamRevision {
+            revision: 1,
+            roles: [planner.clone(), worker, integrator, judge.clone()]
                 .into_iter()
-                .map(|e| e.code)
-                .collect()
-        };
+                .map(|role| (role.id.clone(), role))
+                .collect(),
+            planning_assignment: planner.id,
+            task_assignments: assignments,
+            judgment_assignments: BTreeMap::from([(
+                AssertionId::new("A-1").unwrap(),
+                vec![judge.id],
+            )]),
+            gap_review_assignment: None,
+            guidance: None,
+        }
+    }
 
-        // Under `verified`, an assertion with no oracle can never become
-        // authoritatively Verified, so it is rejected at author time.
-        let sub = plan(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
-        assert_eq!(against(&sub), vec!["assertion_unprovable"]);
-
-        // Bind an oracle and the same plan is accepted.
-        let sub = plan(
-            vec![assertion_with_oracle("A1", "cargo-test")],
-            vec![work("w1", &["A1"], &[])],
-        );
-        assert_eq!(against(&sub), CLEAN);
-
-        // The default `reviewed` inventory accepts the oracle-less plan.
-        let sub = plan(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
-        assert_eq!(codes(&sub), CLEAN);
+    fn task(id: &str, depends_on: &[&str]) -> Task {
+        Task {
+            id: TaskId::new(id).unwrap(),
+            body: id.into(),
+            targets: vec![AssertionId::new("A-1").unwrap()],
+            depends_on: depends_on
+                .iter()
+                .map(|id| TaskId::new(*id).unwrap())
+                .collect(),
+        }
     }
 
     #[test]
-    fn the_terminal_review_task_tag_is_reserved() {
-        // Regression (QA round 2): the reviewer's attempt-dir tag shares the
-        // plan-task namespace; a task by that name could leave crashed-attempt
-        // dirs the closing reviewer would silently reuse.
-        let sub = plan(
-            vec![assertion("A1")],
-            vec![work(
-                super::super::ids::TERMINAL_REVIEW_TASK_TAG,
-                &["A1"],
-                &[],
-            )],
+    fn rejects_multiple_deliverable_sinks() {
+        let plan = contract(vec![task("left", &[]), task("right", &[])]);
+        let team = team(BTreeMap::from([
+            (
+                TaskId::new("left").unwrap(),
+                RoleInstanceId::new("worker").unwrap(),
+            ),
+            (
+                TaskId::new("right").unwrap(),
+                RoleInstanceId::new("integrator").unwrap(),
+            ),
+        ]));
+        assert_eq!(
+            check_dispatch_topology(&plan, &team)[0].code,
+            "deliverable_sink_count"
         );
-        assert_eq!(codes(&sub), vec!["reserved_task_id"]);
+    }
+
+    #[test]
+    fn rejects_one_role_on_parallel_tasks_but_allows_a_serial_assignment() {
+        let parallel = contract(vec![
+            task("left", &[]),
+            task("right", &[]),
+            task("merge", &["left", "right"]),
+        ]);
+        let worker = RoleInstanceId::new("worker").unwrap();
+        let parallel_team = team(BTreeMap::from([
+            (TaskId::new("left").unwrap(), worker.clone()),
+            (TaskId::new("right").unwrap(), worker.clone()),
+            (
+                TaskId::new("merge").unwrap(),
+                RoleInstanceId::new("integrator").unwrap(),
+            ),
+        ]));
+        assert!(check_dispatch_topology(&parallel, &parallel_team)
+            .iter()
+            .any(|error| error.code == "concurrent_role_assignment"));
+
+        let serial = contract(vec![task("left", &[]), task("right", &["left"])]);
+        let team = team(BTreeMap::from([
+            (TaskId::new("left").unwrap(), worker.clone()),
+            (TaskId::new("right").unwrap(), worker),
+        ]));
+        assert!(check_dispatch_topology(&serial, &team).is_empty());
     }
 }

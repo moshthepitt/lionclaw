@@ -1,13 +1,13 @@
 //! Authority compilation and the moat predicate.
 //!
-//! Authority is engine-internal: the author declares only output semantics
-//! (plus the `network`/`secrets` flags); everything enforceable is compiled
-//! here as `effective = role_request ∩ ceiling ∩ semantics_floor`, then
-//! container-enforced. **The moat**: every non-artifact role — a verdict judge
-//! and every planning role (report/proposal) — must be read-only on an enforcing
-//! rung, with no read-write mount overlapping the judged set, no escape class
-//! that could feed back, and no secrets. Any violation refuses to compile — the
-//! mission never starts.
+//! Authority is engine-internal: each team role requests grants across the
+//! secrets, network, install, writes, devices, and inputs axes. Everything
+//! enforceable is compiled here as
+//! `effective = role_request ∩ ceiling ∩ semantics_floor`, then
+//! container-enforced. **The moat**: every non-artifact role is read-only on an
+//! enforcing rung. Proof roles additionally receive no secrets, no escape
+//! class that could feed back, and no read-write mount overlapping the judged
+//! set. Any violation refuses to compile; the mission never starts.
 //!
 //! [`CompiledRolePlan`] has one constructor, [`compile_role_plan`], and the
 //! runner accepts nothing else: an un-vetted plan is unrepresentable.
@@ -21,8 +21,7 @@ use lionclaw_confinement::{
     RUNTIME_MOUNT_TARGET, WORKSPACE_MOUNT_TARGET,
 };
 
-use crate::mission_type::RoleDefinition;
-use crate::model::OutputSemantics;
+use crate::model::{OutputSemantics, RoleInstance};
 
 /// Mission targets no mount may shadow.
 const RESERVED_TARGETS: &[&str] = &[
@@ -77,6 +76,7 @@ pub struct CompiledAuthority {
     role_name: String,
     output: OutputSemantics,
     preset: ExecutionPreset,
+    devices: BTreeSet<String>,
 }
 
 impl CompiledAuthority {
@@ -87,31 +87,16 @@ impl CompiledAuthority {
     pub fn preset(&self) -> &ExecutionPreset {
         &self.preset
     }
-
-    #[cfg(test)]
-    pub(crate) fn for_tests(
-        role_name: &str,
-        output: OutputSemantics,
-        preset: ExecutionPreset,
-    ) -> Self {
-        Self {
-            role_name: role_name.to_string(),
-            output,
-            preset,
-        }
-    }
 }
 
 /// Compile a role's authority. Workspace access is implied solely by output
 /// semantics — there is no author knob to make a judge writable.
 pub fn compile_authority(
-    role: &RoleDefinition,
+    role: &RoleInstance,
     ceiling: &AuthorityCeiling,
 ) -> Result<CompiledAuthority, MoatViolation> {
     validate_role_authority_request(role)?;
     let workspace_access = match role.output {
-        // Only a writer gets the workspace read-write. Judges and every planning
-        // role (report / proposal) are read-only.
         OutputSemantics::ProducesArtifact => WorkspaceAccess::ReadWrite,
         OutputSemantics::ProducesReport
         | OutputSemantics::EmitsVerdict
@@ -123,34 +108,50 @@ pub fn compile_authority(
         // Enforced from the role's `network` flag (default on — agent roles
         // reach the model API; `network: false` air-gaps the container).
         // Oracles take the separate network-off path (`oracle_authority`).
-        network_mode: if role.network {
+        network_mode: if role.grants.network {
             NetworkMode::On
         } else {
             NetworkMode::None
         },
-        install_policy: match role.output {
-            OutputSemantics::ProducesArtifact => InstallPolicy::User,
-            _ => InstallPolicy::None,
+        install_policy: if role.grants.install {
+            InstallPolicy::User
+        } else {
+            InstallPolicy::None
         },
-        mount_runtime_secrets: role.secrets && ceiling.allow_secrets,
+        mount_runtime_secrets: role.grants.secrets && ceiling.allow_secrets,
         // Roles have no escape-request knob yet: request = ∅, so the
         // intersection with the ceiling is always ∅.
         escape_classes: BTreeSet::new(),
     };
     Ok(CompiledAuthority {
-        role_name: role.name.to_string(),
+        role_name: role.id.to_string(),
         output: role.output,
         preset,
+        devices: role.grants.devices.clone(),
     })
 }
 
 /// Validate role-authored authority before any operator ceiling is applied.
 /// A ceiling may remove grants; it can never legalize a request that breaks
 /// the semantic moat.
-pub(crate) fn validate_role_authority_request(role: &RoleDefinition) -> Result<(), MoatViolation> {
-    if role.secrets && role.output != OutputSemantics::ProducesArtifact {
+pub(crate) fn validate_role_authority_request(role: &RoleInstance) -> Result<(), MoatViolation> {
+    let proof_role = matches!(
+        role.output,
+        OutputSemantics::EmitsVerdict | OutputSemantics::EmitsGapVerdict
+    );
+    if proof_role && role.grants.secrets {
         return Err(MoatViolation::SecretsForJudge {
-            role: role.name.to_string(),
+            role: role.id.to_string(),
+        });
+    }
+    if proof_role && role.grants.writes {
+        return Err(MoatViolation::WritableJudge {
+            role: role.id.to_string(),
+        });
+    }
+    if role.output == OutputSemantics::ProducesArtifact && !role.grants.writes {
+        return Err(MoatViolation::WritableJudge {
+            role: role.id.to_string(),
         });
     }
     Ok(())
@@ -169,6 +170,7 @@ pub fn oracle_authority(oracle_name: &str) -> CompiledAuthority {
             mount_runtime_secrets: false,
             escape_classes: BTreeSet::new(),
         },
+        devices: BTreeSet::new(),
     }
 }
 
@@ -190,6 +192,7 @@ pub fn prepared_input_authority(input_name: &str, network: bool) -> CompiledAuth
             mount_runtime_secrets: false,
             escape_classes: BTreeSet::new(),
         },
+        devices: BTreeSet::new(),
     }
 }
 
@@ -275,28 +278,31 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         }
     }
 
-    // (3) The read-only-role floor. Every non-writer role — a verdict judge and
-    // every planning role (report/proposal) — must be read-only, secret-free,
-    // escape-free, and never share a rw mount with the tree it reads. So a
-    // writable or credentialed planner is as unrepresentable as a writable
-    // judge. (The `Judge` violation names are historical; they mean "a role that
-    // must not be able to influence what it reads".)
+    // (3) Every non-artifact role is read-only. Proof roles additionally stay
+    // secret-free and escape-free; planning/report roles may hold bounded
+    // credentials without gaining write authority over the judged tree.
     if authority.output != OutputSemantics::ProducesArtifact {
         if authority.preset.workspace_access != WorkspaceAccess::ReadOnly {
             return Err(MoatViolation::WritableJudge { role });
         }
-        if authority.preset.mount_runtime_secrets {
+        let proof_role = matches!(
+            authority.output,
+            OutputSemantics::EmitsVerdict | OutputSemantics::EmitsGapVerdict
+        );
+        if proof_role && authority.preset.mount_runtime_secrets {
             return Err(MoatViolation::SecretsForJudge { role });
         }
         // Escape-free means *no* escape class, not just the two we thought of:
         // any non-empty set (NetEgress, SecretRequest, SchedulerRun, …) is a
         // channel a judge/planner could use to influence what it reads. Refuse
         // the whole set so a newly-added variant can never silently slip through.
-        if let Some(escape) = authority.preset.escape_classes.iter().next() {
-            return Err(MoatViolation::JudgeEscape {
-                role,
-                escape: escape.as_str().to_string(),
-            });
+        if proof_role {
+            if let Some(escape) = authority.preset.escape_classes.iter().next() {
+                return Err(MoatViolation::JudgeEscape {
+                    role,
+                    escape: escape.as_str().to_string(),
+                });
+            }
         }
         let rw_mounts = request
             .mounts
@@ -348,6 +354,7 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         mcp_servers: Vec::new(),
         mounts,
         mount_runtime_secrets: authority.preset.mount_runtime_secrets,
+        devices: authority.devices.clone(),
         escape_classes: authority.preset.escape_classes.clone(),
         limits,
     }))
@@ -369,368 +376,77 @@ fn target_shadows(target: &str, reserved: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod team_authority_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use super::*;
-    use crate::model::RoleName;
-    use lionclaw_confinement::EscapeClass;
+    use crate::model::{AuthorityGrants, RoleInstanceId};
 
-    fn role(output: OutputSemantics, secrets: bool) -> RoleDefinition {
-        RoleDefinition {
-            name: RoleName::new("probe").expect("role name"),
+    fn role(output: OutputSemantics, grants: AuthorityGrants) -> RoleInstance {
+        RoleInstance {
+            id: RoleInstanceId::new("specialist").unwrap(),
+            purpose: "specialist".into(),
             output,
-            runtime: None,
-            timeout_secs: None,
-            network: true,
-            secrets,
+            runtime: "codex".into(),
+            instructions: "Perform the assigned work.".into(),
             skills: Vec::new(),
-            prompt_body: "p".to_string(),
-        }
-    }
-
-    fn oci() -> ConfinementConfig {
-        ConfinementConfig::Oci(Default::default())
-    }
-
-    fn mounts(extras: Vec<MountSpec>) -> MissionMounts {
-        MissionMounts {
-            workspace: "/repo".into(),
-            extras,
-        }
-    }
-
-    fn request<'a>(
-        authority: &'a CompiledAuthority,
-        m: MissionMounts,
-        judged: &'a [PathBuf],
-    ) -> RolePlanRequest<'a> {
-        RolePlanRequest {
-            authority,
-            runtime_id: "codex".to_string(),
-            confinement: oci(),
-            mounts: m,
-            judged_roots: judged,
-            environment: Vec::new(),
+            environment: BTreeMap::new(),
+            grants,
+            deadline_secs: None,
         }
     }
 
     #[test]
-    fn output_semantics_imply_workspace_access() {
-        let ceiling = AuthorityCeiling::default();
-        let worker = compile_authority(&role(OutputSemantics::ProducesArtifact, false), &ceiling)
-            .expect("worker");
-        assert_eq!(worker.preset().workspace_access, WorkspaceAccess::ReadWrite);
-        for output in [
-            OutputSemantics::ProducesReport,
-            OutputSemantics::EmitsVerdict,
-            OutputSemantics::EmitsGapVerdict,
-            OutputSemantics::ProposesPlan,
-        ] {
-            let authority = compile_authority(&role(output, false), &ceiling).expect("read-only");
-            assert_eq!(
-                authority.preset().workspace_access,
-                WorkspaceAccess::ReadOnly,
-                "{output:?} must be read-only"
-            );
-        }
-    }
-
-    #[test]
-    fn judge_requesting_secrets_refuses_to_compile() {
-        for output in [
-            OutputSemantics::EmitsVerdict,
-            OutputSemantics::EmitsGapVerdict,
-        ] {
-            let err = compile_authority(
-                &role(output, true),
-                &AuthorityCeiling {
-                    allow_secrets: true,
-                },
-            )
-            .expect_err("must refuse");
-            assert!(matches!(err, MoatViolation::SecretsForJudge { .. }));
-        }
-    }
-
-    #[test]
-    fn worker_secrets_are_ceiling_clamped() {
-        let ceiling = AuthorityCeiling::default(); // allow_secrets: false
-        let authority = compile_authority(&role(OutputSemantics::ProducesArtifact, true), &ceiling)
-            .expect("worker");
-        assert!(!authority.preset().mount_runtime_secrets);
-    }
-
-    #[test]
-    fn worker_secrets_are_granted_when_ceiling_allows() {
-        // Pins the AND: ceiling permits + role requests ⇒ actually mounted.
-        let ceiling = AuthorityCeiling {
-            allow_secrets: true,
-        };
-        let authority = compile_authority(&role(OutputSemantics::ProducesArtifact, true), &ceiling)
-            .expect("worker");
-        assert!(authority.preset().mount_runtime_secrets);
-    }
-
-    #[test]
-    fn forged_writable_judge_authority_refuses_to_compile() {
-        // Even an authority forged with a writable preset (test-only
-        // constructor; production fields are private) hits the moat.
-        let forged = CompiledAuthority::for_tests(
-            "forged",
-            OutputSemantics::EmitsVerdict,
-            ExecutionPreset {
-                workspace_access: WorkspaceAccess::ReadWrite,
-                ..Default::default()
-            },
-        );
-        let err =
-            compile_role_plan(request(&forged, mounts(Vec::new()), &[])).expect_err("must refuse");
-        assert!(matches!(err, MoatViolation::WritableJudge { .. }));
-    }
-
-    #[test]
-    fn forged_secrets_judge_authority_refuses_to_compile() {
-        // The plan-compile secrets backstop (sibling of the writable/escape
-        // backstops): a forged read-only verdict authority carrying
-        // mount_runtime_secrets still hits the moat at compile_role_plan.
-        let forged = CompiledAuthority::for_tests(
-            "forged",
-            OutputSemantics::EmitsVerdict,
-            ExecutionPreset {
-                workspace_access: WorkspaceAccess::ReadOnly,
-                mount_runtime_secrets: true,
-                ..Default::default()
-            },
-        );
-        let err =
-            compile_role_plan(request(&forged, mounts(Vec::new()), &[])).expect_err("must refuse");
-        assert!(matches!(err, MoatViolation::SecretsForJudge { .. }));
-    }
-
-    #[test]
-    fn judge_escape_refuses_to_compile() {
-        let mut preset = ExecutionPreset {
-            workspace_access: WorkspaceAccess::ReadOnly,
-            mount_runtime_secrets: false,
+    fn device_grants_reach_the_compiled_plan_without_hardware() {
+        let grants = AuthorityGrants {
+            writes: true,
+            devices: BTreeSet::from(["/dev/dri".to_string()]),
             ..Default::default()
         };
-        preset.escape_classes.insert(EscapeClass::ChannelSend);
-        let forged = CompiledAuthority::for_tests("forged", OutputSemantics::EmitsVerdict, preset);
-        let err =
-            compile_role_plan(request(&forged, mounts(Vec::new()), &[])).expect_err("must refuse");
-        assert!(matches!(err, MoatViolation::JudgeEscape { .. }));
-    }
-
-    #[test]
-    fn rw_mount_overlapping_judged_root_refuses_to_compile() {
-        let ceiling = AuthorityCeiling::default();
-        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
-            .expect("judge");
-        let judged = vec![PathBuf::from("/repo")];
-        let overlapping = MountSpec {
-            source: "/repo/.lionclaw/handoff".into(),
-            target: "/mission/handoff".to_string(),
-            access: MountAccess::ReadWrite,
-        };
-        let err = compile_role_plan(request(&judge, mounts(vec![overlapping]), &judged))
-            .expect_err("must refuse");
-        assert!(matches!(
-            err,
-            MoatViolation::RwMountOverlapsJudgedSet { .. }
-        ));
-    }
-
-    #[test]
-    fn rw_mount_overlap_detected_through_symlink() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let judged_root = dir.path().join("repo");
-        std::fs::create_dir_all(judged_root.join("sub")).expect("mkdir");
-        let alias = dir.path().join("alias");
-        std::os::unix::fs::symlink(&judged_root, &alias).expect("symlink");
-
-        let ceiling = AuthorityCeiling::default();
-        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
-            .expect("judge");
-        let judged = vec![judged_root];
-        // The rw mount source hides behind a symlink outside the judged
-        // root lexically — canonicalization must still catch it.
-        let sneaky = MountSpec {
-            source: alias.join("sub"),
-            target: "/mission/handoff".to_string(),
-            access: MountAccess::ReadWrite,
-        };
-        let err = compile_role_plan(request(&judge, mounts(vec![sneaky]), &judged))
-            .expect_err("must refuse");
-        assert!(matches!(
-            err,
-            MoatViolation::RwMountOverlapsJudgedSet { .. }
-        ));
-    }
-
-    #[test]
-    fn read_only_mount_overlap_is_allowed_for_judges() {
-        let ceiling = AuthorityCeiling::default();
-        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
-            .expect("judge");
-        let judged = vec![PathBuf::from("/repo")];
-        let ro_extra = MountSpec {
-            source: "/repo/docs".into(),
-            target: "/mission/context".to_string(),
-            access: MountAccess::ReadOnly,
-        };
-        compile_role_plan(request(&judge, mounts(vec![ro_extra]), &judged))
-            .expect("read-only overlap is fine");
-    }
-
-    #[test]
-    fn tmpfs_over_judged_workspace_refuses_to_compile() {
-        // Regression (review): a writable tmpfs layered over the judged tree
-        // bypasses the rw-mount check unless the moat inspects tmpfs too.
-        let ceiling = AuthorityCeiling::default();
-        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
-            .expect("judge");
-        for target in [
-            "/workspace",
-            "/workspace/sub:rw",
-            "/mission/oracle",
-            "/scratch",
-        ] {
-            let mut confinement = oci();
-            confinement.oci_mut().tmpfs.push(target.to_string());
-            let err = compile_role_plan(RolePlanRequest {
-                confinement,
-                ..request(&judge, mounts(Vec::new()), &[])
-            })
-            .expect_err("tmpfs over the judged tree must refuse");
-            assert!(
-                matches!(err, MoatViolation::ReservedTargetShadowed { .. }),
-                "target {target}: {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn tmpfs_targets_cannot_reach_reserved_paths_through_traversal() {
-        let ceiling = AuthorityCeiling::default();
-        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
-            .expect("judge");
-        let mut confinement = oci();
-        confinement
-            .oci_mut()
-            .tmpfs
-            .push("/opt/../workspace:rw".to_string());
-
-        let err = compile_role_plan(RolePlanRequest {
-            confinement,
-            ..request(&judge, mounts(Vec::new()), &[])
-        })
-        .expect_err("tmpfs traversal must not bypass reserved targets");
-
-        assert!(err.to_string().contains("invalid tmpfs"), "got {err}");
-    }
-
-    #[test]
-    fn default_tmp_tmpfs_is_allowed() {
-        // The engine's own scratch tmpfs at /tmp is not a reserved target.
-        let ceiling = AuthorityCeiling::default();
-        let worker = compile_authority(&role(OutputSemantics::ProducesArtifact, false), &ceiling)
-            .expect("worker");
-        let mut confinement = oci();
-        confinement
-            .oci_mut()
-            .tmpfs
-            .push("/tmp:rw,size=512m".to_string());
-        compile_role_plan(RolePlanRequest {
-            confinement,
-            ..request(&worker, mounts(Vec::new()), &[])
-        })
-        .expect("/tmp tmpfs compiles");
-    }
-
-    #[test]
-    fn reserved_target_shadowing_refuses_to_compile() {
-        let ceiling = AuthorityCeiling::default();
-        let worker = compile_authority(&role(OutputSemantics::ProducesArtifact, false), &ceiling)
-            .expect("worker");
-        let mut confinement = oci();
-        confinement.oci_mut().additional_mounts.push(MountSpec {
-            source: "/evil".into(),
-            target: "/workspace/vendor".to_string(),
-            access: MountAccess::ReadWrite,
-        });
-        let err = compile_role_plan(RolePlanRequest {
-            confinement,
-            ..request(&worker, mounts(Vec::new()), &[])
-        })
-        .expect_err("must refuse");
-        assert!(matches!(err, MoatViolation::ReservedTargetShadowed { .. }));
-    }
-
-    #[test]
-    fn configured_additional_mounts_are_carried_into_the_effective_plan() {
-        let worker = role(OutputSemantics::ProducesArtifact, false);
-        let authority = compile_authority(&worker, &AuthorityCeiling::default()).unwrap();
-        let mut confinement = oci();
-        confinement.oci_mut().additional_mounts.push(MountSpec {
-            source: "/host/custom".into(),
-            target: "/opt/custom".to_string(),
-            access: MountAccess::ReadOnly,
-        });
-
+        let authority = compile_authority(
+            &role(OutputSemantics::ProducesArtifact, grants),
+            &Default::default(),
+        )
+        .unwrap();
         let compiled = compile_role_plan(RolePlanRequest {
-            confinement,
-            ..request(&authority, mounts(Vec::new()), &[])
+            authority: &authority,
+            runtime_id: "codex".into(),
+            confinement: ConfinementConfig::Oci(Default::default()),
+            mounts: MissionMounts {
+                workspace: "/tmp/work".into(),
+                extras: Vec::new(),
+            },
+            judged_roots: &["/tmp/work".into()],
+            environment: Vec::new(),
         })
-        .expect("additional mount compiles");
-
-        assert!(compiled
-            .plan()
-            .mounts
-            .iter()
-            .any(|mount| mount.target == "/opt/custom"));
-    }
-
-    #[test]
-    fn worker_plan_compiles_a_read_write_workspace() {
-        let ceiling = AuthorityCeiling::default();
-        let worker = compile_authority(&role(OutputSemantics::ProducesArtifact, false), &ceiling)
-            .expect("worker");
-        let compiled =
-            compile_role_plan(request(&worker, mounts(Vec::new()), &[])).expect("compiles");
-        assert_eq!(compiled.plan().workspace_access, WorkspaceAccess::ReadWrite);
-        assert_eq!(compiled.plan().mounts[0].access, MountAccess::ReadWrite);
-        assert_eq!(compiled.plan().network_mode, NetworkMode::On);
-    }
-
-    #[test]
-    fn oracle_authority_is_network_off_read_only() {
-        let authority = oracle_authority("cargo-test");
-        assert_eq!(authority.output(), OutputSemantics::EmitsVerdict);
+        .unwrap();
         assert_eq!(
-            authority.preset().workspace_access,
-            WorkspaceAccess::ReadOnly
+            compiled.plan().devices,
+            BTreeSet::from(["/dev/dri".to_string()])
         );
-        assert_eq!(authority.preset().network_mode, NetworkMode::None);
-        assert_eq!(authority.preset().install_policy, InstallPolicy::None);
-        let compiled = compile_role_plan(request(
-            &authority,
-            mounts(Vec::new()),
-            &[PathBuf::from("/repo")],
-        ))
-        .expect("oracle plan compiles");
-        assert_eq!(compiled.plan().network_mode, NetworkMode::None);
     }
 
     #[test]
-    fn network_flag_is_enforced() {
-        let ceiling = AuthorityCeiling::default();
-        // Default (true) → network on.
-        let on = compile_authority(&role(OutputSemantics::ProducesArtifact, false), &ceiling)
-            .expect("worker");
-        assert_eq!(on.preset().network_mode, NetworkMode::On);
-        // Opt out → network off, honored (not silently ignored).
-        let mut air_gapped = role(OutputSemantics::ProducesArtifact, false);
-        air_gapped.network = false;
-        let off = compile_authority(&air_gapped, &ceiling).expect("worker");
-        assert_eq!(off.preset().network_mode, NetworkMode::None);
+    fn proof_floor_rejects_secrets_while_planning_can_receive_them() {
+        let grants = AuthorityGrants {
+            secrets: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            compile_authority(
+                &role(OutputSemantics::EmitsVerdict, grants.clone()),
+                &AuthorityCeiling {
+                    allow_secrets: true
+                }
+            ),
+            Err(MoatViolation::SecretsForJudge { .. })
+        ));
+        assert!(compile_authority(
+            &role(OutputSemantics::ProposesPlan, grants),
+            &AuthorityCeiling {
+                allow_secrets: true
+            }
+        )
+        .is_ok());
     }
 }

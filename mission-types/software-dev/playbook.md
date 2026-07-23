@@ -18,21 +18,24 @@ proves it.
 
 2. **Choose work boundaries by coherent outcome ownership.** Assertions are
    units of proof; work tasks own implementation outcomes. Exactly one active
-   `work` task owns each assertion (the engine enforces this), while one task
+   task owns each assertion (the engine enforces this), while one task
    may own several related assertions. Group behavior, tests, formatting,
    lint, and build assertions with the implementation outcome they constrain
    instead of creating work whose only purpose is to run a check. Available
-   work roles receive a writable Git checkout and commit any changes they make.
+   artifact-producing role instances receive a writable task-owned Git
+   checkout and commit any changes they make.
 
-3. **Add validators for depth on top of the oracle.** An oracle proves a claim
-   is *green*; a `validate` task dispatched to the `reviewer` adds the judgement
-   an oracle can't — "the fix is correct, not a test weakened to pass." A
-   validator targets an assertion that already binds an oracle; its verdict is
-   **advisory** — it routes and ranks, it never marks the mission verified.
+3. **Assign an independent judgment panel.** An oracle proves a claim is
+   *green*; the team's `judgment_assignments` bind one or more
+   `emits-verdict` role instances that add the judgment an oracle cannot:
+   "the fix is correct, not a test weakened to pass." Judgment lives in the
+   team revision, never in authored validation tasks.
 
-4. **Add a gate to aggregate advisory verdicts.** A `gate` task depending on
-   the validators AND-aggregates their verdicts over its targets. A cleared
-   gate still pauses for a human checkpoint; a blocked gate raises attention.
+4. **Return one complete team revision.** Preserve role contracts that do not
+   need to change, assign every task to one artifact-producing role instance,
+   assign every assertion to its judgment panel, and retain the configured gap
+   reviewer. Role instances carry their runtime, output semantics, skills,
+   timeout, instructions, environment, and grants.
 
 5. **Review the proposal before handing it off.** The default planning pass is
    deliberately one strategist turn. Build an explicit objective-to-contract
@@ -49,11 +52,11 @@ is proven by:
 - an **oracle** (`cargo-test`, `cargo-clippy`, `fmt-check`, `build-release`) —
   an engine-run command, exit 0 = pass, the strong authoritative check; every
   contract assertion binds one; and, optionally,
-- a **reviewer** — an agent's advisory judgement layered *on top* of the
-  oracle, for depth a command can't capture (was the change made honestly?).
+- a **judgment panel** — assigned role instances layered on top of the oracle
+  for depth a command cannot capture (was the change made honestly?).
 
-Every assertion is oracle-bound; a reviewer only adds scrutiny, never stands in
-for the oracle.
+Every assertion is oracle-bound; assigned judges add scrutiny and never stand
+in for the oracle.
 
 ## The honesty bar
 
@@ -67,24 +70,23 @@ reviewer is instructed to catch exactly that.
 ## Handoff evidence
 
 Every completed role handoff carries a bounded narrative report. LionClaw binds
-that report to the exact role effect and records it before disposable effect
-resources are removed. The report remains visible with accepted work, failed
-attempts, cancellation, and terminal review outcomes. Missing, malformed, or
+that report to the exact role effect in `RoleTurnCompleted`. The report remains
+visible with accepted work and gap-review outcomes. Missing, malformed, or
 mismatched handoffs never gain report or verdict authority; their typed failure
 evidence remains visible instead.
 
-## The terminal review (engine-owned; not yours to plan)
+## The gap review
 
 After every work task settles and every oracle verdict is fresh at the final
-commit, the engine dispatches one more judge: a contract-blind **gap
-reviewer** that sees only the objective and the final tree, and re-derives
+commit, the engine dispatches the team's assigned contract-blind **gap
+reviewer**. It sees only the objective and final tree, and re-derives
 the requirements from scratch. It exists to catch what the contract never
 asserted — the oracle proves what you asserted; the reviewer hunts what you
 missed.
 
-Do not add a final catch-all review task to the plan to pre-empt it, and do
-not write assertions "for the reviewer" — plan the contract on its own
-merits. If the terminal review reports blocking gaps, revise the plan. A
+Do not add a final catch-all review task to the plan, and do not write
+assertions "for the reviewer" — plan the contract on its own
+merits. If the gap review reports blocking gaps, revise the plan. A
 revision is a complete next plan, not a patch language: retain the still-valid
 requirements and assertions, add any missing falsifiable assertions and their
 oracle bindings, retire completed work, and add the repair work. Remediation

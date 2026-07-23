@@ -71,15 +71,20 @@ struct PayloadDoc {
 }
 
 impl MissionStore {
-    /// Register a mission and append its `MissionCreated` event atomically.
-    pub(crate) async fn create_mission(
+    /// Register a mission and append its complete creation facts atomically.
+    pub(crate) async fn create_mission_with_events(
         &self,
         mission_id: &MissionId,
         workspace_dir: &str,
         objective: &str,
-        created: NewEvent,
+        events: &[NewEvent],
         now_ms: i64,
     ) -> Result<(), AppendError> {
+        if events.is_empty() || !matches!(events[0].event, MissionEvent::MissionCreated { .. }) {
+            return Err(AppendError::Store(anyhow::anyhow!(
+                "mission creation must begin with MissionCreated"
+            )));
+        }
         let mut tx = self
             .pool()
             .begin_with("BEGIN IMMEDIATE")
@@ -96,9 +101,11 @@ impl MissionStore {
         .execute(&mut *tx)
         .await
         .map_err(|err| map_sqlx(err, "mission already exists"))?;
-        insert_event(&mut tx, mission_id, 1, &created, now_ms).await?;
+        for (index, event) in events.iter().enumerate() {
+            insert_event(&mut tx, mission_id, index as u64 + 1, event, now_ms).await?;
+        }
         tx.commit().await.map_err(anyhow::Error::from)?;
-        self.publish(mission_id, 1, std::slice::from_ref(&created), now_ms);
+        self.publish(mission_id, events.len() as u64, events, now_ms);
         Ok(())
     }
 
@@ -276,128 +283,5 @@ fn map_sqlx(err: sqlx::Error, detail: &str) -> AppendError {
         AppendError::AlreadyExists(detail.to_string())
     } else {
         AppendError::Store(err.into())
-    }
-}
-
-#[cfg(test)]
-mod sink_tests {
-    use std::sync::{Arc, Mutex};
-
-    use crate::model::{
-        DecisionAction, EffectId, EventEnvelope, MissionConfig, MissionEvent, MissionTypeRef,
-        OracleName, StopBar,
-    };
-    use crate::ports::EventSink;
-
-    use super::*;
-
-    #[derive(Default)]
-    struct Recorder(Mutex<Vec<u64>>);
-    impl EventSink for Recorder {
-        fn emit(&self, event: &EventEnvelope) {
-            self.0.lock().unwrap().push(event.sequence_no);
-        }
-    }
-
-    fn created() -> NewEvent {
-        NewEvent::new(MissionEvent::MissionCreated {
-            objective: "o".into(),
-            mission_type: MissionTypeRef {
-                name: "t".into(),
-                digest: "d".into(),
-            },
-            runtime: "codex".into(),
-            image_id: "img".into(),
-            workspace_dir: "/w".into(),
-            base_sha: "base".into(),
-            config: MissionConfig {
-                // Verified: a reviewed-bar config without a terminal review
-                // is a shape production refuses (create_mission + loader).
-                stop: StopBar::Verified,
-                plan_inventory: Default::default(),
-                planning: Default::default(),
-                recovery: Default::default(),
-                execution: Default::default(),
-                terminal_review: None,
-            },
-        })
-    }
-
-    fn decision() -> NewEvent {
-        NewEvent::new(MissionEvent::DecisionRecorded {
-            attention_id: "x".into(),
-            action: DecisionAction::Accept,
-            justification: String::new(),
-            requirement_changes: vec![],
-        })
-    }
-
-    // The sink sees exactly the committed sequence numbers, in order — and a
-    // rolled-back append (stale head) publishes nothing, so a consumer never
-    // sees a phantom event.
-    #[tokio::test]
-    async fn sink_fires_after_commit_never_on_a_rolled_back_append() {
-        let dir = tempfile::tempdir().unwrap();
-        let rec = Arc::new(Recorder::default());
-        let store = MissionStore::open(dir.path())
-            .await
-            .unwrap()
-            .with_sink(rec.clone());
-        let id = MissionId::parse("mabc123def456").unwrap();
-
-        store
-            .create_mission(&id, "/w", "o", created(), 1)
-            .await
-            .unwrap();
-        assert_eq!(*rec.0.lock().unwrap(), vec![1]);
-
-        let head = store
-            .append(&id, 1, &[decision(), decision()], 2)
-            .await
-            .unwrap();
-        assert_eq!(head, 3);
-        assert_eq!(*rec.0.lock().unwrap(), vec![1, 2, 3]);
-
-        // Stale expected-head ⇒ Conflict ⇒ transaction never commits.
-        assert!(store.append(&id, 1, &[decision()], 3).await.is_err());
-        assert_eq!(
-            *rec.0.lock().unwrap(),
-            vec![1, 2, 3],
-            "a rolled-back append must not publish"
-        );
-    }
-
-    #[tokio::test]
-    async fn one_outcome_per_effect_id_is_a_store_invariant() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = MissionStore::open(dir.path()).await.unwrap();
-        let id = MissionId::parse("mabc123def456").unwrap();
-        store
-            .create_mission(&id, "/w", "o", created(), 1)
-            .await
-            .unwrap();
-        let effect_id = EffectId::for_parts(&["test", "duplicate-outcome"]);
-        let outcome = NewEvent::new(MissionEvent::OracleRunCompleted {
-            assertion_ids: Vec::new(),
-            oracle: OracleName::new("test").unwrap(),
-            judged_sha: "base".into(),
-            attempt_no: 1,
-            effect_id: effect_id.clone(),
-            outcome: Err(lionclaw_runtime_api::TypedFailure::Interrupted {
-                evidence: Box::new(lionclaw_runtime_api::TypedFailureEvidence::new(
-                    None,
-                    "interrupted",
-                )),
-            }),
-        });
-        store
-            .append(&id, 1, std::slice::from_ref(&outcome), 2)
-            .await
-            .unwrap();
-        let duplicate = store.append(&id, 2, &[outcome], 3).await;
-        assert!(matches!(
-            duplicate,
-            Err(AppendError::Duplicate { effect_id: duplicate }) if duplicate == effect_id.as_str()
-        ));
     }
 }

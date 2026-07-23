@@ -6,7 +6,8 @@
 use std::path::Path;
 
 use crate::model::{
-    Gap, Handoff, OutputSemantics, PayloadRef, PlanProposal, ValidationItem, MAX_ROLE_REPORT_BYTES,
+    Gap, Handoff, MissionProposal, OutputSemantics, PayloadRef, ValidationItem,
+    MAX_ROLE_REPORT_BYTES,
 };
 use lionclaw_runtime_api::TypedFailure;
 use serde::{Deserialize, Serialize};
@@ -44,7 +45,7 @@ enum AgentHandoff {
         done: bool,
         report: String,
         #[serde(default)]
-        proposal: Option<PlanProposal>,
+        proposal: Option<Box<MissionProposal>>,
         request_attention: bool,
     },
 }
@@ -188,7 +189,8 @@ pub fn read_optional_handoff(
 /// Inspect a handoff left by an interrupted driver. Absence means the role
 /// never reached the handoff boundary; any object that does exist is validated
 /// exactly like a live completion so malformed evidence is not erased.
-pub(crate) fn read_retained_handoff(
+#[cfg(test)]
+fn read_retained_handoff(
     dir: &Path,
     output: OutputSemantics,
 ) -> Result<Option<Handoff>, TypedFailure> {
@@ -547,13 +549,13 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_validate_handoff_rejects_terminal_review_fields() {
+    fn ordinary_validate_handoff_rejects_gap_review_fields() {
         let raw = r#"{"schema":"lionclaw.mission.validate-handoff.v2","type":"validate",
                       "done":true,"report":"checked",
                       "items":[],"passed":true,"request_attention":false,
                       "nonce":"terminal-only","gaps":[]}"#;
         let err = parse_handoff(raw, OutputSemantics::EmitsVerdict)
-            .expect_err("terminal-review fields must not enter a validator handoff");
+            .expect_err("gap-review fields must not enter a validator handoff");
         assert!(err.is_invalid_output());
     }
 
@@ -598,7 +600,7 @@ mod tests {
 
     #[test]
     fn oversized_review_gaps_are_rejected() {
-        // Typed gaps land inline in the event log, so the terminal-review
+        // Typed gaps land inline in the event log, so the gap-review
         // parser caps them before they can reach an event.
         let evidence = "x".repeat(300 * 1024);
         let raw = format!(

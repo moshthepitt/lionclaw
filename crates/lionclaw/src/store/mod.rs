@@ -107,6 +107,10 @@ impl MissionStore {
         self.mission_dir(mission_id).join("mission-type")
     }
 
+    pub(crate) fn mission_skills_dir(&self, mission_id: &MissionId) -> PathBuf {
+        self.mission_dir(mission_id).join("skills")
+    }
+
     pub(crate) fn mission_dirs(&self, mission_id: &MissionId) -> crate::resources::MissionDirs {
         crate::resources::MissionDirs::new(&self.lionclaw_dir, mission_id)
     }

@@ -5,12 +5,10 @@ mod executor;
 mod handoff;
 mod native_home_auth;
 mod prepared_input;
-#[cfg(test)]
-mod real_runtime_continuity_tests;
 mod role_runner;
 
 pub use executor::MissionProgramExecutor;
-pub(crate) use handoff::{read_retained_handoff, validate_handoff};
+pub(crate) use handoff::validate_handoff;
 pub(crate) use prepared_input::{prepare_inputs, PreparedInputs};
 pub use role_runner::OciRoleRunner;
 

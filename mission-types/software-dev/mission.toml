@@ -6,12 +6,16 @@ stop = "verified"
 image = "localhost/lionclaw-runtime-dev:v1"
 environment = { CARGO_HOME = "/scratch/cargo", CARGO_TARGET_DIR = "/scratch/target" }
 
-# The engine-owned closing check: once work and oracles settle, a fresh
-# contract-blind reviewer judges the delivered product against the objective
-# (oracles prove the asserted; this catches what was never asserted).
-# Declared here — not in the plan — so a planner can never omit or weaken it.
-[terminal-review]
-role = "gap-reviewer"
+[team]
+planning-assignment = "strategist"
+gap-review-assignment = "gap-reviewer"
+requires-gap-review = true
+
+[ceilings]
+network = true
+install = true
+writes = true
+inputs = ["cargo-home"]
 
 [recovery]
 max-attempts = 3
@@ -28,11 +32,3 @@ name = "cargo-home"
 network = true
 key-files = ["Cargo.lock"]
 environment = { CARGO_HOME = "/inputs/cargo-home" }
-
-# One planner owns repository investigation, adversarial contract review, and
-# the complete proposal. Additional planning perspectives are a proportional
-# team choice, not default ceremony for every software change.
-[[planning.tasks]]
-id = "strategist"
-role = "strategist"
-body = "Investigate the repository, build the objective-to-contract coverage map, adversarially review it for gaps and vacuous proof, then propose the complete contract and coherent task DAG. Under this mission type's verified bar, every assertion must bind an oracle."

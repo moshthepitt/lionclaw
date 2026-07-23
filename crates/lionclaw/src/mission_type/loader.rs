@@ -7,18 +7,18 @@ use std::path::{Path, PathBuf};
 
 use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
 use crate::model::{
-    InputName, OracleName, PlanningDag, PlanningTask, RoleName, StopBar, TerminalReviewConfig,
+    AuthorityGrants, InputName, OracleName, OutputSemantics, RoleInstance, RoleInstanceId, StopBar,
+    TeamRevision,
 };
 
 use super::bounded_tree::{BoundedTree, ControlTextBudget};
 use super::digest::ContentDigest;
 use super::frontmatter::{parse_role_file, RoleFrontmatter};
-use super::manifest::{is_path_safe_name, ManifestFile, ManifestInput, ManifestPlanningDag};
+use super::manifest::{is_path_safe_name, ManifestFile, ManifestInput};
 use super::prepared_input::{validate_prepared_inputs, PreparedInputContractError};
 use super::skills::load_skills;
 use super::{
-    has_shebang, is_executable, MissionType, MissionTypeDefinition, PreparedInput, RoleDefinition,
-    SkillPackage,
+    has_shebang, is_executable, MissionType, MissionTypeDefinition, PreparedInput, SkillPackage,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -113,15 +113,14 @@ pub(crate) fn load_materialized_mission_type(
     if roles.is_empty() {
         return Err(MissionTypeError::NoRoles(root.to_path_buf()));
     }
-    let planning = resolve_planning_dag(manifest.planning, &roles)?;
-
-    let terminal_review = match &manifest.terminal_review {
-        None => None,
-        Some(declared) => {
-            let role_name = RoleName::new(&declared.role)
-                .map_err(|e| MissionTypeError::Manifest(format!("[terminal-review] role: {e}")))?;
-            Some(TerminalReviewConfig { role: role_name })
-        }
+    let team = TeamRevision {
+        revision: 0,
+        roles,
+        planning_assignment: manifest.team.planning_assignment,
+        task_assignments: BTreeMap::new(),
+        judgment_assignments: BTreeMap::new(),
+        gap_review_assignment: manifest.team.gap_review_assignment,
+        guidance: None,
     };
 
     let playbook = read(&tree, Path::new("playbook.md"), &mut text_budget)?;
@@ -137,12 +136,12 @@ pub(crate) fn load_materialized_mission_type(
         stop,
         image: manifest.mission_type.image,
         environment: manifest.mission_type.environment,
-        planning,
+        default_team: team,
+        ceilings: manifest.ceilings,
+        requires_gap_review: manifest.team.requires_gap_review,
         recovery: manifest.recovery,
         execution: manifest.execution,
-        terminal_review,
         playbook: Some(playbook),
-        roles,
         skills,
         inputs,
         oracles,
@@ -152,35 +151,6 @@ pub(crate) fn load_materialized_mission_type(
         .validate_at(0)
         .map_err(|error| MissionTypeError::Manifest(error.to_string()))?;
     Ok(mission_type)
-}
-
-fn resolve_planning_dag(
-    dag: ManifestPlanningDag,
-    roles: &BTreeMap<RoleName, RoleDefinition>,
-) -> Result<PlanningDag, MissionTypeError> {
-    let tasks = dag
-        .tasks
-        .into_iter()
-        .map(|task| {
-            let output = roles
-                .get(&task.role)
-                .map(|role| role.output)
-                .ok_or_else(|| {
-                    MissionTypeError::Manifest(format!(
-                    "[planning] task '{}' names role '{}' which the mission type does not provide",
-                    task.id, task.role
-                ))
-                })?;
-            Ok(PlanningTask {
-                id: task.id,
-                role: task.role,
-                output,
-                body: task.body,
-                depends_on: task.depends_on,
-            })
-        })
-        .collect::<Result<Vec<_>, MissionTypeError>>()?;
-    Ok(PlanningDag { tasks })
 }
 
 fn load_inputs(
@@ -233,7 +203,7 @@ fn load_roles(
     ceiling: &AuthorityCeiling,
     packages: &BTreeMap<String, SkillPackage>,
     text_budget: &mut ControlTextBudget,
-) -> Result<BTreeMap<RoleName, RoleDefinition>, MissionTypeError> {
+) -> Result<BTreeMap<RoleInstanceId, RoleInstance>, MissionTypeError> {
     let mut roles = BTreeMap::new();
     if !dir.exists() {
         return Ok(roles);
@@ -250,7 +220,7 @@ fn load_roles(
                     role: path.display().to_string(),
                     detail: "non-utf8 filename".to_string(),
                 })?;
-        let name = RoleName::new(stem).map_err(|e| MissionTypeError::Role {
+        let name = RoleInstanceId::new(stem).map_err(|e| MissionTypeError::Role {
             role: stem.to_string(),
             detail: e.to_string(),
         })?;
@@ -265,6 +235,10 @@ fn load_roles(
             output,
             network,
             secrets,
+            install,
+            writes,
+            devices,
+            inputs,
             runtime,
             timeout_secs,
             skills,
@@ -294,15 +268,34 @@ fn load_roles(
                 });
             }
         }
-        let role = RoleDefinition {
-            name: name.clone(),
+        let runtime = runtime.ok_or_else(|| MissionTypeError::Role {
+            role: stem.to_string(),
+            detail: "missing required key 'runtime'".to_string(),
+        })?;
+        let role = RoleInstance {
+            id: name.clone(),
+            purpose: stem.replace('-', " "),
             output,
             runtime,
-            timeout_secs,
-            network,
-            secrets,
+            instructions: prompt_body,
             skills,
-            prompt_body,
+            environment: BTreeMap::new(),
+            grants: AuthorityGrants {
+                secrets,
+                network,
+                install: install.unwrap_or(output == OutputSemantics::ProducesArtifact),
+                writes: writes.unwrap_or(output == OutputSemantics::ProducesArtifact),
+                devices: devices.into_iter().collect(),
+                inputs: inputs
+                    .into_iter()
+                    .map(InputName::new)
+                    .collect::<Result<_, _>>()
+                    .map_err(|error| MissionTypeError::Role {
+                        role: stem.to_string(),
+                        detail: error.to_string(),
+                    })?,
+            },
+            deadline_secs: timeout_secs,
         };
         // Fail-closed moat check at load time: an authority that cannot
         // compile (e.g. a judge requesting secrets) rejects the mission type.

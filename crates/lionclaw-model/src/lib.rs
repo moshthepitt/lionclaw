@@ -26,25 +26,24 @@ pub mod decision;
 pub mod event;
 pub mod failure;
 pub mod fold;
-pub mod gate;
 pub mod ids;
 pub mod plan;
 pub mod plan_validation;
 pub mod state;
 pub mod step;
+pub mod team;
 pub mod verdict;
 
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
     resolve_execution_deadline_ms, role_prompt_template, role_success_contract_error,
-    ArtifactOutcome, BlobRef, ContinueMode, ControlAction, ConversationRecipient, DecisionAction,
-    EffectEventClass, EffectResource, EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff,
-    MessageReference, MissionConfig, MissionEvent, MissionTypeRef, OracleRunSuccess, PayloadRef,
-    PreparedInputRef, RecoveryConfig, RoleHandoffObservation, RolePromptTemplate,
-    RoleRunRequestIdentity, RoleRunSuccess, RoleTurnObservation, RuntimeConfigurationEvidence,
-    StopBar, TaskNamespace, TerminalReviewConfig, TerminalReviewSuccess, UnavailableReferenceCause,
-    ValidationItem, VersionStamps, WorkspacePreparation, MAX_EXECUTION_DURATION_SECS,
-    MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES, MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES,
+    ArtifactOutcome, BlobRef, ContinueMode, ControlAction, DecisionAction, EffectEventClass,
+    EffectResource, EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff, MessageReference,
+    MissionConfig, MissionEvent, MissionProposal, MissionSkill, MissionTypeRef, OracleRunSuccess,
+    PayloadRef, PreparedInputRef, RecoveryConfig, RolePromptTemplate, RoleTurnSuccess,
+    RuntimeConfigurationEvidence, StopBar, UnavailableReferenceCause, ValidationItem,
+    VersionStamps, WorkspacePreparation, MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES,
+    MAX_MESSAGE_BYTES, MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES,
     MAX_QUEUED_MESSAGES_PER_CONVERSATION, MAX_ROLE_REPORT_BYTES, SCHEMA_VERSION,
 };
 pub use failure::{
@@ -52,33 +51,32 @@ pub use failure::{
     RuntimeConfigurationConfirmation, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
-pub use gate::{evaluate_gate, GateResult};
 pub use ids::{
-    short_hex, AssertionId, ConversationId, EffectId, IdError, InputName, MissionId, OracleName,
-    RequirementId, RoleName, TaskId, TERMINAL_REVIEW_TASK_TAG,
+    short_hex, AssertionId, EffectId, IdError, InputName, MissionId, OracleName, RequirementId,
+    RoleInstanceId, TaskId,
 };
 pub use plan::{
-    Assertion, AssertionSupersession, OutputSemantics, Plan, PlanInventory, PlanProposal,
-    PlanningDag, PlanningTask, Requirement, RequirementDisposition, RequirementKind,
-    RoleResourceLifetime, Task, TaskKind,
+    Assertion, AssertionSupersession, OutputSemantics, Plan, PlanProposal, Requirement,
+    RequirementDisposition, RequirementKind, RoleResourceLifetime, Task,
 };
 pub use plan_validation::{
-    validate_plan, validate_plan_proposal, validate_planning_dag, PlanValidationError,
+    validate_mission_proposal, validate_plan, validate_plan_proposal, PlanValidationError,
     ProposalError, MAX_TASK_DEPENDENCIES,
 };
 pub use state::{
     resolve_role_assignment, resolve_task_assignment, AdvisoryStatus, AssertionState,
     AttentionItem, AttentionKind, ConversationLifecycle, ConversationState, DecisionEvidence,
     DeliveryMarker, DurableCancellation, EffectCleanupFailure, FailureEvidence, FailureFeedback,
-    InflightEffect, MissionPhase, MissionState, ParkedEffect, PlanningInput, PlanningRefinement,
-    PlanningState, QueuedMessage, ReferenceRecipientPolicy, ReviewAcceptance, ReviewAcceptanceKind,
-    ReviewOutcome, RoleAssignment, RoleAssignmentContext, RoleAttemptAuthority,
-    RoleAttemptDisposition, RoleAttemptEvidenceUse, RoleAttemptGeneration, RoleAttemptReceipt,
-    RoleEffectSource, SettledHandoff, SupersededAssertion, TaskAddress, TaskAttemptOutcome,
-    TaskRoleAssignment, TaskRuntimeState, TaskStatus, TaskWorkspaceProvenance, TerminalReviewState,
-    UnavailableReferenceEvidence,
+    GapReviewState, InflightEffect, MissionPhase, MissionState, ParkedEffect, PlanningInput,
+    PlanningRefinement, QueuedMessage, ReferenceRecipientPolicy, ReviewAcceptance,
+    ReviewAcceptanceKind, ReviewOutcome, RoleAssignment, RoleAssignmentContext,
+    RoleAttemptAuthority, RoleAttemptDisposition, RoleAttemptEvidenceUse, RoleAttemptGeneration,
+    RoleAttemptReceipt, RoleEffectSource, RoleTurnProvenance, SettledHandoff, SupersededAssertion,
+    TaskAttemptOutcome, TaskRoleAssignment, TaskRuntimeState, TaskStatus, TaskWorkspaceProvenance,
 };
-pub use step::{
-    step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,
+pub use step::{step, OracleDispatchIntent, RoleDispatchIntent, StepDecision};
+pub use team::{
+    AuthorityCeilings, AuthorityGrants, MissionGuidance, RoleInstance, TeamRevision,
+    MAX_GUIDANCE_BYTES,
 };
 pub use verdict::{classify_finish, AuthoritativeVerdict, FinishClass};

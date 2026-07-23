@@ -32,15 +32,13 @@ pub use install::{install_mission_type, materialize_mission_type, InstallOutcome
 pub(crate) use loader::load_materialized_mission_type;
 pub use loader::{load_mission_type, MissionTypeError};
 pub use locator::MissionTypeLocator;
-pub use skill_install::{add_skill, remove_skill, SkillChange, SkillSource};
+pub use skill_install::{add_mission_skill, add_skill, remove_skill, SkillChange, SkillSource};
+pub(crate) use skills::load_skill_package;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::model::{
-    InputName, OracleName, OutputSemantics, PlanInventory, PlanningDag, RoleName, StopBar,
-    TerminalReviewConfig,
-};
+use crate::model::{AuthorityCeilings, InputName, OracleName, StopBar, TeamRevision};
 
 /// Aggregate program and declared-key content admitted to one prepared-input
 /// cache identity.
@@ -59,23 +57,6 @@ pub(crate) fn has_shebang(path: &Path) -> bool {
     std::fs::File::open(path)
         .and_then(|mut file| file.read_exact(&mut bytes))
         .is_ok_and(|_| &bytes == b"#!")
-}
-
-/// A role is property-composed data: open fields (name, prompt, runtime) plus
-/// the closed engine-understood axes (`output`, and the plain `network`/
-/// `secrets` flags). There is no role "kind".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoleDefinition {
-    pub name: RoleName,
-    pub output: OutputSemantics,
-    /// Runtime profile name; `None` uses the mission default.
-    pub runtime: Option<String>,
-    pub timeout_secs: Option<u64>,
-    pub network: bool,
-    pub secrets: bool,
-    /// Mission-owned skills projected for this role. Empty is valid.
-    pub skills: Vec<String>,
-    pub prompt_body: String,
 }
 
 /// One resolved Agent Skills package in the loaded mission-type closure.
@@ -111,17 +92,13 @@ pub struct MissionTypeDefinition {
     /// Domain-owned environment shared by roles and oracles. Kernel-owned
     /// execution coordinates cannot be overridden here.
     pub environment: BTreeMap<String, String>,
-    /// The planning DAG (how an objective becomes a proposed contract). Empty
-    /// ⇒ no in-engine planning; a mission of this type awaits a proposed plan.
-    pub planning: PlanningDag,
+    pub default_team: TeamRevision,
+    pub ceilings: AuthorityCeilings,
+    pub requires_gap_review: bool,
     /// Mission-level role recovery budget.
     pub recovery: crate::model::RecoveryConfig,
     pub execution: crate::model::ExecutionPolicy,
-    /// The closing review (the pure-core config type, threaded verbatim into
-    /// `MissionConfig` at mission start). Required when `stop = "reviewed"`.
-    pub terminal_review: Option<TerminalReviewConfig>,
     pub playbook: Option<String>,
-    pub roles: BTreeMap<RoleName, RoleDefinition>,
     pub skills: BTreeMap<String, SkillPackage>,
     pub inputs: BTreeMap<InputName, PreparedInput>,
     pub oracles: BTreeMap<OracleName, PathBuf>,
@@ -183,9 +160,9 @@ impl MissionType {
     /// where immutable effect deadlines will be derived. Bundle loading and
     /// direct engine creation use this same boundary.
     pub fn validate_at(&self, now_ms: i64) -> anyhow::Result<()> {
-        if self.roles.is_empty() {
-            anyhow::bail!("mission type has no roles");
-        }
+        self.default_team
+            .validate_shape()
+            .map_err(|error| anyhow::anyhow!("[team] {error}"))?;
         if self.recovery.max_attempts == 0 {
             anyhow::bail!("[recovery] max-attempts must be at least 1");
         }
@@ -193,60 +170,38 @@ impl MissionType {
             .validate_at(now_ms)
             .map_err(|error| anyhow::anyhow!("[execution] invalid execution policy: {error}"))?;
         validate_mission_environment(&self.environment)?;
-        for (name, role) in &self.roles {
+        for (name, role) in &self.default_team.roles {
             crate::authority::validate_role_authority_request(role)?;
-            if name != &role.name {
+            if name != &role.id {
                 anyhow::bail!(
                     "role map key '{name}' does not match role definition '{}'",
-                    role.name
+                    role.id
                 );
             }
-            if let Some(timeout_secs) = role.timeout_secs {
+            if !role.grants.within(&self.ceilings) {
+                anyhow::bail!(
+                    "role instance '{}' exceeds mission authority ceilings",
+                    role.id
+                );
+            }
+            if let Some(timeout_secs) = role.deadline_secs {
                 if timeout_secs == 0 {
-                    anyhow::bail!("role '{}' timeout must be at least 1 second", role.name);
+                    anyhow::bail!("role '{}' timeout must be at least 1 second", role.id);
                 }
                 crate::model::resolve_execution_deadline_ms(now_ms, timeout_secs).map_err(
-                    |error| anyhow::anyhow!("role '{}' deadline is invalid: {error}", role.name),
+                    |error| anyhow::anyhow!("role '{}' deadline is invalid: {error}", role.id),
                 )?;
             }
             for skill in &role.skills {
                 if !self.skills.contains_key(skill) {
-                    anyhow::bail!("role '{}' names missing skill '{skill}'", role.name);
+                    anyhow::bail!("role '{}' names missing skill '{skill}'", role.id);
                 }
             }
         }
         prepared_input::validate_prepared_inputs(&self.inputs)
             .map_err(|error| anyhow::anyhow!(error))?;
-        let planning_errors =
-            crate::model::validate_planning_dag(&self.planning, &self.inventory());
-        if !planning_errors.is_empty() {
-            anyhow::bail!(
-                "[planning] is invalid:\n{}",
-                planning_errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
-        }
-        if self.stop == StopBar::Reviewed && self.terminal_review.is_none() {
-            anyhow::bail!(
-                "stop = \"reviewed\" requires [terminal-review]: the reviewed bar is defined by an independent terminal review"
-            );
-        }
-        if let Some(review) = &self.terminal_review {
-            match self.roles.get(&review.role) {
-                Some(role) if role.output == OutputSemantics::EmitsGapVerdict => {}
-                Some(role) => anyhow::bail!(
-                    "[terminal-review] role '{}' must be emits-gap-verdict, got {}",
-                    review.role,
-                    role.output.slug()
-                ),
-                None => anyhow::bail!(
-                    "[terminal-review] role '{}' is not provided by this mission type",
-                    review.role
-                ),
-            }
+        if self.requires_gap_review && self.default_team.gap_review_assignment.is_none() {
+            anyhow::bail!("[team] requires-gap-review needs a gap-review assignment");
         }
         Ok(())
     }
@@ -257,23 +212,11 @@ impl MissionType {
     pub fn mission_config(&self) -> crate::model::MissionConfig {
         crate::model::MissionConfig {
             stop: self.stop,
-            plan_inventory: self.inventory(),
-            planning: self.planning.clone(),
+            oracles: self.oracles.keys().cloned().collect(),
+            ceilings: self.ceilings.clone(),
+            requires_gap_review: self.requires_gap_review,
             recovery: self.recovery.clone(),
             execution: self.execution.clone(),
-            terminal_review: self.terminal_review.clone(),
-        }
-    }
-
-    /// The pure inventory plan validation runs against.
-    fn inventory(&self) -> PlanInventory {
-        PlanInventory {
-            roles: self
-                .roles
-                .iter()
-                .map(|(name, role)| (name.clone(), role.output))
-                .collect(),
-            oracles: self.oracles.keys().cloned().collect::<BTreeSet<_>>(),
         }
     }
 }

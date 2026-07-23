@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use super::event::{
     EffectResource, MissionConfig, MissionTypeRef, PayloadRef, RuntimeConfigurationEvidence,
 };
-use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
-use super::plan::{Assertion, Plan, PlanProposal};
+use super::ids::{AssertionId, MissionId, OracleName, RoleInstanceId, TaskId};
+use super::plan::{Assertion, Plan};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
@@ -44,21 +44,8 @@ pub struct QueuedMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnavailableReferenceEvidence {
-    pub conversation_id: super::ConversationId,
-    pub assignment_epoch: u32,
-    pub message_sequence: u64,
-    pub reference: super::MessageReference,
-    pub cause: super::UnavailableReferenceCause,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationState {
-    pub role: RoleName,
-    pub namespace: super::TaskNamespace,
-    pub task_id: TaskId,
-    pub assignment_epoch: u32,
-    pub workspace_base_sha: String,
+    pub role_instance: RoleInstanceId,
     pub lifecycle: ConversationLifecycle,
     pub queued: Vec<QueuedMessage>,
     pub consumed_through: u64,
@@ -126,9 +113,8 @@ impl DurableCancellation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum MissionPhase {
-    /// No execution plan yet: drives the in-engine planning DAG (research →
-    /// red-team → author) toward a proposal, or — with an empty planning DAG —
-    /// idles awaiting a manually proposed plan.
+    /// No accepted plan yet: dispatches the team's planning assignment toward
+    /// a joint plan/team proposal.
     Planning,
     Running,
     /// Open attention items — parked at zero compute (durable interrupt).
@@ -182,22 +168,6 @@ pub enum TaskStatus {
     Superseded,
 }
 
-/// Stable identity of one task runtime across the planning and execution
-/// namespaces. A bare `TaskId` is intentionally insufficient: both maps may
-/// contain the same id at once.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskAddress {
-    pub namespace: super::TaskNamespace,
-    pub task_id: TaskId,
-}
-
-impl TaskAddress {
-    pub fn new(namespace: super::TaskNamespace, task_id: TaskId) -> Self {
-        Self { namespace, task_id }
-    }
-}
-
 /// Exact folded provenance and lifecycle evidence for one role attempt.
 ///
 /// The fold creates one receipt from the matching active request, then only
@@ -212,9 +182,9 @@ pub struct RoleAttemptReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_configuration: Option<RuntimeConfigurationEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn: Option<super::RoleTurnObservation>,
+    pub final_response: Option<PayloadRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handoff: Option<super::RoleHandoffObservation>,
+    pub handoff: Option<super::Handoff>,
     pub disposition: RoleAttemptDisposition,
 }
 
@@ -265,17 +235,31 @@ pub struct RoleAttemptAuthority {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RoleEffectSource {
-    Task {
-        request: Box<super::RoleRunRequestIdentity>,
+    Turn {
+        request: Box<RoleTurnProvenance>,
         plan_revision: u32,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        authorized_targets: Vec<AssertionId>,
     },
-    TerminalReview {
-        attempt_no: u32,
-        role: RoleName,
-        judged_sha: String,
-    },
+}
+
+/// Folded provenance copied only from an accepted role-turn request. Outcome
+/// events carry the effect id and result; they cannot restate this authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleTurnProvenance {
+    pub role_instance: RoleInstanceId,
+    pub team_revision: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertion_ids: Vec<AssertionId>,
+    pub attempt_no: u32,
+    pub assignment_epoch: u32,
+    pub prompt_template: super::RolePromptTemplate,
+    pub prompt_hash: String,
+    pub base_sha: String,
+    pub workspace_preparation: super::WorkspacePreparation,
+    pub message_boundary: u64,
+    pub presented_messages: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,7 +269,7 @@ pub enum RoleAttemptDisposition {
     Retired,
     Succeeded {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        handoff: Option<SettledHandoff>,
+        handoff: Option<Box<SettledHandoff>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<super::ArtifactOutcome>,
     },
@@ -312,7 +296,7 @@ pub enum SettledHandoff {
     },
     Plan {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        proposal: Option<PlanProposal>,
+        proposal: Option<Box<super::MissionProposal>>,
         request_attention: bool,
     },
 }
@@ -354,27 +338,17 @@ impl SettledHandoff {
 impl RoleAttemptReceipt {
     /// Canonical folded runtime configuration for this attempt.
     ///
-    /// `EffectRuntimeConfigured` grows this progressive evidence and a durable
-    /// turn observation reconciles its final value. The configuration nested
-    /// in `RoleTurnObservation` remains the exact raw observation used by fold
-    /// validation; consumers must use this accessor instead of choosing
-    /// between the progressive and raw forms.
+    /// Canonical folded runtime configuration from `RoleTurnCompleted`.
     pub fn effective_runtime_configuration(&self) -> Option<&RuntimeConfigurationEvidence> {
         self.runtime_configuration.as_ref()
     }
 
     pub fn accepted_report(&self) -> Option<&PayloadRef> {
-        match &self.handoff {
-            Some(super::RoleHandoffObservation::Accepted { report }) => Some(report),
-            Some(super::RoleHandoffObservation::Rejected { .. }) | None => None,
-        }
+        self.handoff.as_ref().map(super::Handoff::report)
     }
 
     pub fn rejection(&self) -> Option<&TypedFailure> {
-        match &self.handoff {
-            Some(super::RoleHandoffObservation::Rejected { failure }) => Some(failure),
-            Some(super::RoleHandoffObservation::Accepted { .. }) | None => None,
-        }
+        self.failure().filter(|failure| failure.is_invalid_output())
     }
 
     pub fn failure(&self) -> Option<&TypedFailure> {
@@ -388,7 +362,7 @@ impl RoleAttemptReceipt {
 
     pub fn settled_handoff(&self) -> Option<&SettledHandoff> {
         match &self.disposition {
-            RoleAttemptDisposition::Succeeded { handoff, .. } => handoff.as_ref(),
+            RoleAttemptDisposition::Succeeded { handoff, .. } => handoff.as_deref(),
             RoleAttemptDisposition::Active
             | RoleAttemptDisposition::Retired
             | RoleAttemptDisposition::Failed { .. } => None,
@@ -440,6 +414,8 @@ pub struct TaskRuntimeState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskRoleAssignment {
+    pub role_instance: RoleInstanceId,
+    pub team_revision: u32,
     pub base_sha: String,
     pub assignment_epoch: u32,
 }
@@ -450,7 +426,6 @@ pub struct TaskRoleAssignment {
 #[serde(deny_unknown_fields)]
 pub struct TaskWorkspaceProvenance {
     pub effect_id: super::EffectId,
-    pub conversation_id: super::ConversationId,
     pub base_sha: String,
     pub assignment_epoch: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -505,10 +480,11 @@ pub fn resolve_task_assignment(
 /// than independently inferring a current conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleAssignment {
+    pub role_instance: RoleInstanceId,
+    pub team_revision: u32,
     pub base_sha: String,
     pub generation: u32,
     pub workspace_preparation: super::WorkspacePreparation,
-    pub conversation_id: super::ConversationId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -521,10 +497,8 @@ pub struct RoleAssignmentContext<'a> {
 }
 
 pub fn resolve_role_assignment(
-    mission_id: &MissionId,
-    namespace: super::TaskNamespace,
-    task_id: &TaskId,
-    role: &RoleName,
+    role_instance: &RoleInstanceId,
+    team_revision: u32,
     context: RoleAssignmentContext<'_>,
 ) -> RoleAssignment {
     let (base_sha, generation, proposed_workspace_preparation) = resolve_task_assignment(
@@ -539,9 +513,8 @@ pub fn resolve_role_assignment(
         super::WorkspacePreparation::Preserve
     };
     RoleAssignment {
-        conversation_id: super::ConversationId::for_role_instance(
-            mission_id, namespace, task_id, role, generation,
-        ),
+        role_instance: role_instance.clone(),
+        team_revision,
         base_sha,
         generation,
         workspace_preparation,
@@ -616,7 +589,7 @@ pub enum PlanningRefinement {
 pub struct PlanningInput {
     /// Latest complete candidate rejected during plan ratification. Kept as
     /// planning input until a candidate is approved.
-    pub latest_rejected_proposal: Option<PlanProposal>,
+    pub latest_rejected_proposal: Option<super::MissionProposal>,
     /// The single active refinement input for the next planning pass.
     pub refinement: Option<PlanningRefinement>,
 }
@@ -626,13 +599,6 @@ pub struct EffectCleanupFailure {
     pub effect_id: super::EffectId,
     pub resource: EffectResource,
     pub failure: TypedFailure,
-}
-
-/// Runtime status of the contract-free planning DAG. A separate map from the
-/// execution `tasks` so a planning id can never satisfy execution coverage.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct PlanningState {
-    pub tasks: BTreeMap<TaskId, TaskRuntimeState>,
 }
 
 /// Zenith's sticky per-assertion advisory status: `pending → passed` is
@@ -660,8 +626,8 @@ impl AdvisoryStatus {
 pub struct AssertionState {
     /// The engine-run oracle binding, if any (copied from the plan).
     pub oracle: Option<OracleName>,
-    /// Last evidence-bearing verdict per validator task (gate input).
-    pub last_advisory: BTreeMap<TaskId, super::EffectId>,
+    /// Last evidence-bearing verdict per assigned judgment role instance.
+    pub last_advisory: BTreeMap<RoleInstanceId, super::EffectId>,
     /// Only the fold can mint this, and only from `OracleRunCompleted`.
     pub last_authoritative: Option<AuthoritativeVerdict>,
 }
@@ -676,12 +642,12 @@ pub struct SupersededAssertion {
     pub superseded_at_revision: u32,
 }
 
-/// The terminal-review ledger: fold-owned, advisory-only (never read by
+/// The gap-review ledger: fold-owned, advisory-only (never read by
 /// `classify_finish`). All-default == "no review has run".
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct TerminalReviewState {
+pub struct GapReviewState {
     /// Dispatch counter (mirrors `oracle_attempts`): folded from
-    /// `TerminalReviewRequested.attempt_no`; the next dispatch and its
+    /// The assigned gap role's request attempt; the next dispatch and its
     /// effect ID ride on it, so a retry re-rolls under a fresh identity.
     #[serde(default)]
     pub attempts: u32,
@@ -698,7 +664,7 @@ pub struct TerminalReviewState {
     pub accepted: Option<ReviewAcceptance>,
 }
 
-impl TerminalReviewState {
+impl GapReviewState {
     /// The acceptance, if it still holds at the current head — the ONE
     /// freshness-law site the fold's derivations and the CLI's summaries all
     /// share, so they can never disagree about whether the mission may close.
@@ -750,14 +716,14 @@ impl ReviewOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParkedEffect {
-    RoleRun {
-        namespace: super::TaskNamespace,
-        task_id: TaskId,
+    RoleTurn {
+        role_instance: RoleInstanceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<TaskId>,
     },
     OracleRun {
         oracle: OracleName,
     },
-    TerminalReview,
 }
 
 /// Fold-authoritative policy for attaching durable evidence to lead messages.
@@ -767,7 +733,7 @@ pub enum ParkedEffect {
 pub enum ReferenceRecipientPolicy {
     Permitted,
     Disallowed {
-        conversation_id: super::ConversationId,
+        role_instance: RoleInstanceId,
         output: super::OutputSemantics,
     },
     Mixed,
@@ -818,7 +784,7 @@ impl ReviewAcceptanceKind {
     }
 }
 
-/// A terminal reviewer's verdict. Plain public data — deliberately NOT an
+/// A gap reviewer's verdict. Plain public data — deliberately NOT an
 /// `AuthoritativeVerdict` (private-field mint, `verdict.rs`): this verdict
 /// is advisory, mints nothing, and gates closure only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -835,14 +801,14 @@ pub enum AttentionKind {
     GateCheckpoint,
     /// A complete plan proposal awaits approval before promotion.
     PlanProposal,
-    /// The terminal review's blocking verdict awaits a human (revise to
+    /// The gap review's blocking verdict awaits a human (revise to
     /// remediate / retry to re-run / accept to acknowledge-and-close /
     /// abort). Raised only when the mission would otherwise close, so
     /// remediation work auto-clears it.
-    TerminalReviewGaps,
-    /// The terminal reviewer failed to run or hand off a verdict
+    GapReviewGaps,
+    /// The gap reviewer failed to run or hand off a verdict
     /// (infrastructure), distinct from a verdict with gaps.
-    TerminalReviewFailed,
+    GapReviewFailed,
 }
 
 impl AttentionKind {
@@ -858,8 +824,8 @@ impl AttentionKind {
             Self::GateFailed => "gate_failed",
             Self::GateCheckpoint => "gate_checkpoint",
             Self::PlanProposal => "plan_proposal",
-            Self::TerminalReviewGaps => "terminal_review_gaps",
-            Self::TerminalReviewFailed => "terminal_review_failed",
+            Self::GapReviewGaps => "gap_review_gaps",
+            Self::GapReviewFailed => "gap_review_failed",
         }
     }
 }
@@ -886,12 +852,14 @@ pub struct AttentionItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InflightEffect {
-    RoleRun {
-        conversation_id: super::ConversationId,
-        namespace: super::TaskNamespace,
-        task_id: TaskId,
+    RoleTurn {
+        role_instance: RoleInstanceId,
+        team_revision: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<TaskId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        assertion_ids: Vec<AssertionId>,
         attempt_no: u32,
-        role: RoleName,
         output: super::OutputSemantics,
         runtime: String,
         prompt_template: super::RolePromptTemplate,
@@ -917,21 +885,6 @@ pub enum InflightEffect {
         deadline_ms: i64,
         requested_seq: u64,
     },
-    TerminalReview {
-        attempt_no: u32,
-        role: RoleName,
-        runtime: String,
-        prompt: PayloadRef,
-        judged_sha: String,
-        /// Carried from the event so the runner's handoff-forgery check
-        /// still has its expected token after a crash/resume.
-        nonce: String,
-        requested_at_ms: i64,
-        not_before_ms: i64,
-        deadline_ms: i64,
-        budget_deadline_ms: i64,
-        requested_seq: u64,
-    },
 }
 
 impl InflightEffect {
@@ -942,23 +895,11 @@ impl InflightEffect {
         &self,
         effect_id: &super::EffectId,
         plan_revision: u32,
-        authorized_targets: Vec<AssertionId>,
     ) -> Option<RoleAttemptReceipt> {
         let source = match self {
-            Self::RoleRun { .. } => RoleEffectSource::Task {
-                request: Box::new(self.role_request_identity()?),
+            Self::RoleTurn { .. } => RoleEffectSource::Turn {
+                request: Box::new(self.role_turn_provenance()?),
                 plan_revision,
-                authorized_targets,
-            },
-            Self::TerminalReview {
-                attempt_no,
-                role,
-                judged_sha,
-                ..
-            } => RoleEffectSource::TerminalReview {
-                attempt_no: *attempt_no,
-                role: role.clone(),
-                judged_sha: judged_sha.clone(),
             },
             Self::OracleRun { .. } => return None,
         };
@@ -966,21 +907,19 @@ impl InflightEffect {
             effect_id: effect_id.clone(),
             source,
             runtime_configuration: None,
-            turn: None,
+            final_response: None,
             handoff: None,
             disposition: RoleAttemptDisposition::Active,
         })
     }
 
-    pub fn role_request_identity(&self) -> Option<super::RoleRunRequestIdentity> {
-        let Self::RoleRun {
-            conversation_id,
-            namespace,
+    pub fn role_turn_provenance(&self) -> Option<RoleTurnProvenance> {
+        let Self::RoleTurn {
+            role_instance,
+            team_revision,
             task_id,
+            assertion_ids,
             attempt_no,
-            role,
-            output,
-            runtime,
             prompt_template,
             prompt_hash,
             base_sha,
@@ -993,15 +932,13 @@ impl InflightEffect {
         else {
             return None;
         };
-        Some(super::RoleRunRequestIdentity {
-            conversation_id: conversation_id.clone(),
-            namespace: *namespace,
+        Some(RoleTurnProvenance {
+            role_instance: role_instance.clone(),
+            team_revision: *team_revision,
             task_id: task_id.clone(),
+            assertion_ids: assertion_ids.clone(),
             attempt_no: *attempt_no,
             assignment_epoch: *assignment_epoch,
-            role: role.clone(),
-            output: *output,
-            runtime: runtime.clone(),
             prompt_template: *prompt_template,
             prompt_hash: prompt_hash.clone(),
             base_sha: base_sha.clone(),
@@ -1013,34 +950,31 @@ impl InflightEffect {
 
     pub fn set_deadline_ms(&mut self, new_deadline_ms: i64) {
         match self {
-            Self::RoleRun { deadline_ms, .. }
-            | Self::OracleRun { deadline_ms, .. }
-            | Self::TerminalReview { deadline_ms, .. } => *deadline_ms = new_deadline_ms,
+            Self::RoleTurn { deadline_ms, .. } | Self::OracleRun { deadline_ms, .. } => {
+                *deadline_ms = new_deadline_ms
+            }
         }
     }
 
     pub fn deadline_ms(&self) -> i64 {
         match self {
-            Self::RoleRun { deadline_ms, .. }
-            | Self::OracleRun { deadline_ms, .. }
-            | Self::TerminalReview { deadline_ms, .. } => *deadline_ms,
+            Self::RoleTurn { deadline_ms, .. } | Self::OracleRun { deadline_ms, .. } => {
+                *deadline_ms
+            }
         }
     }
 
     pub fn not_before_ms(&self) -> i64 {
         match self {
-            Self::RoleRun { not_before_ms, .. }
-            | Self::OracleRun { not_before_ms, .. }
-            | Self::TerminalReview { not_before_ms, .. } => *not_before_ms,
+            Self::RoleTurn { not_before_ms, .. } | Self::OracleRun { not_before_ms, .. } => {
+                *not_before_ms
+            }
         }
     }
 
     pub fn budget_deadline_ms(&self) -> Option<i64> {
         match self {
-            Self::RoleRun {
-                budget_deadline_ms, ..
-            }
-            | Self::TerminalReview {
+            Self::RoleTurn {
                 budget_deadline_ms, ..
             } => Some(*budget_deadline_ms),
             Self::OracleRun { .. } => None,
@@ -1051,18 +985,18 @@ impl InflightEffect {
     pub fn from_request(
         event: &super::event::MissionEvent,
         requested_seq: u64,
+        teams: &BTreeMap<u32, super::TeamRevision>,
+        not_before_ms: i64,
     ) -> Option<(super::EffectId, Self)> {
         use super::event::MissionEvent;
         match event {
-            MissionEvent::RoleRunRequested {
-                conversation_id,
-                namespace,
+            MissionEvent::RoleTurnRequested {
+                role_instance,
+                team_revision,
                 task_id,
+                assertion_ids,
                 attempt_no,
                 effect_id,
-                role,
-                output,
-                runtime,
                 prompt_template,
                 prompt_hash,
                 base_sha,
@@ -1071,33 +1005,35 @@ impl InflightEffect {
                 presented_messages,
                 workspace_preparation,
                 requested_at_ms,
-                not_before_ms,
                 deadline_ms,
                 budget_deadline_ms,
-            } => Some((
-                effect_id.clone(),
-                Self::RoleRun {
-                    conversation_id: conversation_id.clone(),
-                    namespace: *namespace,
-                    task_id: task_id.clone(),
-                    attempt_no: *attempt_no,
-                    role: role.clone(),
-                    output: *output,
-                    runtime: runtime.clone(),
-                    prompt_template: *prompt_template,
-                    prompt_hash: prompt_hash.clone(),
-                    base_sha: base_sha.clone(),
-                    assignment_epoch: *assignment_epoch,
-                    message_boundary: *message_boundary,
-                    presented_messages: presented_messages.clone(),
-                    workspace_preparation: workspace_preparation.clone(),
-                    requested_at_ms: *requested_at_ms,
-                    not_before_ms: *not_before_ms,
-                    deadline_ms: *deadline_ms,
-                    budget_deadline_ms: *budget_deadline_ms,
-                    requested_seq,
-                },
-            )),
+            } => {
+                let role = teams.get(team_revision)?.role(role_instance)?;
+                Some((
+                    effect_id.clone(),
+                    Self::RoleTurn {
+                        role_instance: role_instance.clone(),
+                        team_revision: *team_revision,
+                        task_id: task_id.clone(),
+                        assertion_ids: assertion_ids.clone(),
+                        attempt_no: *attempt_no,
+                        output: role.output,
+                        runtime: role.runtime.clone(),
+                        prompt_template: *prompt_template,
+                        prompt_hash: prompt_hash.clone(),
+                        base_sha: base_sha.clone(),
+                        assignment_epoch: *assignment_epoch,
+                        message_boundary: *message_boundary,
+                        presented_messages: presented_messages.clone(),
+                        workspace_preparation: workspace_preparation.clone(),
+                        requested_at_ms: *requested_at_ms,
+                        not_before_ms,
+                        deadline_ms: *deadline_ms,
+                        budget_deadline_ms: *budget_deadline_ms,
+                        requested_seq,
+                    },
+                ))
+            }
             MissionEvent::OracleRunRequested {
                 assertion_ids,
                 oracle,
@@ -1105,7 +1041,6 @@ impl InflightEffect {
                 attempt_no,
                 effect_id,
                 requested_at_ms,
-                not_before_ms,
                 deadline_ms,
             } => Some((
                 effect_id.clone(),
@@ -1115,103 +1050,24 @@ impl InflightEffect {
                     judged_sha: judged_sha.clone(),
                     attempt_no: *attempt_no,
                     requested_at_ms: *requested_at_ms,
-                    not_before_ms: *not_before_ms,
+                    not_before_ms,
                     deadline_ms: *deadline_ms,
-                    requested_seq,
-                },
-            )),
-            MissionEvent::TerminalReviewRequested {
-                attempt_no,
-                effect_id,
-                role,
-                runtime,
-                prompt,
-                judged_sha,
-                nonce,
-                requested_at_ms,
-                not_before_ms,
-                deadline_ms,
-                budget_deadline_ms,
-            } => Some((
-                effect_id.clone(),
-                Self::TerminalReview {
-                    attempt_no: *attempt_no,
-                    role: role.clone(),
-                    runtime: runtime.clone(),
-                    prompt: prompt.clone(),
-                    judged_sha: judged_sha.clone(),
-                    nonce: nonce.clone(),
-                    requested_at_ms: *requested_at_ms,
-                    not_before_ms: *not_before_ms,
-                    deadline_ms: *deadline_ms,
-                    budget_deadline_ms: *budget_deadline_ms,
                     requested_seq,
                 },
             )),
             // Exhaustive on purpose: every new `…Requested` event must build
             // its inflight entry here.
             MissionEvent::MissionCreated { .. }
-            | MissionEvent::PlanProposed { .. }
+            | MissionEvent::ProposalRecorded { .. }
+            | MissionEvent::TeamConfigured { .. }
+            | MissionEvent::SkillAdded { .. }
             | MissionEvent::MessageSent { .. }
-            | MissionEvent::MessageReferenceUnavailable { .. }
-            | MissionEvent::TaskWorkspacePrepared { .. }
-            | MissionEvent::EffectRuntimeConfigured { .. }
-            | MissionEvent::RoleTurnObserved { .. }
-            | MissionEvent::RoleHandoffObserved { .. }
-            | MissionEvent::RoleRunCompleted { .. }
+            | MissionEvent::RoleTurnCompleted { .. }
             | MissionEvent::OracleRunCompleted { .. }
-            | MissionEvent::TerminalReviewCompleted { .. }
             | MissionEvent::MissionAborted { .. }
             | MissionEvent::DecisionRecorded { .. }
             | MissionEvent::ControlRequested { .. }
-            | MissionEvent::EffectDeadlineReached { .. }
             | MissionEvent::EffectCleanupFailed { .. } => None,
-        }
-    }
-
-    /// Whether an outcome fact names the exact immutable request identity.
-    /// Effect IDs are store-unique, but the redundant identity fields remain
-    /// part of the auditable wire contract and must agree before settlement.
-    pub(crate) fn matches_outcome(&self, event: &super::event::MissionEvent) -> bool {
-        use super::event::MissionEvent;
-        match (self, event) {
-            (Self::RoleRun { .. }, MissionEvent::RoleRunCompleted { request, .. }) => self
-                .role_request_identity()
-                .is_some_and(|active| active == **request),
-            (
-                Self::OracleRun {
-                    assertion_ids,
-                    oracle,
-                    judged_sha,
-                    attempt_no,
-                    ..
-                },
-                MissionEvent::OracleRunCompleted {
-                    assertion_ids: completed_assertions,
-                    oracle: completed_oracle,
-                    judged_sha: completed_sha,
-                    attempt_no: completed_attempt,
-                    ..
-                },
-            ) => {
-                assertion_ids == completed_assertions
-                    && oracle == completed_oracle
-                    && judged_sha == completed_sha
-                    && attempt_no == completed_attempt
-            }
-            (
-                Self::TerminalReview {
-                    attempt_no,
-                    judged_sha,
-                    ..
-                },
-                MissionEvent::TerminalReviewCompleted {
-                    attempt_no: completed_attempt,
-                    judged_sha: completed_sha,
-                    ..
-                },
-            ) => attempt_no == completed_attempt && judged_sha == completed_sha,
-            _ => false,
         }
     }
 }
@@ -1222,35 +1078,26 @@ pub struct MissionState {
     pub objective: String,
     /// The mission type, pinned by content digest (verified on every open).
     pub mission_type: MissionTypeRef,
-    /// The runtime profile id roles run under.
-    pub runtime: String,
     /// The confinement image, resolved to a content id at start.
     pub image_id: String,
     pub workspace_dir: String,
     /// Target repo HEAD at mission creation.
     pub base_sha: String,
     pub config: MissionConfig,
+    pub team: Option<super::TeamRevision>,
+    pub team_history: BTreeMap<u32, super::TeamRevision>,
+    #[serde(default)]
+    pub skills: BTreeMap<String, super::MissionSkill>,
     pub phase: MissionPhase,
     pub plan: Option<Plan>,
     pub contract: BTreeMap<AssertionId, AssertionState>,
     #[serde(default)]
     pub superseded_assertions: Vec<SupersededAssertion>,
     pub tasks: BTreeMap<TaskId, TaskRuntimeState>,
-    /// The contract-free planning phase: the runtime status of the mission
-    /// type's planning DAG. Disjoint from `tasks` (execution); the active era
-    /// decides which map receives role events and operator decisions.
-    pub planning: PlanningState,
-    /// Monotonic identity of the active planning assignment generation.
-    #[serde(default)]
-    pub planning_generation: u32,
-    /// Revision the active planning DAG is authoring against. `None` means the
-    /// planning DAG is idle; this is independent of whether an accepted plan
-    /// already exists, so the same DAG can author repairs.
-    pub planning_base_revision: Option<u32>,
     /// Active candidate/guidance/evidence input for the next planning pass.
     pub planning_input: PlanningInput,
     /// Complete plan proposal awaiting approval or automatic promotion.
-    pub proposal: Option<PlanProposal>,
+    pub proposal: Option<super::MissionProposal>,
     /// Latest recorded artifact head (starts at `base_sha`). Oracle verdicts
     /// are fresh only when judged at this commit.
     pub current_sha: String,
@@ -1264,14 +1111,10 @@ pub struct MissionState {
     pub role_attempt_receipts: BTreeMap<super::EffectId, RoleAttemptReceipt>,
     /// Mission-private dialogue authority, keyed by stable role-instance id.
     #[serde(default)]
-    pub conversations: BTreeMap<super::ConversationId, ConversationState>,
-    /// Monotonic evidence of retained writer archives, keyed by the exact
-    /// conversation that owns their resource tree.
+    pub conversations: BTreeMap<RoleInstanceId, ConversationState>,
+    /// Monotonic evidence of retained writer archives, keyed by task.
     #[serde(default)]
-    pub retained_workspace_archives: BTreeMap<super::ConversationId, BTreeSet<super::EffectId>>,
-    /// Exact fail-closed settlements for references lost after ingress.
-    #[serde(default)]
-    pub unavailable_references: Vec<UnavailableReferenceEvidence>,
+    pub retained_workspace_archives: BTreeMap<TaskId, BTreeSet<super::EffectId>>,
     /// Exact same-mission evidence identities eligible for message references.
     #[serde(default)]
     pub authoritative_receipts: BTreeSet<super::EffectId>,
@@ -1305,7 +1148,7 @@ pub struct MissionState {
     /// Tasks whose handoff asked for a human look (`request_attention`), until
     /// a decision clears them. Namespaced because planning and execution may
     /// legitimately use the same task id.
-    pub flagged_tasks: BTreeSet<TaskAddress>,
+    pub flagged_tasks: BTreeSet<TaskId>,
     /// Oracles that failed to *run* (infrastructure failure, distinct from a
     /// nonzero exit) → mapped to the failure detail, until a decision clears
     /// them. Prevents a broken oracle from re-requesting forever.
@@ -1317,7 +1160,7 @@ pub struct MissionState {
     /// Terminal-review runtime (config-gated; default-empty for every
     /// pre-feature mission and snapshot).
     #[serde(default)]
-    pub terminal_review: TerminalReviewState,
+    pub gap_review: GapReviewState,
     /// Sequence number of the last folded event (optimistic-concurrency head).
     pub head: u64,
 }
@@ -1334,26 +1177,20 @@ impl MissionState {
             .superseded_assertions
             .iter()
             .any(|entry| entry.state.last_advisory.values().any(|id| id == effect_id));
-        let superseded_task = match &receipt.source {
-            RoleEffectSource::Task {
-                request,
-                plan_revision,
-                ..
-            } => {
-                *plan_revision < self.revision
-                    || self
-                        .tasks_in(request.namespace)
-                        .get(&request.task_id)
-                        .is_some_and(|task| {
-                            task.status == TaskStatus::Superseded
-                                && task
-                                    .last_outcome
-                                    .as_ref()
-                                    .is_some_and(|outcome| outcome.effect_id() == effect_id)
-                        })
-            }
-            RoleEffectSource::TerminalReview { .. } => false,
-        };
+        let RoleEffectSource::Turn {
+            request,
+            plan_revision,
+        } = &receipt.source;
+        let superseded_task = *plan_revision < self.revision
+            || request.task_id.as_ref().is_some_and(|task_id| {
+                self.tasks.get(task_id).is_some_and(|task| {
+                    task.status == TaskStatus::Superseded
+                        && task
+                            .last_outcome
+                            .as_ref()
+                            .is_some_and(|outcome| outcome.effect_id() == effect_id)
+                })
+            });
         let generation = if receipt.disposition == RoleAttemptDisposition::Retired
             || superseded_assertion
             || superseded_task
@@ -1363,36 +1200,22 @@ impl MissionState {
             RoleAttemptGeneration::Current
         };
 
-        let current_task = match &receipt.source {
-            RoleEffectSource::Task { request, .. } => self
-                .tasks_in(request.namespace)
-                .get(&request.task_id)
-                .and_then(|task| task.last_outcome.as_ref())
-                .is_some_and(|outcome| outcome.effect_id() == effect_id),
-            RoleEffectSource::TerminalReview { .. } => false,
-        };
+        let current_task = request
+            .task_id
+            .as_ref()
+            .and_then(|task_id| self.tasks.get(task_id))
+            .and_then(|task| task.last_outcome.as_ref())
+            .is_some_and(|outcome| outcome.effect_id() == effect_id);
         let current_advisory = self.contract.iter().any(|(assertion_id, assertion)| {
             assertion.last_advisory.iter().any(|(validator, id)| {
                 id == effect_id && self.advisory_receipt(assertion_id, validator, id).is_some()
             })
         });
-        let current_review = match (
-            &self.terminal_review.outcome,
-            &receipt.source,
-            receipt.settled_handoff(),
-        ) {
-            (
-                Some(ReviewOutcome::Verdict { effect_id: current }),
-                RoleEffectSource::TerminalReview { judged_sha, .. },
-                Some(SettledHandoff::Review { .. }),
-            ) => current == effect_id && judged_sha == self.deliverable_head(),
-            (
-                Some(ReviewOutcome::Failed { effect_id: current }),
-                RoleEffectSource::TerminalReview { .. },
-                _,
-            ) => current == effect_id,
-            _ => false,
-        };
+        let current_review = self
+            .gap_review
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.effect_id() == effect_id);
         let current_feedback = self
             .planning_input
             .refinement
@@ -1426,87 +1249,61 @@ impl MissionState {
         }
     }
 
-    pub fn task_last_role_attempt(
-        &self,
-        namespace: super::TaskNamespace,
-        task_id: &TaskId,
-    ) -> Option<&RoleAttemptReceipt> {
-        let effect_id = self
-            .tasks_in(namespace)
-            .get(task_id)?
-            .last_outcome
-            .as_ref()?
-            .effect_id();
+    pub fn task_last_role_attempt(&self, task_id: &TaskId) -> Option<&RoleAttemptReceipt> {
+        let effect_id = self.tasks.get(task_id)?.last_outcome.as_ref()?.effect_id();
         let receipt = self.role_attempt_receipts.get(effect_id)?;
         matches!(
             &receipt.source,
-            RoleEffectSource::Task {
-                request,
-                ..
-            } if request.namespace == namespace && &request.task_id == task_id
+            RoleEffectSource::Turn { request, .. }
+                if request.task_id.as_ref() == Some(task_id)
         )
         .then_some(receipt)
     }
 
-    pub fn task_last_failure(
-        &self,
-        namespace: super::TaskNamespace,
-        task_id: &TaskId,
-    ) -> Option<&TypedFailure> {
-        self.task_last_role_attempt(namespace, task_id)?.failure()
+    pub fn task_last_failure(&self, task_id: &TaskId) -> Option<&TypedFailure> {
+        self.task_last_role_attempt(task_id)?.failure()
     }
 
-    pub fn task_automatic_retry_remaining(
-        &self,
-        namespace: super::TaskNamespace,
-        task_id: &TaskId,
-    ) -> bool {
-        let Some(task) = self.tasks_in(namespace).get(task_id) else {
+    pub fn task_automatic_retry_remaining(&self, task_id: &TaskId) -> bool {
+        let Some(task) = self.tasks.get(task_id) else {
             return false;
         };
         task.status == TaskStatus::Failed
             && task.consecutive_failures < self.config.recovery.max_attempts
             && self
-                .task_last_failure(namespace, task_id)
+                .task_last_failure(task_id)
                 .is_some_and(|failure| failure.is_transient() || failure.is_invalid_output())
     }
 
     pub fn advisory_receipt(
         &self,
         assertion_id: &AssertionId,
-        validator: &TaskId,
+        validator: &RoleInstanceId,
         effect_id: &super::EffectId,
     ) -> Option<(&RoleAttemptReceipt, bool)> {
         let receipt = self.role_attempt_receipts.get(effect_id)?;
-        let RoleEffectSource::Task {
+        let RoleEffectSource::Turn {
             request,
             plan_revision,
-            authorized_targets,
-        } = &receipt.source
-        else {
-            return None;
-        };
-        if request.namespace != super::TaskNamespace::Execution
-            || &request.task_id != validator
-            || request.output != super::OutputSemantics::EmitsVerdict
-            || !authorized_targets.contains(assertion_id)
+        } = &receipt.source;
+        if &request.role_instance != validator
+            || !request.assertion_ids.contains(assertion_id)
+            || request.task_id.is_some()
         {
             return None;
         }
-        let plan = self.plan.as_ref()?;
-        let planned = plan.tasks.iter().find(|task| &task.id == validator)?;
-        let task = self.tasks.get(validator)?;
-        if planned.kind != super::TaskKind::Validate
-            || !planned.targets.contains(assertion_id)
-            || task.status != TaskStatus::Cleared
-            || !matches!(
-                task.last_outcome.as_ref(),
-                Some(TaskAttemptOutcome::Accepted { effect_id: current }) if current == effect_id
-            )
-            || planned.role.as_ref() != Some(&request.role)
-            || authorized_targets != &planned.targets
+        let role = self
+            .team_history
+            .get(&request.team_revision)?
+            .role(&request.role_instance)?;
+        if role.output != super::OutputSemantics::EmitsVerdict
             || *plan_revision != self.revision
             || request.base_sha != self.deliverable_head()
+            || !self
+                .team
+                .as_ref()
+                .and_then(|team| team.judgment_assignments.get(assertion_id))
+                .is_some_and(|panel| panel.contains(validator))
         {
             return None;
         }
@@ -1526,20 +1323,20 @@ impl MissionState {
         let mut saw_failure = false;
         for (validator, effect_id) in &assertion.last_advisory {
             match self.advisory_receipt(assertion_id, validator, effect_id) {
-                Some((_, true)) => return AdvisoryStatus::Passed,
+                Some((_, true)) => {}
                 Some((_, false)) => saw_failure = true,
-                None => {}
+                None => return AdvisoryStatus::Pending,
             }
         }
         if saw_failure {
             AdvisoryStatus::Failed
         } else {
-            AdvisoryStatus::Pending
+            AdvisoryStatus::Passed
         }
     }
 
-    pub fn terminal_review_receipt(&self) -> Option<&RoleAttemptReceipt> {
-        self.terminal_review
+    pub fn gap_review_receipt(&self) -> Option<&RoleAttemptReceipt> {
+        self.gap_review
             .outcome
             .as_ref()
             .and_then(|outcome| self.role_attempt_receipts.get(outcome.effect_id()))
@@ -1549,131 +1346,73 @@ impl MissionState {
     /// workspace observation.
     pub fn role_dispatch_contract_matches(
         &self,
-        namespace: super::TaskNamespace,
-        task_id: &TaskId,
-        role: &RoleName,
-        output: super::OutputSemantics,
+        role_instance: &RoleInstanceId,
+        team_revision: u32,
+        task_id: Option<&TaskId>,
+        assertion_ids: &[AssertionId],
     ) -> bool {
-        match namespace {
-            super::TaskNamespace::Planning => self
-                .config
-                .planning
-                .tasks
-                .iter()
-                .find(|planned| &planned.id == task_id)
-                .is_some_and(|planned| planned.role == *role && planned.output == output),
-            super::TaskNamespace::Execution => self
-                .plan
-                .as_ref()
-                .and_then(|plan| plan.tasks.iter().find(|planned| &planned.id == task_id))
-                .is_some_and(|planned| {
-                    planned.role.as_ref() == Some(role)
-                        && output.execution_task_kind() == Some(planned.kind)
-                }),
-        }
-    }
-
-    /// Resolve the exact folded conversation whose retained checkout belongs
-    /// to one task. Active writers pass through the stricter request validator;
-    /// settled generations remain addressable only while their task authority
-    /// is unique and internally consistent.
-    pub fn task_workspace_conversation(
-        &self,
-        namespace: super::TaskNamespace,
-        task_id: &TaskId,
-    ) -> Result<Option<(&super::ConversationId, &ConversationState)>, &'static str> {
-        let task = self.tasks_in(namespace).get(task_id);
-        let Some(task) = task else {
-            return Ok(None);
+        let Some(team) = self.team_history.get(&team_revision) else {
+            return false;
         };
-
-        let mut inflight = self.inflight.iter().filter(|(_, effect)| {
-            matches!(
-                effect,
-                InflightEffect::RoleRun {
-                    namespace: effect_namespace,
-                    task_id: effect_task_id,
-                    output: super::OutputSemantics::ProducesArtifact,
-                    ..
-                } if *effect_namespace == namespace && effect_task_id == task_id
-            )
-        });
-        if let Some((effect_id, _)) = inflight.next() {
-            if inflight.next().is_some() {
-                return Err("multiple active effects claim one conversation workspace");
+        let Some(role) = team.role(role_instance) else {
+            return false;
+        };
+        match (role.output, task_id) {
+            (super::OutputSemantics::ProducesArtifact, Some(task_id)) => {
+                team.task_assignments.get(task_id) == Some(role_instance)
+                    && self
+                        .plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.tasks.iter().any(|task| &task.id == task_id))
             }
-            return self.active_workspace_conversation(effect_id).map(Some);
+            (super::OutputSemantics::ProposesPlan, None) => {
+                team.planning_assignment == *role_instance && assertion_ids.is_empty()
+            }
+            (super::OutputSemantics::EmitsVerdict, None) => {
+                !assertion_ids.is_empty()
+                    && assertion_ids.iter().all(|assertion| {
+                        team.judgment_assignments
+                            .get(assertion)
+                            .is_some_and(|panel| panel.contains(role_instance))
+                    })
+            }
+            (super::OutputSemantics::EmitsGapVerdict, None) => {
+                team.gap_review_assignment.as_ref() == Some(role_instance)
+                    && assertion_ids.is_empty()
+            }
+            (super::OutputSemantics::ProducesReport, None) => assertion_ids.is_empty(),
+            _ => false,
         }
+    }
+}
 
-        let Some(workspace) = task.workspace_provenance.as_ref() else {
+impl MissionState {
+    pub fn task_workspace_role(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<(&RoleInstanceId, &ConversationState)>, &'static str> {
+        let Some(task) = self.tasks.get(task_id) else {
             return Ok(None);
         };
-        let conversation_id = &workspace.conversation_id;
-        let Some(conversation) = self.conversations.get(conversation_id) else {
-            return Err("prepared workspace has no authoritative conversation");
+        let Some(assignment) = task.role_assignment.as_ref() else {
+            return Ok(None);
         };
-        if conversation.namespace != namespace || conversation.task_id != *task_id {
-            return Err("prepared workspace conversation belongs to another task");
-        }
-        if conversation_id
-            != &super::ConversationId::for_role_instance(
-                &self.mission_id,
-                conversation.namespace,
-                &conversation.task_id,
-                &conversation.role,
-                conversation.assignment_epoch,
-            )
-        {
-            return Err("folded conversation key does not match its identity");
-        }
-        if workspace.base_sha != conversation.workspace_base_sha
-            || workspace.assignment_epoch != conversation.assignment_epoch
-        {
-            return Err("task and conversation workspace bases disagree");
-        }
-        let assignment_agrees = match namespace {
-            super::TaskNamespace::Planning => self
-                .config
-                .planning
-                .tasks
-                .iter()
-                .find(|planned| &planned.id == task_id)
-                .is_some_and(|planned| planned.role == conversation.role),
-            super::TaskNamespace::Execution => self
-                .plan
-                .as_ref()
-                .and_then(|plan| plan.tasks.iter().find(|planned| &planned.id == task_id))
-                .map_or(task.status == TaskStatus::Superseded, |planned| {
-                    planned.kind == super::TaskKind::Work
-                        && planned.role.as_ref() == Some(&conversation.role)
-                }),
+        let Some(conversation) = self.conversations.get(&assignment.role_instance) else {
+            return Err("assigned role instance has no conversation");
         };
-        if !assignment_agrees {
-            return Err("folded conversation role disagrees with the assigned role");
-        }
-        if conversation.lifecycle == ConversationLifecycle::Running
-            || conversation.active_delivery.is_some()
-        {
-            return Err("retained conversation has an active delivery without an active effect");
-        }
-        Ok(Some((conversation_id, conversation)))
+        Ok(Some((&assignment.role_instance, conversation)))
     }
 
-    /// Validate one active role against every folded fact that grants its
-    /// conversation authority. This is intentionally model-owned: filesystem
-    /// observers consume the result and never infer a current generation.
     pub fn active_role_conversation(
         &self,
         effect_id: &super::EffectId,
-    ) -> Result<(&super::ConversationId, &ConversationState), &'static str> {
-        let Some(InflightEffect::RoleRun {
-            conversation_id,
-            namespace,
+    ) -> Result<(&RoleInstanceId, &ConversationState), &'static str> {
+        let Some(InflightEffect::RoleTurn {
+            role_instance,
+            team_revision,
             task_id,
+            assertion_ids,
             attempt_no,
-            role,
-            output,
-            base_sha,
             assignment_epoch,
             message_boundary,
             presented_messages,
@@ -1681,18 +1420,18 @@ impl MissionState {
             ..
         }) = self.inflight.get(effect_id)
         else {
-            return Err("effect is not an active role run");
+            return Err("effect is not an active role turn");
         };
-        let request = self
-            .inflight
-            .get(effect_id)
-            .and_then(InflightEffect::role_request_identity)
-            .expect("matched role effect");
-        let Some(conversation) = self.conversations.get(conversation_id) else {
-            return Err("active effect conversation is absent from folded state");
-        };
-        let Some(task) = self.tasks_in(*namespace).get(task_id) else {
-            return Err("active effect task is absent from folded state");
+        if !self.role_dispatch_contract_matches(
+            role_instance,
+            *team_revision,
+            task_id.as_ref(),
+            assertion_ids,
+        ) {
+            return Err("active role turn no longer matches its team assignment");
+        }
+        let Some(conversation) = self.conversations.get(role_instance) else {
+            return Err("active role instance conversation is absent");
         };
         let expected_presented = conversation
             .queued
@@ -1711,41 +1450,40 @@ impl MissionState {
                     && delivery.message_boundary == *message_boundary
                     && delivery.presented_messages == *presented_messages
             });
-        if !request.has_canonical_coordinates(&self.mission_id, effect_id, *requested_seq)
-            || !self.role_dispatch_contract_matches(*namespace, task_id, role, *output)
-            || task.status != TaskStatus::Running
-            || task.attempts != *attempt_no
-            || task.role_assignment.as_ref()
-                != Some(&TaskRoleAssignment {
-                    base_sha: base_sha.clone(),
-                    assignment_epoch: *assignment_epoch,
-                })
+        let effect_is_canonical = effect_id
+            == &super::EffectId::for_role_turn(
+                &self.mission_id,
+                role_instance,
+                *team_revision,
+                task_id.as_ref(),
+                *attempt_no,
+                *assignment_epoch,
+                self.inflight
+                    .get(effect_id)
+                    .and_then(InflightEffect::role_turn_provenance)
+                    .as_ref()
+                    .map_or("", |request| request.prompt_hash.as_str()),
+            );
+        if !effect_is_canonical
+            || *requested_seq == 0
             || *requested_seq > self.head
             || expected_presented != *presented_messages
-            || conversation.namespace != *namespace
-            || conversation.task_id != *task_id
-            || conversation.role != *role
-            || conversation.assignment_epoch != *assignment_epoch
-            || *assignment_epoch < self.role_lifecycle_generation(*namespace).max(1)
-            || conversation.workspace_base_sha != *base_sha
+            || conversation.role_instance != *role_instance
             || conversation.lifecycle != ConversationLifecycle::Running
             || !delivery_agrees
         {
-            return Err("active effect and folded conversation workspace authority disagree");
+            return Err("active role turn and conversation authority disagree");
         }
-        Ok((conversation_id, conversation))
+        Ok((role_instance, conversation))
     }
 
-    /// Derive the only workspace provenance one exact active writer may
-    /// establish. Preparation folding and later observation share this value.
     pub fn expected_active_workspace_provenance(
         &self,
         effect_id: &super::EffectId,
-    ) -> Result<(TaskAddress, TaskWorkspaceProvenance), &'static str> {
-        let result = self.active_role_conversation(effect_id)?;
-        let Some(InflightEffect::RoleRun {
-            namespace,
-            task_id,
+    ) -> Result<(TaskId, TaskWorkspaceProvenance), &'static str> {
+        self.active_role_conversation(effect_id)?;
+        let Some(InflightEffect::RoleTurn {
+            task_id: Some(task_id),
             output,
             base_sha,
             assignment_epoch,
@@ -1753,16 +1491,15 @@ impl MissionState {
             ..
         }) = self.inflight.get(effect_id)
         else {
-            return Err("effect is not an active role run");
+            return Err("effect is not an assigned work turn");
         };
         if *output != super::OutputSemantics::ProducesArtifact {
             return Err("active effect is not an artifact-producing role");
         }
         Ok((
-            TaskAddress::new(*namespace, task_id.clone()),
+            task_id.clone(),
             TaskWorkspaceProvenance {
                 effect_id: effect_id.clone(),
-                conversation_id: result.0.clone(),
                 base_sha: base_sha.clone(),
                 assignment_epoch: *assignment_epoch,
                 archived_effect_id: workspace_preparation.archived_effect().cloned(),
@@ -1770,16 +1507,15 @@ impl MissionState {
         ))
     }
 
-    /// Resolve a live writer checkout only after the exact active effect has
-    /// durably recorded its successful preparation.
-    pub fn active_workspace_conversation(
+    pub fn active_workspace_task(
         &self,
         effect_id: &super::EffectId,
-    ) -> Result<(&super::ConversationId, &ConversationState), &'static str> {
-        let (address, expected) = self.expected_active_workspace_provenance(effect_id)?;
-        let Some(task) = self.tasks_in(address.namespace).get(&address.task_id) else {
-            return Err("active effect task is absent from folded state");
-        };
+    ) -> Result<(&TaskId, &TaskRuntimeState), &'static str> {
+        let (task_id, expected) = self.expected_active_workspace_provenance(effect_id)?;
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or("active effect task is absent from folded state")?;
         if task.workspace_provenance.as_ref() != Some(&expected)
             || task.pending_workspace_recreation.is_some()
             || expected
@@ -1788,123 +1524,74 @@ impl MissionState {
                 .is_some_and(|archived| {
                     !self
                         .retained_workspace_archives
-                        .get(&expected.conversation_id)
+                        .get(&task_id)
                         .is_some_and(|archives| archives.contains(archived))
                 })
         {
             return Err("active effect has no exact prepared workspace authority");
         }
-        self.active_role_conversation(effect_id)
+        Ok((
+            self.tasks.get_key_value(&task_id).expect("task exists").0,
+            task,
+        ))
     }
 
-    /// Whether this derived state can safely seed a snapshot tail fold without
-    /// authenticating an event prefix. Active writer authority and unsettled
-    /// writer recovery depend on event history, so those states always rebuild
-    /// from the full log.
     pub fn is_safe_snapshot_seed(&self) -> bool {
-        if self.has_unsettled_writer_recovery() {
-            return false;
-        }
-        self.inflight.iter().all(|(effect_id, effect)| {
-            let InflightEffect::RoleRun { output, .. } = effect else {
-                return true;
-            };
-            if self.active_role_conversation(effect_id).is_err() {
-                return false;
-            }
-            *output != super::OutputSemantics::ProducesArtifact
-        })
-    }
-
-    /// Writer recovery controls can carry an archive intent across several
-    /// effects. Until that intent is prepared and settled, the event log is
-    /// the only complete authority, so a derived snapshot must not seed a
-    /// tail fold.
-    fn has_unsettled_writer_recovery(&self) -> bool {
-        self.tasks.iter().any(|(task_id, task)| {
-            let is_writer = self.plan.as_ref().is_some_and(|plan| {
-                plan.tasks
-                    .iter()
-                    .any(|planned| planned.id == *task_id && planned.kind == super::TaskKind::Work)
-            });
-            if !is_writer {
-                return false;
-            }
+        !self.tasks.values().any(|task| {
             task.pending_workspace_recreation.is_some()
-                || (task.status == TaskStatus::Failed
-                    && self.parked_effects.values().any(|parked| {
-                        matches!(
-                            parked,
-                            ParkedEffect::RoleRun {
-                                namespace: super::TaskNamespace::Execution,
-                                task_id: parked_task,
-                            } if parked_task == task_id
-                        )
-                    }))
                 || (task.status == TaskStatus::Pending
                     && task.attempts > 0
                     && task.workspace_provenance.is_some())
+        }) && self.inflight.iter().all(|(effect_id, effect)| {
+            !matches!(
+                effect,
+                InflightEffect::RoleTurn {
+                    output: super::OutputSemantics::ProducesArtifact,
+                    ..
+                }
+            ) || self.active_role_conversation(effect_id).is_ok()
         })
     }
 
     pub fn reference_recipient_policy(
         &self,
-        recipients: &[super::ConversationRecipient],
+        recipients: &[RoleInstanceId],
     ) -> ReferenceRecipientPolicy {
         if recipients.is_empty() {
             return ReferenceRecipientPolicy::Invalid;
         }
-        let resolved = recipients
-            .iter()
-            .map(|recipient| {
-                self.config
-                    .plan_inventory
-                    .roles
-                    .get(&recipient.role)
-                    .copied()
-                    .map(|output| (recipient, output))
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(resolved) = resolved else {
+        let Some(team) = self.team.as_ref() else {
             return ReferenceRecipientPolicy::Invalid;
         };
-        let permitted = resolved
+        let outputs = recipients
+            .iter()
+            .map(|recipient| team.role(recipient).map(|role| (recipient, role.output)))
+            .collect::<Option<Vec<_>>>();
+        let Some(outputs) = outputs else {
+            return ReferenceRecipientPolicy::Invalid;
+        };
+        let permitted = outputs
             .iter()
             .filter(|(_, output)| output.permits_message_references())
             .count();
-        if permitted == resolved.len() {
+        if permitted == outputs.len() {
             ReferenceRecipientPolicy::Permitted
         } else if permitted != 0 {
             ReferenceRecipientPolicy::Mixed
         } else {
-            let (recipient, output) = resolved
-                .first()
-                .expect("nonempty recipients were checked above");
+            let (role_instance, output) = outputs[0];
             ReferenceRecipientPolicy::Disallowed {
-                conversation_id: recipient.conversation_id.clone(),
-                output: *output,
+                role_instance: role_instance.clone(),
+                output,
             }
         }
     }
 
-    /// Fold-authoritative generation floor for role assignments in each
-    /// namespace. Planning replacements advance `planning_generation`; plan
-    /// promotions advance `revision`. Resource recreation is derived
-    /// independently; only a role-assignment replacement changes identity.
-    pub fn role_lifecycle_generation(&self, namespace: super::TaskNamespace) -> u32 {
-        match namespace {
-            super::TaskNamespace::Planning => self.planning_generation,
-            super::TaskNamespace::Execution => self.revision,
-        }
-    }
-
-    /// Whether lead messaging is executable for this exact durable dialogue.
-    /// Conversation identity, rather than mutable task state, is the authority.
-    pub fn conversation_is_messageable(&self, conversation_id: &super::ConversationId) -> bool {
+    pub fn conversation_is_messageable(&self, role_instance: &RoleInstanceId) -> bool {
         !self.phase.is_terminal()
             && self
                 .conversations
-                .get(conversation_id)
+                .get(role_instance)
                 .is_some_and(|conversation| {
                     !matches!(
                         conversation.lifecycle,
@@ -1913,23 +1600,17 @@ impl MissionState {
                 })
     }
 
-    /// Whether this exact live conversation can accept another retained message.
-    /// Every delivery marker consumes capacity because every entry remains part
-    /// of the serialized authoritative state until exact successful settlement.
-    pub fn conversation_accepts_message(&self, conversation_id: &super::ConversationId) -> bool {
-        self.conversation_is_messageable(conversation_id)
-            && self.conversations[conversation_id].queued.len()
+    pub fn conversation_accepts_message(&self, role_instance: &RoleInstanceId) -> bool {
+        self.conversation_is_messageable(role_instance)
+            && self.conversations[role_instance].queued.len()
                 < crate::MAX_QUEUED_MESSAGES_PER_CONVERSATION
     }
 
-    pub fn conversation_legal_actions(
-        &self,
-        conversation_id: &super::ConversationId,
-    ) -> Vec<&'static str> {
-        if !self.conversation_is_messageable(conversation_id) {
+    pub fn conversation_legal_actions(&self, role_instance: &RoleInstanceId) -> Vec<&'static str> {
+        if !self.conversation_is_messageable(role_instance) {
             return Vec::new();
         }
-        let mut actions = match self.conversations[conversation_id].lifecycle {
+        let mut actions = match self.conversations[role_instance].lifecycle {
             ConversationLifecycle::AwaitingLead => Vec::new(),
             ConversationLifecycle::Running => vec!["mission status"],
             ConversationLifecycle::Ready | ConversationLifecycle::ReworkingInvalidHandoff => {
@@ -1937,20 +1618,16 @@ impl MissionState {
             }
             ConversationLifecycle::Completed | ConversationLifecycle::Retired => return Vec::new(),
         };
-        if self.conversation_accepts_message(conversation_id) {
+        if self.conversation_accepts_message(role_instance) {
             actions.push("mission send");
         }
         actions
     }
 
-    /// The authoritative serial artifact head. Later slices may change how
-    /// this value is produced; proof and closure consumers use this boundary.
     pub fn deliverable_head(&self) -> &str {
         &self.current_sha
     }
 
-    /// The cancellation fact, if any, that became durable before settlement
-    /// of this exact effect. Abort dominates stop, which dominates deadline.
     pub fn durable_cancellation(&self, effect_id: &super::EffectId) -> Option<DurableCancellation> {
         if let MissionPhase::Aborted { reason } = &self.phase {
             return Some(DurableCancellation::Aborted {
@@ -1968,9 +1645,6 @@ impl MissionState {
             .map(|deadline_ms| DurableCancellation::DeadlineReached { deadline_ms })
     }
 
-    /// Whether the exact parked effect still belongs to live mission work.
-    /// Controls and replay share this query so a stale operator view cannot
-    /// reopen a task era retired by a later plan promotion.
     pub fn parked_effect_is_continuable(&self, effect_id: &super::EffectId) -> bool {
         !self.phase.is_terminal()
             && self
@@ -1979,35 +1653,23 @@ impl MissionState {
                 .is_some_and(|effect| self.parked_effect_remains_continuable(effect))
     }
 
-    /// Resolve the one parked effect for which workspace recreation is legal.
-    /// The CLI, fold, and operator projections share this query.
-    pub fn parked_workspace_recreation(&self, effect_id: &super::EffectId) -> Option<TaskAddress> {
+    pub fn parked_workspace_recreation(&self, effect_id: &super::EffectId) -> Option<TaskId> {
         if !self.parked_effect_is_continuable(effect_id) {
             return None;
         }
-        let ParkedEffect::RoleRun {
-            namespace: super::TaskNamespace::Execution,
-            task_id,
+        let ParkedEffect::RoleTurn {
+            task_id: Some(task_id),
+            ..
         } = self.parked_effects.get(effect_id)?
         else {
             return None;
         };
-        let address = self
-            .plan
-            .as_ref()?
-            .tasks
-            .iter()
-            .find(|task| &task.id == task_id && task.kind == super::TaskKind::Work)
-            .map(|_| TaskAddress::new(super::TaskNamespace::Execution, task_id.clone()))?;
-        self.task_workspace_conversation(address.namespace, &address.task_id)
-            .ok()
-            .flatten()
-            .map(|_| address)
+        self.tasks
+            .get(task_id)
+            .and_then(|task| task.workspace_provenance.as_ref())
+            .map(|_| task_id.clone())
     }
 
-    /// Whether one exact continuation mode is legal for a parked effect.
-    /// A pending archive is an irreversible durable intent: later retries may
-    /// repeat it, but cannot silently clear or bind it to another effect.
     pub fn parked_continue_is_legal(
         &self,
         effect_id: &super::EffectId,
@@ -2018,9 +1680,9 @@ impl MissionState {
                 self.parked_effect_is_continuable(effect_id)
                     && self
                         .parked_workspace_recreation(effect_id)
-                        .and_then(|address| {
-                            self.tasks_in(address.namespace)
-                                .get(&address.task_id)
+                        .and_then(|task_id| {
+                            self.tasks
+                                .get(&task_id)
                                 .and_then(|task| task.pending_workspace_recreation.as_ref())
                         })
                         .is_none()
@@ -2031,9 +1693,6 @@ impl MissionState {
         }
     }
 
-    /// Validate the complete durable continue event contract. Automatic
-    /// recovery may preserve an assignment, but destructive recreation is
-    /// always an explicit operator choice.
     pub fn continue_is_legal(
         &self,
         effect_id: &super::EffectId,
@@ -2046,69 +1705,26 @@ impl MissionState {
 
     pub(crate) fn parked_effect_remains_continuable(&self, effect: &ParkedEffect) -> bool {
         match effect {
-            ParkedEffect::RoleRun { namespace, task_id } => {
-                let task_failed = self
-                    .tasks_in(*namespace)
-                    .get(task_id)
-                    .is_some_and(|task| task.status == TaskStatus::Failed);
-                let task_is_live = match namespace {
-                    super::TaskNamespace::Planning => self
-                        .config
-                        .planning
+            ParkedEffect::RoleTurn {
+                role_instance,
+                task_id,
+            } => match task_id {
+                Some(task_id) => {
+                    self.team.as_ref().is_some_and(|team| {
+                        team.task_assignments.get(task_id) == Some(role_instance)
+                    }) && self
                         .tasks
-                        .iter()
-                        .any(|task| &task.id == task_id),
-                    super::TaskNamespace::Execution => self
-                        .plan
-                        .as_ref()
-                        .is_some_and(|plan| plan.tasks.iter().any(|task| &task.id == task_id)),
-                };
-                task_failed && task_is_live
-            }
+                        .get(task_id)
+                        .is_some_and(|task| task.status == TaskStatus::Failed)
+                }
+                None => self.conversation_is_messageable(role_instance),
+            },
             ParkedEffect::OracleRun { oracle } => self.oracle_failures.contains_key(oracle),
-            ParkedEffect::TerminalReview => matches!(
-                self.terminal_review.outcome,
-                Some(ReviewOutcome::Failed { .. })
-            ),
         }
     }
 
-    pub fn active_task_namespace(&self) -> super::TaskNamespace {
-        if self.planning_base_revision.is_some() {
-            super::TaskNamespace::Planning
-        } else {
-            super::TaskNamespace::Execution
-        }
-    }
-
-    /// Runtime state for the task era currently allowed to dispatch roles.
     pub fn active_tasks(&self) -> &BTreeMap<TaskId, TaskRuntimeState> {
-        self.tasks_in(self.active_task_namespace())
-    }
-
-    pub fn tasks_in(&self, namespace: super::TaskNamespace) -> &BTreeMap<TaskId, TaskRuntimeState> {
-        match namespace {
-            super::TaskNamespace::Planning => &self.planning.tasks,
-            super::TaskNamespace::Execution => &self.tasks,
-        }
-    }
-
-    pub(crate) fn active_tasks_mut(&mut self) -> &mut BTreeMap<TaskId, TaskRuntimeState> {
-        if self.planning_base_revision.is_some() {
-            &mut self.planning.tasks
-        } else {
-            &mut self.tasks
-        }
-    }
-
-    pub(crate) fn tasks_in_mut(
-        &mut self,
-        namespace: super::TaskNamespace,
-    ) -> &mut BTreeMap<TaskId, TaskRuntimeState> {
-        match namespace {
-            super::TaskNamespace::Planning => &mut self.planning.tasks,
-            super::TaskNamespace::Execution => &mut self.tasks,
-        }
+        &self.tasks
     }
 
     pub(crate) fn oracle_automatic_retry_remaining(&self, oracle: &OracleName) -> bool {
@@ -2123,8 +1739,6 @@ impl MissionState {
                 < self.config.recovery.max_attempts
     }
 
-    /// Assertions the named oracle still owes at the current deliverable.
-    /// This is the shared proof query used by scheduling and request ingress.
     pub(crate) fn owed_assertions_for_oracle(&self, oracle: &OracleName) -> Vec<AssertionId> {
         self.contract
             .iter()
@@ -2143,150 +1757,5 @@ impl MissionState {
         !self.waived_oracles.contains(oracle)
             && (!self.oracle_failures.contains_key(oracle)
                 || self.oracle_automatic_retry_remaining(oracle))
-    }
-}
-
-#[cfg(test)]
-mod slug_tests {
-    use super::*;
-    use crate::{FinishClass, GapSeverity, OutputSemantics, StopBar};
-
-    /// Every `slug()` must equal the enum's serde repr — the single source that
-    /// keeps the CLI, the fold's attention ids, and the wire format from
-    /// drifting (`InternallyConsistent` → `internally_consistent`, not
-    /// `internallyconsistent`).
-    fn assert_slug<T: serde::Serialize>(value: &T, slug: &str) {
-        let serde = serde_json::to_value(value).unwrap();
-        // Unit enums serialize to a bare string; the internally-tagged
-        // `MissionPhase` to an object whose tag field is the variant name.
-        let repr = serde
-            .as_str()
-            .or_else(|| serde.get("phase").and_then(|v| v.as_str()))
-            .expect("a string or a tagged object");
-        assert_eq!(repr, slug, "slug drifted from the serde repr");
-    }
-
-    #[test]
-    fn slugs_match_the_serde_repr() {
-        for namespace in [
-            crate::TaskNamespace::Planning,
-            crate::TaskNamespace::Execution,
-        ] {
-            assert_slug(&namespace, namespace.slug());
-        }
-        for k in [
-            AttentionKind::NodeFailed,
-            AttentionKind::NodeAttention,
-            AttentionKind::OracleFailed,
-            AttentionKind::OracleVerdictFailed,
-            AttentionKind::GateFailed,
-            AttentionKind::GateCheckpoint,
-            AttentionKind::PlanProposal,
-            AttentionKind::TerminalReviewGaps,
-            AttentionKind::TerminalReviewFailed,
-        ] {
-            assert_slug(&k, k.slug());
-        }
-        for g in [
-            GapSeverity::Blocking,
-            GapSeverity::Major,
-            GapSeverity::Minor,
-        ] {
-            assert_slug(&g, g.slug());
-        }
-        for k in [
-            ReviewAcceptanceKind::AcknowledgedGaps,
-            ReviewAcceptanceKind::Waived,
-        ] {
-            assert_slug(&k, k.slug());
-        }
-        for s in [
-            AdvisoryStatus::Pending,
-            AdvisoryStatus::Passed,
-            AdvisoryStatus::Failed,
-        ] {
-            assert_slug(&s, s.slug());
-        }
-        for f in [
-            FinishClass::Verified,
-            FinishClass::InternallyConsistent,
-            FinishClass::Unverified,
-        ] {
-            assert_slug(&f, f.slug());
-        }
-        for b in [StopBar::Verified, StopBar::Reviewed] {
-            assert_slug(&b, b.slug());
-        }
-        for o in [
-            OutputSemantics::ProducesReport,
-            OutputSemantics::ProducesArtifact,
-            OutputSemantics::EmitsVerdict,
-            OutputSemantics::EmitsGapVerdict,
-            OutputSemantics::ProposesPlan,
-        ] {
-            assert_slug(&o, o.slug());
-        }
-        for p in [
-            MissionPhase::Planning,
-            MissionPhase::Running,
-            MissionPhase::AttentionNeeded,
-            MissionPhase::Done {
-                finish: FinishClass::Verified,
-            },
-            MissionPhase::Aborted {
-                reason: String::new(),
-            },
-        ] {
-            assert_slug(&p, p.slug());
-        }
-    }
-
-    #[test]
-    fn only_artifact_outputs_receive_workspace_preparation_authority() {
-        let mission_id = MissionId::from_digest_prefix("assignment-authority");
-        let task_id = TaskId::new("role-task").unwrap();
-        let role = RoleName::new("role").unwrap();
-        for output in [
-            OutputSemantics::ProducesReport,
-            OutputSemantics::EmitsVerdict,
-            OutputSemantics::EmitsGapVerdict,
-            OutputSemantics::ProposesPlan,
-        ] {
-            let assignment = resolve_role_assignment(
-                &mission_id,
-                crate::TaskNamespace::Execution,
-                &task_id,
-                &role,
-                RoleAssignmentContext {
-                    previous: None,
-                    required_base: "base",
-                    lifecycle_generation: 1,
-                    retrying_failure: false,
-                    output,
-                },
-            );
-            assert_eq!(
-                assignment.workspace_preparation,
-                crate::WorkspacePreparation::Preserve,
-                "{output:?}"
-            );
-        }
-        let writer = resolve_role_assignment(
-            &mission_id,
-            crate::TaskNamespace::Execution,
-            &task_id,
-            &role,
-            RoleAssignmentContext {
-                previous: None,
-                required_base: "base",
-                lifecycle_generation: 1,
-                retrying_failure: false,
-                output: OutputSemantics::ProducesArtifact,
-            },
-        );
-        assert_eq!(
-            writer.workspace_preparation,
-            crate::WorkspacePreparation::ResetForAssignment
-        );
     }
 }

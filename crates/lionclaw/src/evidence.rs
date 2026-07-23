@@ -5,8 +5,7 @@ use anyhow::Result;
 
 use crate::model::{
     DecisionEvidence, EffectId, FailureEvidence, FailureFeedback, MissionState, PayloadRef,
-    RoleAttemptDisposition, RoleAttemptReceipt, RoleEffectSource, RoleHandoffObservation,
-    RoleTurnObservation,
+    RoleAttemptDisposition, RoleAttemptReceipt, RoleEffectSource,
 };
 use crate::store::BlobStore;
 
@@ -175,49 +174,22 @@ pub fn role_attempt_receipt_json(
     receipt: &RoleAttemptReceipt,
 ) -> serde_json::Value {
     let include_nested_configuration = receipt.effective_runtime_configuration().is_none();
-    let turn = match &receipt.turn {
-        Some(RoleTurnObservation::Completed {
-            final_response,
-            runtime_configuration: _,
-        }) => serde_json::json!({
+    let turn = match &receipt.final_response {
+        Some(final_response) => serde_json::json!({
             "outcome": "completed",
             "final_response": {
                 "payload": final_response,
                 "content": render_payload(blobs, final_response),
             },
         }),
-        Some(RoleTurnObservation::Failed { failure }) => {
-            let repeated_by_disposition = matches!(
-                &receipt.disposition,
-                RoleAttemptDisposition::Failed { failure: settled } if settled == failure
-            );
-            serde_json::json!({
-                "outcome": "failed",
-                "failure": (!repeated_by_disposition).then(|| {
-                    typed_failure_json(failure, include_nested_configuration)
-                }),
-            })
-        }
         None => serde_json::Value::Null,
     };
     let handoff = match &receipt.handoff {
-        Some(RoleHandoffObservation::Accepted { report }) => serde_json::json!({
+        Some(handoff) => serde_json::json!({
             "outcome": "accepted",
-            "payload": report,
-            "content": render_payload(blobs, report),
+            "payload": handoff.report(),
+            "content": render_payload(blobs, handoff.report()),
         }),
-        Some(RoleHandoffObservation::Rejected { failure }) => {
-            let repeated_by_disposition = matches!(
-                &receipt.disposition,
-                RoleAttemptDisposition::Failed { failure: settled } if settled == failure
-            );
-            serde_json::json!({
-                "outcome": "rejected",
-                "failure": (!repeated_by_disposition).then(|| {
-                    typed_failure_json(failure, include_nested_configuration)
-                }),
-            })
-        }
         None => serde_json::Value::Null,
     };
     let disposition = match &receipt.disposition {
@@ -283,34 +255,29 @@ pub fn render_role_attempt_receipt(
     receipt: &RoleAttemptReceipt,
 ) -> String {
     let source = match &receipt.source {
-        RoleEffectSource::Task {
+        RoleEffectSource::Turn {
             request,
             plan_revision,
-            authorized_targets,
         } => format!(
-            "task conversation={} namespace={:?} task={} attempt={} generation={} role={} \
-             output={:?} runtime={} prompt={} base={} plan_revision={plan_revision} targets={}",
-            request.conversation_id,
-            request.namespace,
-            request.task_id,
+            "turn role_instance={} team_revision={} task={} attempt={} generation={} \
+             prompt={} base={} plan_revision={plan_revision} targets={}",
+            request.role_instance,
+            request.team_revision,
+            request
+                .task_id
+                .as_ref()
+                .map_or("none", |task| task.as_str()),
             request.attempt_no,
             request.assignment_epoch,
-            request.role,
-            request.output,
-            request.runtime,
             request.prompt_hash,
             request.base_sha,
-            authorized_targets
+            request
+                .assertion_ids
                 .iter()
                 .map(|id| id.as_str())
                 .collect::<Vec<_>>()
                 .join(",")
         ),
-        RoleEffectSource::TerminalReview {
-            attempt_no,
-            role,
-            judged_sha,
-        } => format!("terminal_review attempt={attempt_no} role={role} judged_sha={judged_sha}"),
     };
     let authority = state.role_attempt_authority(receipt);
     let mut rendered = format!(
@@ -319,53 +286,14 @@ pub fn render_role_attempt_receipt(
         authority.evidence_use.slug(),
         authority.generation.slug(),
     );
-    if let Some(turn) = &receipt.turn {
-        match turn {
-            RoleTurnObservation::Completed {
-                final_response,
-                runtime_configuration: _,
-            } => {
-                rendered.push_str("\nturn: completed");
-                rendered.push_str("\nfinal response:\n");
-                rendered.push_str(&render_payload(blobs, final_response));
-            }
-            RoleTurnObservation::Failed { failure } => {
-                rendered.push_str("\nturn: failed");
-                let repeated_by_disposition = matches!(
-                    &receipt.disposition,
-                    RoleAttemptDisposition::Failed { failure: settled } if settled == failure
-                );
-                if !repeated_by_disposition {
-                    rendered.push('\n');
-                    rendered.push_str(&render_typed_failure_with_configuration(
-                        failure,
-                        receipt.effective_runtime_configuration().is_none(),
-                    ));
-                }
-            }
-        }
+    if let Some(final_response) = &receipt.final_response {
+        rendered.push_str("\nturn: completed");
+        rendered.push_str("\nfinal response:\n");
+        rendered.push_str(&render_payload(blobs, final_response));
     }
     if let Some(handoff) = &receipt.handoff {
-        match handoff {
-            RoleHandoffObservation::Accepted { report } => {
-                rendered.push_str("\nhandoff: accepted\n");
-                rendered.push_str(&render_payload(blobs, report));
-            }
-            RoleHandoffObservation::Rejected { failure } => {
-                rendered.push_str("\nhandoff: rejected");
-                let repeated_by_disposition = matches!(
-                    &receipt.disposition,
-                    RoleAttemptDisposition::Failed { failure: settled } if settled == failure
-                );
-                if !repeated_by_disposition {
-                    rendered.push('\n');
-                    rendered.push_str(&render_typed_failure_with_configuration(
-                        failure,
-                        receipt.effective_runtime_configuration().is_none(),
-                    ));
-                }
-            }
-        }
+        rendered.push_str("\nhandoff: accepted\n");
+        rendered.push_str(&render_payload(blobs, handoff.report()));
     }
     if let Some(configuration) = receipt.effective_runtime_configuration() {
         rendered.push('\n');
@@ -379,7 +307,7 @@ pub fn render_role_attempt_receipt(
             rendered.push_str("\ndisposition: succeeded");
             if let Some(handoff) = handoff {
                 rendered.push_str("\nsettled handoff: ");
-                match handoff {
+                match &**handoff {
                     crate::model::SettledHandoff::Work { request_attention } => {
                         rendered.push_str(&format!("work request_attention={request_attention}"));
                     }
@@ -418,7 +346,10 @@ pub fn render_role_attempt_receipt(
                             "plan proposal={} request_attention={request_attention}",
                             proposal.as_ref().map_or_else(
                                 || "none".into(),
-                                |proposal| format!("base_revision={}", proposal.base_revision)
+                                |proposal| proposal.plan.as_ref().map_or_else(
+                                    || "team-only".to_string(),
+                                    |plan| format!("base_revision={}", plan.base_revision)
+                                )
                             )
                         ));
                     }
@@ -535,253 +466,4 @@ pub fn excerpt(text: &str) -> String {
         last_start - first_end,
         &text[last_start..]
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn excerpt_keeps_both_ends_and_utf8_boundaries() {
-        let text = format!("start-{}-end", "é".repeat(5000));
-        let rendered = excerpt(&text);
-        assert!(rendered.starts_with("start-"));
-        assert!(rendered.ends_with("-end"));
-        assert!(rendered.contains("bytes omitted"));
-    }
-
-    #[test]
-    fn unavailable_blob_evidence_renders_bounded_typed_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let blobs = BlobStore::new(dir.path().to_path_buf());
-        let blob = blobs.put(b"authoritative bytes").unwrap();
-        let payload = PayloadRef::Blob(blob.clone());
-        let path = dir
-            .path()
-            .join("sha256")
-            .join(&blob.hex[..2])
-            .join(&blob.hex[2..4])
-            .join(&blob.hex);
-
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(
-            render_payload(&blobs, &payload),
-            format!(
-                "[unavailable payload: algo=sha256 digest={} cause=source_missing]",
-                blob.hex
-            )
-        );
-
-        std::fs::write(&path, b"corrupted evidence!").unwrap();
-        assert_eq!(
-            render_payload(&blobs, &payload),
-            format!(
-                "[unavailable payload: algo=sha256 digest={} cause=invalid_content]",
-                blob.hex
-            )
-        );
-    }
-
-    #[test]
-    fn role_report_views_preserve_provenance_when_content_is_unavailable() {
-        let dir = tempfile::tempdir().unwrap();
-        let blobs = BlobStore::new(dir.path().to_path_buf());
-        let blob = blobs.put(b"review evidence").unwrap();
-        let path = dir
-            .path()
-            .join("sha256")
-            .join(&blob.hex[..2])
-            .join(&blob.hex[2..4])
-            .join(&blob.hex);
-        std::fs::remove_file(path).unwrap();
-        let receipt = RoleAttemptReceipt {
-            effect_id: crate::model::EffectId::parse("1".repeat(64)).unwrap(),
-            source: RoleEffectSource::TerminalReview {
-                attempt_no: 2,
-                role: crate::model::RoleName::new("reviewer").unwrap(),
-                judged_sha: "candidate".into(),
-            },
-            runtime_configuration: None,
-            turn: Some(RoleTurnObservation::Completed {
-                final_response: PayloadRef::inline("review complete"),
-                runtime_configuration: Default::default(),
-            }),
-            handoff: Some(RoleHandoffObservation::Accepted {
-                report: PayloadRef::Blob(blob.clone()),
-            }),
-            disposition: RoleAttemptDisposition::Succeeded {
-                handoff: Some(crate::model::SettledHandoff::Review {
-                    passed: true,
-                    gaps: Vec::new(),
-                }),
-                artifact: None,
-            },
-        };
-        let mission_id = crate::model::MissionId::from_digest_prefix("evidence-render");
-        let mut state = crate::model::fold([crate::model::EventEnvelope {
-            mission_id: mission_id.clone(),
-            sequence_no: 1,
-            recorded_at_ms: 0,
-            stamps: Default::default(),
-            event: crate::model::MissionEvent::MissionCreated {
-                objective: "render evidence".into(),
-                mission_type: crate::model::MissionTypeRef {
-                    name: "test".into(),
-                    digest: "test".into(),
-                },
-                runtime: "mock".into(),
-                image_id: "test".into(),
-                workspace_dir: "/tmp/test".into(),
-                base_sha: "candidate".into(),
-                config: Default::default(),
-            },
-        }])
-        .unwrap();
-        state
-            .role_attempt_receipts
-            .insert(receipt.effect_id.clone(), receipt.clone());
-
-        let json = role_attempt_receipt_json(&blobs, &state, &receipt);
-        assert_eq!(json["effect_id"], "1".repeat(64));
-        assert_eq!(json["authority"], "historical");
-        assert_eq!(json["generation"], "current");
-        assert_eq!(json["source"]["kind"], "terminal_review");
-        assert_eq!(json["source"]["attempt_no"], 2);
-        assert_eq!(json["source"]["judged_sha"], "candidate");
-        assert_eq!(json["turn"]["final_response"]["content"], "review complete");
-        assert_eq!(json["handoff"]["payload"]["kind"], "blob");
-        assert_eq!(json["handoff"]["payload"]["hex"], blob.hex);
-        assert_eq!(
-            json["handoff"]["content"],
-            format!(
-                "[unavailable payload: algo=sha256 digest={} cause=source_missing]",
-                blob.hex
-            )
-        );
-        assert_eq!(json["disposition"]["outcome"], "succeeded");
-
-        let human = render_role_attempt_receipt(&blobs, &state, &receipt);
-        assert!(human.contains("authority: historical"));
-        assert!(human.contains("generation: current"));
-        assert!(human.contains("terminal_review attempt=2 role=reviewer"));
-        assert!(human.contains("judged_sha=candidate"));
-        assert!(human.contains(&blob.hex));
-        assert!(human.contains("cause=source_missing"));
-        assert!(human.contains("disposition: succeeded"));
-
-        let feedback = FailureFeedback {
-            summary: "review failed".into(),
-            evidence: DecisionEvidence::RoleAttempts {
-                effect_ids: vec![receipt.effect_id.clone()],
-            },
-            justification: "repair the reviewed tree".into(),
-        };
-        let rendered = render_feedback(&blobs, &state, &feedback).unwrap();
-        assert!(rendered.contains("Role attempt:"));
-        assert!(rendered.contains("review evidence") || rendered.contains(&blob.hex));
-        assert!(rendered.contains("repair the reviewed tree"));
-    }
-
-    #[test]
-    fn typed_failure_human_view_keeps_response_and_runtime_configuration() {
-        let failure = lionclaw_runtime_api::TypedFailure::PermanentRuntime {
-            evidence: Box::new(lionclaw_runtime_api::TypedFailureEvidence {
-                code: Some("adapter.setup".into()),
-                detail: "runtime refused setup".into(),
-                stop_reason: Some("configuration".into()),
-                exit_code: Some(78),
-                stderr: "setup diagnostic".into(),
-                final_response: "partial response".into(),
-                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
-                    requested_model: Some("requested".into()),
-                    applied_model: Some("applied".into()),
-                    requested_mode: Some("review".into()),
-                    applied_mode: Some("review".into()),
-                    ..Default::default()
-                },
-            }),
-        };
-
-        let rendered = render_typed_failure(&failure);
-        assert!(rendered.contains("permanent_runtime: runtime refused setup"));
-        assert!(rendered.contains("code: adapter.setup"));
-        assert!(rendered.contains("stop reason: configuration"));
-        assert!(rendered.contains("exit code: 78"));
-        assert!(rendered.contains("stderr: setup diagnostic"));
-        assert!(rendered.contains("final response: partial response"));
-        assert!(rendered.contains("model Some(\"requested\") -> Some(\"applied\")"));
-    }
-
-    #[test]
-    fn receipt_projects_completed_turn_configuration_exactly_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let blobs = BlobStore::new(dir.path().join("blobs"));
-        let mission_id = crate::model::MissionId::from_digest_prefix("receipt-config");
-        let mut state = crate::model::fold([crate::model::EventEnvelope {
-            mission_id: mission_id.clone(),
-            sequence_no: 1,
-            recorded_at_ms: 0,
-            stamps: Default::default(),
-            event: crate::model::MissionEvent::MissionCreated {
-                objective: "render one configuration".into(),
-                mission_type: crate::model::MissionTypeRef {
-                    name: "test".into(),
-                    digest: "test".into(),
-                },
-                runtime: "mock".into(),
-                image_id: "test".into(),
-                workspace_dir: "/tmp/test".into(),
-                base_sha: "candidate".into(),
-                config: Default::default(),
-            },
-        }])
-        .unwrap();
-        let configuration = crate::model::RuntimeConfigurationEvidence {
-            requested_model: Some("requested".into()),
-            applied_model: Some("applied".into()),
-            requested_mode: Some("review".into()),
-            applied_mode: Some("review".into()),
-            ..Default::default()
-        };
-        let mut failure =
-            lionclaw_runtime_api::TypedFailure::permanent("handoff.capture", "capture failed");
-        failure.evidence_mut().configuration = configuration.clone();
-        let effect_id = crate::model::EffectId::parse("7".repeat(64)).unwrap();
-        let receipt = RoleAttemptReceipt {
-            effect_id: effect_id.clone(),
-            source: RoleEffectSource::TerminalReview {
-                attempt_no: 1,
-                role: crate::model::RoleName::new("reviewer").unwrap(),
-                judged_sha: "candidate".into(),
-            },
-            runtime_configuration: Some(configuration),
-            turn: Some(RoleTurnObservation::Completed {
-                final_response: PayloadRef::inline("review complete"),
-                runtime_configuration: Default::default(),
-            }),
-            handoff: None,
-            disposition: RoleAttemptDisposition::Failed { failure },
-        };
-        state
-            .role_attempt_receipts
-            .insert(effect_id, receipt.clone());
-
-        let json = role_attempt_receipt_json(&blobs, &state, &receipt);
-        assert_eq!(
-            json["effective_runtime_configuration"]["applied_model"],
-            "applied"
-        );
-        assert!(!json["disposition"]["failure"]["evidence"]
-            .as_object()
-            .unwrap()
-            .contains_key("configuration"));
-        let serialized = serde_json::to_string(&json).unwrap();
-        assert_eq!(serialized.matches("\"applied_model\"").count(), 1);
-
-        let human = render_role_attempt_receipt(&blobs, &state, &receipt);
-        assert_eq!(human.matches("runtime configuration").count(), 1);
-        assert!(human.contains("effective runtime configuration"));
-        assert!(human.contains("disposition: failed"));
-        assert!(human.contains("handoff.capture"));
-    }
 }

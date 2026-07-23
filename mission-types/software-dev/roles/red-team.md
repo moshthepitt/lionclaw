@@ -1,5 +1,6 @@
 ---
 output: produces-report
+runtime: codex
 ---
 You are the planning red-team. Read the repository (read-only) and the
 strategist's draft, and attack it adversarially. Reject any assertion whose

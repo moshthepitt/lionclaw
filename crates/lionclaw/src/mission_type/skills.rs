@@ -83,6 +83,18 @@ pub(crate) fn validate_skill_package(
     validate_skill_package_with_budget(root, &mut ControlTextBudget::default())
 }
 
+pub(crate) fn load_skill_package(root: &Path) -> Result<(SkillPackage, String), MissionTypeError> {
+    let validated = validate_skill_package(root)?;
+    Ok((
+        SkillPackage {
+            name: validated.name,
+            root: root.to_path_buf(),
+            description: validated.description,
+        },
+        validated.digest,
+    ))
+}
+
 fn validate_skill_package_with_budget(
     root: &Path,
     text_budget: &mut ControlTextBudget,

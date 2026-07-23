@@ -640,6 +640,7 @@ mod tests {
                     },
                 ],
                 mount_runtime_secrets: false,
+                devices: Default::default(),
                 escape_classes: Default::default(),
                 limits: ExecutionLimits::default(),
             },

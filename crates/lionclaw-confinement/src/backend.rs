@@ -194,6 +194,7 @@ mod tests {
                     mcp_servers: Vec::new(),
                     mounts: Vec::new(),
                     mount_runtime_secrets: true,
+                    devices: Default::default(),
                     escape_classes: Default::default(),
                     limits: ExecutionLimits::default(),
                 },

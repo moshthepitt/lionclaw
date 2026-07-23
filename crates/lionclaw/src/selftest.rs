@@ -1,6 +1,6 @@
 //! `lionclaw mission self-test`: drive the real stack (real store + fold +
 //! loop + real podman confinement + real engine-run oracle) and assert the
-//! four Slice-1 invariants, complete plan revision, terminal-review closure,
+//! four Slice-1 invariants, complete plan revision, gap-review closure,
 //! native read-only skill mounting, and prepared inputs (eight checks). Hermetic and
 //! model-auth-free — the *oracle*
 //! decides every outcome, so no agent turn (and no model credentials) is
@@ -26,14 +26,14 @@ use crate::engine::{Engine, EngineServices, MissionDisposition, ProposeError};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
     Assertion, AssertionId, DecisionAction, EffectId, FinishClass, Gap, GapSeverity, Handoff,
-    MissionEvent, MissionId, MissionPhase, OracleName, PayloadRef, Plan, PlanProposal,
-    ProposalError, Requirement, RequirementDisposition, RequirementId, RequirementKind,
-    ReviewAcceptanceKind, RoleHandoffObservation, RoleName, Task, TaskId, TaskKind, TaskStatus,
+    MissionEvent, MissionId, MissionPhase, MissionProposal, OracleName, PayloadRef, Plan,
+    PlanProposal, ProposalError, Requirement, RequirementDisposition, RequirementId,
+    RequirementKind, ReviewAcceptanceKind, RoleInstanceId, Task, TaskId, TaskStatus, TeamRevision,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, OracleOutcome, OracleRunRequest,
-    OracleRunner, RoleRunOutcome, RoleRunRequest, RoleRunner, SystemClock,
+    OracleRunner, RoleRunner, RoleTurnOutcome, RoleTurnRequest, SystemClock,
 };
 use crate::resources::MissionDirs;
 use crate::runner::MissionProgramExecutor;
@@ -53,18 +53,12 @@ struct NoopRoleRunner;
 
 #[async_trait]
 impl RoleRunner for NoopRoleRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+    async fn run(&self, request: RoleTurnRequest) -> Result<RoleTurnOutcome, TypedFailure> {
         prepare_scripted_writer(&request)
             .await
             .map_err(|error| TypedFailure::permanent("selftest.runner", format!("{error:#}")))?;
         let report = PayloadRef::inline("self-test noop worker");
-        confirm_scripted_turn(&request, "self-test noop worker").await?;
-        request
-            .confirm_handoff_observed(RoleHandoffObservation::Accepted {
-                report: report.clone(),
-            })
-            .await?;
-        Ok(RoleRunOutcome {
+        Ok(RoleTurnOutcome {
             handoff: Some(Handoff::Work {
                 done: true,
                 report,
@@ -77,7 +71,7 @@ impl RoleRunner for NoopRoleRunner {
     }
 }
 
-/// An already-satisfied worker plus a terminal reviewer that returns one
+/// An already-satisfied worker plus a gap reviewer that returns one
 /// blocking gap (echoing the prompt's nonce, as a real agent must). Drives
 /// check (6) without a model or a container.
 struct ReviewParkRoleRunner;
@@ -99,16 +93,10 @@ impl EffectCleaner for ScriptedEffectCleaner {
 
 #[async_trait]
 impl RoleRunner for ReviewParkRoleRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
-        if request.task_id.as_str() == crate::engine::TERMINAL_REVIEW_TASK_TAG {
+    async fn run(&self, request: RoleTurnRequest) -> Result<RoleTurnOutcome, TypedFailure> {
+        if request.role.output == crate::model::OutputSemantics::EmitsGapVerdict {
             let report = PayloadRef::inline("self-test scripted review");
-            confirm_scripted_turn(&request, "self-test scripted review").await?;
-            request
-                .confirm_handoff_observed(RoleHandoffObservation::Accepted {
-                    report: report.clone(),
-                })
-                .await?;
-            Ok(RoleRunOutcome {
+            Ok(RoleTurnOutcome {
                 handoff: Some(Handoff::Review {
                     done: true,
                     report,
@@ -122,7 +110,7 @@ impl RoleRunner for ReviewParkRoleRunner {
                         evidence: "self-test scripted verdict".to_string(),
                     }],
                     nonce: crate::prompt::handoff_nonce(&request.prompt)
-                        .expect("terminal-review prompt has a nonce")
+                        .expect("gap-review prompt has a nonce")
                         .to_string(),
                 }),
                 artifact: None,
@@ -134,13 +122,7 @@ impl RoleRunner for ReviewParkRoleRunner {
                 TypedFailure::permanent("selftest.runner", format!("{error:#}"))
             })?;
             let report = PayloadRef::inline("self-test worker");
-            confirm_scripted_turn(&request, "self-test worker").await?;
-            request
-                .confirm_handoff_observed(RoleHandoffObservation::Accepted {
-                    report: report.clone(),
-                })
-                .await?;
-            Ok(RoleRunOutcome {
+            Ok(RoleTurnOutcome {
                 handoff: Some(Handoff::Work {
                     done: true,
                     report,
@@ -203,7 +185,7 @@ pub async fn run(json: bool) -> Result<ExitCode> {
     let podman = podman_readiness().await;
     let mut checks = Vec::new();
 
-    // (3) Moat, (5) re-planning, and (6) terminal review are pure — they
+    // (3) Moat, (5) re-planning, and (6) gap review are pure — they
     // always run, even without podman.
     checks.push(Check {
         name: "moat-refuses-over-privileged-judge",
@@ -214,8 +196,8 @@ pub async fn run(json: bool) -> Result<ExitCode> {
         status: to_status(check_replanning().await),
     });
     checks.push(Check {
-        name: "terminal-review-gates-closure",
-        status: to_status(check_terminal_review().await),
+        name: "gap-review-gates-closure",
+        status: to_status(check_gap_review().await),
     });
 
     // (1),(2),(4),(7) need real confinement.
@@ -332,7 +314,6 @@ const ADD_CARGO: &str = "[package]\nname = \"selftest-add\"\nversion = \"0.1.0\"
 /// to prove a real writable worker's fix lands and is judged.
 const BROKEN_ADD_LIB: &str = "\
 pub fn add(a: i64, b: i64) -> i64 { a - b }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +344,8 @@ fn manifest_toml(name: &str) -> String {
     format!(
         "[mission-type]\nname = \"{name}\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n\
          environment = {{ CARGO_HOME = \"/scratch/cargo\", CARGO_TARGET_DIR = \"/scratch/target\" }}\n\
+         \n[team]\nplanning-assignment = \"strategist\"\nrequires-gap-review = false\n\
+         \n[ceilings]\nwrites = true\nnetwork = true\ninputs = [\"fixture\"]\n\
          \n[execution]\ndefault-timeout-secs = 1800\nmax-task-time-secs = 1800\n\
          extension-step-secs = 300\nauto-continue-candidate = true\nauto-continue-proof = true\n"
     )
@@ -373,6 +356,20 @@ output: produces-artifact
 runtime: codex
 ---
 Self-test worker.
+";
+const STRATEGIST_ROLE: &str = "\
+---
+output: proposes-plan
+runtime: codex
+---
+Self-test strategist.
+";
+const REVIEWER_ROLE: &str = "\
+---
+output: emits-verdict
+runtime: codex
+---
+Self-test reviewer.
 ";
 const CARGO_TEST_ORACLE: &str = "#!/bin/sh\nset -e\ncd /workspace\nexec cargo test --locked\n";
 const PREPARED_CARGO_TEST_ORACLE: &str =
@@ -387,6 +384,7 @@ const PREPARE_FIXTURE_INPUT: &str =
 const SECRETS_JUDGE_REVIEWER: &str = "\
 ---
 output: emits-verdict
+runtime: codex
 secrets: true
 ---
 A verdict role illegally requesting secrets — the loader must refuse it.
@@ -399,6 +397,8 @@ fn materialize_sw_mission_type(root: &Path) -> Result<()> {
     std::fs::write(root.join("mission.toml"), manifest_toml("selftest"))?;
     std::fs::write(root.join("playbook.md"), "# Self-test\n")?;
     std::fs::write(root.join("roles/implementer.md"), IMPLEMENTER_ROLE)?;
+    std::fs::write(root.join("roles/strategist.md"), STRATEGIST_ROLE)?;
+    std::fs::write(root.join("roles/reviewer.md"), REVIEWER_ROLE)?;
     let oracle = root.join("oracles/cargo-test");
     std::fs::write(&oracle, CARGO_TEST_ORACLE)?;
     workspace::make_executable(&oracle)?;
@@ -429,6 +429,7 @@ fn materialize_secrets_judge_mission_type(root: &Path) -> Result<()> {
     std::fs::write(root.join("mission.toml"), manifest_toml("secrets-judge"))?;
     std::fs::write(root.join("playbook.md"), "# Secrets judge\n")?;
     std::fs::write(root.join("roles/reviewer.md"), SECRETS_JUDGE_REVIEWER)?;
+    std::fs::write(root.join("roles/strategist.md"), STRATEGIST_ROLE)?;
     Ok(())
 }
 
@@ -500,22 +501,43 @@ fn oracle_plan() -> Plan {
         }],
         tasks: vec![Task {
             id: TaskId::new("build").expect("task id"),
-            kind: TaskKind::Work,
             body: "produce the change".to_string(),
             targets: vec![AssertionId::new("TESTS-PASS").expect("assertion id")],
-            role: Some(RoleName::new("implementer").expect("role name")),
             depends_on: Vec::new(),
         }],
     }
 }
 
-fn proposal(base_revision: u32, plan: Plan) -> PlanProposal {
-    PlanProposal {
-        base_revision,
-        requirement_changes: vec![],
-        assertion_supersessions: vec![],
-        plan,
-    }
+async fn proposal(
+    engine: &Engine,
+    mission_id: &MissionId,
+    base_revision: u32,
+    plan: Plan,
+) -> Result<MissionProposal> {
+    let state = engine.load_state(mission_id).await?;
+    let mut team: TeamRevision = state.team.context("mission has no active team")?.clone();
+    team.revision = team.revision.saturating_add(1);
+    let implementer = RoleInstanceId::new("implementer")?;
+    let reviewer = RoleInstanceId::new("reviewer")?;
+    team.task_assignments = plan
+        .tasks
+        .iter()
+        .map(|task| (task.id.clone(), implementer.clone()))
+        .collect();
+    team.judgment_assignments = plan
+        .assertions
+        .iter()
+        .map(|assertion| (assertion.id.clone(), vec![reviewer.clone()]))
+        .collect();
+    Ok(MissionProposal {
+        plan: Some(PlanProposal {
+            base_revision,
+            requirement_changes: vec![],
+            assertion_supersessions: vec![],
+            plan,
+        }),
+        team: Some(team),
+    })
 }
 
 async fn approve_plan(engine: &Engine, mission_id: &MissionId) -> Result<()> {
@@ -541,7 +563,7 @@ struct ScriptedRoleRunner {
 
 #[async_trait]
 impl RoleRunner for ScriptedRoleRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+    async fn run(&self, request: RoleTurnRequest) -> Result<RoleTurnOutcome, TypedFailure> {
         self.run_inner(request)
             .await
             .map_err(|e| TypedFailure::permanent("selftest.runner", format!("{e:#}")))
@@ -549,7 +571,7 @@ impl RoleRunner for ScriptedRoleRunner {
 }
 
 impl ScriptedRoleRunner {
-    async fn run_inner(&self, request: RoleRunRequest) -> Result<RoleRunOutcome> {
+    async fn run_inner(&self, request: RoleTurnRequest) -> Result<RoleTurnOutcome> {
         let dest = prepare_scripted_writer(&request).await?;
         let capture = request
             .artifact_capture
@@ -573,14 +595,8 @@ impl ScriptedRoleRunner {
             );
         }
         let report = PayloadRef::inline("self-test scripted fix");
-        confirm_scripted_turn(&request, "self-test scripted fix").await?;
-        request
-            .confirm_handoff_observed(RoleHandoffObservation::Accepted {
-                report: report.clone(),
-            })
-            .await?;
         let artifact = capture.capture().await?;
-        Ok(RoleRunOutcome {
+        Ok(RoleTurnOutcome {
             handoff: Some(Handoff::Work {
                 done: true,
                 report,
@@ -593,33 +609,15 @@ impl ScriptedRoleRunner {
     }
 }
 
-/// Prepare the exact checkout authority required by a successful scripted
-/// writer. Self-test runners bypass the production adapter, so they must emit
-/// the same durable preparation observation explicitly.
-async fn prepare_scripted_writer(request: &RoleRunRequest) -> Result<std::path::PathBuf> {
+/// Prepare the exact checkout authority required by a successful scripted writer.
+async fn prepare_scripted_writer(request: &RoleTurnRequest) -> Result<std::path::PathBuf> {
     let capture = request
         .artifact_capture
         .as_ref()
         .context("scripted writer received no artifact capture authority")?;
     let checkout = capture.checkout_dir().to_path_buf();
     workspace::create_checkout(&request.workspace_dir, &checkout, &request.base_sha).await?;
-    request
-        .confirm_workspace_prepared()
-        .await
-        .map_err(|failure| anyhow::anyhow!(failure.detail().to_string()))?;
     Ok(checkout)
-}
-
-async fn confirm_scripted_turn(
-    request: &RoleRunRequest,
-    final_response: &str,
-) -> Result<(), TypedFailure> {
-    request
-        .confirm_turn_observed(crate::model::RoleTurnObservation::Completed {
-            final_response: PayloadRef::inline(final_response),
-            runtime_configuration: Default::default(),
-        })
-        .await
 }
 
 /// Run a shell command in a real container under a compiled role plan. Shared
@@ -683,7 +681,6 @@ async fn build_engine(
     Ok(Engine::new(
         store,
         mission_type,
-        "codex".to_string(),
         image,
         EngineServices::new(
             role_runner,
@@ -724,7 +721,7 @@ async fn check_happy_writer_and_resume() -> Result<()> {
             )
             .await?;
         engine
-            .propose_plan(&id, proposal(0, oracle_plan()))
+            .propose_plan(&id, proposal(&engine, &id, 0, oracle_plan()).await?)
             .await
             .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
         approve_plan(&engine, &id).await?;
@@ -779,7 +776,7 @@ async fn check_prepared_input() -> Result<()> {
         )
         .await?;
     engine
-        .propose_plan(&id, proposal(0, oracle_plan()))
+        .propose_plan(&id, proposal(&engine, &id, 0, oracle_plan()).await?)
         .await
         .map_err(|error| anyhow::anyhow!("plan proposal rejected: {error}"))?;
     approve_plan(&engine, &id).await?;
@@ -873,7 +870,7 @@ async fn check_oracle_honesty() -> Result<()> {
         )
         .await?;
     engine
-        .propose_plan(&id, proposal(0, oracle_plan()))
+        .propose_plan(&id, proposal(&engine, &id, 0, oracle_plan()).await?)
         .await
         .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
     approve_plan(&engine, &id).await?;
@@ -934,7 +931,10 @@ async fn check_replanning() -> Result<()> {
         )
         .await?;
     engine
-        .propose_plan(&mission_id, proposal(0, oracle_plan()))
+        .propose_plan(
+            &mission_id,
+            proposal(&engine, &mission_id, 0, oracle_plan()).await?,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
     approve_plan(&engine, &mission_id).await?;
@@ -943,14 +943,12 @@ async fn check_replanning() -> Result<()> {
     let mut next = oracle_plan();
     next.tasks = vec![Task {
         id: TaskId::new("build2").expect("task id"),
-        kind: TaskKind::Work,
         body: "produce the change again".to_string(),
         targets: vec![AssertionId::new("TESTS-PASS").expect("assertion id")],
-        role: Some(RoleName::new("implementer").expect("role name")),
         depends_on: Vec::new(),
     }];
     engine
-        .propose_plan(&mission_id, proposal(1, next))
+        .propose_plan(&mission_id, proposal(&engine, &mission_id, 1, next).await?)
         .await
         .map_err(|e| anyhow::anyhow!("revision rejected: {e}"))?;
     approve_plan(&engine, &mission_id).await?;
@@ -974,47 +972,29 @@ async fn check_replanning() -> Result<()> {
     // existing assertion to a different oracle.
     let mut weaken = state.plan.clone().expect("accepted plan");
     weaken.assertions[0].oracle = Some(OracleName::new("cargo-clippy").expect("oracle name"));
-    match engine.propose_plan(&mission_id, proposal(2, weaken)).await {
+    let weakening = proposal(&engine, &mission_id, 2, weaken).await?;
+    match engine.propose_plan(&mission_id, weakening).await {
         Err(ProposeError::Rejected(ProposalError::AssertionSupersessionsMismatch { .. })) => Ok(()),
         Ok(()) => anyhow::bail!("contract-weakening revision was accepted"),
         Err(other) => anyhow::bail!("weakening refused for the wrong reason: {other}"),
     }
 }
 
-/// (6) Terminal review gates closure: a mission type declaring a closing
+/// (6) Gap review gates closure: a mission type declaring a closing
 /// review does not close on a blocking verdict — it parks for a human, and
 /// only an explicit `accept` (acknowledge) lets it finish, with the
 /// acknowledgment on record. Also: the loader refuses `stop = "reviewed"`
 /// without the declaration (that bar is *defined* by the review). Pure — no
 /// agent turn, no oracle run — so it always runs.
-async fn check_terminal_review() -> Result<()> {
-    // Loader gate: an agent-graded bar without an independent closing review
-    // must refuse to load.
-    let bar_dir = tempfile::tempdir().context("tempdir")?;
-    materialize_sw_mission_type(bar_dir.path())?;
-    std::fs::write(
-        bar_dir.path().join("mission.toml"),
-        format!("[mission-type]\nname = \"reviewed-bare\"\nstop = \"reviewed\"\nimage = \"{RUNTIME_IMAGE}\"\n"),
-    )?;
-    match load_mission_type(bar_dir.path(), &AuthorityCeiling::default()) {
-        Ok(_) => anyhow::bail!("stop=reviewed loaded without [terminal-review]"),
-        Err(MissionTypeError::Manifest(detail))
-            if detail.contains("requires [terminal-review]") => {}
-        Err(other) => anyhow::bail!("refused, but not for the missing review: {other}"),
-    }
-
+async fn check_gap_review() -> Result<()> {
     // Closure gate: blocking verdict → park → acknowledge → done.
     let type_dir = tempfile::tempdir().context("tempdir")?;
     materialize_sw_mission_type(type_dir.path())?;
-    std::fs::write(
-        type_dir.path().join("mission.toml"),
-        format!(
-            "[mission-type]\nname = \"selftest\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n\
-             \n[execution]\ndefault-timeout-secs = 1800\nmax-task-time-secs = 1800\n\
-             extension-step-secs = 300\nauto-continue-candidate = true\nauto-continue-proof = true\n\
-             \n[terminal-review]\nrole = \"gap-reviewer\"\n"
-        ),
-    )?;
+    let manifest = manifest_toml("selftest").replace(
+        "requires-gap-review = false",
+        "gap-review-assignment = \"gap-reviewer\"\nrequires-gap-review = true",
+    );
+    std::fs::write(type_dir.path().join("mission.toml"), manifest)?;
     std::fs::write(
         type_dir.path().join("roles/gap-reviewer.md"),
         "---\noutput: emits-gap-verdict\nruntime: codex\n---\nSelf-test gap reviewer.\n",
@@ -1027,7 +1007,6 @@ async fn check_terminal_review() -> Result<()> {
     let engine = Engine::new(
         MissionStore::open(repo.path()).await?,
         mission_type,
-        "codex".to_string(),
         RUNTIME_IMAGE.to_string(),
         EngineServices::new(
             Arc::new(ReviewParkRoleRunner),
@@ -1039,12 +1018,15 @@ async fn check_terminal_review() -> Result<()> {
     let mission_id = engine
         .create_mission(
             repo.path().to_str().context("utf8 repo path")?,
-            "terminal-review self-test",
+            "gap-review self-test",
             &base,
         )
         .await?;
     engine
-        .propose_plan(&mission_id, proposal(0, oracle_plan()))
+        .propose_plan(
+            &mission_id,
+            proposal(&engine, &mission_id, 0, oracle_plan()).await?,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
     approve_plan(&engine, &mission_id).await?;
@@ -1059,15 +1041,15 @@ async fn check_terminal_review() -> Result<()> {
     }
     if !parked
         .open_attention
-        .contains_key("terminal_review_gaps:mission")
+        .contains_key("gap_review_gaps:mission")
     {
-        anyhow::bail!("park is not the terminal-review gaps item");
+        anyhow::bail!("park is not the gap-review gaps item");
     }
 
     engine
         .decide(
             &mission_id,
-            "terminal_review_gaps:mission",
+            "gap_review_gaps:mission",
             DecisionAction::Accept,
             "self-test acknowledges the gap",
         )
@@ -1085,7 +1067,7 @@ async fn check_terminal_review() -> Result<()> {
             done.phase
         );
     }
-    match &done.terminal_review.accepted {
+    match &done.gap_review.accepted {
         Some(a) if a.kind == ReviewAcceptanceKind::AcknowledgedGaps && a.judged_sha == base => {
             Ok(())
         }
@@ -1155,18 +1137,10 @@ async fn check_runtime_skill_mount() -> Result<()> {
     let mut profile = RuntimeProfiles::built_in()?.get("codex")?;
     profile.confinement.oci_mut().image = Some(RUNTIME_IMAGE.to_string());
     let mission = MissionId::for_creation("/workspace", "runtime-skill-mount", 1);
-    let conversation = crate::model::ConversationId::for_role_instance(
-        &mission,
-        crate::model::TaskNamespace::Execution,
-        &TaskId::new("runtime-skill-mount")?,
-        &RoleName::new("validator")?,
-        1,
-    );
+    let role_instance = RoleInstanceId::new("validator")?;
     let mission_dirs = MissionDirs::new(state.path(), &mission);
-    let role_state = mission_dirs
-        .conversation(&conversation)
-        .role_state()
-        .clone();
+    let role_dirs = mission_dirs.role(&role_instance);
+    let role_state = role_dirs.role_state();
     role_state.prepare()?;
     let runtime_profile = role_state.runtime_profile(&profile.native_state_key(None))?;
     runtime_profile.prepare()?;
@@ -1231,28 +1205,4 @@ async fn check_runtime_skill_mount() -> Result<()> {
     std::fs::remove_dir_all(runtime_profile.native_home().join(".agents"))
         .context("native skill mountpoints were not removable after the container exited")?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn embedded_cargo_mission_declares_writable_build_resources() {
-        let root = tempfile::tempdir().unwrap();
-        materialize_sw_mission_type(root.path()).unwrap();
-
-        let mission_type = load_mission_type(root.path(), &AuthorityCeiling::default()).unwrap();
-
-        assert_eq!(mission_type.environment["CARGO_HOME"], "/scratch/cargo");
-        assert_eq!(
-            mission_type.environment["CARGO_TARGET_DIR"],
-            "/scratch/target"
-        );
-    }
-
-    #[tokio::test]
-    async fn scripted_writer_preparation_reaches_terminal_review_closure() {
-        check_terminal_review().await.unwrap();
-    }
 }

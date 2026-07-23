@@ -130,12 +130,19 @@ mod tests {
         std::fs::create_dir_all(source.join("roles")).unwrap();
         std::fs::write(
             source.join("mission.toml"),
-            "[mission-type]\nname = \"install-test\"\nstop = \"verified\"\nimage = \"img\"\n",
+            "[mission-type]\nname = \"install-test\"\nstop = \"verified\"\nimage = \"img\"\n\
+             \n[team]\nplanning-assignment = \"planner\"\nrequires-gap-review = false\n\
+             \n[ceilings]\nnetwork = true\ninstall = true\nwrites = true\n",
         )
         .unwrap();
         std::fs::write(
             source.join("roles/worker.md"),
-            "---\noutput: produces-artifact\n---\nDo it.\n",
+            "---\noutput: produces-artifact\nruntime: codex\n---\nDo it.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("roles/planner.md"),
+            "---\noutput: proposes-plan\nruntime: codex\n---\nPlan it.\n",
         )
         .unwrap();
         std::fs::write(source.join("playbook.md"), "# Install test\n").unwrap();

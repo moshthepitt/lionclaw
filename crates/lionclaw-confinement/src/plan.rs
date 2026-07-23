@@ -286,6 +286,7 @@ pub struct EffectiveExecutionPlan {
     pub mcp_servers: Vec<lionclaw_runtime_api::RuntimeMcpServerSpec>,
     pub mounts: Vec<MountSpec>,
     pub mount_runtime_secrets: bool,
+    pub devices: BTreeSet<String>,
     pub escape_classes: BTreeSet<EscapeClass>,
     pub limits: ExecutionLimits,
 }
@@ -305,6 +306,7 @@ impl fmt::Debug for EffectiveExecutionPlan {
             .field("mcp_servers", &self.mcp_servers)
             .field("mounts", &self.mounts)
             .field("mount_runtime_secrets", &self.mount_runtime_secrets)
+            .field("devices", &self.devices)
             .field("escape_classes", &self.escape_classes)
             .field("limits", &self.limits)
             .finish()
@@ -469,6 +471,7 @@ mod tests {
                 mcp_servers: Vec::new(),
                 mounts: Vec::new(),
                 mount_runtime_secrets: false,
+                devices: Default::default(),
                 escape_classes: Default::default(),
                 limits: ExecutionLimits::default(),
             }

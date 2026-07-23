@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::model::{
     EventEnvelope, MessageReference, MissionEvent, MissionState, OracleRunSuccess, ParkedEffect,
-    PayloadRef, ReviewOutcome, TypedFailure,
+    PayloadRef, TypedFailure,
 };
 use crate::store::BlobStore;
 
@@ -368,9 +368,8 @@ fn capture_reference_authority(
         }
     }
     let completed_effect = match &envelope.event {
-        MissionEvent::RoleRunCompleted { effect_id, .. }
-        | MissionEvent::OracleRunCompleted { effect_id, .. }
-        | MissionEvent::TerminalReviewCompleted { effect_id, .. } => Some(effect_id),
+        MissionEvent::RoleTurnCompleted { effect_id, .. }
+        | MissionEvent::OracleRunCompleted { effect_id, .. } => Some(effect_id),
         _ => None,
     };
     if let Some(effect_id) = completed_effect.filter(|id| requested_parks.contains(*id)) {
@@ -385,17 +384,11 @@ fn parked_failure<'a>(
     effect_id: &crate::model::EffectId,
 ) -> Option<&'a TypedFailure> {
     match state.parked_effects.get(effect_id)? {
-        ParkedEffect::RoleRun { namespace, task_id } => {
-            state.task_last_failure(*namespace, task_id)
-        }
+        ParkedEffect::RoleTurn { .. } => state
+            .role_attempt_receipts
+            .get(effect_id)
+            .and_then(crate::model::RoleAttemptReceipt::failure),
         ParkedEffect::OracleRun { oracle } => state.oracle_failures.get(oracle),
-        ParkedEffect::TerminalReview => match state.terminal_review.outcome.as_ref()? {
-            ReviewOutcome::Failed { effect_id } => state
-                .role_attempt_receipts
-                .get(effect_id)
-                .and_then(crate::model::RoleAttemptReceipt::failure),
-            ReviewOutcome::Verdict { .. } => None,
-        },
     }
 }
 
@@ -470,7 +463,6 @@ mod tests {
                         name: "test".into(),
                         digest: "digest".into(),
                     },
-                    runtime: "codex".into(),
                     image_id: "image".into(),
                     workspace_dir: "/workspace".into(),
                     base_sha: "base".into(),

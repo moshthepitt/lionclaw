@@ -1,13 +1,12 @@
 //! Plan vocabulary: the contract of assertions and the task DAG.
 //!
 //! Shapes ported from Zenith (Apache-2.0, Intelligent Internet) `models.py`
-//! (`Task`, `TaskType`, `TaskList`), adapted: one [`Plan`] contains the contract
-//! and task list, and tasks reference mission-type
-//! *roles* rather than skills.
+//! (`Task`, `TaskType`, `TaskList`), adapted: one [`Plan`] contains only the
+//! contract and work graph; role contracts and assignments live in the team.
 
 use serde::{Deserialize, Serialize};
 
-use super::ids::{AssertionId, OracleName, RequirementId, RoleName, TaskId};
+use super::ids::{AssertionId, OracleName, RequirementId, TaskId};
 use crate::prelude::*;
 
 /// What part of the objective a requirement captures. This is descriptive
@@ -108,16 +107,6 @@ impl OutputSemantics {
             Self::ProposesPlan => "proposes-plan",
         }
     }
-
-    /// The execution task kind this output may serve. Planning and terminal
-    /// review outputs never appear in an execution plan.
-    pub const fn execution_task_kind(self) -> Option<TaskKind> {
-        match self {
-            Self::ProducesArtifact => Some(TaskKind::Work),
-            Self::EmitsVerdict => Some(TaskKind::Validate),
-            Self::ProducesReport | Self::EmitsGapVerdict | Self::ProposesPlan => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -154,16 +143,6 @@ mod output_semantics_tests {
     }
 }
 
-/// Resolved mission-type names that a plan may bind. Persisted with mission
-/// policy so live ingress and replay enforce the same closed world without
-/// reopening bundle files.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanInventory {
-    pub roles: BTreeMap<RoleName, OutputSemantics>,
-    pub oracles: BTreeSet<OracleName>,
-}
-
 /// One falsifiable claim in the mission contract. `oracle` binds it to a
 /// worker-independent engine-run check; without one it can only ever be
 /// covered by advisory verdicts.
@@ -176,41 +155,16 @@ pub struct Assertion {
     pub oracle: Option<OracleName>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskKind {
-    Work,
-    Validate,
-    Gate,
-}
-
-impl TaskKind {
-    pub const fn slug(self) -> &'static str {
-        match self {
-            Self::Work => "work",
-            Self::Validate => "validate",
-            Self::Gate => "gate",
-        }
-    }
-}
-
-/// A DAG node. Dependencies are inline adjacency (`depends_on`); list order
-/// is a topological tie-break hint.
+/// One artifact-producing work assignment. Judgment and gates derive from
+/// assertions, receipts, and the active team rather than authored task nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Task {
     pub id: TaskId,
-    pub kind: TaskKind,
-    /// Mission-specific instruction (must be empty for gates).
     #[serde(default)]
     pub body: String,
-    /// Contract assertion ids this task addresses.
     #[serde(default)]
     pub targets: Vec<AssertionId>,
-    /// Mission-type role dispatched for this task (required for work/validate,
-    /// forbidden for gates).
-    #[serde(default)]
-    pub role: Option<RoleName>,
     #[serde(default)]
     pub depends_on: Vec<TaskId>,
 }
@@ -259,32 +213,4 @@ pub struct AssertionSupersession {
     pub assertion_id: AssertionId,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replacement_ids: Vec<AssertionId>,
-}
-
-/// A node in the contract-free planning DAG. Unlike a `Task` it has no `kind`
-/// and no `targets`: planning produces a *proposal*, not contract coverage. Its
-/// role is always a `ProducesReport` or the single `ProposesPlan` author.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanningTask {
-    pub id: TaskId,
-    pub role: RoleName,
-    /// Resolved from the pinned mission type when the mission is created.
-    /// Persisted so the pure fold can enforce the exact role contract without
-    /// loading mission-type files during replay.
-    pub output: OutputSemantics,
-    #[serde(default)]
-    pub body: String,
-    #[serde(default)]
-    pub depends_on: Vec<TaskId>,
-}
-
-/// The planning DAG a mission type ships: how an objective becomes a proposed
-/// contract (research → draft → adversary → author). Empty means "no in-engine
-/// planning" — the mission idles awaiting a manually proposed plan.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanningDag {
-    #[serde(default)]
-    pub tasks: Vec<PlanningTask>,
 }

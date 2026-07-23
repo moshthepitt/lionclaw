@@ -11,5 +11,5 @@ auto-continue-candidate = true
 auto-continue-proof = true
 
 # The reviewed bar is defined by an independent closing review.
-[terminal-review]
+[gap-review]
 role = "gap-reviewer"

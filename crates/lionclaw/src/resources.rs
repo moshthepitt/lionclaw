@@ -16,7 +16,7 @@ use lionclaw_durable_fs::{
 use rustix::fs::{chmodat, fchmod, mkdirat, open, openat, unlinkat, AtFlags, Dir, Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::model::{ConversationId, EffectId, MissionId};
+use crate::model::{EffectId, MissionId, RoleInstanceId, TaskId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MissionDirs {
@@ -54,12 +54,17 @@ impl MissionDirs {
         RootedDirectory::new(self.state_dir.clone(), self.root.clone())
     }
 
-    pub(crate) fn conversation(&self, conversation_id: &ConversationId) -> ConversationDirs {
-        ConversationDirs::new(
+    pub(crate) fn role(&self, role_instance: &RoleInstanceId) -> RoleDirs {
+        RoleDirs::new(
             self.state_dir.clone(),
-            self.root
-                .join("conversations")
-                .join(conversation_id.as_str()),
+            self.root.join("conversations").join(role_instance.as_str()),
+        )
+    }
+
+    pub(crate) fn task(&self, task_id: &TaskId) -> TaskDirs {
+        TaskDirs::new(
+            self.state_dir.clone(),
+            self.root.join("tasks").join(task_id.as_str()),
         )
     }
 
@@ -73,18 +78,45 @@ impl MissionDirs {
 
 /// Durable resources for one exact folded conversation generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConversationDirs {
+pub(crate) struct RoleDirs {
+    role_state: RoleStateDirs,
+}
+
+impl RoleDirs {
+    fn new(state_dir: PathBuf, root: PathBuf) -> Self {
+        Self {
+            role_state: RoleStateDirs::new(state_dir.clone(), &root),
+        }
+    }
+
+    pub(crate) fn role_state(&self) -> &RoleStateDirs {
+        &self.role_state
+    }
+
+    pub(crate) async fn remove_disposable_scratch(&self) -> std::io::Result<()> {
+        let state_dir = self.role_state.state_dir.clone();
+        let scratch = self.role_state.scratch.clone();
+        tokio::task::spawn_blocking(move || remove_tree_beneath(&state_dir, &scratch))
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("role scratch cleanup task failed: {error}"))
+            })?
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskDirs {
     state_dir: PathBuf,
     root: PathBuf,
-    role_state: RoleStateDirs,
+    work: PathBuf,
     observer_index: PathBuf,
     workspace_archives: PathBuf,
 }
 
-impl ConversationDirs {
+impl TaskDirs {
     fn new(state_dir: PathBuf, root: PathBuf) -> Self {
         Self {
-            role_state: RoleStateDirs::new(state_dir.clone(), &root),
+            work: root.join("work"),
             observer_index: root.join("observer.index"),
             workspace_archives: root.join("workspace-archives"),
             state_dir,
@@ -97,15 +129,11 @@ impl ConversationDirs {
     }
 
     pub(crate) fn work(&self) -> &Path {
-        self.role_state.work()
+        &self.work
     }
 
     pub(crate) fn observer_index(&self) -> &Path {
         &self.observer_index
-    }
-
-    pub(crate) fn role_state(&self) -> &RoleStateDirs {
-        &self.role_state
     }
 
     pub(crate) fn workspace_archive(&self, effect_id: &EffectId) -> PathBuf {
@@ -114,19 +142,6 @@ impl ConversationDirs {
 
     pub(crate) fn prepare_workspace_archives(&self) -> std::io::Result<()> {
         ensure_dirs_beneath(&self.state_dir, [&self.workspace_archives])
-    }
-
-    /// Remove only disposable build/scratch data after this conversation has
-    /// settled. Retained work, runtime state, and observer evidence remain in
-    /// the conversation tree.
-    pub(crate) async fn remove_disposable_scratch(&self) -> std::io::Result<()> {
-        let state_dir = self.role_state.state_dir.clone();
-        let scratch = self.role_state.scratch.clone();
-        tokio::task::spawn_blocking(move || remove_tree_beneath(&state_dir, &scratch))
-            .await
-            .map_err(|error| {
-                std::io::Error::other(format!("conversation scratch cleanup task failed: {error}"))
-            })?
     }
 }
 
@@ -338,15 +353,6 @@ fn runtime_retention_limit_error(
         observed,
         maximum,
     })
-}
-
-pub(crate) fn runtime_retention_failure(
-    error: anyhow::Error,
-) -> lionclaw_runtime_api::TypedFailure {
-    lionclaw_runtime_api::TypedFailure::permanent(
-        "runtime.native_state_limit",
-        format!("retained runtime state violates the fixed product limit: {error:#}"),
-    )
 }
 
 /// Retained runtime-owned state for one exact role-state and compatible runtime
@@ -805,603 +811,32 @@ fn resource_tree_limit(display: &Path, dimension: &str) -> std::io::Error {
 }
 
 #[cfg(test)]
-mod tests {
+mod team_resource_tests {
     use super::*;
-    use crate::model::{RoleName, TaskId, TaskNamespace};
-    use std::os::unix::fs::{symlink, PermissionsExt};
 
     #[test]
-    fn one_mission_graph_separates_conversation_and_effect_lifetimes() {
-        let state = tempfile::tempdir().unwrap();
-        let mission = MissionId::for_creation("/workspace", "test", 1);
-        let conversation = ConversationId::for_role_instance(
-            &mission,
-            TaskNamespace::Execution,
-            &TaskId::new("worker").unwrap(),
-            &RoleName::new("implementer").unwrap(),
-            1,
-        );
-        let effect = EffectId::for_parts(&["resource", "test"]);
-        let mission_dirs = MissionDirs::new(state.path(), &mission);
-        let conversation_dirs = mission_dirs.conversation(&conversation);
-        let effect_dirs = mission_dirs.effect(&effect);
-        let role_effect = effect_dirs.role();
-        let oracle_effect = effect_dirs.oracle();
+    fn task_workspace_identity_is_independent_of_role_and_runtime_identity() {
+        let state = Path::new("/state");
+        let mission = MissionId::parse("mabc123abc123").unwrap();
+        let task = TaskId::new("implement").unwrap();
+        let engineer = RoleInstanceId::new("engineer").unwrap();
+        let specialist = RoleInstanceId::new("specialist").unwrap();
+        let dirs = MissionDirs::new(state, &mission);
 
-        assert!(!mission_dirs.root().exists());
-        let replacement = ConversationId::for_role_instance(
-            &mission,
-            TaskNamespace::Execution,
-            &TaskId::new("worker").unwrap(),
-            &RoleName::new("implementer").unwrap(),
-            2,
-        );
-        assert_ne!(
-            conversation_dirs.root,
-            mission_dirs.conversation(&replacement).root
-        );
-        assert_ne!(
-            role_effect.root(),
-            mission_dirs
-                .effect(&EffectId::for_parts(&["resource", "other"]))
-                .role()
-                .root()
-        );
-
-        assert!(conversation_dirs
-            .root
-            .starts_with(mission_dirs.root().join("conversations")));
-        assert!(role_effect
-            .root()
-            .starts_with(mission_dirs.root().join("effects")));
-        assert!(!conversation_dirs.root.starts_with(role_effect.root()));
-        assert!(!role_effect.root().starts_with(&conversation_dirs.root));
-
-        conversation_dirs.role_state().prepare().unwrap();
-        role_effect.prepare().unwrap();
-        role_effect.role_state().prepare().unwrap();
-        let profile_key_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let profile_key_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let retained_profile = conversation_dirs
-            .role_state()
-            .runtime_profile(profile_key_a)
-            .unwrap();
-        let replacement_profile = mission_dirs
-            .conversation(&replacement)
-            .role_state()
-            .runtime_profile(profile_key_a)
-            .unwrap();
-        let changed_profile = conversation_dirs
-            .role_state()
-            .runtime_profile(profile_key_b)
-            .unwrap();
-        let transient_profile = role_effect
-            .role_state()
-            .runtime_profile(profile_key_a)
-            .unwrap();
-        retained_profile.prepare().unwrap();
-        transient_profile.prepare().unwrap();
-        assert!(conversation_dirs.role_state().scratch().is_dir());
-        assert!(conversation_dirs.role_state().runtime().is_dir());
-        assert!(retained_profile.native_home().is_dir());
+        let task_work = dirs.task(&task).work().to_path_buf();
         assert_eq!(
-            retained_profile,
-            conversation_dirs
-                .role_state()
-                .runtime_profile(profile_key_a)
-                .unwrap()
+            task_work,
+            state.join("missions/mabc123abc123/tasks/implement/work")
         );
-        assert_ne!(
-            retained_profile.native_home(),
-            replacement_profile.native_home()
-        );
-        assert_ne!(
-            retained_profile.native_home(),
-            changed_profile.native_home()
-        );
-        assert_ne!(
-            retained_profile.native_home(),
-            transient_profile.native_home()
-        );
-        assert!(role_effect.handoff().is_dir());
-        assert!(role_effect.auth_staging().is_dir());
-        assert!(role_effect.role_state().scratch().is_dir());
-        assert!(role_effect.role_state().runtime().is_dir());
-        assert!(!oracle_effect.work().exists());
-        assert!(!oracle_effect.program().exists());
+        assert_eq!(dirs.task(&task).work(), task_work);
 
-        std::fs::remove_dir_all(role_effect.root()).unwrap();
-        oracle_effect.prepare().unwrap();
-        assert!(oracle_effect.scratch().is_dir());
-        assert!(oracle_effect.program().is_dir());
-        assert!(!role_effect.handoff().exists());
-        assert!(!role_effect.auth_staging().exists());
-        assert!(retained_profile.native_home().is_dir());
-
-        let mounts = crate::runner::effect_mounts(&role_effect, &retained_profile);
-        let source_for = |target: &str| {
-            mounts
-                .iter()
-                .find(|mount| mount.target == target)
-                .map(|mount| mount.source.as_path())
-                .unwrap()
-        };
+        let engineer_runtime = dirs.role(&engineer).role_state().runtime().to_path_buf();
+        let specialist_runtime = dirs.role(&specialist).role_state().runtime().to_path_buf();
         assert_eq!(
-            source_for(crate::runner::SCRATCH_MOUNT_TARGET),
-            conversation_dirs.role_state().scratch()
+            engineer_runtime,
+            state.join("missions/mabc123abc123/conversations/engineer/runtime")
         );
-        assert_eq!(
-            source_for(lionclaw_confinement::RUNTIME_MOUNT_TARGET),
-            conversation_dirs.role_state().runtime()
-        );
-
-        let transient_mounts = crate::runner::effect_mounts(&role_effect, &transient_profile);
-        let transient_source_for = |target: &str| {
-            transient_mounts
-                .iter()
-                .find(|mount| mount.target == target)
-                .map(|mount| mount.source.as_path())
-                .unwrap()
-        };
-        assert_eq!(
-            transient_source_for(crate::runner::SCRATCH_MOUNT_TARGET),
-            role_effect.role_state().scratch()
-        );
-        assert_eq!(
-            transient_source_for(lionclaw_confinement::RUNTIME_MOUNT_TARGET),
-            role_effect.role_state().runtime()
-        );
-        assert_eq!(
-            source_for(crate::runner::HANDOFF_MOUNT_TARGET),
-            role_effect.handoff()
-        );
-        assert_eq!(
-            source_for(lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET),
-            retained_profile.native_home()
-        );
-    }
-
-    #[test]
-    fn runtime_profile_paths_require_a_lowercase_sha256_digest() {
-        let state = tempfile::tempdir().unwrap();
-        let mission = MissionId::for_creation("/workspace", "profile-path", 1);
-        let conversation = ConversationId::parse("f".repeat(64)).unwrap();
-        let mission_dirs = MissionDirs::new(state.path(), &mission);
-        let role_state = mission_dirs
-            .conversation(&conversation)
-            .role_state()
-            .clone();
-
-        for key in [
-            "../escape",
-            "profile-name",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        ] {
-            assert!(role_state.runtime_profile(key).is_err(), "accepted {key}");
-        }
-    }
-
-    #[test]
-    fn runtime_retention_combines_roots_at_the_exact_byte_boundary() {
-        let state = tempfile::tempdir().unwrap();
-        let mission = MissionId::for_creation("/workspace", "runtime-retention-bytes", 1);
-        let conversation = ConversationId::parse("f".repeat(64)).unwrap();
-        let role_state = MissionDirs::new(state.path(), &mission)
-            .conversation(&conversation)
-            .role_state()
-            .clone();
-        role_state.prepare().unwrap();
-        let runtime = std::fs::File::create(role_state.runtime().join("runtime-state")).unwrap();
-        runtime.set_len(256 * 1024 * 1024).unwrap();
-        let control =
-            std::fs::File::create(role_state.session_control_root().join("control-state")).unwrap();
-        control.set_len(256 * 1024 * 1024).unwrap();
-
-        let exact = role_state.assess_runtime_retention().unwrap();
-        assert_eq!(exact.bytes, RUNTIME_RETENTION_POLICY.tree.max_bytes);
-        assert_eq!(exact.entries, 2);
-        assert_eq!(exact.profiles, 0);
-
-        control.set_len(256 * 1024 * 1024 + 1).unwrap();
-        let error = role_state
-            .assess_runtime_retention()
-            .expect_err("combined retained roots must not exceed the fixed byte limit");
-        let exceeded = error.downcast_ref::<MetadataTreeLimitExceeded>().unwrap();
-        assert_eq!(exceeded.limit, MetadataTreeLimit::Bytes);
-        assert_eq!(
-            exceeded.observed,
-            RUNTIME_RETENTION_POLICY.tree.max_bytes + 1
-        );
-    }
-
-    #[test]
-    fn runtime_retention_admits_at_most_eight_profile_directories() {
-        let state = tempfile::tempdir().unwrap();
-        let mission = MissionId::for_creation("/workspace", "runtime-retention-profiles", 1);
-        let conversation = ConversationId::parse("f".repeat(64)).unwrap();
-        let role_state = MissionDirs::new(state.path(), &mission)
-            .conversation(&conversation)
-            .role_state()
-            .clone();
-        role_state.prepare().unwrap();
-        for index in 0..RUNTIME_RETENTION_POLICY.max_profiles {
-            let key = format!("{index:064x}");
-            role_state.runtime_profile(&key).unwrap().prepare().unwrap();
-        }
-        let existing = format!("{:064x}", RUNTIME_RETENTION_POLICY.max_profiles - 1);
-        assert_eq!(
-            role_state
-                .admit_runtime_profile(&existing)
-                .unwrap()
-                .profiles,
-            RUNTIME_RETENTION_POLICY.max_profiles
-        );
-
-        let ninth = format!("{:064x}", RUNTIME_RETENTION_POLICY.max_profiles);
-        let error = role_state
-            .admit_runtime_profile(&ninth)
-            .expect_err("a ninth retained profile must be refused before creation");
-        assert!(error.to_string().contains("profile limit exceeded"));
-        assert!(!role_state
-            .session_control_root()
-            .join("profiles")
-            .join(ninth)
-            .exists());
-    }
-
-    #[test]
-    fn runtime_retention_rejects_unsafe_metadata_without_following_it() {
-        let state = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::fs::write(outside.path().join("credential"), "preserve").unwrap();
-        let mission = MissionId::for_creation("/workspace", "runtime-retention-unsafe", 1);
-        let conversation = ConversationId::parse("f".repeat(64)).unwrap();
-        let role_state = MissionDirs::new(state.path(), &mission)
-            .conversation(&conversation)
-            .role_state()
-            .clone();
-        role_state.prepare().unwrap();
-        symlink(outside.path(), role_state.runtime().join("escape")).unwrap();
-
-        let error = role_state
-            .assess_runtime_retention()
-            .expect_err("retained runtime accounting must reject symlinks");
-        let detail = format!("{error:#}");
-        assert!(
-            detail.contains("symlink")
-                || detail.contains("unsupported")
-                || detail.contains("must be a regular file or directory"),
-            "{detail}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(outside.path().join("credential")).unwrap(),
-            "preserve"
-        );
-    }
-
-    #[test]
-    fn preparation_protects_new_resources_without_rewriting_retained_runtime_modes() {
-        let state = tempfile::tempdir().unwrap();
-        let mission = MissionId::for_creation("/workspace", "resource-modes", 1);
-        let conversation = ConversationId::parse("f".repeat(64)).unwrap();
-        let profile = MissionDirs::new(state.path(), &mission)
-            .conversation(&conversation)
-            .role_state()
-            .clone()
-            .runtime_profile("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-            .unwrap();
-        std::fs::create_dir_all(profile.native_home()).unwrap();
-        std::fs::set_permissions(
-            profile.native_home(),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-
-        profile.prepare().unwrap();
-
-        assert_eq!(
-            std::fs::metadata(state.path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        assert_eq!(
-            std::fs::metadata(profile.native_home())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755,
-            "LionClaw must not normalize existing runtime-owned state"
-        );
-        assert_eq!(
-            std::fs::metadata(profile.runtime_state().control_path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-    }
-
-    #[test]
-    fn newly_created_resources_are_owner_only_under_restrictive_umask() {
-        const CHILD_ROOT: &str = "LIONCLAW_RESOURCE_MODE_TEST_ROOT";
-        if let Some(root) = std::env::var_os(CHILD_ROOT) {
-            rustix::process::umask(Mode::from_raw_mode(0o777));
-            let state = PathBuf::from(root);
-            let mission = MissionId::for_creation("/workspace", "resource-umask", 1);
-            let mission_dirs = MissionDirs::new(&state, &mission);
-            mission_dirs.prepare().unwrap();
-            assert_eq!(
-                std::fs::metadata(mission_dirs.root())
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700
-            );
-            return;
-        }
-
-        let state = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "resources::tests::newly_created_resources_are_owner_only_under_restrictive_umask",
-                "--test-threads=1",
-            ])
-            .env(CHILD_ROOT, state.path())
-            .status()
-            .unwrap();
-        assert!(status.success(), "isolated umask proof failed");
-    }
-
-    #[test]
-    fn preparation_rejects_symlinked_resource_ancestors() {
-        for target in [
-            "missions",
-            "mission",
-            "effects",
-            "effect",
-            "conversations",
-            "conversation",
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let state_dir = temp.path().join("state");
-            let outside = temp.path().join("outside");
-            std::fs::create_dir(&state_dir).unwrap();
-            std::fs::create_dir(&outside).unwrap();
-            let mission = MissionId::parse("mabc123def456").unwrap();
-            let conversation = ConversationId::for_role_instance(
-                &mission,
-                TaskNamespace::Execution,
-                &TaskId::new("worker").unwrap(),
-                &RoleName::new("implementer").unwrap(),
-                1,
-            );
-            let effect = EffectId::for_parts(&["resource", "symlink"]);
-            let mission_dirs = MissionDirs::new(&state_dir, &mission);
-            let link = match target {
-                "missions" => state_dir.join("missions"),
-                "mission" => mission_dirs.root().to_path_buf(),
-                "effects" => mission_dirs.root().join("effects"),
-                "effect" => mission_dirs.effect(&effect).role().root().to_path_buf(),
-                "conversations" => mission_dirs.root().join("conversations"),
-                "conversation" => mission_dirs.conversation(&conversation).root.clone(),
-                _ => unreachable!(),
-            };
-            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-            symlink(&outside, &link).unwrap();
-
-            let result = if matches!(target, "conversations" | "conversation") {
-                mission_dirs
-                    .conversation(&conversation)
-                    .role_state()
-                    .prepare()
-            } else {
-                mission_dirs.effect(&effect).role().prepare()
-            };
-            let error = result.expect_err("symlinked resource ancestor must fail closed");
-            assert!(
-                error.to_string().contains("real directory"),
-                "{target}: {error}"
-            );
-            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "{target}");
-        }
-    }
-
-    #[tokio::test]
-    async fn effect_cleanup_is_descriptor_rooted_and_idempotent() {
-        let temp = tempfile::tempdir().unwrap();
-        let state_dir = temp.path().join("state");
-        let outside = temp.path().join("outside");
-        std::fs::create_dir(&state_dir).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("sentinel"), "preserve\n").unwrap();
-        let mission = MissionId::parse("mabc123def456").unwrap();
-        let conversation = ConversationId::for_role_instance(
-            &mission,
-            TaskNamespace::Execution,
-            &TaskId::new("worker").unwrap(),
-            &RoleName::new("implementer").unwrap(),
-            1,
-        );
-        let current = EffectId::for_parts(&["resource", "current"]);
-        let adjacent = EffectId::for_parts(&["resource", "adjacent"]);
-        let mission_dirs = MissionDirs::new(&state_dir, &mission);
-        let current_dirs = mission_dirs.effect(&current);
-        let role = current_dirs.role();
-        role.prepare().unwrap();
-        role.role_state().prepare().unwrap();
-        std::fs::write(role.role_state().scratch().join("private"), "delete\n").unwrap();
-        symlink(&outside, role.root().join("outside-link")).unwrap();
-        mission_dirs.effect(&adjacent).role().prepare().unwrap();
-        mission_dirs
-            .conversation(&conversation)
-            .role_state()
-            .prepare()
-            .unwrap();
-
-        current_dirs.remove().await.unwrap();
-        current_dirs.remove().await.unwrap();
-        assert!(!current_dirs.role().root().exists());
-        assert!(mission_dirs.effect(&adjacent).role().root().is_dir());
-        assert!(mission_dirs
-            .conversation(&conversation)
-            .role_state()
-            .runtime()
-            .is_dir());
-        assert_eq!(
-            std::fs::read_to_string(outside.join("sentinel")).unwrap(),
-            "preserve\n"
-        );
-
-        symlink(&outside, current_dirs.role().root()).unwrap();
-        current_dirs.remove().await.unwrap();
-        assert!(std::fs::symlink_metadata(current_dirs.role().root()).is_err());
-        assert!(outside.join("sentinel").is_file());
-    }
-
-    #[tokio::test]
-    async fn conversation_cleanup_removes_only_scratch_and_is_idempotent() {
-        let temp = tempfile::tempdir().unwrap();
-        let state_dir = temp.path().join("state");
-        std::fs::create_dir(&state_dir).unwrap();
-        let mission = MissionId::parse("mabc123def456").unwrap();
-        let conversation = ConversationId::for_role_instance(
-            &mission,
-            TaskNamespace::Execution,
-            &TaskId::new("worker").unwrap(),
-            &RoleName::new("implementer").unwrap(),
-            1,
-        );
-        let adjacent = ConversationId::for_role_instance(
-            &mission,
-            TaskNamespace::Execution,
-            &TaskId::new("reviewer").unwrap(),
-            &RoleName::new("reviewer").unwrap(),
-            1,
-        );
-        let mission_dirs = MissionDirs::new(&state_dir, &mission);
-        let current = mission_dirs.conversation(&conversation);
-        current.role_state().prepare().unwrap();
-        std::fs::create_dir_all(current.work()).unwrap();
-        std::fs::write(current.work().join("checkout"), "preserve\n").unwrap();
-        std::fs::write(
-            current.role_state().runtime().join("native-session"),
-            "preserve\n",
-        )
-        .unwrap();
-        std::fs::write(current.observer_index(), "preserve\n").unwrap();
-        std::fs::write(current.role_state().scratch().join("build"), "delete\n").unwrap();
-        let adjacent = mission_dirs.conversation(&adjacent);
-        adjacent.role_state().prepare().unwrap();
-        std::fs::write(adjacent.role_state().scratch().join("build"), "preserve\n").unwrap();
-
-        current.remove_disposable_scratch().await.unwrap();
-        current.remove_disposable_scratch().await.unwrap();
-
-        assert!(!current.role_state().scratch().exists());
-        assert_eq!(
-            std::fs::read_to_string(current.work().join("checkout")).unwrap(),
-            "preserve\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(current.role_state().runtime().join("native-session"),)
-                .unwrap(),
-            "preserve\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(current.observer_index()).unwrap(),
-            "preserve\n"
-        );
-        assert!(adjacent.role_state().scratch().join("build").is_file());
-    }
-
-    #[tokio::test]
-    async fn conversation_cleanup_rejects_a_symlinked_conversation_parent() {
-        let temp = tempfile::tempdir().unwrap();
-        let state_dir = temp.path().join("state");
-        let outside = temp.path().join("outside");
-        std::fs::create_dir(&state_dir).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("sentinel"), "preserve\n").unwrap();
-        let mission = MissionId::parse("mabc123def456").unwrap();
-        let conversation = ConversationId::for_role_instance(
-            &mission,
-            TaskNamespace::Execution,
-            &TaskId::new("worker").unwrap(),
-            &RoleName::new("implementer").unwrap(),
-            1,
-        );
-        let mission_dirs = MissionDirs::new(&state_dir, &mission);
-        std::fs::create_dir_all(mission_dirs.root().join("conversations")).unwrap();
-        symlink(
-            &outside,
-            mission_dirs
-                .root()
-                .join("conversations")
-                .join(conversation.as_str()),
-        )
-        .unwrap();
-
-        let error = mission_dirs
-            .conversation(&conversation)
-            .remove_disposable_scratch()
-            .await
-            .expect_err("symlinked conversation parent must fail closed");
-        assert!(error.to_string().contains("unavailable or unsafe"));
-        assert!(outside.join("sentinel").is_file());
-    }
-
-    #[tokio::test]
-    async fn effect_cleanup_rejects_a_symlinked_effects_parent() {
-        let temp = tempfile::tempdir().unwrap();
-        let state_dir = temp.path().join("state");
-        let outside = temp.path().join("outside");
-        std::fs::create_dir(&state_dir).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("sentinel"), "preserve\n").unwrap();
-        let mission = MissionId::parse("mabc123def456").unwrap();
-        let effect = EffectId::for_parts(&["resource", "unsafe-parent"]);
-        let mission_dirs = MissionDirs::new(&state_dir, &mission);
-        std::fs::create_dir_all(mission_dirs.root()).unwrap();
-        symlink(&outside, mission_dirs.root().join("effects")).unwrap();
-
-        let error = mission_dirs
-            .effect(&effect)
-            .remove()
-            .await
-            .expect_err("symlinked effects parent must fail closed");
-        assert!(error.to_string().contains("unavailable or unsafe"));
-        assert!(outside.join("sentinel").is_file());
-    }
-
-    #[tokio::test]
-    async fn effect_cleanup_retains_an_excessively_deep_tree() {
-        let temp = tempfile::tempdir().unwrap();
-        let state_dir = temp.path().join("state");
-        std::fs::create_dir(&state_dir).unwrap();
-        let mission = MissionId::parse("mabc123def456").unwrap();
-        let effect = EffectId::for_parts(&["resource", "deep"]);
-        let effect_dirs = MissionDirs::new(&state_dir, &mission).effect(&effect);
-        let role = effect_dirs.role();
-        role.prepare().unwrap();
-        let mut deepest = role.handoff().to_path_buf();
-        for index in 0..RESOURCE_TREE_MAX_DEPTH {
-            deepest.push(format!("d{index}"));
-        }
-        std::fs::create_dir_all(&deepest).unwrap();
-
-        let error = effect_dirs
-            .remove()
-            .await
-            .expect_err("cleanup depth must be bounded");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("cleanup depth limit"));
-        assert!(effect_dirs.role().root().is_dir());
+        assert_ne!(engineer_runtime, specialist_runtime);
+        assert!(!task_work.starts_with(state.join("missions/mabc123abc123/conversations")));
     }
 }

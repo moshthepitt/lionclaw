@@ -96,6 +96,59 @@ pub async fn add_skill(
     })
 }
 
+pub async fn add_mission_skill(
+    skills_root: &Path,
+    source: SkillSource,
+) -> Result<(SkillChange, super::SkillPackage)> {
+    let resolved = resolve_skill(source).await?;
+    let source_package = validate_skill_package(&resolved.package)?;
+    std::fs::create_dir_all(skills_root)
+        .with_context(|| format!("creating '{}'", skills_root.display()))?;
+    let destination = skills_root.join(&source_package.name);
+    if destination.exists() {
+        let (package, digest) = super::skills::load_skill_package(&destination)?;
+        if digest != source_package.digest {
+            bail!(
+                "mission skill '{}' already exists with different content",
+                source_package.name
+            );
+        }
+        return Ok((
+            SkillChange {
+                name: source_package.name,
+                digest,
+                changed: false,
+            },
+            package,
+        ));
+    }
+    let transaction = tempfile::Builder::new()
+        .prefix(".lionclaw-mission-skill@")
+        .tempdir_in(skills_root)
+        .context("creating mission skill transaction")?;
+    let staged = transaction.path().join("package");
+    copy_tree_strict(&resolved.package, &staged)
+        .with_context(|| format!("staging mission skill '{}'", source_package.name))?;
+    let staged_package = validate_skill_package(&staged)?;
+    if staged_package != source_package {
+        bail!(
+            "mission skill '{}' changed while it was copied",
+            source_package.name
+        );
+    }
+    std::fs::rename(&staged, &destination)
+        .with_context(|| format!("installing mission skill '{}'", source_package.name))?;
+    let (package, digest) = super::skills::load_skill_package(&destination)?;
+    Ok((
+        SkillChange {
+            name: source_package.name,
+            digest,
+            changed: true,
+        },
+        package,
+    ))
+}
+
 pub fn remove_skill(
     mission_root: &Path,
     name: &str,
@@ -108,10 +161,11 @@ pub fn remove_skill(
         .get(name)
         .ok_or_else(|| anyhow!("mission type has no skill '{name}'"))?;
     let assigned = mission_type
+        .default_team
         .roles
         .values()
         .filter(|role| role.skills.iter().any(|skill| skill == name))
-        .map(|role| role.name.as_str())
+        .map(|role| role.id.as_str())
         .collect::<Vec<_>>();
     if !assigned.is_empty() {
         bail!(
@@ -423,7 +477,9 @@ mod tests {
         std::fs::create_dir_all(root.join("roles")).unwrap();
         std::fs::write(
             root.join("mission.toml"),
-            "[mission-type]\nname = \"skill-test\"\nstop = \"verified\"\nimage = \"img\"\n",
+            "[mission-type]\nname = \"skill-test\"\nstop = \"verified\"\nimage = \"img\"\n\
+             \n[team]\nplanning-assignment = \"strategist\"\nrequires-gap-review = false\n\
+             \n[ceilings]\nnetwork = true\ninstall = true\nwrites = true\n",
         )
         .unwrap();
         let skills = assigned_skill
@@ -431,10 +487,36 @@ mod tests {
             .unwrap_or_default();
         std::fs::write(
             root.join("roles/worker.md"),
-            format!("---\noutput: produces-artifact\n{skills}---\nWork.\n"),
+            format!("---\noutput: produces-artifact\nruntime: codex\n{skills}---\nWork.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("roles/strategist.md"),
+            "---\noutput: proposes-plan\nruntime: codex\n---\nPlan.\n",
         )
         .unwrap();
         std::fs::write(root.join("playbook.md"), "# Skill test\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn mission_local_add_is_content_addressed_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("mission-skills");
+        write_skill(&source, "specialist", "Use the specialist procedure.");
+
+        let (first, package) = add_mission_skill(&destination, SkillSource::Path(source.clone()))
+            .await
+            .unwrap();
+        assert!(first.changed);
+        assert_eq!(package.name, "specialist");
+        assert!(package.root.join("SKILL.md").is_file());
+
+        let (second, _) = add_mission_skill(&destination, SkillSource::Path(source))
+            .await
+            .unwrap();
+        assert!(!second.changed);
+        assert_eq!(first.digest, second.digest);
     }
 
     fn write_skill(root: &Path, name: &str, body: &str) {

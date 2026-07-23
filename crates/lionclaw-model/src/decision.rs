@@ -51,8 +51,8 @@ pub fn allowed_actions(kind: AttentionKind) -> &'static [DecisionAction] {
         AttentionKind::OracleVerdictFailed => ORACLE_VERDICT_FAILED,
         AttentionKind::GateFailed => GATE_FAILED,
         AttentionKind::GateCheckpoint => GATE_CHECKPOINT,
-        AttentionKind::TerminalReviewGaps => TERMINAL_REVIEW_GAPS,
-        AttentionKind::TerminalReviewFailed => TERMINAL_REVIEW_FAILED,
+        AttentionKind::GapReviewGaps => TERMINAL_REVIEW_GAPS,
+        AttentionKind::GapReviewFailed => TERMINAL_REVIEW_FAILED,
     }
 }
 

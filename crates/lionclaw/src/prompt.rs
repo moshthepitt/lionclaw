@@ -4,10 +4,7 @@
 //! judge's prompt never includes a producer's narrative prose — verdict
 //! roles see the contract and the artifact, not the worker's story.
 
-use std::collections::BTreeMap;
-
-use crate::mission_type::RoleDefinition;
-use crate::model::{Assertion, OutputSemantics, Plan, PlanProposal, RoleName};
+use crate::model::{Assertion, MissionProposal, OutputSemantics, Plan, RoleInstance, TeamRevision};
 
 pub struct ExecutionContext<'a> {
     pub objective: &'a str,
@@ -19,7 +16,7 @@ pub struct ExecutionContext<'a> {
     /// artifact and the contract, never the producer's narrative
     /// (fresh-context).
     pub upstream_reports: &'a [String],
-    /// Reserved for Slice 5 team guidance. Empty in Slice 4.
+    /// Accepted team guidance, present only in execution and planning turns.
     pub guidance: &'a str,
     /// Engine-routed failure evidence and repair guidance from prior attempts.
     pub feedback: &'a [String],
@@ -33,10 +30,10 @@ pub struct JudgmentContext<'a> {
 }
 
 pub enum TurnContext<'a> {
-    Execution(&'a RoleDefinition, ExecutionContext<'a>),
-    Planning(&'a RoleDefinition, PlanningPromptContext<'a>),
-    Judgment(&'a RoleDefinition, JudgmentContext<'a>),
-    GapReview(&'a RoleDefinition, TerminalReviewPromptContext<'a>),
+    Execution(&'a RoleInstance, ExecutionContext<'a>),
+    Planning(&'a RoleInstance, PlanningPromptContext<'a>),
+    Judgment(&'a RoleInstance, JudgmentContext<'a>),
+    GapReview(&'a RoleInstance, GapReviewPromptContext<'a>),
 }
 
 /// The only prompt renderer. Closed context variants make exclusions a type
@@ -50,11 +47,11 @@ pub fn render(context: TurnContext<'_>) -> String {
     }
 }
 
-fn render_execution(role: &RoleDefinition, ctx: &ExecutionContext<'_>) -> String {
+fn render_execution(role: &RoleInstance, ctx: &ExecutionContext<'_>) -> String {
     let mut prompt = String::new();
     prompt.push_str(skeleton(role.output));
     prompt.push_str("\n\n## Role\n\n");
-    prompt.push_str(&role.prompt_body);
+    prompt.push_str(&role.instructions);
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
     if !ctx.task_body.is_empty() {
@@ -81,11 +78,11 @@ fn render_execution(role: &RoleDefinition, ctx: &ExecutionContext<'_>) -> String
     prompt
 }
 
-fn render_judgment(role: &RoleDefinition, ctx: &JudgmentContext<'_>) -> String {
+fn render_judgment(role: &RoleInstance, ctx: &JudgmentContext<'_>) -> String {
     let mut prompt = String::new();
     prompt.push_str(skeleton(role.output));
     prompt.push_str("\n\n## Role\n\n");
-    prompt.push_str(&role.prompt_body);
+    prompt.push_str(&role.instructions);
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
     if !ctx.task_body.is_empty() {
@@ -116,15 +113,15 @@ pub struct PlanningPromptContext<'a> {
     pub input: PlanningPromptInput<'a>,
     /// The mission type's playbook (its method), if any.
     pub playbook: Option<&'a str>,
-    /// The mission type's canonical role definitions. The assembler exposes
-    /// only roles eligible for proposed execution tasks.
-    pub roles: &'a BTreeMap<RoleName, RoleDefinition>,
+    /// The complete accepted team snapshot. Planning proposals replace it as
+    /// one revision so role contracts and assignments cannot drift apart.
+    pub team: &'a TeamRevision,
     /// The oracles the author may bind assertions to.
     pub oracle_inventory: &'a [String],
     pub task_body: &'a str,
-    /// Reports from this planning node's cleared dependencies.
+    /// Reports supplied to this planning turn by the lead.
     pub upstream_reports: &'a [String],
-    /// Reserved for Slice 5 team guidance. Empty in Slice 4.
+    /// Accepted team guidance.
     pub guidance: &'a str,
     /// Rework for this planning role's current attempt, separate from the
     /// mission-level planning input above.
@@ -133,7 +130,7 @@ pub struct PlanningPromptContext<'a> {
 
 pub struct PlanningPromptInput<'a> {
     pub accepted_plan: Option<&'a Plan>,
-    pub latest_rejected_candidate: Option<&'a PlanProposal>,
+    pub latest_rejected_candidate: Option<&'a MissionProposal>,
     pub refinement: Option<PlanningPromptRefinement<'a>>,
 }
 
@@ -142,11 +139,11 @@ pub enum PlanningPromptRefinement<'a> {
     FailureEvidence(String),
 }
 
-fn render_planning(role: &RoleDefinition, ctx: &PlanningPromptContext<'_>) -> String {
+fn render_planning(role: &RoleInstance, ctx: &PlanningPromptContext<'_>) -> String {
     let mut prompt = String::new();
     prompt.push_str(skeleton(role.output));
     prompt.push_str("\n\n## Role\n\n");
-    prompt.push_str(&role.prompt_body);
+    prompt.push_str(&role.instructions);
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
     prompt.push_str(&format!("\n\n## Planning generation\n\n{}", ctx.generation));
@@ -181,30 +178,10 @@ fn render_planning(role: &RoleDefinition, ctx: &PlanningPromptContext<'_>) -> St
         prompt.push_str("\n\n## Playbook\n\n");
         prompt.push_str(playbook);
     }
-    prompt.push_str("\n\n## Available execution roles\n\n");
-    prompt.push_str(
-        "These are roles you may assign in the proposal, not instructions for you to follow.\n\n",
-    );
-    let mut found_execution_role = false;
-    for role in ctx.roles.values() {
-        let Some(kind) = role.output.execution_task_kind() else {
-            continue;
-        };
-        found_execution_role = true;
-        prompt.push_str(&format!("### {} (`{}`)\n\n", role.name, kind.slug()));
-        if !role.skills.is_empty() {
-            prompt.push_str("Skills:");
-            for skill in &role.skills {
-                prompt.push_str(&format!(" `{skill}`"));
-            }
-            prompt.push_str("\n\n");
-        }
-        prompt.push_str(&role.prompt_body);
-        prompt.push('\n');
-    }
-    if !found_execution_role {
-        prompt.push_str("This mission type provides no execution roles.\n");
-    }
+    prompt.push_str("\n\n## Current team revision\n\n");
+    prompt.push_str("Return a complete next team revision, preserving every role contract you do not deliberately change. Assign every work task and assertion using role-instance ids from that returned revision.\n\n```json\n");
+    prompt.push_str(&serde_json::to_string_pretty(ctx.team).expect("team serializes"));
+    prompt.push_str("\n```\n");
     if !ctx.oracle_inventory.is_empty() {
         prompt.push_str("\n\n## Available oracles\n\n");
         prompt
@@ -231,11 +208,11 @@ fn render_planning(role: &RoleDefinition, ctx: &PlanningPromptContext<'_>) -> St
     prompt
 }
 
-/// Context for the terminal reviewer. A **separate** assembler with no fields
+/// Context for the gap reviewer. A **separate** assembler with no fields
 /// for contract assertions, task bodies, playbook, or upstream reports — the
 /// fresh-context/contract-blind guarantee is structural (the same trick that
 /// keeps planning prose out of execution judges), not a filter.
-pub struct TerminalReviewPromptContext<'a> {
+pub struct GapReviewPromptContext<'a> {
     pub objective: &'a str,
     /// Limitations explicitly disclosed by the accepted plan. These are
     /// context for coverage, not waivers of the objective.
@@ -246,11 +223,11 @@ pub struct TerminalReviewPromptContext<'a> {
     pub nonce: &'a str,
 }
 
-fn render_gap_review(role: &RoleDefinition, ctx: &TerminalReviewPromptContext<'_>) -> String {
+fn render_gap_review(role: &RoleInstance, ctx: &GapReviewPromptContext<'_>) -> String {
     let mut prompt = String::new();
     prompt.push_str(TERMINAL_REVIEW_SKELETON);
     prompt.push_str("\n\n## Role\n\n");
-    prompt.push_str(&role.prompt_body);
+    prompt.push_str(&role.instructions);
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
     if !ctx.limitations.is_empty() {
@@ -265,7 +242,7 @@ fn render_gap_review(role: &RoleDefinition, ctx: &TerminalReviewPromptContext<'_
     prompt
 }
 
-/// The nonce a terminal-review prompt carries — the parsing dual of the
+/// The nonce a gap-review prompt carries — the parsing dual of the
 /// assembler above (one place defines the `## Handoff nonce` framing).
 /// Scripted reviewers (tests, self-test) echo it exactly as a real agent must.
 /// The LAST occurrence is the assembler's: an objective or role body that
@@ -303,7 +280,7 @@ fn append_feedback(prompt: &mut String, feedback: &[String]) {
 }
 
 const TERMINAL_REVIEW_SKELETON: &str = "\
-You are the terminal reviewer of a finished mission: a fresh, independent
+You are the gap reviewer of a finished mission: a fresh, independent
 examiner dispatched after all planned work has completed. You have
 deliberately been given nothing but the mission objective and the final
 product tree — no plan, no task list, no checklists, no reports from those
@@ -439,134 +416,125 @@ When you are finished you MUST write /mission/handoff/handoff.json exactly like:
 const PROPOSES_PLAN_SKELETON: &str = "\
 You are the planning author. Read the workspace (mounted read-only at
 /workspace) and the upstream reports, then propose the mission's contract and
-task DAG. You do not modify anything; your deliverable is the proposal itself.
+team-owned assignments. You do not modify anything; your deliverable is the
+joint proposal itself.
 
 A proposal separates outcomes from proof:
 - requirements decompose the objective; each is covered by assertion ids or
   records an explicit limitation with a rationale
-- a `work` task owns one coherent outcome; one work task may own multiple assertions
+- a task owns one coherent outcome; one task may own multiple assertions
 - assertions are independently provable properties of the resulting mission state
-- each assertion has exactly one active `work` owner; dependencies express
+- each assertion has exactly one active task owner; dependencies express
   contribution and real ordering between tasks
-- `validate` tasks independently judge outcomes; they do not produce them
+- the complete team revision owns role contracts, task assignments, independent
+  judgment panels, and the optional gap-review assignment
 
 Rules the engine enforces (an invalid proposal is rejected):
 - assertion ids match ^[A-Z][A-Z0-9-]+$ ; task ids match ^[A-Za-z][A-Za-z0-9_-]*$
 - requirement ids follow the assertion-id format; every assertion covers at
   least one requirement
-- each assertion is covered by exactly one `work` task (via its `targets`)
+- each assertion is covered by exactly one task (via its `targets`)
 - an assertion an oracle can check should bind that oracle by name; under a
   `verified` mission type EVERY assertion must bind an oracle
-- `validate` tasks add an independent reviewer; `gate` tasks (no role, no body)
-  gate a set of assertions behind their validators
 - the DAG is acyclic and every dependency resolves
+- the team is the complete next revision shown below, not a patch; every task
+  has one artifact-producing assignment and every assertion has the required
+  independent judgment assignments
+- role instances carry their complete output semantics, runtime, instructions,
+  skills, environment, authority grants, and optional deadline
 
-When assigning a role or binding an oracle, use its exact name from the
-available inventories. Angle-bracketed values in the shape example below are
-placeholders.
+Use exact role-instance ids and oracle names from the inventories. Preserve
+contracts from the current team unless the mission requires a deliberate
+change. Angle-bracketed values below are placeholders.
 
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:
    {\"schema\": \"lionclaw.mission.plan-handoff.v2\",
     \"type\": \"plan\",
     \"done\": true,
     \"report\": \"<why this contract>\",
-    \"proposal\": {\"base_revision\": <the proposal base revision below>,
-                   \"plan\": {
+    \"proposal\": {
+      \"plan\": {\"base_revision\": <the proposal base revision below>,
+                 \"requirement_changes\": [],
+                 \"assertion_supersessions\": [],
+                 \"plan\": {
                      \"requirements\": [{\"id\": \"OBJECTIVE-MET\", \"kind\": \"capability\",
                        \"prose\": \"...\", \"disposition\": {\"type\": \"covered\",
                        \"assertion_ids\": [\"OUTCOME-HOLDS\"]}}],
                      \"assertions\": [{\"id\": \"OUTCOME-HOLDS\", \"prose\": \"...\"}],
-                     \"tasks\": [{\"id\": \"change\", \"kind\": \"work\", \"body\": \"...\",
-                                 \"targets\": [\"OUTCOME-HOLDS\"], \"role\": \"<available-work-role>\",
+                     \"tasks\": [{\"id\": \"change\", \"body\": \"...\",
+                                 \"targets\": [\"OUTCOME-HOLDS\"],
                                  \"depends_on\": []}]}},
+      \"team\": {\"revision\": <current team revision plus one>,
+                \"roles\": {\"<role-id>\": {\"id\": \"<role-id>\",
+                  \"purpose\": \"...\", \"output\": \"produces-artifact\",
+                  \"runtime\": \"<runtime>\", \"instructions\": \"...\",
+                  \"grants\": {\"writes\": true}}},
+                \"planning_assignment\": \"<planning-role-id>\",
+                \"task_assignments\": {\"change\": \"<artifact-role-id>\"},
+                \"judgment_assignments\": {\"OUTCOME-HOLDS\": [\"<judge-role-id>\"]},
+                \"gap_review_assignment\": \"<gap-review-role-id>\"}}
+    },
     \"request_attention\": false}";
 
 #[cfg(test)]
-mod tests {
+mod team_prompt_tests {
+    use std::collections::BTreeMap;
+
     use super::*;
-    use crate::model::RoleName;
+    use crate::model::{AuthorityGrants, RoleInstanceId, TaskId, TeamRevision};
 
-    fn role(output: OutputSemantics) -> RoleDefinition {
-        named_role("r", output, "role body")
-    }
-
-    fn named_role(name: &str, output: OutputSemantics, prompt_body: &str) -> RoleDefinition {
-        RoleDefinition {
-            name: RoleName::new(name).unwrap(),
+    fn role(id: &str, output: OutputSemantics) -> RoleInstance {
+        RoleInstance {
+            id: RoleInstanceId::new(id).unwrap(),
+            purpose: format!("{id} purpose"),
             output,
-            runtime: None,
-            timeout_secs: None,
-            network: false,
-            secrets: false,
+            runtime: "codex".into(),
+            instructions: format!("{id} instructions"),
             skills: Vec::new(),
-            prompt_body: prompt_body.to_string(),
-        }
-    }
-
-    fn ctx<'a>(upstream: &'a [String]) -> ExecutionContext<'a> {
-        ExecutionContext {
-            objective: "obj",
-            task_body: "do it",
-            targets: &[],
-            upstream_reports: upstream,
-            guidance: "",
-            feedback: &[],
+            environment: BTreeMap::new(),
+            grants: AuthorityGrants::default(),
+            deadline_secs: None,
         }
     }
 
     #[test]
-    fn worker_prompt_includes_upstream_reports() {
-        let upstream = vec!["the planner said: change add()".to_string()];
-        let role = role(OutputSemantics::ProducesArtifact);
-        let prompt = render(TurnContext::Execution(&role, ctx(&upstream)));
-        assert!(prompt.contains("Handoffs from upstream tasks"));
-        assert!(prompt.contains("the planner said"));
-    }
+    fn guidance_reaches_only_execution_and_planning_shapes() {
+        let planner = role("planner", OutputSemantics::ProposesPlan);
+        let worker = role("worker", OutputSemantics::ProducesArtifact);
+        let judge = role("judge", OutputSemantics::EmitsVerdict);
+        let gap = role("gap", OutputSemantics::EmitsGapVerdict);
+        let team = TeamRevision {
+            revision: 4,
+            roles: BTreeMap::from([
+                (planner.id.clone(), planner.clone()),
+                (worker.id.clone(), worker.clone()),
+                (judge.id.clone(), judge.clone()),
+                (gap.id.clone(), gap.clone()),
+            ]),
+            planning_assignment: planner.id.clone(),
+            task_assignments: BTreeMap::from([(TaskId::new("change").unwrap(), worker.id.clone())]),
+            judgment_assignments: BTreeMap::new(),
+            gap_review_assignment: Some(gap.id.clone()),
+            guidance: None,
+        };
+        let guidance = "Preserve the public contract exactly.";
 
-    #[test]
-    fn worker_prompt_accepts_an_already_satisfied_outcome_without_an_empty_commit() {
-        let role = role(OutputSemantics::ProducesArtifact);
-        let prompt = render(TurnContext::Execution(&role, ctx(&[])));
-
-        assert!(prompt.contains("do not create an empty commit"));
-        assert!(prompt.contains("unchanged HEAD"));
-    }
-
-    #[test]
-    fn planning_prompt_describes_coherent_ownership_and_configured_execution_roles() {
-        let mut novelist = named_role(
-            "novelist",
-            OutputSemantics::ProducesArtifact,
-            "Own coherent prose revisions.",
-        );
-        novelist.skills.push("prose-craft".to_string());
-        let roles = [
-            novelist,
-            named_role(
-                "reader-panel",
-                OutputSemantics::EmitsVerdict,
-                "Judge voice and continuity independently.",
-            ),
-            named_role(
-                "strategist",
-                OutputSemantics::ProducesReport,
-                "Planning-only private instructions.",
-            ),
-            named_role(
-                "gap-reviewer",
-                OutputSemantics::EmitsGapVerdict,
-                "Terminal-review-only private instructions.",
-            ),
-        ]
-        .into_iter()
-        .map(|role| (role.name.clone(), role))
-        .collect();
-        let role = role(OutputSemantics::ProposesPlan);
-        let prompt = render(TurnContext::Planning(
-            &role,
+        let execution = render(TurnContext::Execution(
+            &worker,
+            ExecutionContext {
+                objective: "objective",
+                task_body: "change it",
+                targets: &[],
+                upstream_reports: &[],
+                guidance,
+                feedback: &[],
+            },
+        ));
+        let planning = render(TurnContext::Planning(
+            &planner,
             PlanningPromptContext {
-                objective: "revise the novel",
-                generation: 1,
+                objective: "objective",
+                generation: 4,
                 base_revision: 0,
                 input: PlanningPromptInput {
                     accepted_plan: None,
@@ -574,118 +542,38 @@ mod tests {
                     refinement: None,
                 },
                 playbook: None,
-                roles: &roles,
+                team: &team,
                 oracle_inventory: &[],
-                task_body: "author the plan",
+                task_body: "plan it",
                 upstream_reports: &[],
-                guidance: "",
+                guidance,
                 task_feedback: &[],
             },
         ));
-
-        assert!(prompt.contains("one work task may own multiple assertions"));
-        assert!(prompt.contains("not instructions for you to follow"));
-        assert!(prompt.contains("novelist (`work`)"));
-        assert!(prompt.contains("Skills: `prose-craft`"));
-        assert!(prompt.contains("Own coherent prose revisions."));
-        assert!(prompt.contains("reader-panel (`validate`)"));
-        assert!(prompt.contains("Judge voice and continuity independently."));
-        assert!(!prompt.contains("cargo-test"));
-        assert!(!prompt.contains("implementer"));
-        assert!(!prompt.contains("<available-oracle>"));
-        assert!(!prompt.contains("Planning-only private instructions."));
-        assert!(!prompt.contains("Terminal-review-only private instructions."));
-    }
-
-    #[test]
-    fn planning_prompt_keeps_plan_inputs_distinct_and_complete() {
-        let accepted = Plan {
-            requirements: Vec::new(),
-            assertions: Vec::new(),
-            tasks: Vec::new(),
-        };
-        let rejected = PlanProposal {
-            base_revision: 7,
-            requirement_changes: vec![],
-            assertion_supersessions: vec![],
-            plan: Plan {
-                requirements: Vec::new(),
-                assertions: Vec::new(),
-                tasks: Vec::new(),
-            },
-        };
-        let task_feedback = vec!["retry only this planning role".to_string()];
-        let role = role(OutputSemantics::ProposesPlan);
-        let prompt = render(TurnContext::Planning(
-            &role,
-            PlanningPromptContext {
-                objective: "obj",
-                generation: 8,
-                base_revision: 7,
-                input: PlanningPromptInput {
-                    accepted_plan: Some(&accepted),
-                    latest_rejected_candidate: Some(&rejected),
-                    refinement: Some(PlanningPromptRefinement::FailureEvidence(
-                        "cargo test failed\nstderr:\ncompiler error".to_string(),
-                    )),
-                },
-                playbook: None,
-                roles: &BTreeMap::new(),
-                oracle_inventory: &[],
-                task_body: "author the replacement",
-                upstream_reports: &[],
-                guidance: "",
-                task_feedback: &task_feedback,
-            },
-        ));
-
-        assert_eq!(prompt.matches("## Current accepted plan").count(), 1);
-        assert!(prompt.contains("## Planning generation\n\n8"));
-        assert_eq!(
-            prompt.matches("## Latest rejected plan candidate").count(),
-            1
-        );
-        assert_eq!(prompt.matches("## Active planning input").count(), 1);
-        assert!(prompt.contains("\"base_revision\": 7"));
-        assert!(
-            prompt.contains("### Failure evidence\n\ncargo test failed\nstderr:\ncompiler error")
-        );
-        assert!(prompt.contains("## Required rework"));
-        assert!(prompt.contains("\n---\nretry only this planning role\n"));
-    }
-
-    #[test]
-    fn handoff_nonce_reads_the_assemblers_section_not_an_objectives() {
-        // Regression (QA round 1): the assembler appends its nonce section
-        // LAST; an objective that happens to contain the heading text must
-        // not shadow the real nonce.
-        let role = role(OutputSemantics::EmitsGapVerdict);
-        let prompt = render(TurnContext::GapReview(
-            &role,
-            TerminalReviewPromptContext {
-                objective: "document our ## Handoff nonce protocol",
-                limitations: &[],
-                nonce: "the-real-nonce",
-            },
-        ));
-        assert_eq!(handoff_nonce(&prompt), Some("the-real-nonce"));
-        assert_eq!(handoff_nonce("no nonce section here"), None);
-    }
-
-    #[test]
-    fn judge_prompt_excludes_producer_prose_fresh_context() {
-        let role = role(OutputSemantics::EmitsVerdict);
-        let prompt = render(TurnContext::Judgment(
-            &role,
+        let judgment = render(TurnContext::Judgment(
+            &judge,
             JudgmentContext {
-                objective: "obj",
+                objective: "objective",
                 task_body: "judge it",
                 targets: &[],
                 feedback: &[],
             },
         ));
-        // A judge must never see the producer's narrative.
-        assert!(!prompt.contains("the implementer said"));
-        assert!(!prompt.contains("Handoffs from upstream tasks"));
+        let gap_review = render(TurnContext::GapReview(
+            &gap,
+            GapReviewPromptContext {
+                objective: "objective",
+                limitations: &[],
+                nonce: "nonce",
+            },
+        ));
+
+        assert!(execution.contains(guidance));
+        assert!(planning.contains(guidance));
+        assert!(planning.contains("\"revision\": 4"));
+        assert!(planning.contains("\"task_assignments\""));
+        assert!(!planning.contains("\"kind\": \"work\""));
+        assert!(!judgment.contains(guidance));
+        assert!(!gap_review.contains(guidance));
     }
 }

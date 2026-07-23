@@ -21,6 +21,10 @@ pub struct RoleFrontmatter {
     pub output: OutputSemantics,
     pub network: bool,
     pub secrets: bool,
+    pub install: Option<bool>,
+    pub writes: Option<bool>,
+    pub devices: Vec<String>,
+    pub inputs: Vec<String>,
     pub runtime: Option<String>,
     pub timeout_secs: Option<u64>,
     pub skills: Vec<String>,
@@ -34,6 +38,10 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
     // opts out with `network: false` (enforced in `compile_authority`).
     let mut network = true;
     let mut secrets = false;
+    let mut install = None;
+    let mut writes = None;
+    let mut devices = Vec::new();
+    let mut inputs = Vec::new();
     let mut runtime: Option<String> = None;
     let mut timeout_secs: Option<u64> = None;
     let mut skills: Vec<String> = Vec::new();
@@ -56,6 +64,10 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
             "output" => output = Some(parse_output(value)?),
             "network" => network = parse_bool(key, value)?,
             "secrets" => secrets = parse_bool(key, value)?,
+            "install" => install = Some(parse_bool(key, value)?),
+            "writes" => writes = Some(parse_bool(key, value)?),
+            "devices" => devices = parse_string_list(value)?,
+            "inputs" => inputs = parse_string_list(value)?,
             "runtime" => runtime = Some(parse_scalar(key, value)?),
             "timeout-secs" => {
                 let parsed = value
@@ -82,6 +94,10 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
         output,
         network,
         secrets,
+        install,
+        writes,
+        devices,
+        inputs,
         runtime,
         timeout_secs,
         skills,
