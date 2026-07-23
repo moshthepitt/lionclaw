@@ -8,8 +8,8 @@ use anyhow::{anyhow, Result};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use lionclaw_runtime_api::{
-    clear_state_value, load_ready_state_value, save_state_value, RuntimeSessionReady,
-    RuntimeStateDir,
+    clear_state_value, load_ready_state_value, save_state_value, RuntimeNativeSessionObservation,
+    RuntimeSessionReady, RuntimeStateDir,
 };
 
 use crate::driver::AcpRuntimeConfig;
@@ -19,6 +19,7 @@ pub(crate) struct AcpSessionState {
     pub(crate) runtime_state: Option<RuntimeStateDir>,
     pub(crate) session_id: Option<String>,
     pub(crate) active_turn: Option<ActiveAcpTurn>,
+    pub(crate) native_session_observation: Option<RuntimeNativeSessionObservation>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,13 +77,13 @@ pub(crate) fn remember_acp_session_id(
     sessions: &RwLock<HashMap<String, AcpSessionState>>,
     runtime_session_id: &str,
     session_id: &str,
-) -> Result<()> {
-    let runtime_state =
-        update_runtime_session_id(sessions, runtime_session_id, session_id.to_string())?;
+) -> Result<bool> {
+    let runtime_state = runtime_state_for(sessions, runtime_session_id)?;
     if let Some(state) = runtime_state.as_ref() {
         save_acp_session_id(config, state, session_id)?;
     }
-    Ok(())
+    update_runtime_session_id(sessions, runtime_session_id, Some(session_id.to_string()))?;
+    Ok(runtime_state.is_some())
 }
 
 pub(crate) fn forget_acp_session_id(
@@ -90,44 +91,73 @@ pub(crate) fn forget_acp_session_id(
     sessions: &RwLock<HashMap<String, AcpSessionState>>,
     runtime_session_id: &str,
 ) -> Result<()> {
-    let runtime_state = clear_runtime_session_id(sessions, runtime_session_id)?;
+    let runtime_state = runtime_state_for(sessions, runtime_session_id)?;
     if let Some(state) = runtime_state.as_ref() {
         clear_state_value(state, &config.session_id_state_file, "ACP session id")?;
     }
+    update_runtime_session_id(sessions, runtime_session_id, None)?;
     Ok(())
+}
+
+fn runtime_state_for(
+    sessions: &RwLock<HashMap<String, AcpSessionState>>,
+    runtime_session_id: &str,
+) -> Result<Option<RuntimeStateDir>> {
+    Ok(sessions
+        .read()
+        .map_err(|_| anyhow!("ACP runtime session state lock poisoned"))?
+        .get(runtime_session_id)
+        .ok_or_else(|| anyhow!("unknown ACP runtime session '{runtime_session_id}'"))?
+        .runtime_state
+        .clone())
 }
 
 fn update_runtime_session_id(
     sessions: &RwLock<HashMap<String, AcpSessionState>>,
     runtime_session_id: &str,
-    session_id: String,
-) -> Result<Option<RuntimeStateDir>> {
+    session_id: Option<String>,
+) -> Result<()> {
     let mut sessions = sessions
         .write()
         .map_err(|_| anyhow!("ACP runtime session state lock poisoned"))?;
     let state = sessions
         .get_mut(runtime_session_id)
         .ok_or_else(|| anyhow!("unknown ACP runtime session '{runtime_session_id}'"))?;
-    state.session_id = Some(session_id);
-    let runtime_state = state.runtime_state.clone();
+    state.session_id = session_id;
+    state.native_session_observation = None;
     drop(sessions);
-    Ok(runtime_state)
+    Ok(())
 }
 
-fn clear_runtime_session_id(
+pub(crate) fn record_native_session_observation(
     sessions: &RwLock<HashMap<String, AcpSessionState>>,
     runtime_session_id: &str,
-) -> Result<Option<RuntimeStateDir>> {
+    observation: RuntimeNativeSessionObservation,
+) -> Result<()> {
     let mut sessions = sessions
         .write()
         .map_err(|_| anyhow!("ACP runtime session state lock poisoned"))?;
-    let state = sessions
+    sessions
         .get_mut(runtime_session_id)
-        .ok_or_else(|| anyhow!("unknown ACP runtime session '{runtime_session_id}'"))?;
-    state.session_id = None;
-    let runtime_state = state.runtime_state.clone();
+        .ok_or_else(|| anyhow!("unknown ACP runtime session '{runtime_session_id}'"))?
+        .native_session_observation = Some(observation);
     drop(sessions);
-    Ok(runtime_state)
+    Ok(())
+}
+
+pub(crate) fn clear_native_session_observation(
+    sessions: &RwLock<HashMap<String, AcpSessionState>>,
+    runtime_session_id: &str,
+) -> Result<()> {
+    let mut sessions = sessions
+        .write()
+        .map_err(|_| anyhow!("ACP runtime session state lock poisoned"))?;
+    sessions
+        .get_mut(runtime_session_id)
+        .ok_or_else(|| anyhow!("unknown ACP runtime session '{runtime_session_id}'"))?
+        .native_session_observation = None;
+    drop(sessions);
+    Ok(())
 }
 
 pub(crate) fn register_active_acp_turn(

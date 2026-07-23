@@ -29,6 +29,20 @@ use super::transport::{AppServerMessage, AppServerTransport};
 
 const MAX_TRACKED_PROTOCOL_ENTRIES: usize = 256;
 
+pub(crate) enum AppServerRequestFailure {
+    Rejected(TypedFailure),
+    Other(anyhow::Error),
+}
+
+impl AppServerRequestFailure {
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Rejected(failure) => failure.into(),
+            Self::Other(error) => error,
+        }
+    }
+}
+
 pub(crate) struct CodexAppServerClient<T> {
     transport: T,
     runtime_context: Option<RuntimeExecutionContext>,
@@ -128,22 +142,50 @@ where
         sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<Value> {
+        self.request_classified(method, params, sink, thread_state)
+            .await
+            .map_err(AppServerRequestFailure::into_anyhow)
+    }
+
+    pub(crate) async fn request_classified<'a>(
+        &mut self,
+        method: &str,
+        params: Value,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
+        thread_state: &CodexThreadState,
+    ) -> std::result::Result<Value, AppServerRequestFailure> {
         let sink = sink.into();
         let id = self.next_request_id();
         self.transport
             .send(&app_server_request_message(id, method, params))
-            .await?;
+            .await
+            .map_err(AppServerRequestFailure::Other)?;
 
         loop {
-            let Some(message) = self.transport.recv().await? else {
-                bail!("codex app-server closed before responding to {method}");
+            let Some(message) = self
+                .transport
+                .recv()
+                .await
+                .map_err(AppServerRequestFailure::Other)?
+            else {
+                return Err(AppServerRequestFailure::Other(anyhow!(
+                    "codex app-server closed before responding to {method}"
+                )));
             };
             if response_id(message.value()).is_some_and(|response_id| response_id == id) {
-                return parse_app_server_response(message.into_value(), method);
+                return parse_app_server_response(message.into_value(), method)
+                    .map_err(AppServerRequestFailure::Rejected);
             }
-            self.dispatch_message(message, sink, thread_state).await?;
+            self.dispatch_message_for_request(
+                message,
+                sink,
+                thread_state,
+                (method == "thread/start").then_some(id),
+            )
+            .await
+            .map_err(AppServerRequestFailure::Other)?;
             if let Some(failure) = self.turn_failure(None) {
-                return Err(failure.clone().into());
+                return Err(AppServerRequestFailure::Other(failure.clone().into()));
             }
         }
     }
@@ -461,10 +503,21 @@ where
     /// produces, in order. Protocol side effects (responding to server-initiated
     /// requests, persisting the thread id, recording turn state) happen here;
     /// emitting the returned events to a sender or journal is the caller's job.
+    #[cfg(test)]
     pub(crate) async fn handle_message(
         &mut self,
         message: Value,
         thread_state: &CodexThreadState,
+    ) -> Result<Vec<RuntimeEvent>> {
+        self.handle_message_for_request(message, thread_state, None)
+            .await
+    }
+
+    async fn handle_message_for_request(
+        &mut self,
+        message: Value,
+        thread_state: &CodexThreadState,
+        thread_start_request_id: Option<u64>,
     ) -> Result<Vec<RuntimeEvent>> {
         let mut events = Vec::new();
         if message.get("id").is_some() && message.get("method").is_some() {
@@ -491,7 +544,9 @@ where
             "thread/started" => {
                 if let Some(thread_id) = extract_app_server_thread_id(params) {
                     validate_protocol_id(&thread_id)?;
-                    thread_state.persist_thread_id(&thread_id)?;
+                    if thread_start_request_id.is_some() {
+                        thread_state.persist_thread_id(&thread_id)?;
+                    }
                     events.push(RuntimeEvent::Status {
                         code: None,
                         text: format!("codex thread started: {thread_id}"),
@@ -622,9 +677,26 @@ where
     where
         M: Into<AppServerMessage>,
     {
+        self.dispatch_message_for_request(message, sink, thread_state, None)
+            .await
+    }
+
+    async fn dispatch_message_for_request<'a, M>(
+        &mut self,
+        message: M,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
+        thread_state: &CodexThreadState,
+        thread_start_request_id: Option<u64>,
+    ) -> Result<()>
+    where
+        M: Into<AppServerMessage>,
+    {
         let sink = sink.into();
         let message = message.into();
-        for event in self.handle_message(message.value, thread_state).await? {
+        for event in self
+            .handle_message_for_request(message.value, thread_state, thread_start_request_id)
+            .await?
+        {
             lionclaw_runtime_api::observe_final_response(&mut self.final_response, &event);
             sink.send(event).await;
         }

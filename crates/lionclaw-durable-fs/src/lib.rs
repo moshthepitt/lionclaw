@@ -137,30 +137,34 @@ impl RootedDirectory {
         let Some(file) = open_regular_file(&parent, &self.path, file_name, label)? else {
             return Ok(BoundedRead::Missing);
         };
-        let metadata = file.metadata().with_context(|| {
-            format!(
-                "failed to stat {label} '{}'",
-                self.path.join(file_name).display()
-            )
-        })?;
-        if metadata.len() > limit as u64 {
-            return Ok(BoundedRead::TooLarge);
-        }
+        read_open_file_bounded(file, &self.path, file_name, limit, label)
+    }
 
-        let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
-        let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
-        file.take(read_limit)
-            .read_to_end(&mut bytes)
-            .with_context(|| {
-                format!(
-                    "failed to read {label} '{}'",
-                    self.path.join(file_name).display()
-                )
-            })?;
-        if bytes.len() > limit {
-            return Ok(BoundedRead::TooLarge);
+    /// Read and durably remove one bounded regular file through the same
+    /// descriptor-rooted directory authority.
+    ///
+    /// Concurrent takers are serialized by the unlink result: a loser observes
+    /// `Missing` even if it opened the old file first. Writers remain governed
+    /// by the caller's higher-level single-writer authority.
+    pub fn take_bounded_status(
+        &self,
+        file_name: &OsStr,
+        limit: usize,
+        label: &str,
+    ) -> Result<BoundedRead> {
+        ensure_file_name(file_name, label)?;
+        let Some(parent) = self.open_existing()? else {
+            return Ok(BoundedRead::Missing);
+        };
+        let Some(file) = open_regular_file(&parent, &self.path, file_name, label)? else {
+            return Ok(BoundedRead::Missing);
+        };
+        let contents = read_open_file_bounded(file, &self.path, file_name, limit, label)?;
+        if remove_file_if_exists(&parent, &self.path, file_name, label)? {
+            Ok(contents)
+        } else {
+            Ok(BoundedRead::Missing)
         }
-        Ok(BoundedRead::Contents(bytes))
     }
 
     /// Atomically replace a private regular file in this directory.
@@ -244,6 +248,39 @@ impl RootedDirectory {
         }
         Ok(Some(directory))
     }
+}
+
+fn read_open_file_bounded(
+    file: File,
+    parent_path: &Path,
+    file_name: &OsStr,
+    limit: usize,
+    label: &str,
+) -> Result<BoundedRead> {
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to stat {label} '{}'",
+            parent_path.join(file_name).display()
+        )
+    })?;
+    if metadata.len() > limit as u64 {
+        return Ok(BoundedRead::TooLarge);
+    }
+
+    let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "failed to read {label} '{}'",
+                parent_path.join(file_name).display()
+            )
+        })?;
+    if bytes.len() > limit {
+        return Ok(BoundedRead::TooLarge);
+    }
+    Ok(BoundedRead::Contents(bytes))
 }
 
 fn directory_flags() -> OFlags {
@@ -547,6 +584,49 @@ mod tests {
             .read_bounded(OsStr::new("session"), 4, "session state")
             .unwrap_err();
         assert!(error.to_string().contains("4-byte limit"));
+    }
+
+    #[test]
+    fn concurrent_takers_have_exactly_one_winner() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = rooted(&root);
+        std::fs::create_dir_all(directory.path()).unwrap();
+        directory
+            .write_private_atomic(OsStr::new("session"), b"ready", 32, "session state")
+            .unwrap();
+        let directory = std::sync::Arc::new(directory);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let takers = (0..8)
+            .map(|_| {
+                let directory = std::sync::Arc::clone(&directory);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    directory
+                        .take_bounded_status(OsStr::new("session"), 32, "session state")
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = takers
+            .into_iter()
+            .map(|taker| taker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == BoundedRead::Contents(b"ready".to_vec()))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == BoundedRead::Missing)
+                .count(),
+            7
+        );
     }
 
     #[test]

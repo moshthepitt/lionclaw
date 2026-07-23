@@ -3,8 +3,8 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, bail, Result};
 use lionclaw_runtime_api::{
-    clear_state_value, load_ready_state_value, save_state_value, RuntimeSessionReady,
-    RuntimeStateDir,
+    clear_state_value, load_ready_state_value, save_state_value, RuntimeNativeSessionObservation,
+    RuntimeSessionReady, RuntimeStateDir,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -29,7 +29,7 @@ pub(crate) struct CodexSessionState {
     pub(crate) runtime_state: Option<RuntimeStateDir>,
     pub(crate) thread_id: Option<String>,
     pub(crate) active_turn: Option<ActiveCodexTurn>,
-    pub(crate) native_reopen_failed: bool,
+    pub(crate) native_session_observation: Option<RuntimeNativeSessionObservation>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,12 +92,12 @@ pub(crate) fn forget_thread_id(
         .get_mut(runtime_session_id)
         .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))?;
     session.thread_id = None;
-    session.native_reopen_failed = false;
+    session.native_session_observation = None;
     drop(sessions);
     Ok(())
 }
 
-pub(crate) fn mark_native_reopen_failed(
+pub(crate) fn record_native_reopen_failure(
     sessions: &RwLock<HashMap<String, CodexSessionState>>,
     runtime_session_id: &str,
 ) -> Result<()> {
@@ -107,12 +107,43 @@ pub(crate) fn mark_native_reopen_failed(
     sessions
         .get_mut(runtime_session_id)
         .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))?
-        .native_reopen_failed = true;
+        .native_session_observation = Some(RuntimeNativeSessionObservation::ReopenFailed);
+    drop(sessions);
+    Ok(())
+}
+
+pub(crate) fn clear_native_session_observation(
+    sessions: &RwLock<HashMap<String, CodexSessionState>>,
+    runtime_session_id: &str,
+) -> Result<()> {
+    let mut sessions = sessions
+        .write()
+        .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?;
+    sessions
+        .get_mut(runtime_session_id)
+        .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))?
+        .native_session_observation = None;
     drop(sessions);
     Ok(())
 }
 
 impl CodexThreadState {
+    pub(crate) fn record_native_session_observation(
+        &self,
+        observation: RuntimeNativeSessionObservation,
+    ) -> Result<()> {
+        let mut sessions = self
+            .sessions
+            .write()
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?;
+        sessions
+            .get_mut(&self.runtime_session_id)
+            .ok_or_else(|| anyhow!("runtime session '{}' not found", self.runtime_session_id))?
+            .native_session_observation = Some(observation);
+        drop(sessions);
+        Ok(())
+    }
+
     pub(crate) fn set_active_turn(
         &self,
         thread_id: &str,
@@ -167,7 +198,7 @@ impl CodexThreadState {
             .clone())
     }
 
-    pub(crate) fn persist_thread_id(&self, thread_id: &str) -> Result<()> {
+    pub(crate) fn persist_thread_id(&self, thread_id: &str) -> Result<bool> {
         validate_protocol_id(thread_id)?;
         let root = self
             .sessions
@@ -193,6 +224,6 @@ impl CodexThreadState {
             session.thread_id = Some(thread_id.to_string());
             drop(sessions);
         }
-        Ok(())
+        Ok(root.is_some())
     }
 }

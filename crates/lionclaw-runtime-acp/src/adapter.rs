@@ -10,18 +10,18 @@ use tracing::warn;
 use uuid::Uuid;
 
 use lionclaw_runtime_api::{
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeMcpServerSpec, RuntimeProgramExecutor,
-    RuntimeProgramSpec, RuntimeResume, RuntimeResumeMode, RuntimeSessionHandle,
-    RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTurnJournalSender, TurnExecution,
-    TurnInput, TurnResult, TypedFailure,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeMcpServerSpec, RuntimeNativeReopenRecovery,
+    RuntimeNativeSessionObservation, RuntimeProgramExecutor, RuntimeProgramSpec, RuntimeResume,
+    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+    RuntimeTurnJournalSender, TurnExecution, TurnInput, TurnResult, TypedFailure,
 };
 
 use crate::client::{finish_acp_session, AcpClient, AcpEnsureSession};
 use crate::driver::AcpRuntimeConfig;
 use crate::program::{build_acp_program, build_acp_terminal_program};
 use crate::state::{
-    get_runtime_session, load_ready_acp_session_id, register_active_acp_turn, AcpCancelRequest,
-    AcpSessionState,
+    clear_native_session_observation, forget_acp_session_id, get_runtime_session,
+    load_ready_acp_session_id, register_active_acp_turn, AcpCancelRequest, AcpSessionState,
 };
 
 const ACP_CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,7 +58,25 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
         Ok(build_acp_terminal_program(&self.config))
     }
 
-    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
+    fn native_reopen_recovery(&self) -> RuntimeNativeReopenRecovery {
+        RuntimeNativeReopenRecovery::ForgetAndReconstruct
+    }
+
+    fn forget_native_reopen(&self, handle: &RuntimeSessionHandle) -> Result<()> {
+        forget_acp_session_id(&self.config, &self.sessions, &handle.runtime_session_id)
+    }
+
+    fn native_session_observation(
+        &self,
+        handle: &RuntimeSessionHandle,
+    ) -> Result<Option<RuntimeNativeSessionObservation>> {
+        Ok(
+            get_runtime_session(&self.sessions, &handle.runtime_session_id)?
+                .native_session_observation,
+        )
+    }
+
+    fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_id = self.config.normalized_runtime_id();
         let runtime_session_id = format!("{runtime_id}-{}", Uuid::new_v4());
         let (runtime_state, session_id) = match input.resume {
@@ -68,7 +86,6 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
             }
             RuntimeResume::Reconstruct => (None, None),
         };
-        let resumes_existing_session = session_id.is_some();
         self.sessions
             .write()
             .map_err(|_| anyhow!("ACP runtime session state lock poisoned"))?
@@ -78,17 +95,11 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
                     runtime_state,
                     session_id,
                     active_turn: None,
+                    native_session_observation: None,
                 },
             );
 
-        Ok(RuntimeSessionHandle {
-            runtime_session_id,
-            resume_mode: if resumes_existing_session {
-                RuntimeResumeMode::Resumed
-            } else {
-                RuntimeResumeMode::Reconstructed
-            },
-        })
+        Ok(RuntimeSessionHandle { runtime_session_id })
     }
 
     async fn turn(
@@ -172,7 +183,7 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
         }
     }
 
-    async fn close(&self, handle: &RuntimeSessionHandle) -> Result<()> {
+    fn close(&self, handle: &RuntimeSessionHandle) -> Result<()> {
         self.sessions
             .write()
             .map_err(|_| anyhow!("ACP runtime session state lock poisoned"))?
@@ -196,6 +207,7 @@ impl AcpTurnRunner {
         journal: RuntimeTurnJournalSender,
     ) -> Result<TurnResult> {
         let runtime_session_id = input.runtime_session_id.clone();
+        clear_native_session_observation(&self.sessions, &runtime_session_id)?;
         let session_state = get_runtime_session(&self.sessions, &runtime_session_id)?;
         let program = build_acp_program(&self.config);
         let session = self.executor.spawn(program).await?;

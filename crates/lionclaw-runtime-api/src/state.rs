@@ -62,15 +62,58 @@ impl RuntimeSessionReady {
         }
     }
 
-    pub fn from_state_dir(runtime_state: &RuntimeStateDir) -> Result<Self> {
-        Ok(Self {
-            marker_present: runtime_session_ready_marker_exists(runtime_state)?,
-        })
-    }
-
     pub const fn is_ready(self) -> bool {
         self.marker_present
     }
+}
+
+#[must_use = "dropping an attempt intentionally leaves native state uncommitted"]
+#[derive(Debug)]
+pub struct RuntimeSessionAttempt {
+    runtime_state: RuntimeStateDir,
+    previous_ready: RuntimeSessionReady,
+}
+
+impl RuntimeSessionAttempt {
+    pub const fn previous_ready(&self) -> RuntimeSessionReady {
+        self.previous_ready
+    }
+
+    /// Commits adapter-observed, reopenable native state for the next attempt.
+    pub fn commit(self, observation: crate::RuntimeNativeSessionObservation) -> Result<()> {
+        let Some(mode) = observation.committable_mode() else {
+            return Ok(());
+        };
+        let value = match mode {
+            crate::RuntimeResumeMode::Reconstructed => RECONSTRUCTED_RESUME_MODE,
+            crate::RuntimeResumeMode::Resumed => RESUMED_RESUME_MODE,
+        };
+        write_value(
+            &self.runtime_state.marker_files,
+            RUNTIME_SESSION_READY_MARKER,
+            &format!("{} {value}", self.runtime_state.profile_key),
+            "runtime resume mode",
+        )
+    }
+}
+
+/// Begins one native-session attempt by consuming the prior commit marker.
+///
+/// A valid marker authorizes exactly one reopen attempt for the matching
+/// profile. Invalid content degrades to reconstruction, while filesystem
+/// authority violations remain errors. In every non-error case the marker is
+/// removed before external runtime work can begin. The mission scheduler
+/// serializes role effects, so only the owning attempt may later commit a new
+/// marker; concurrent takers still have exactly one winner.
+pub fn begin_runtime_session_attempt(
+    runtime_state: &RuntimeStateDir,
+) -> Result<RuntimeSessionAttempt> {
+    let marker_present = take_marker(runtime_state)?
+        .is_some_and(|marker| marker.profile_key == runtime_state.profile_key);
+    Ok(RuntimeSessionAttempt {
+        runtime_state: runtime_state.clone(),
+        previous_ready: RuntimeSessionReady { marker_present },
+    })
 }
 
 pub fn load_ready_state_value(
@@ -83,30 +126,6 @@ pub fn load_ready_state_value(
         return Ok(None);
     }
     load_state_value(runtime_state, file_name, label)
-}
-
-pub fn runtime_session_ready_marker_exists(runtime_state: &RuntimeStateDir) -> Result<bool> {
-    Ok(read_marker(runtime_state)?
-        .is_some_and(|marker| marker.profile_key == runtime_state.profile_key))
-}
-
-/// Records the adapter-observed mode in mission-private conversation state.
-/// The same file remains the commit marker which permits native state to be
-/// considered by the next process.
-pub fn record_runtime_resume_mode(
-    runtime_state: &RuntimeStateDir,
-    mode: crate::RuntimeResumeMode,
-) -> Result<()> {
-    let value = match mode {
-        crate::RuntimeResumeMode::Reconstructed => RECONSTRUCTED_RESUME_MODE,
-        crate::RuntimeResumeMode::Resumed => RESUMED_RESUME_MODE,
-    };
-    write_value(
-        &runtime_state.marker_files,
-        RUNTIME_SESSION_READY_MARKER,
-        &format!("{} {value}", runtime_state.profile_key),
-        "runtime resume mode",
-    )
 }
 
 /// Reads the last adapter-observed mode without exposing native identity.
@@ -186,16 +205,24 @@ struct RuntimeMarker {
     mode: crate::RuntimeResumeMode,
 }
 
-fn read_marker(runtime_state: &RuntimeStateDir) -> Result<Option<RuntimeMarker>> {
-    read_marker_files(&runtime_state.marker_files)
-}
-
 fn read_marker_files(files: &RootedDirectory) -> Result<Option<RuntimeMarker>> {
-    let contents = match files.read_bounded_status(
+    parse_marker(files.read_bounded_status(
         OsStr::new(RUNTIME_SESSION_READY_MARKER),
         RUNTIME_STATE_VALUE_LIMIT,
         "runtime session marker",
-    )? {
+    )?)
+}
+
+fn take_marker(runtime_state: &RuntimeStateDir) -> Result<Option<RuntimeMarker>> {
+    parse_marker(runtime_state.marker_files.take_bounded_status(
+        OsStr::new(RUNTIME_SESSION_READY_MARKER),
+        RUNTIME_STATE_VALUE_LIMIT,
+        "runtime session marker",
+    )?)
+}
+
+fn parse_marker(contents: BoundedRead) -> Result<Option<RuntimeMarker>> {
+    let contents = match contents {
         BoundedRead::Missing | BoundedRead::TooLarge => return Ok(None),
         BoundedRead::Contents(contents) => contents,
     };
@@ -260,7 +287,9 @@ fn normalize_state_value(value: impl AsRef<str>, label: &str) -> Result<Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RuntimeResumeMode;
+    use crate::{
+        RuntimeNativeSessionObservation, RuntimeNativeStateAvailability, RuntimeResumeMode,
+    };
 
     const PROFILE_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -278,6 +307,22 @@ mod tests {
         std::fs::create_dir_all(runtime_state.path()).unwrap();
     }
 
+    fn reopenable(mode: RuntimeResumeMode) -> RuntimeNativeSessionObservation {
+        match mode {
+            RuntimeResumeMode::Reconstructed => RuntimeNativeSessionObservation::Reconstructed {
+                state: RuntimeNativeStateAvailability::Reopenable,
+            },
+            RuntimeResumeMode::Resumed => RuntimeNativeSessionObservation::Resumed,
+        }
+    }
+
+    fn publish(runtime_state: &RuntimeStateDir, mode: RuntimeResumeMode) {
+        begin_runtime_session_attempt(runtime_state)
+            .unwrap()
+            .commit(reopenable(mode))
+            .unwrap();
+    }
+
     #[test]
     fn recorded_resume_mode_is_truthful_and_replaces_prior_observation() {
         use std::os::unix::fs::PermissionsExt;
@@ -287,14 +332,17 @@ mod tests {
         prepare(&runtime_state);
 
         assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
-        record_runtime_resume_mode(&runtime_state, RuntimeResumeMode::Reconstructed).unwrap();
-        assert!(runtime_session_ready_marker_exists(&runtime_state).unwrap());
+        publish(&runtime_state, RuntimeResumeMode::Reconstructed);
         assert_eq!(
             recorded_runtime_resume_mode(&runtime_state).unwrap(),
             Some(RuntimeResumeMode::Reconstructed)
         );
 
-        record_runtime_resume_mode(&runtime_state, RuntimeResumeMode::Resumed).unwrap();
+        let attempt = begin_runtime_session_attempt(&runtime_state).unwrap();
+        assert!(attempt.previous_ready().is_ready());
+        attempt
+            .commit(RuntimeNativeSessionObservation::Resumed)
+            .unwrap();
         assert_eq!(
             recorded_runtime_resume_mode(&runtime_state).unwrap(),
             Some(RuntimeResumeMode::Resumed)
@@ -314,6 +362,46 @@ mod tests {
     }
 
     #[test]
+    fn begin_consumes_readiness_before_loading_the_authorized_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+        save_state_value(&runtime_state, "session", "native-id", "test").unwrap();
+        publish(&runtime_state, RuntimeResumeMode::Resumed);
+
+        let attempt = begin_runtime_session_attempt(&runtime_state).unwrap();
+
+        assert!(attempt.previous_ready().is_ready());
+        assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
+        assert_eq!(
+            load_ready_state_value(&runtime_state, "session", "test", attempt.previous_ready(),)
+                .unwrap()
+                .as_deref(),
+            Some("native-id")
+        );
+    }
+
+    #[test]
+    fn noncommittable_observations_cannot_publish_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+
+        for observation in [
+            RuntimeNativeSessionObservation::Reconstructed {
+                state: RuntimeNativeStateAvailability::Unavailable,
+            },
+            RuntimeNativeSessionObservation::ReopenFailed,
+        ] {
+            begin_runtime_session_attempt(&runtime_state)
+                .unwrap()
+                .commit(observation)
+                .unwrap();
+            assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
+        }
+    }
+
+    #[test]
     fn invalid_recorded_resume_mode_is_not_projected_as_native() {
         let root = tempfile::tempdir().unwrap();
         let runtime_state = runtime_state(&root);
@@ -327,7 +415,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
-        assert!(!runtime_session_ready_marker_exists(&runtime_state).unwrap());
     }
 
     #[test]
@@ -335,7 +422,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let runtime_state = runtime_state(&root);
         prepare(&runtime_state);
-        record_runtime_resume_mode(&runtime_state, RuntimeResumeMode::Resumed).unwrap();
+        publish(&runtime_state, RuntimeResumeMode::Resumed);
 
         let other_profile = RuntimeStateDir::new(
             root.path(),
@@ -345,17 +432,14 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(other_profile.path()).unwrap();
 
-        assert!(RuntimeSessionReady::from_state_dir(&runtime_state)
-            .unwrap()
-            .is_ready());
-        assert!(!RuntimeSessionReady::from_state_dir(&other_profile)
-            .unwrap()
-            .is_ready());
         assert_eq!(
             recorded_runtime_resume_mode(&other_profile).unwrap(),
             Some(RuntimeResumeMode::Resumed),
             "operator projection reports the last observation without granting another profile readiness"
         );
+        let attempt = begin_runtime_session_attempt(&other_profile).unwrap();
+        assert!(!attempt.previous_ready().is_ready());
+        assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
     }
 
     #[test]
@@ -374,9 +458,9 @@ mod tests {
         ] {
             std::fs::write(&marker, contents).unwrap();
             assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
-            assert!(!RuntimeSessionReady::from_state_dir(&runtime_state)
-                .unwrap()
-                .is_ready());
+            let attempt = begin_runtime_session_attempt(&runtime_state).unwrap();
+            assert!(!attempt.previous_ready().is_ready());
+            assert!(!marker.exists(), "corrupt marker must be consumed");
         }
     }
 
@@ -403,7 +487,10 @@ mod tests {
             load_state_value(&runtime_state, "session", "test").unwrap(),
             None
         );
-        assert!(!runtime_session_ready_marker_exists(&runtime_state).unwrap());
+        assert!(!begin_runtime_session_attempt(&runtime_state)
+            .unwrap()
+            .previous_ready()
+            .is_ready());
         assert!(save_state_value(&runtime_state, "session", "one", "test")
             .unwrap_err()
             .to_string()
@@ -459,5 +546,60 @@ mod tests {
 
         let error = recorded_runtime_resume_mode(&runtime_state).unwrap_err();
         assert!(error.to_string().contains("cannot be a symlink"));
+        let error = begin_runtime_session_attempt(&runtime_state).unwrap_err();
+        assert!(error.to_string().contains("cannot be a symlink"));
+        assert!(
+            outside.path().exists(),
+            "authority target must remain untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consumed_readiness_preserves_identity_authority_checks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+        symlink(outside.path(), runtime_state.path().join("session")).unwrap();
+        publish(&runtime_state, RuntimeResumeMode::Resumed);
+
+        let attempt = begin_runtime_session_attempt(&runtime_state).unwrap();
+        assert!(attempt.previous_ready().is_ready());
+        let error =
+            load_ready_state_value(&runtime_state, "session", "test", attempt.previous_ready())
+                .unwrap_err();
+        assert!(error.to_string().contains("cannot be a symlink"));
+        assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
+        assert!(
+            outside.path().exists(),
+            "identity target must remain untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unready_attempt_does_not_inspect_stale_identity() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+        symlink(outside.path(), runtime_state.path().join("session")).unwrap();
+
+        let attempt = begin_runtime_session_attempt(&runtime_state).unwrap();
+        assert!(!attempt.previous_ready().is_ready());
+        assert_eq!(
+            load_ready_state_value(&runtime_state, "session", "test", attempt.previous_ready(),)
+                .unwrap(),
+            None
+        );
+        assert!(
+            outside.path().exists(),
+            "identity target must remain untouched"
+        );
     }
 }

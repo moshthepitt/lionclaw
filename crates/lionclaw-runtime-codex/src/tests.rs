@@ -13,10 +13,11 @@ use lionclaw_runtime_api::{
     append_streamed_text_boundary, append_streamed_text_delta, canonical_events, ExecutionOutput,
     NetworkMode, RuntimeAdapter, RuntimeDriverConfig, RuntimeDriverProvider, RuntimeEvent,
     RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMcpServerSpec, RuntimeMessageLane,
-    RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-    RuntimeProgramStdoutSender, RuntimeResume, RuntimeResumeMode, RuntimeSessionHandle,
-    RuntimeSessionReady, RuntimeSessionStartInput, RuntimeStateDir, RuntimeTerminalProgramInput,
-    TurnEvent, TurnExecution, TurnInput, TypedFailure,
+    RuntimeNativeSessionObservation, RuntimeNativeStateAvailability, RuntimePathProjection,
+    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
+    RuntimeResume, RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+    RuntimeStateDir, RuntimeTerminalProgramInput, TurnEvent, TurnExecution, TurnInput,
+    TypedFailure,
 };
 
 use crate::codex_runtime_auth_kind;
@@ -51,13 +52,15 @@ fn runtime_state_value_path(runtime_state_root: &Path, file_name: &str) -> PathB
 }
 
 fn mark_runtime_ready(runtime_state: &RuntimeStateDir) -> RuntimeSessionReady {
-    lionclaw_runtime_api::record_runtime_resume_mode(
-        runtime_state,
-        RuntimeResumeMode::Reconstructed,
-    )
-    .expect("write runtime ready marker");
-    RuntimeSessionReady::from_state_dir(runtime_state)
-        .expect("runtime ready marker should be valid")
+    lionclaw_runtime_api::begin_runtime_session_attempt(runtime_state)
+        .expect("begin marker setup")
+        .commit(RuntimeNativeSessionObservation::Reconstructed {
+            state: RuntimeNativeStateAvailability::Reopenable,
+        })
+        .expect("write runtime ready marker");
+    lionclaw_runtime_api::begin_runtime_session_attempt(runtime_state)
+        .expect("consume runtime ready marker")
+        .previous_ready()
 }
 
 fn runtime_home_projection_context(
@@ -211,7 +214,6 @@ async fn start_codex_test_session_with_config(
                 None => RuntimeResume::Reconstruct,
             },
         })
-        .await
         .expect("start");
     let thread_state = adapter.thread_state_for(&handle.runtime_session_id);
     (adapter, handle, thread_state)
@@ -717,7 +719,7 @@ async fn app_server_rejects_oversized_thread_id_from_start_response() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-    let (adapter, handle, thread_state) =
+    let (adapter, _handle, thread_state) =
         start_codex_test_session(Some(runtime_state_root.clone())).await;
     let transport = FakeAppServerTransport::new(vec![json!({
         "id": 1,
@@ -727,12 +729,7 @@ async fn app_server_rejects_oversized_thread_id_from_start_response() {
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let error = adapter
-        .ensure_app_server_thread(
-            &mut client,
-            &handle.runtime_session_id,
-            &event_tx,
-            &thread_state,
-        )
+        .ensure_app_server_thread(&mut client, None, &event_tx, &thread_state)
         .await
         .expect_err("oversized response thread id must fail closed");
 
@@ -805,7 +802,6 @@ async fn codex_session_rejects_oversized_restored_thread_id() {
                 ready,
             },
         })
-        .await
         .expect_err("oversized restored thread id must fail closed");
 
     assert!(error.to_string().contains("identifier"));
@@ -995,12 +991,7 @@ async fn codex_app_server_protocol_streams_turn_and_saves_thread_id() {
         .await
         .expect("initialize");
     let thread_id = adapter
-        .ensure_app_server_thread(
-            &mut client,
-            &handle.runtime_session_id,
-            &event_tx,
-            &thread_state,
-        )
+        .ensure_app_server_thread(&mut client, None, &event_tx, &thread_state)
         .await
         .expect("thread");
     assert_eq!(thread_id, "thr_1");
@@ -1038,6 +1029,14 @@ async fn codex_app_server_protocol_streams_turn_and_saves_thread_id() {
         .expect("thread state"),
         "thr_1\n"
     );
+    assert_eq!(
+        adapter
+            .native_session_observation(&handle)
+            .expect("native observation"),
+        Some(RuntimeNativeSessionObservation::Reconstructed {
+            state: RuntimeNativeStateAvailability::Reopenable,
+        })
+    );
 
     let sent = sent.lock().expect("sent lock").clone();
     assert!(sent.iter().all(omits_jsonrpc_header));
@@ -1054,7 +1053,7 @@ async fn codex_app_server_protocol_streams_turn_and_saves_thread_id() {
         "restricted"
     );
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -1088,7 +1087,7 @@ async fn codex_app_server_separates_distinct_agent_message_items() {
     let events = std::iter::from_fn(|| event_rx.try_recv().ok());
     assert_eq!(answer_text_from_events(events), "First.\n\nSecond.");
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 async fn assert_image_generation_event_emits_runtime_artifact(event_message: Value) {
@@ -1165,7 +1164,7 @@ async fn assert_image_generation_event_emits_runtime_artifact_at(
     assert_eq!(artifact.mime_type.as_deref(), Some("image/png"));
     assert_eq!(artifact.path, generated_dir.join("ig_1.png"));
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -1476,7 +1475,7 @@ async fn codex_app_server_image_generation_unsafe_saved_path_does_not_use_defaul
         .count();
     assert_eq!(artifacts, 0);
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -1590,7 +1589,7 @@ async fn codex_app_server_image_generation_interim_update_does_not_dedupe_comple
     assert_eq!(artifacts[0].filename.as_deref(), Some("ig_1-final.png"));
     assert_eq!(artifacts[0].path, final_image);
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -1605,18 +1604,29 @@ async fn codex_app_server_protocol_resumes_saved_thread_id() {
     )
     .expect("write thread id");
 
-    let (adapter, handle, thread_state) = start_codex_ready_test_session(runtime_state_root).await;
+    let (adapter, handle, thread_state) =
+        start_codex_ready_test_session(runtime_state_root.clone()).await;
     let transport = FakeAppServerTransport::new(vec![
-        json!({"id": 1, "result": {"thread": {"id": "thr_saved"}}}),
+        json!({"method": "thread/started", "params": {"threadId": "thr_forged_during_initialize"}}),
+        json!({"id": 1, "result": {"serverInfo": {"name": "codex", "version": "test"}}}),
+        json!({"method": "thread/started", "params": {"threadId": "thr_forged_during_resume"}}),
+        json!({"id": 2, "result": {"thread": {"id": "thr_saved"}}}),
     ]);
     let sent = transport.sent.clone();
     let mut client = CodexAppServerClient::new(transport);
-    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    let saved_thread_id = adapter
+        .current_thread_id(&handle.runtime_session_id)
+        .expect("snapshot saved thread");
+    client
+        .initialize(&event_tx, &thread_state)
+        .await
+        .expect("initialize");
     let thread_id = adapter
         .ensure_app_server_thread(
             &mut client,
-            &handle.runtime_session_id,
+            saved_thread_id.as_deref(),
             &event_tx,
             &thread_state,
         )
@@ -1624,11 +1634,153 @@ async fn codex_app_server_protocol_resumes_saved_thread_id() {
         .expect("resume thread");
 
     assert_eq!(thread_id, "thr_saved");
-    let sent = sent.lock().expect("sent lock").clone();
-    assert_eq!(sent[0]["method"], "thread/resume");
-    assert_eq!(sent[0]["params"]["threadId"], "thr_saved");
+    assert_eq!(
+        adapter
+            .current_thread_id(&handle.runtime_session_id)
+            .expect("thread identity"),
+        Some("thr_saved".to_string())
+    );
+    assert_eq!(
+        std::fs::read_to_string(runtime_state_value_path(
+            &runtime_state_root,
+            CODEX_THREAD_ID_STATE_FILE,
+        ))
+        .expect("saved thread identity"),
+        "thr_saved\n"
+    );
+    assert_eq!(
+        adapter
+            .native_session_observation(&handle)
+            .expect("native observation"),
+        Some(RuntimeNativeSessionObservation::Resumed)
+    );
+    let statuses = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            RuntimeEvent::Status { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(statuses
+        .iter()
+        .any(|text| text.contains("thr_forged_during_initialize")));
+    assert!(statuses
+        .iter()
+        .any(|text| text.contains("thr_forged_during_resume")));
 
-    adapter.close(&handle).await.expect("close");
+    let sent = sent.lock().expect("sent lock").clone();
+    assert_eq!(sent[0]["method"], "initialize");
+    assert_eq!(sent[1]["method"], "initialized");
+    assert_eq!(sent[2]["method"], "thread/resume");
+    assert_eq!(sent[2]["params"]["threadId"], "thr_saved");
+
+    adapter.close(&handle).expect("close");
+}
+
+#[tokio::test]
+async fn codex_thread_start_reports_reconstructed_availability() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let (adapter, handle, thread_state) =
+        start_codex_test_session(Some(runtime_state_root.clone())).await;
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(vec![json!({
+        "id": 1,
+        "result": {"thread": {"id": "thr_reopenable"}}
+    })]));
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    assert_eq!(
+        adapter
+            .ensure_app_server_thread(&mut client, None, &event_tx, &thread_state)
+            .await
+            .expect("start reopenable thread"),
+        "thr_reopenable"
+    );
+    assert_eq!(
+        adapter
+            .native_session_observation(&handle)
+            .expect("native observation"),
+        Some(RuntimeNativeSessionObservation::Reconstructed {
+            state: RuntimeNativeStateAvailability::Reopenable,
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(runtime_state_value_path(
+            &runtime_state_root,
+            CODEX_THREAD_ID_STATE_FILE,
+        ))
+        .expect("persisted thread"),
+        "thr_reopenable\n"
+    );
+    adapter.close(&handle).expect("close");
+
+    let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(vec![json!({
+        "id": 1,
+        "result": {"thread": {"id": "thr_ephemeral"}}
+    })]));
+
+    adapter
+        .ensure_app_server_thread(&mut client, None, &event_tx, &thread_state)
+        .await
+        .expect("start ephemeral thread");
+    assert_eq!(
+        adapter
+            .native_session_observation(&handle)
+            .expect("native observation"),
+        Some(RuntimeNativeSessionObservation::Reconstructed {
+            state: RuntimeNativeStateAvailability::Unavailable,
+        })
+    );
+    adapter.close(&handle).expect("close");
+}
+
+#[tokio::test]
+async fn codex_resume_response_cannot_replace_saved_thread_identity() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root.clone());
+    std::fs::write(
+        runtime_state.path().join(CODEX_THREAD_ID_STATE_FILE),
+        "thr_saved\n",
+    )
+    .expect("write thread id");
+    let (adapter, handle, thread_state) =
+        start_codex_ready_test_session(runtime_state_root.clone()).await;
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(vec![json!({
+        "id": 1,
+        "result": {"thread": {"id": "thr_substitute"}}
+    })]));
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = adapter
+        .ensure_app_server_thread(&mut client, Some("thr_saved"), &event_tx, &thread_state)
+        .await
+        .expect_err("resume must preserve exact saved identity");
+    assert!(error
+        .to_string()
+        .contains("resumed thread 'thr_substitute', expected 'thr_saved'"));
+    assert_eq!(
+        adapter
+            .current_thread_id(&handle.runtime_session_id)
+            .expect("thread identity"),
+        Some("thr_saved".to_string())
+    );
+    assert_eq!(
+        std::fs::read_to_string(runtime_state_value_path(
+            &runtime_state_root,
+            CODEX_THREAD_ID_STATE_FILE,
+        ))
+        .expect("saved thread identity"),
+        "thr_saved\n"
+    );
+    assert_eq!(
+        adapter
+            .native_session_observation(&handle)
+            .expect("native observation"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -1668,7 +1820,7 @@ async fn codex_app_server_unmatched_terminal_notifications_complete_current_wait
         .iter()
         .any(|event| matches!(event, RuntimeEvent::Done)));
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -1709,7 +1861,7 @@ async fn codex_app_server_compaction_uses_context_compaction_contract_fixture() 
         .iter()
         .any(|event| matches!(event, RuntimeEvent::Done)));
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 /// Translate a fixture's server notifications into a canonical turn journal,
@@ -1856,7 +2008,7 @@ async fn codex_app_server_successful_turn_uses_contract_fixture() {
     );
     assert_eq!(answer_text_from_events(events), "Hello world!");
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -1876,7 +2028,7 @@ async fn codex_app_server_turn_interrupt_uses_contract_fixture() {
     let sent = sent.lock().expect("sent lock").clone();
     assert_eq!(sent, vec![fixture_client_message(&fixture)]);
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -1909,7 +2061,7 @@ async fn codex_cancel_interrupts_active_app_server_turn() {
     );
     wait_task.await.expect("wait task joins");
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -1957,7 +2109,7 @@ async fn codex_turn_started_notification_registers_active_cancel_target() {
         .expect("cancel sends native Codex interrupt");
     wait_task.await.expect("wait task joins");
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -2002,7 +2154,7 @@ async fn codex_app_server_failed_turn_completion_returns_error() {
         .iter()
         .any(|event| matches!(event, RuntimeEvent::Done)));
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -2048,7 +2200,7 @@ async fn codex_app_server_unmatched_terminal_error_returns_error() {
         .iter()
         .any(|event| matches!(event, RuntimeEvent::Done)));
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[test]
@@ -2163,7 +2315,7 @@ async fn codex_app_server_retryable_error_notification_does_not_fail_turn() {
         .iter()
         .any(|event| matches!(event, RuntimeEvent::Done)));
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -2205,7 +2357,7 @@ async fn codex_app_server_protocol_rejects_internal_approval_callbacks() {
                 .is_some_and(|message| message.contains("LionClaw policy"))
     }));
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -2233,9 +2385,14 @@ async fn missing_or_invalid_thread_file_starts_fresh_codex_thread() {
         .expect("write invalid thread id");
 
     let (adapter, handle, _) = start_codex_test_session(Some(runtime_state_root)).await;
-    assert_eq!(handle.resume_mode, RuntimeResumeMode::Reconstructed);
+    assert_eq!(
+        adapter
+            .current_thread_id(&handle.runtime_session_id)
+            .expect("thread state"),
+        None
+    );
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -2251,9 +2408,14 @@ async fn saved_thread_file_without_ready_marker_starts_fresh_codex_thread() {
     .expect("write thread id");
 
     let (adapter, handle, _) = start_codex_test_session(Some(runtime_state_root)).await;
-    assert_eq!(handle.resume_mode, RuntimeResumeMode::Reconstructed);
+    assert_eq!(
+        adapter
+            .current_thread_id(&handle.runtime_session_id)
+            .expect("thread state"),
+        None
+    );
 
-    adapter.close(&handle).await.expect("close");
+    adapter.close(&handle).expect("close");
 }
 
 #[tokio::test]
@@ -2284,7 +2446,6 @@ async fn symlinked_thread_file_is_rejected() {
                 ready: runtime_session_ready,
             },
         })
-        .await
         .expect_err("symlinked thread state should fail");
     assert!(err.to_string().contains("cannot be a symlink"));
 }
@@ -2318,7 +2479,6 @@ async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
                 ready: runtime_a_ready,
             },
         })
-        .await
         .expect("start a");
     let handle_b = adapter
         .session_start(RuntimeSessionStartInput {
@@ -2330,7 +2490,6 @@ async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
                 ready: runtime_b_ready,
             },
         })
-        .await
         .expect("start b");
 
     assert_eq!(
@@ -2346,8 +2505,8 @@ async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
         Some("thread-b".to_string())
     );
 
-    adapter.close(&handle_a).await.expect("close a");
-    adapter.close(&handle_b).await.expect("close b");
+    adapter.close(&handle_a).expect("close a");
+    adapter.close(&handle_b).expect("close b");
 }
 
 #[tokio::test]
@@ -2362,28 +2521,49 @@ async fn native_reopen_recovery_durably_forgets_exact_stale_codex_thread() {
     )
     .expect("write stale thread");
 
-    let (adapter, handle, _) = start_codex_ready_test_session(runtime_state_root.clone()).await;
-    assert_eq!(handle.resume_mode, RuntimeResumeMode::Resumed);
+    let (adapter, handle, thread_state) =
+        start_codex_ready_test_session(runtime_state_root.clone()).await;
+    assert_eq!(
+        adapter
+            .current_thread_id(&handle.runtime_session_id)
+            .expect("thread state"),
+        Some("thread-stale".to_string())
+    );
     assert_eq!(
         adapter.native_reopen_recovery(),
         lionclaw_runtime_api::RuntimeNativeReopenRecovery::ForgetAndReconstruct
     );
-    let failure = TypedFailure::permanent("codex.thread_rollout", "stale thread");
     assert_eq!(
-        adapter.native_reopen_outcome(&handle, &failure),
-        lionclaw_runtime_api::RuntimeNativeReopenOutcome::NotReopenFailure
+        adapter
+            .native_session_observation(&handle)
+            .expect("native observation"),
+        None
     );
-    adapter
-        .mark_native_reopen_failed(&handle.runtime_session_id)
-        .expect("record failed thread/resume boundary");
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(vec![json!({
+        "id": 1,
+        "error": {
+            "code": "thread_not_found",
+            "message": "saved thread no longer exists"
+        }
+    })]));
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let error = adapter
+        .ensure_app_server_thread(&mut client, Some("thread-stale"), &event_tx, &thread_state)
+        .await
+        .expect_err("app-server rejection must report a failed native reopen");
+    let failure = error
+        .downcast_ref::<TypedFailure>()
+        .expect("app-server rejection remains typed");
+    assert_eq!(failure.evidence().code.as_deref(), Some("thread_not_found"));
     assert_eq!(
-        adapter.native_reopen_outcome(&handle, &failure),
-        lionclaw_runtime_api::RuntimeNativeReopenOutcome::Recoverable
+        adapter
+            .native_session_observation(&handle)
+            .expect("native observation"),
+        Some(RuntimeNativeSessionObservation::ReopenFailed)
     );
 
     adapter
         .forget_native_reopen(&handle)
-        .await
         .expect("forget stale reopen identity");
     assert_eq!(
         adapter
@@ -2394,6 +2574,52 @@ async fn native_reopen_recovery_durably_forgets_exact_stale_codex_thread() {
     assert!(
         !runtime_state_value_path(&runtime_state_root, CODEX_THREAD_ID_STATE_FILE).exists(),
         "forget confirmation must follow durable removal"
+    );
+}
+
+#[tokio::test]
+async fn native_reopen_transport_failure_does_not_claim_resume_rejection() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root.clone());
+    std::fs::write(
+        runtime_state.path().join(CODEX_THREAD_ID_STATE_FILE),
+        "thread-saved\n",
+    )
+    .expect("write saved thread");
+
+    let (adapter, handle, thread_state) =
+        start_codex_ready_test_session(runtime_state_root.clone()).await;
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = adapter
+        .ensure_app_server_thread(&mut client, Some("thread-saved"), &event_tx, &thread_state)
+        .await
+        .expect_err("closed transport must fail resume");
+    assert!(error
+        .to_string()
+        .contains("closed before responding to thread/resume"));
+    assert_eq!(
+        adapter
+            .native_session_observation(&handle)
+            .expect("native observation"),
+        None
+    );
+    assert_eq!(
+        adapter
+            .current_thread_id(&handle.runtime_session_id)
+            .expect("thread identity"),
+        Some("thread-saved".to_string())
+    );
+    assert_eq!(
+        std::fs::read_to_string(runtime_state_value_path(
+            &runtime_state_root,
+            CODEX_THREAD_ID_STATE_FILE,
+        ))
+        .expect("saved thread identity"),
+        "thread-saved\n"
     );
 }
 
@@ -2417,7 +2643,6 @@ async fn start_codex_ready_test_session(
                 ready: runtime_session_ready,
             },
         })
-        .await
         .expect("start");
     let thread_state = adapter.thread_state_for(&handle.runtime_session_id);
     (adapter, handle, thread_state)

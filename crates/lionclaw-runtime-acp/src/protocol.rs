@@ -1,11 +1,10 @@
-use anyhow::Result;
+use anyhow::anyhow;
 use lionclaw_runtime_api::TypedFailure;
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AcpOpenedSession {
     pub(crate) session_id: String,
-    pub(crate) resumed_existing: bool,
     pub(crate) selections: AcpSessionSelections,
 }
 
@@ -152,6 +151,11 @@ pub(crate) struct AcpResponse {
     pub(crate) result: Value,
 }
 
+pub(crate) enum AcpResponseOutcome {
+    Success(AcpResponse),
+    Rejected(TypedFailure),
+}
+
 pub(crate) fn acp_response_id(message: &Value) -> Option<u64> {
     if message.get("result").is_none() && message.get("error").is_none() {
         return None;
@@ -166,13 +170,40 @@ pub(crate) fn acp_is_server_request(message: &Value) -> bool {
         && message.get("error").is_none()
 }
 
-pub(crate) fn parse_acp_response(message: AcpMessage, method: &str) -> Result<AcpResponse> {
-    if let Some(error) = message.value.get("error") {
-        return Err(acp_typed_failure(method, error).into());
+pub(crate) fn parse_acp_response(
+    message: AcpMessage,
+    method: &str,
+) -> anyhow::Result<AcpResponseOutcome> {
+    let Some(response) = message.value.as_object() else {
+        return Err(anyhow!("ACP {method} returned a non-object response"));
+    };
+    if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(anyhow!(
+            "ACP {method} returned a response without JSON-RPC 2.0"
+        ));
     }
-    Ok(AcpResponse {
-        result: message.value.get("result").cloned().unwrap_or(Value::Null),
-    })
+    match (response.get("result"), response.get("error")) {
+        (Some(result), None) => Ok(AcpResponseOutcome::Success(AcpResponse {
+            result: result.clone(),
+        })),
+        (None, Some(error))
+            if error.get("code").and_then(Value::as_i64).is_some()
+                && error.get("message").and_then(Value::as_str).is_some() =>
+        {
+            Ok(AcpResponseOutcome::Rejected(acp_typed_failure(
+                method, error,
+            )))
+        }
+        (None, Some(_)) => Err(anyhow!(
+            "ACP {method} returned a malformed JSON-RPC error response"
+        )),
+        (Some(_), Some(_)) => Err(anyhow!(
+            "ACP {method} returned both result and error in one response"
+        )),
+        (None, None) => Err(anyhow!(
+            "ACP {method} returned neither result nor error in its response"
+        )),
+    }
 }
 
 pub(crate) fn acp_typed_failure(method: &str, error: &Value) -> TypedFailure {

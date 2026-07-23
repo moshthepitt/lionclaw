@@ -38,13 +38,51 @@ pub enum RuntimeResume {
 #[derive(Debug, Clone)]
 pub struct RuntimeSessionHandle {
     pub runtime_session_id: String,
-    pub resume_mode: RuntimeResumeMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeResumeMode {
     Reconstructed,
     Resumed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeNativeStateAvailability {
+    Reopenable,
+    Unavailable,
+}
+
+/// The adapter's authoritative observation after one native session attempt.
+///
+/// Intent belongs to [`RuntimeSessionHandle`]. This observation is recorded
+/// only after the runtime has actually established or rejected native state,
+/// so the runner never infers continuity from a requested start mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeNativeSessionObservation {
+    Reconstructed {
+        state: RuntimeNativeStateAvailability,
+    },
+    Resumed,
+    ReopenFailed,
+}
+
+impl RuntimeNativeSessionObservation {
+    pub(crate) const fn committable_mode(self) -> Option<RuntimeResumeMode> {
+        match self {
+            Self::Reconstructed {
+                state: RuntimeNativeStateAvailability::Reopenable,
+            } => Some(RuntimeResumeMode::Reconstructed),
+            Self::Resumed => Some(RuntimeResumeMode::Resumed),
+            Self::Reconstructed {
+                state: RuntimeNativeStateAvailability::Unavailable,
+            }
+            | Self::ReopenFailed => None,
+        }
+    }
+
+    pub const fn is_reopen_failure(self) -> bool {
+        matches!(self, Self::ReopenFailed)
+    }
 }
 
 /// Adapter-declared policy for a failed attempt to reopen native conversation
@@ -54,14 +92,6 @@ pub enum RuntimeResumeMode {
 pub enum RuntimeNativeReopenRecovery {
     Unsupported,
     ForgetAndReconstruct,
-}
-
-/// Typed adapter observation of whether a failed turn was in fact a failed
-/// native reopen and is eligible for the declared recovery policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeNativeReopenOutcome {
-    NotReopenFailure,
-    Recoverable,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +120,9 @@ pub enum RuntimeCancellation {
     Acknowledged,
 }
 
+/// Synchronous lifecycle hooks in this trait are bounded host-side state
+/// operations. Implementations must not wait on child processes, protocol
+/// responses, or network I/O from these hooks.
 #[async_trait]
 pub trait RuntimeAdapter: Send + Sync {
     async fn info(&self) -> RuntimeAdapterInfo;
@@ -99,17 +132,18 @@ pub trait RuntimeAdapter: Send + Sync {
     fn native_reopen_recovery(&self) -> RuntimeNativeReopenRecovery {
         RuntimeNativeReopenRecovery::Unsupported
     }
-    fn native_reopen_outcome(
-        &self,
-        _handle: &RuntimeSessionHandle,
-        _failure: &crate::TypedFailure,
-    ) -> RuntimeNativeReopenOutcome {
-        RuntimeNativeReopenOutcome::NotReopenFailure
-    }
-    async fn forget_native_reopen(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+    /// Forget the host-owned identity rejected by the exact reopen attempt.
+    fn forget_native_reopen(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         Err(anyhow!("runtime does not support native reopen recovery"))
     }
-    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle>;
+    fn native_session_observation(
+        &self,
+        _handle: &RuntimeSessionHandle,
+    ) -> Result<Option<RuntimeNativeSessionObservation>> {
+        Ok(None)
+    }
+    /// Register bounded host state for one runtime session attempt.
+    fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle>;
     async fn turn(
         &self,
         execution: TurnExecution,
@@ -126,5 +160,6 @@ pub trait RuntimeAdapter: Send + Sync {
         handle: &RuntimeSessionHandle,
         reason: Option<String>,
     ) -> Result<RuntimeCancellation>;
-    async fn close(&self, handle: &RuntimeSessionHandle) -> Result<()>;
+    /// Release bounded host state for a completed runtime session attempt.
+    fn close(&self, handle: &RuntimeSessionHandle) -> Result<()>;
 }

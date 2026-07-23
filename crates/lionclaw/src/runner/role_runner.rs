@@ -11,10 +11,9 @@ use lionclaw_confinement::WORKSPACE_MOUNT_TARGET;
 use lionclaw_runtime_acp::AcpRuntimeDriver;
 use lionclaw_runtime_api::{
     RuntimeAdapter, RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig,
-    RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeNativeReopenOutcome,
-    RuntimeNativeReopenRecovery, RuntimeResume, RuntimeResumeMode, RuntimeSessionHandle,
-    RuntimeSessionReady, RuntimeSessionStartInput, TurnExecution, TurnInput, TypedFailure,
-    TypedFailureEvidence,
+    RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeNativeReopenRecovery,
+    RuntimeNativeSessionObservation, RuntimeResume, RuntimeSessionHandle, RuntimeSessionReady,
+    RuntimeSessionStartInput, TurnExecution, TurnInput, TypedFailure, TypedFailureEvidence,
 };
 use lionclaw_runtime_codex::{CodexRuntimeAuthProvider, CodexRuntimeDriver};
 use tokio::sync::Mutex;
@@ -615,6 +614,9 @@ impl OciRoleRunner {
         )
             -> anyhow::Result<lionclaw_runtime_api::RuntimeExecutionContext>,
     ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
+        if let Some(failure) = current_control_failure(profile, request, None, "") {
+            return Err(failure);
+        }
         let driver = self
             .driver(profile)
             .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
@@ -628,80 +630,119 @@ impl OciRoleRunner {
             .map_err(|e| launch(format!("driver config invalid: {e}")))?;
         let adapter = driver.create_adapter(config);
 
-        // Compute the fallible execution context *before* opening a session,
-        // so a failure here cannot leak a started session.
-        let context =
-            context_builder(&plan).map_err(|e| launch(format!("execution context failed: {e}")))?;
-
+        // Compute the fallible execution context exactly once before opening a
+        // session, so reconstruction cannot drift or leak another session.
+        let context = prefer_terminal_control(
+            profile,
+            request,
+            context_builder(&plan).map_err(|e| launch(format!("execution context failed: {e}"))),
+            None,
+            "",
+        )?;
         let runtime_state = profile
             .native_resume
             .then(|| context.runtime_state.clone())
             .flatten();
-        let runtime_session_ready = runtime_state
-            .as_ref()
-            .map(RuntimeSessionReady::from_state_dir)
-            .transpose()
-            .map_err(|e| launch(format!("native session state invalid: {e}")))?
-            .unwrap_or_else(RuntimeSessionReady::not_ready);
-        let start = async {
-            adapter
-                .session_start(RuntimeSessionStartInput {
-                    session_id: uuid_from_key(request.effect_id.as_str()),
-                    working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
-                    environment: plan.environment.clone(),
-                    resume: match runtime_state.clone() {
-                        Some(state) => RuntimeResume::Native {
-                            state,
-                            ready: runtime_session_ready,
-                        },
-                        None => RuntimeResume::Reconstruct,
-                    },
-                })
-                .await
-                .map_err(|e| launch(format!("session_start failed: {e}")))
-        };
-        let handle = await_controlled(Box::pin(start), request.control.clone(), |control| {
-            setup_control_failure(profile, control)
-        })
-        .await?;
-        let mut resume_mode = handle.resume_mode;
+        let attempt = prefer_terminal_control(
+            profile,
+            request,
+            runtime_state
+                .as_ref()
+                .map(lionclaw_runtime_api::begin_runtime_session_attempt)
+                .transpose()
+                .map_err(|e| launch(format!("native session state invalid: {e}"))),
+            None,
+            "",
+        )?;
+        let handle = adapter.session_start(RuntimeSessionStartInput {
+            session_id: uuid_from_key(request.effect_id.as_str()),
+            working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
+            environment: plan.environment.clone(),
+            resume: match (runtime_state.clone(), attempt.as_ref()) {
+                (Some(state), Some(attempt)) => RuntimeResume::Native {
+                    state,
+                    ready: attempt.previous_ready(),
+                },
+                (None, None) => RuntimeResume::Reconstruct,
+                _ => unreachable!("native state and attempt are created together"),
+            },
+        });
+        if let Some(control_failure) = current_control_failure(profile, request, None, "") {
+            if let Ok(handle) = &handle {
+                settle_runtime_session(adapter.as_ref(), handle);
+            }
+            return Err(control_failure);
+        }
+        let handle = handle.map_err(|e| launch(format!("session_start failed: {e}")))?;
         let (mut result, mut fallback_final_response) = execute_turn_attempt(
             Arc::clone(&adapter),
             &handle,
             profile,
             request,
-            context,
+            context.clone(),
             plan.clone(),
             auth_registry.clone(),
         )
         .await;
 
-        let recoverable_reopen = match &result {
-            Err(failure) => {
-                adapter.native_reopen_outcome(&handle, failure)
-                    == RuntimeNativeReopenOutcome::Recoverable
-            }
-            Ok(_) => false,
-        };
-        if recoverable_reopen
-            && resume_mode == RuntimeResumeMode::Resumed
+        let mut observation = observe_native_session(adapter.as_ref(), &handle);
+        let settled;
+        if result.is_err()
+            && observation.is_some_and(RuntimeNativeSessionObservation::is_reopen_failure)
             && adapter.native_reopen_recovery() == RuntimeNativeReopenRecovery::ForgetAndReconstruct
         {
+            if let Some(control_failure) = current_control_failure(
+                profile,
+                request,
+                Some(AttemptEvidence::from_result(&result)),
+                &fallback_final_response,
+            ) {
+                settle_runtime_session(adapter.as_ref(), &handle);
+                return Err(control_failure);
+            }
             let reopen_failure = match result {
                 Err(failure) => failure,
                 Ok(_) => unreachable!("recoverable reopen requires a failed turn"),
             };
-            if let Err(error) = adapter.forget_native_reopen(&handle).await {
-                let _ = adapter.close(&handle).await;
-                return Err(recovery_failure(
+            let forget_result = adapter.forget_native_reopen(&handle);
+            if let Some(control_failure) = current_control_failure(
+                profile,
+                request,
+                Some(AttemptEvidence::Failure(&reopen_failure)),
+                &fallback_final_response,
+            ) {
+                settle_runtime_session(adapter.as_ref(), &handle);
+                return Err(control_failure);
+            }
+            if let Err(error) = forget_result {
+                settled = settle_runtime_session(adapter.as_ref(), &handle);
+                if let Some(control_failure) = current_control_failure(
+                    profile,
+                    request,
+                    Some(AttemptEvidence::Failure(&reopen_failure)),
+                    &fallback_final_response,
+                ) {
+                    return Err(control_failure);
+                }
+                result = Err(recovery_failure(
                     &reopen_failure,
                     "forget",
                     &error.to_string(),
                 ));
-            }
-            let _ = adapter.close(&handle).await;
-            let reconstruction = adapter
-                .session_start(RuntimeSessionStartInput {
+            } else if !settle_runtime_session(adapter.as_ref(), &handle) {
+                settled = false;
+                observation = None;
+                result = Err(reopen_failure);
+            } else {
+                if let Some(control_failure) = current_control_failure(
+                    profile,
+                    request,
+                    Some(AttemptEvidence::Failure(&reopen_failure)),
+                    &fallback_final_response,
+                ) {
+                    return Err(control_failure);
+                }
+                let reconstruction = adapter.session_start(RuntimeSessionStartInput {
                     session_id: uuid_from_key(request.effect_id.as_str()),
                     working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
                     environment: plan.environment.clone(),
@@ -712,49 +753,76 @@ impl OciRoleRunner {
                         },
                         None => RuntimeResume::Reconstruct,
                     },
-                })
-                .await
-                .map_err(|error| {
+                });
+                if let Some(control_failure) = current_control_failure(
+                    profile,
+                    request,
+                    Some(AttemptEvidence::Failure(&reopen_failure)),
+                    &fallback_final_response,
+                ) {
+                    if let Ok(reconstruction) = &reconstruction {
+                        settle_runtime_session(adapter.as_ref(), reconstruction);
+                    }
+                    return Err(control_failure);
+                }
+                let reconstruction = reconstruction.map_err(|error| {
                     recovery_failure(&reopen_failure, "reconstruction_start", &error.to_string())
                 })?;
-            resume_mode = reconstruction.resume_mode;
-            let reconstruction_context = match context_builder(&plan) {
-                Ok(context) => context,
-                Err(error) => {
-                    let _ = adapter.close(&reconstruction).await;
-                    return Err(recovery_failure(
-                        &reopen_failure,
-                        "reconstruction_context",
-                        &error.to_string(),
-                    ));
+                let (reconstructed, reconstructed_response) = execute_turn_attempt(
+                    Arc::clone(&adapter),
+                    &reconstruction,
+                    profile,
+                    request,
+                    context,
+                    plan.clone(),
+                    auth_registry,
+                )
+                .await;
+                observation = observe_native_session(adapter.as_ref(), &reconstruction);
+                settled = settle_runtime_session(adapter.as_ref(), &reconstruction);
+                fallback_final_response = reconstructed_response;
+                if let Some(control_failure) = current_control_failure(
+                    profile,
+                    request,
+                    Some(AttemptEvidence::from_result(&reconstructed)),
+                    &fallback_final_response,
+                ) {
+                    return Err(control_failure);
                 }
-            };
-            let (reconstructed, reconstructed_response) = execute_turn_attempt(
-                Arc::clone(&adapter),
-                &reconstruction,
-                profile,
-                request,
-                reconstruction_context,
-                plan.clone(),
-                auth_registry,
-            )
-            .await;
-            let _ = adapter.close(&reconstruction).await;
-            fallback_final_response = reconstructed_response;
-            result =
-                reconstructed.map_err(|failure| double_recovery_failure(&reopen_failure, &failure));
+                result = reconstructed
+                    .map_err(|failure| double_recovery_failure(&reopen_failure, &failure));
+            }
         } else {
-            let _ = adapter.close(&handle).await;
+            settled = settle_runtime_session(adapter.as_ref(), &handle);
         }
 
-        // Native identity is conversation state, not successful-effect state.
-        // Once a turn has launched, retain whatever opaque identity the
-        // adapter durably recorded even when the delivered outcome is a
-        // failure, interruption, or deadline. Adapters with no saved identity
-        // truthfully reconstruct on the next request.
-        if let Some(state) = runtime_state {
-            lionclaw_runtime_api::record_runtime_resume_mode(&state, resume_mode)
-                .map_err(|e| launch(format!("failed to commit native session state: {e}")))?;
+        if let Some(control_failure) = current_control_failure(
+            profile,
+            request,
+            Some(AttemptEvidence::from_result(&result)),
+            &fallback_final_response,
+        ) {
+            return Err(control_failure);
+        }
+
+        if settled {
+            if let (Some(attempt), Some(observation)) = (attempt, observation) {
+                if let Err(error) = attempt.commit(observation) {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to commit observed native session state; the next turn will reconstruct"
+                    );
+                }
+            }
+        }
+
+        if let Some(control_failure) = current_control_failure(
+            profile,
+            request,
+            Some(AttemptEvidence::from_result(&result)),
+            &fallback_final_response,
+        ) {
+            return Err(control_failure);
         }
 
         match result {
@@ -767,6 +835,105 @@ impl OciRoleRunner {
                 let result = validate_completed_turn(profile, result)?;
                 Ok(result)
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AttemptEvidence<'a> {
+    Success(&'a lionclaw_runtime_api::TurnResult),
+    Failure(&'a TypedFailure),
+}
+
+impl<'a> AttemptEvidence<'a> {
+    fn from_result(result: &'a Result<lionclaw_runtime_api::TurnResult, TypedFailure>) -> Self {
+        match result {
+            Ok(result) => Self::Success(result),
+            Err(failure) => Self::Failure(failure),
+        }
+    }
+}
+
+fn current_control_failure(
+    profile: &MissionRuntimeProfile,
+    request: &RoleRunRequest,
+    observed: Option<AttemptEvidence<'_>>,
+    fallback_final_response: &str,
+) -> Option<TypedFailure> {
+    let control = request.control.borrow().clone();
+    control_failure(profile, &control, observed, fallback_final_response)
+}
+
+/// A durable terminal decision outranks the result of a fallible host
+/// operation completed before the runner could observe that decision.
+fn prefer_terminal_control<T>(
+    profile: &MissionRuntimeProfile,
+    request: &RoleRunRequest,
+    result: Result<T, TypedFailure>,
+    observed: Option<AttemptEvidence<'_>>,
+    fallback_final_response: &str,
+) -> Result<T, TypedFailure> {
+    match current_control_failure(profile, request, observed, fallback_final_response) {
+        Some(failure) => Err(failure),
+        None => result,
+    }
+}
+
+fn control_failure(
+    profile: &MissionRuntimeProfile,
+    control: &ExecutionControl,
+    observed: Option<AttemptEvidence<'_>>,
+    fallback_final_response: &str,
+) -> Option<TypedFailure> {
+    let mut failure = setup_control_failure(profile, control)?;
+    let evidence = failure.evidence_mut();
+    match observed {
+        Some(AttemptEvidence::Success(observed)) => {
+            evidence.configuration = observed.configuration.clone().projected();
+            evidence.final_response = lionclaw_runtime_api::bounded_text(&observed.final_response);
+        }
+        Some(AttemptEvidence::Failure(observed)) => {
+            let source = observed.evidence();
+            evidence.exit_code = source.exit_code;
+            evidence.stderr.clone_from(&source.stderr);
+            evidence.final_response.clone_from(&source.final_response);
+            evidence.configuration.clone_from(&source.configuration);
+        }
+        None => {}
+    }
+    if evidence.final_response.is_empty() {
+        evidence.final_response = lionclaw_runtime_api::bounded_text(fallback_final_response);
+    }
+    Some(failure)
+}
+
+fn settle_runtime_session(adapter: &dyn RuntimeAdapter, handle: &RuntimeSessionHandle) -> bool {
+    match adapter.close(handle) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                runtime_session_id = handle.runtime_session_id,
+                error = %error,
+                "failed to close native runtime session; readiness will remain uncommitted"
+            );
+            false
+        }
+    }
+}
+
+fn observe_native_session(
+    adapter: &dyn RuntimeAdapter,
+    handle: &RuntimeSessionHandle,
+) -> Option<RuntimeNativeSessionObservation> {
+    match adapter.native_session_observation(handle) {
+        Ok(observation) => observation,
+        Err(error) => {
+            tracing::warn!(
+                runtime_session_id = handle.runtime_session_id,
+                error = %error,
+                "failed to read native session observation; the next turn will reconstruct"
+            );
+            None
         }
     }
 }
@@ -1064,8 +1231,32 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FallbackFailurePoint {
         None,
+        InitialStart,
         ReconstructionStart,
-        ReconstructionContext,
+        ExecutionContext,
+        ObservationRead,
+        Forget,
+        OriginalClose,
+        ReconstructedClose,
+        MarkerCommit,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FallbackControlPoint {
+        ExecutionContext,
+        InitialStart,
+        Observation,
+        Forget,
+        ReconstructionStart,
+        OriginalClose,
+        ReconstructedClose,
+    }
+
+    #[derive(Clone)]
+    struct FallbackControl {
+        point: FallbackControlPoint,
+        value: ExecutionControl,
+        sender: tokio::sync::watch::Sender<ExecutionControl>,
     }
 
     #[derive(Debug, Default)]
@@ -1073,17 +1264,34 @@ mod tests {
         starts: Vec<(bool, bool)>,
         prompts: Vec<String>,
         events: Vec<String>,
+        close_attempts: usize,
         closed: Vec<String>,
         drained: Vec<String>,
+        native_sessions: BTreeMap<String, RuntimeNativeSessionObservation>,
         native_identity: Option<String>,
         identity_before_reconstructed_success: Option<String>,
+        context_calls: usize,
     }
 
     struct FallbackAdapter {
         turns: StdMutex<VecDeque<FallbackTurn>>,
         observations: Arc<StdMutex<FallbackObservations>>,
-        reopen_outcome: RuntimeNativeReopenOutcome,
         failure_point: FallbackFailurePoint,
+        control: Option<FallbackControl>,
+    }
+
+    impl FallbackAdapter {
+        fn signal_control(&self, point: FallbackControlPoint) -> bool {
+            let Some(control) = self
+                .control
+                .as_ref()
+                .filter(|control| control.point == point)
+            else {
+                return false;
+            };
+            control.sender.send_replace(control.value.clone());
+            true
+        }
     }
 
     #[async_trait]
@@ -1100,24 +1308,41 @@ mod tests {
             RuntimeNativeReopenRecovery::ForgetAndReconstruct
         }
 
-        fn native_reopen_outcome(
+        fn native_session_observation(
             &self,
-            _handle: &RuntimeSessionHandle,
-            _failure: &TypedFailure,
-        ) -> RuntimeNativeReopenOutcome {
-            self.reopen_outcome
+            handle: &RuntimeSessionHandle,
+        ) -> anyhow::Result<Option<RuntimeNativeSessionObservation>> {
+            if self.failure_point == FallbackFailurePoint::ObservationRead {
+                anyhow::bail!("scripted observation read failure");
+            }
+            let observation = self
+                .observations
+                .lock()
+                .unwrap()
+                .native_sessions
+                .get(&handle.runtime_session_id)
+                .copied();
+            if observation == Some(RuntimeNativeSessionObservation::ReopenFailed) {
+                self.signal_control(FallbackControlPoint::Observation);
+            }
+            Ok(observation)
         }
 
-        async fn forget_native_reopen(&self, handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+        fn forget_native_reopen(&self, handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            if self.failure_point == FallbackFailurePoint::Forget {
+                anyhow::bail!("scripted native identity removal failure");
+            }
             let mut observations = self.observations.lock().unwrap();
             observations.native_identity = None;
             observations
                 .events
                 .push(format!("forget:{}", handle.runtime_session_id));
+            drop(observations);
+            self.signal_control(FallbackControlPoint::Forget);
             Ok(())
         }
 
-        async fn session_start(
+        fn session_start(
             &self,
             input: RuntimeSessionStartInput,
         ) -> anyhow::Result<RuntimeSessionHandle> {
@@ -1129,16 +1354,22 @@ mod tests {
             let ordinal = observations.starts.len() + 1;
             observations.starts.push((ready, !ready));
             observations.events.push(format!("start:{ordinal}"));
-            if ordinal == 2 && self.failure_point == FallbackFailurePoint::ReconstructionStart {
-                anyhow::bail!("scripted reconstruction session start failure");
+            drop(observations);
+            let control_point = if ordinal == 1 {
+                FallbackControlPoint::InitialStart
+            } else {
+                FallbackControlPoint::ReconstructionStart
+            };
+            self.signal_control(control_point);
+            if matches!(
+                (ordinal, self.failure_point),
+                (1, FallbackFailurePoint::InitialStart)
+                    | (2, FallbackFailurePoint::ReconstructionStart)
+            ) {
+                anyhow::bail!("scripted session start failure at attempt {ordinal}");
             }
             Ok(RuntimeSessionHandle {
                 runtime_session_id: format!("session-{ordinal}"),
-                resume_mode: if ready {
-                    RuntimeResumeMode::Resumed
-                } else {
-                    RuntimeResumeMode::Reconstructed
-                },
             })
         }
 
@@ -1155,6 +1386,30 @@ mod tests {
                 .expect("no third turn");
             {
                 let mut observations = self.observations.lock().unwrap();
+                let observation = match turn {
+                    FallbackTurn::Stale => RuntimeNativeSessionObservation::ReopenFailed,
+                    FallbackTurn::Success | FallbackTurn::Failure
+                        if execution.input.runtime_session_id == "session-1" =>
+                    {
+                        RuntimeNativeSessionObservation::Resumed
+                    }
+                    FallbackTurn::Success | FallbackTurn::Failure => {
+                        RuntimeNativeSessionObservation::Reconstructed {
+                            state: lionclaw_runtime_api::RuntimeNativeStateAvailability::Reopenable,
+                        }
+                    }
+                };
+                observations
+                    .native_sessions
+                    .insert(execution.input.runtime_session_id.clone(), observation);
+                if self.failure_point == FallbackFailurePoint::MarkerCommit {
+                    let runtime_state = execution
+                        .context
+                        .runtime_state
+                        .as_ref()
+                        .expect("native runtime state");
+                    std::fs::remove_dir_all(runtime_state.marker_path())?;
+                }
                 if matches!(turn, FallbackTurn::Success)
                     && execution.input.runtime_session_id == "session-2"
                 {
@@ -1185,11 +1440,18 @@ mod tests {
                 ))
                 .await?;
             match turn {
-                FallbackTurn::Stale => Err(anyhow::Error::new(TypedFailure::transient(
-                    "codex.thread_rollout",
-                    "stale native thread",
-                    None,
-                ))),
+                FallbackTurn::Stale => {
+                    let mut failure = TypedFailure::transient(
+                        "codex.thread_rollout",
+                        "stale native thread",
+                        None,
+                    );
+                    failure.evidence_mut().exit_code = Some(17);
+                    failure.evidence_mut().stderr = "exact reopen stderr".into();
+                    failure.evidence_mut().configuration.requested_model =
+                        Some("observed-reopen-model".into());
+                    Err(anyhow::Error::new(failure))
+                }
                 FallbackTurn::Success => Ok(TurnResult {
                     final_response: "authoritative reconstructed completion".into(),
                     ..Default::default()
@@ -1209,7 +1471,25 @@ mod tests {
             Ok(RuntimeCancellation::Acknowledged)
         }
 
-        async fn close(&self, handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+        fn close(&self, handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            let ordinal = {
+                let mut observations = self.observations.lock().unwrap();
+                observations.close_attempts += 1;
+                observations.close_attempts
+            };
+            let control_point = if ordinal == 1 {
+                FallbackControlPoint::OriginalClose
+            } else {
+                FallbackControlPoint::ReconstructedClose
+            };
+            if matches!(
+                (ordinal, self.failure_point),
+                (1, FallbackFailurePoint::OriginalClose)
+                    | (2, FallbackFailurePoint::ReconstructedClose)
+            ) {
+                anyhow::bail!("scripted close failure");
+            }
+            self.signal_control(control_point);
             self.observations
                 .lock()
                 .unwrap()
@@ -1222,8 +1502,8 @@ mod tests {
     struct FallbackProvider {
         turns: Vec<FallbackTurn>,
         observations: Arc<StdMutex<FallbackObservations>>,
-        reopen_outcome: RuntimeNativeReopenOutcome,
         failure_point: FallbackFailurePoint,
+        control: Option<FallbackControl>,
     }
 
     impl RuntimeDriverProvider for FallbackProvider {
@@ -1235,8 +1515,8 @@ mod tests {
             Arc::new(FallbackAdapter {
                 turns: StdMutex::new(self.turns.iter().copied().collect()),
                 observations: self.observations.clone(),
-                reopen_outcome: self.reopen_outcome,
                 failure_point: self.failure_point,
+                control: self.control.clone(),
             })
         }
     }
@@ -1363,8 +1643,20 @@ mod tests {
 
     async fn run_fallback_boundary(
         turns: Vec<FallbackTurn>,
-        reopen_outcome: RuntimeNativeReopenOutcome,
         failure_point: FallbackFailurePoint,
+    ) -> (
+        Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure>,
+        Arc<StdMutex<FallbackObservations>>,
+        tempfile::TempDir,
+    ) {
+        run_fallback_boundary_with_control(turns, failure_point, None, None).await
+    }
+
+    async fn run_fallback_boundary_with_control(
+        turns: Vec<FallbackTurn>,
+        failure_point: FallbackFailurePoint,
+        initial_control: Option<ExecutionControl>,
+        control_at: Option<(FallbackControlPoint, ExecutionControl)>,
     ) -> (
         Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure>,
         Arc<StdMutex<FallbackObservations>>,
@@ -1380,11 +1672,10 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(runtime_state.marker_path()).unwrap();
         std::fs::create_dir_all(runtime_state.path()).unwrap();
-        lionclaw_runtime_api::record_runtime_resume_mode(
-            &runtime_state,
-            RuntimeResumeMode::Resumed,
-        )
-        .unwrap();
+        lionclaw_runtime_api::begin_runtime_session_attempt(&runtime_state)
+            .unwrap()
+            .commit(RuntimeNativeSessionObservation::Resumed)
+            .unwrap();
         let observations = Arc::new(StdMutex::new(FallbackObservations {
             native_identity: Some("stale-native-thread-1".into()),
             ..FallbackObservations::default()
@@ -1394,6 +1685,15 @@ mod tests {
             temp.path(),
         )
         .unwrap();
+        let (control_tx, control) = tokio::sync::watch::channel(
+            initial_control.unwrap_or(ExecutionControl::RunUntil(i64::MAX)),
+        );
+        let control_at = control_at.map(|(point, value)| FallbackControl {
+            point,
+            value,
+            sender: control_tx.clone(),
+        });
+        let context_control = control_at.clone();
         let runner = OciRoleRunner::with_registries(
             profiles,
             "unused-test-image".into(),
@@ -1401,13 +1701,14 @@ mod tests {
             RuntimeDriverRegistry::new([Arc::new(FallbackProvider {
                 turns,
                 observations: observations.clone(),
-                reopen_outcome,
                 failure_point,
+                control: control_at.clone(),
             }) as Arc<dyn RuntimeDriverProvider>]),
             RuntimeAuthRegistry::empty(),
         );
         let profile = runner.profile("codex").unwrap();
         let mut request = fallback_request(temp.path());
+        request.control = control;
         let (updates, mut updates_rx) = tokio::sync::mpsc::channel(8);
         request.updates = updates;
         let drain_observations = observations.clone();
@@ -1420,8 +1721,7 @@ mod tests {
                 }
             }
         });
-        let context_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let calls = context_calls.clone();
+        let context_observations = observations.clone();
         let state = runtime_state.clone();
         let result = runner
             .run_turn_with_context(
@@ -1429,9 +1729,18 @@ mod tests {
                 &request,
                 fallback_plan(temp.path()),
                 move |plan| {
-                    let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if failure_point == FallbackFailurePoint::ReconstructionContext && call == 1 {
-                        anyhow::bail!("scripted reconstruction context failure");
+                    let mut observations = context_observations.lock().unwrap();
+                    observations.context_calls += 1;
+                    let call = observations.context_calls;
+                    drop(observations);
+                    if let Some(control) = context_control
+                        .as_ref()
+                        .filter(|control| control.point == FallbackControlPoint::ExecutionContext)
+                    {
+                        control.sender.send_replace(control.value.clone());
+                    }
+                    if failure_point == FallbackFailurePoint::ExecutionContext && call == 1 {
+                        anyhow::bail!("scripted execution context failure");
                     }
                     mission_execution_context(plan, Some(state.clone()))
                 },
@@ -1446,7 +1755,6 @@ mod tests {
     async fn production_runner_recovers_one_stale_reopen_with_canonical_reconstruction() {
         let (result, observations, temp) = run_fallback_boundary(
             vec![FallbackTurn::Stale, FallbackTurn::Success],
-            RuntimeNativeReopenOutcome::Recoverable,
             FallbackFailurePoint::None,
         )
         .await;
@@ -1471,6 +1779,10 @@ mod tests {
         );
         assert_eq!(observations.closed, vec!["session-1", "session-2"]);
         assert_eq!(
+            observations.context_calls, 1,
+            "reconstruction must reuse the exact prepared execution context"
+        );
+        assert_eq!(
             observations.drained,
             vec!["journal-Stale", "journal-Success"]
         );
@@ -1481,7 +1793,7 @@ mod tests {
         );
         drop(observations);
         assert!(
-            lionclaw_runtime_api::RuntimeSessionReady::from_state_dir(
+            lionclaw_runtime_api::recorded_runtime_resume_mode(
                 &lionclaw_runtime_api::RuntimeStateDir::new(
                     temp.path(),
                     temp.path().join("runtime"),
@@ -1490,8 +1802,420 @@ mod tests {
                 .unwrap(),
             )
             .unwrap()
-            .is_ready(),
+                == Some(lionclaw_runtime_api::RuntimeResumeMode::Reconstructed),
             "the reconstructed observation must be eligible for native resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn preexisting_control_precedes_context_and_preserves_committed_native_state() {
+        for control in [
+            ExecutionControl::Stop("stop before start".into()),
+            ExecutionControl::Abort("abort before start".into()),
+            ExecutionControl::DeadlineExhausted,
+        ] {
+            let (result, observations, temp) = run_fallback_boundary_with_control(
+                vec![FallbackTurn::Success],
+                FallbackFailurePoint::ExecutionContext,
+                Some(control),
+                None,
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(TypedFailure::OperatorStopped { .. }
+                    | TypedFailure::OperatorAborted { .. }
+                    | TypedFailure::DeadlineExhausted { .. })
+            ));
+            let observations = observations.lock().unwrap();
+            assert_eq!(
+                observations.context_calls, 0,
+                "terminal control must win before fallible context construction"
+            );
+            assert!(observations.starts.is_empty());
+            drop(observations);
+            let state = lionclaw_runtime_api::RuntimeStateDir::new(
+                temp.path(),
+                temp.path().join("runtime"),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+            assert_eq!(
+                lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+                Some(lionclaw_runtime_api::RuntimeResumeMode::Resumed)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_control_wins_when_context_construction_also_fails() {
+        for control in [
+            ExecutionControl::Stop("stop during failed context".into()),
+            ExecutionControl::Abort("abort during failed context".into()),
+            ExecutionControl::DeadlineExhausted,
+        ] {
+            let (result, observations, temp) = run_fallback_boundary_with_control(
+                vec![FallbackTurn::Success],
+                FallbackFailurePoint::ExecutionContext,
+                None,
+                Some((FallbackControlPoint::ExecutionContext, control)),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(TypedFailure::OperatorStopped { .. }
+                    | TypedFailure::OperatorAborted { .. }
+                    | TypedFailure::DeadlineExhausted { .. })
+            ));
+            let observations = observations.lock().unwrap();
+            assert_eq!(observations.context_calls, 1);
+            assert!(observations.starts.is_empty());
+            drop(observations);
+            let state = lionclaw_runtime_api::RuntimeStateDir::new(
+                temp.path(),
+                temp.path().join("runtime"),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+            assert_eq!(
+                lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+                Some(lionclaw_runtime_api::RuntimeResumeMode::Resumed),
+                "control before readiness consumption must preserve its commit marker"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_control_wins_when_the_same_session_start_fails() {
+        for control in [
+            ExecutionControl::Stop("stop during failed start".into()),
+            ExecutionControl::Abort("abort during failed start".into()),
+            ExecutionControl::DeadlineExhausted,
+        ] {
+            let (result, observations, temp) = run_fallback_boundary_with_control(
+                vec![FallbackTurn::Success],
+                FallbackFailurePoint::InitialStart,
+                None,
+                Some((FallbackControlPoint::InitialStart, control.clone())),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(TypedFailure::OperatorStopped { .. }
+                    | TypedFailure::OperatorAborted { .. }
+                    | TypedFailure::DeadlineExhausted { .. })
+            ));
+            {
+                let observations = observations.lock().unwrap();
+                assert_eq!(observations.context_calls, 1);
+                assert_eq!(observations.starts.len(), 1);
+                assert!(observations.prompts.is_empty());
+                assert!(observations.closed.is_empty());
+            }
+            let state = lionclaw_runtime_api::RuntimeStateDir::new(
+                temp.path(),
+                temp.path().join("runtime"),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+            assert_eq!(
+                lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+                None,
+                "a started attempt consumes readiness even when registration fails"
+            );
+
+            let (result, observations, temp) = run_fallback_boundary_with_control(
+                vec![FallbackTurn::Stale],
+                FallbackFailurePoint::ReconstructionStart,
+                None,
+                Some((FallbackControlPoint::ReconstructionStart, control)),
+            )
+            .await;
+            let failure = result.expect_err("terminal control must own reconstruction failure");
+            assert!(matches!(
+                failure,
+                TypedFailure::OperatorStopped { .. }
+                    | TypedFailure::OperatorAborted { .. }
+                    | TypedFailure::DeadlineExhausted { .. }
+            ));
+            assert_eq!(failure.evidence().exit_code, Some(17));
+            assert_eq!(failure.evidence().stderr, "exact reopen stderr");
+            assert_eq!(failure.evidence().final_response, "journal-Stale");
+            assert_eq!(
+                failure.evidence().configuration.requested_model.as_deref(),
+                Some("observed-reopen-model")
+            );
+            let observations = observations.lock().unwrap();
+            assert_eq!(observations.context_calls, 1);
+            assert_eq!(observations.starts.len(), 2);
+            assert_eq!(observations.prompts.len(), 1);
+            assert_eq!(observations.closed, vec!["session-1"]);
+            drop(observations);
+            let state = lionclaw_runtime_api::RuntimeStateDir::new(
+                temp.path(),
+                temp.path().join("runtime"),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+            assert_eq!(
+                lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_control_after_reopen_rejection_prevents_reconstruction() {
+        let (result, observations, temp) = run_fallback_boundary_with_control(
+            vec![FallbackTurn::Stale, FallbackTurn::Success],
+            FallbackFailurePoint::None,
+            None,
+            Some((
+                FallbackControlPoint::Observation,
+                ExecutionControl::Stop("stop after native reopen rejection".into()),
+            )),
+        )
+        .await;
+        assert!(matches!(result, Err(TypedFailure::OperatorStopped { .. })));
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.starts.len(), 1);
+        assert_eq!(observations.prompts.len(), 1);
+        assert_eq!(observations.closed, vec!["session-1"]);
+        assert!(
+            !observations
+                .events
+                .iter()
+                .any(|event| event.starts_with("forget:")),
+            "terminal control must win before destructive recovery"
+        );
+        drop(observations);
+        let state = lionclaw_runtime_api::RuntimeStateDir::new(
+            temp.path(),
+            temp.path().join("runtime"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        assert_eq!(
+            lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_control_is_authoritative_at_every_recovery_boundary() {
+        for point in [
+            FallbackControlPoint::Forget,
+            FallbackControlPoint::OriginalClose,
+            FallbackControlPoint::ReconstructionStart,
+            FallbackControlPoint::ReconstructedClose,
+        ] {
+            for control in [
+                ExecutionControl::Stop("stop at recovery boundary".into()),
+                ExecutionControl::Abort("abort at recovery boundary".into()),
+                ExecutionControl::DeadlineExhausted,
+            ] {
+                let (result, observations, temp) = run_fallback_boundary_with_control(
+                    vec![FallbackTurn::Stale, FallbackTurn::Success],
+                    FallbackFailurePoint::None,
+                    None,
+                    Some((point, control)),
+                )
+                .await;
+                let failure = result.expect_err("terminal control must own the result");
+                assert!(matches!(
+                    failure,
+                    TypedFailure::OperatorStopped { .. }
+                        | TypedFailure::OperatorAborted { .. }
+                        | TypedFailure::DeadlineExhausted { .. }
+                ));
+                let evidence = failure.evidence();
+                let after_reconstructed_turn = point == FallbackControlPoint::ReconstructedClose;
+                assert_eq!(
+                    evidence.final_response,
+                    if after_reconstructed_turn {
+                        "authoritative reconstructed completion"
+                    } else {
+                        "journal-Stale"
+                    }
+                );
+                if after_reconstructed_turn {
+                    assert_eq!(evidence.exit_code, None);
+                    assert!(evidence.stderr.is_empty());
+                } else {
+                    assert_eq!(evidence.exit_code, Some(17));
+                    assert_eq!(evidence.stderr, "exact reopen stderr");
+                    assert_eq!(
+                        evidence.configuration.requested_model.as_deref(),
+                        Some("observed-reopen-model")
+                    );
+                }
+
+                let observations = observations.lock().unwrap();
+                let reconstructed_started = matches!(
+                    point,
+                    FallbackControlPoint::ReconstructionStart
+                        | FallbackControlPoint::ReconstructedClose
+                );
+                assert_eq!(
+                    observations.starts.len(),
+                    usize::from(reconstructed_started) + 1
+                );
+                assert_eq!(
+                    observations.prompts.len(),
+                    if point == FallbackControlPoint::ReconstructedClose {
+                        2
+                    } else {
+                        1
+                    }
+                );
+                assert_eq!(
+                    observations.close_attempts,
+                    usize::from(reconstructed_started) + 1
+                );
+                assert_eq!(observations.closed.len(), observations.close_attempts);
+                drop(observations);
+
+                let state = lionclaw_runtime_api::RuntimeStateDir::new(
+                    temp.path(),
+                    temp.path().join("runtime"),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .unwrap();
+                assert_eq!(
+                    lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+                    None
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_failure_preserves_success_and_leaves_state_uncommitted() {
+        let (result, observations, temp) = run_fallback_boundary(
+            vec![FallbackTurn::Success],
+            FallbackFailurePoint::ObservationRead,
+        )
+        .await;
+        assert_eq!(result.unwrap().1, "authoritative reconstructed completion");
+        assert_eq!(observations.lock().unwrap().closed, vec!["session-1"]);
+        let state = lionclaw_runtime_api::RuntimeStateDir::new(
+            temp.path(),
+            temp.path().join("runtime"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        assert_eq!(
+            lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn marker_commit_failure_preserves_success_and_requires_reconstruction() {
+        let (result, observations, temp) = run_fallback_boundary(
+            vec![FallbackTurn::Success],
+            FallbackFailurePoint::MarkerCommit,
+        )
+        .await;
+        assert_eq!(result.unwrap().1, "authoritative reconstructed completion");
+        assert_eq!(observations.lock().unwrap().closed, vec!["session-1"]);
+        let state = lionclaw_runtime_api::RuntimeStateDir::new(
+            temp.path(),
+            temp.path().join("runtime"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        assert_eq!(
+            lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_identity_forget_stops_bounded_recovery_without_a_second_start() {
+        let (result, observations, temp) =
+            run_fallback_boundary(vec![FallbackTurn::Stale], FallbackFailurePoint::Forget).await;
+        let failure = result.unwrap_err();
+        assert_eq!(
+            failure.evidence().code.as_deref(),
+            Some("runtime.native_reopen_recovery")
+        );
+        assert!(failure.detail().contains("forget="));
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.starts.len(), 1);
+        assert_eq!(observations.prompts.len(), 1);
+        assert_eq!(observations.closed, vec!["session-1"]);
+        drop(observations);
+        let state = lionclaw_runtime_api::RuntimeStateDir::new(
+            temp.path(),
+            temp.path().join("runtime"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        assert_eq!(
+            lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_original_close_prevents_reconstruction_and_readiness_commit() {
+        let (result, observations, temp) = run_fallback_boundary(
+            vec![FallbackTurn::Stale, FallbackTurn::Success],
+            FallbackFailurePoint::OriginalClose,
+        )
+        .await;
+        let failure = result.expect_err("the original reopen failure remains authoritative");
+        assert_eq!(
+            failure.evidence().code.as_deref(),
+            Some("codex.thread_rollout")
+        );
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.starts.len(), 1);
+        assert_eq!(observations.prompts.len(), 1);
+        assert_eq!(observations.close_attempts, 1);
+        assert!(observations.closed.is_empty());
+        drop(observations);
+        let state = lionclaw_runtime_api::RuntimeStateDir::new(
+            temp.path(),
+            temp.path().join("runtime"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        assert_eq!(
+            lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reconstructed_close_preserves_turn_success_without_publishing_readiness() {
+        let (result, observations, temp) = run_fallback_boundary(
+            vec![FallbackTurn::Stale, FallbackTurn::Success],
+            FallbackFailurePoint::ReconstructedClose,
+        )
+        .await;
+        assert_eq!(
+            result
+                .expect("close failure does not erase the completed turn")
+                .1,
+            "authoritative reconstructed completion"
+        );
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.starts.len(), 2);
+        assert_eq!(observations.prompts.len(), 2);
+        assert_eq!(observations.close_attempts, 2);
+        assert_eq!(observations.closed, vec!["session-1"]);
+        drop(observations);
+        let state = lionclaw_runtime_api::RuntimeStateDir::new(
+            temp.path(),
+            temp.path().join("runtime"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        assert_eq!(
+            lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+            None
         );
     }
 
@@ -1499,7 +2223,6 @@ mod tests {
     async fn production_runner_bounds_failed_reconstruction_and_settles_both_attempts() {
         let (result, observations, _temp) = run_fallback_boundary(
             vec![FallbackTurn::Stale, FallbackTurn::Failure],
-            RuntimeNativeReopenOutcome::Recoverable,
             FallbackFailurePoint::None,
         )
         .await;
@@ -1526,10 +2249,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconstructed_reopen_rejection_cannot_trigger_a_third_attempt() {
+        let (result, observations, temp) = run_fallback_boundary(
+            vec![FallbackTurn::Stale, FallbackTurn::Stale],
+            FallbackFailurePoint::None,
+        )
+        .await;
+        let failure = result.expect_err("the second reopen rejection is terminal");
+        assert_eq!(
+            failure.evidence().code.as_deref(),
+            Some("runtime.native_reopen_reconstruction_failed")
+        );
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.starts.len(), 2);
+        assert_eq!(observations.prompts.len(), 2);
+        assert_eq!(observations.close_attempts, 2);
+        assert_eq!(observations.closed, vec!["session-1", "session-2"]);
+        drop(observations);
+        let state = lionclaw_runtime_api::RuntimeStateDir::new(
+            temp.path(),
+            temp.path().join("runtime"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        assert_eq!(
+            lionclaw_runtime_api::recorded_runtime_resume_mode(&state).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn production_runner_settles_original_handle_when_reconstruction_start_fails() {
         let (result, observations, _temp) = run_fallback_boundary(
             vec![FallbackTurn::Stale],
-            RuntimeNativeReopenOutcome::Recoverable,
             FallbackFailurePoint::ReconstructionStart,
         )
         .await;
@@ -1551,30 +2303,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_runner_closes_reconstruction_when_context_setup_fails() {
+    async fn production_runner_builds_fallible_context_before_opening_any_session() {
         let (result, observations, _temp) = run_fallback_boundary(
             vec![FallbackTurn::Stale],
-            RuntimeNativeReopenOutcome::Recoverable,
-            FallbackFailurePoint::ReconstructionContext,
+            FallbackFailurePoint::ExecutionContext,
         )
         .await;
         let failure = result.unwrap_err();
-        assert!(failure.detail().contains("reconstruction_context="));
+        assert!(failure.detail().contains("execution context failed"));
         let observations = observations.lock().unwrap();
-        assert_eq!(observations.starts.len(), 2);
-        assert_eq!(observations.prompts.len(), 1);
-        assert_eq!(observations.closed, vec!["session-1", "session-2"]);
-        assert_eq!(observations.drained, vec!["journal-Stale"]);
+        assert!(observations.starts.is_empty());
+        assert!(observations.prompts.is_empty());
+        assert!(observations.closed.is_empty());
+        assert!(observations.drained.is_empty());
+        assert_eq!(observations.context_calls, 1);
     }
 
     #[tokio::test]
     async fn production_runner_settles_non_recoverable_original_turn_failure() {
-        let (result, observations, _temp) = run_fallback_boundary(
-            vec![FallbackTurn::Failure],
-            RuntimeNativeReopenOutcome::NotReopenFailure,
-            FallbackFailurePoint::None,
-        )
-        .await;
+        let (result, observations, _temp) =
+            run_fallback_boundary(vec![FallbackTurn::Failure], FallbackFailurePoint::None).await;
         assert!(result.is_err());
         let observations = observations.lock().unwrap();
         assert_eq!(observations.starts.len(), 1);

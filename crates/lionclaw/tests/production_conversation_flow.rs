@@ -1,7 +1,7 @@
 //! The Slice 4 production conversation proof.  Only the native agent and
 //! oracle transports are scripted; every boundary around them is production.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -25,7 +25,8 @@ use lionclaw::{cli, workspace};
 use lionclaw_runtime_api::{
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthContext, RuntimeAuthPreparation,
     RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeCancellation, RuntimeDriverConfig,
-    RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeResumeMode, RuntimeSessionHandle,
+    RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeNativeSessionObservation,
+    RuntimeNativeStateAvailability, RuntimeResumeMode, RuntimeSessionHandle,
     RuntimeSessionStartInput, TurnExecution, TurnResult, TypedFailure,
 };
 use lionclaw_runtime_codex::CodexRuntimeDriver;
@@ -44,6 +45,64 @@ enum DeliveryTurn {
 
 type SessionObservations = Arc<Mutex<Vec<(Option<String>, bool)>>>;
 type PromptObservations = Arc<Mutex<Vec<(String, std::path::PathBuf)>>>;
+
+#[derive(Default)]
+struct ObservedNativeSessions {
+    sessions: Mutex<BTreeMap<String, (RuntimeResumeMode, bool)>>,
+}
+
+impl ObservedNativeSessions {
+    fn start(&self, runtime_session_id: &str, mode: RuntimeResumeMode) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(runtime_session_id.to_string(), (mode, false));
+    }
+
+    fn establish(&self, runtime_session_id: &str) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get_mut(runtime_session_id)
+            .expect("started native session")
+            .1 = true;
+    }
+
+    fn observation(&self, runtime_session_id: &str) -> Option<RuntimeNativeSessionObservation> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(runtime_session_id)
+            .and_then(|(mode, established)| established.then_some(*mode))
+            .map(|mode| match mode {
+                RuntimeResumeMode::Reconstructed => {
+                    RuntimeNativeSessionObservation::Reconstructed {
+                        state: RuntimeNativeStateAvailability::Reopenable,
+                    }
+                }
+                RuntimeResumeMode::Resumed => RuntimeNativeSessionObservation::Resumed,
+            })
+    }
+}
+
+fn observed_start_mode(
+    resume: lionclaw_runtime_api::RuntimeResume,
+    state_file: &str,
+    label: &str,
+) -> anyhow::Result<RuntimeResumeMode> {
+    match resume {
+        lionclaw_runtime_api::RuntimeResume::Native { state, ready } => {
+            if lionclaw_runtime_api::load_ready_state_value(&state, state_file, label, ready)?
+                .is_some()
+            {
+                Ok(RuntimeResumeMode::Resumed)
+            } else {
+                Ok(RuntimeResumeMode::Reconstructed)
+            }
+        }
+        lionclaw_runtime_api::RuntimeResume::Reconstruct => Ok(RuntimeResumeMode::Reconstructed),
+    }
+}
 
 struct TestCodexAuth;
 
@@ -320,6 +379,7 @@ struct DeliveryTransport {
     sessions: SessionObservations,
     prompts: PromptObservations,
     launch_failures: Arc<Mutex<usize>>,
+    native_sessions: ObservedNativeSessions,
 }
 
 impl DeliveryTransport {
@@ -358,7 +418,7 @@ impl RuntimeAdapter for DeliveryTransport {
         }
     }
 
-    async fn session_start(
+    fn session_start(
         &self,
         input: RuntimeSessionStartInput,
     ) -> anyhow::Result<RuntimeSessionHandle> {
@@ -368,22 +428,21 @@ impl RuntimeAdapter for DeliveryTransport {
             anyhow::bail!("scripted session launch failure");
         }
         drop(launch_failures);
-        let native_ready = matches!(
-            &input.resume,
-            lionclaw_runtime_api::RuntimeResume::Native { ready, .. } if ready.is_ready()
-        );
-        self.sessions
-            .lock()
-            .unwrap()
-            .push((input.working_dir.clone(), native_ready));
-        Ok(RuntimeSessionHandle {
-            runtime_session_id: input.session_id.to_string(),
-            resume_mode: if native_ready {
-                RuntimeResumeMode::Resumed
-            } else {
-                RuntimeResumeMode::Reconstructed
-            },
-        })
+        let mode = observed_start_mode(input.resume, "delivery-session", "test delivery session")?;
+        let runtime_session_id = input.session_id.to_string();
+        self.native_sessions.start(&runtime_session_id, mode);
+        self.sessions.lock().unwrap().push((
+            input.working_dir.clone(),
+            mode == RuntimeResumeMode::Resumed,
+        ));
+        Ok(RuntimeSessionHandle { runtime_session_id })
+    }
+
+    fn native_session_observation(
+        &self,
+        handle: &RuntimeSessionHandle,
+    ) -> anyhow::Result<Option<RuntimeNativeSessionObservation>> {
+        Ok(self.native_sessions.observation(&handle.runtime_session_id))
     }
 
     async fn turn(
@@ -397,16 +456,23 @@ impl RuntimeAdapter for DeliveryTransport {
             .unwrap()
             .pop_front()
             .expect("scripted turn");
-        self.prompts.lock().unwrap().push((
-            execution.input.prompt.clone(),
-            execution
-                .context
-                .runtime_state
-                .as_ref()
-                .expect("native state root")
-                .path()
-                .to_path_buf(),
-        ));
+        let runtime = execution
+            .context
+            .runtime_state
+            .as_ref()
+            .expect("native state root");
+        lionclaw_runtime_api::save_state_value(
+            runtime,
+            "delivery-session",
+            "durable-delivery-id",
+            "test delivery session",
+        )?;
+        self.native_sessions
+            .establish(&execution.input.runtime_session_id);
+        self.prompts
+            .lock()
+            .unwrap()
+            .push((execution.input.prompt.clone(), runtime.path().to_path_buf()));
         self.entered.add_permits(1);
         self.release.acquire().await.unwrap().forget();
         if matches!(turn, DeliveryTurn::Fail) {
@@ -495,7 +561,7 @@ impl RuntimeAdapter for DeliveryTransport {
         Ok(RuntimeCancellation::Acknowledged)
     }
 
-    async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+    fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -536,12 +602,14 @@ impl RuntimeDriverProvider for DeliveryProvider {
             sessions: self.sessions.clone(),
             prompts: self.prompts.clone(),
             launch_failures: self.launch_failures.clone(),
+            native_sessions: ObservedNativeSessions::default(),
         })
     }
 }
 
 struct NativeTransport {
     turns: Arc<Mutex<Vec<String>>>,
+    sessions: ObservedNativeSessions,
 }
 
 #[async_trait]
@@ -554,20 +622,21 @@ impl RuntimeAdapter for NativeTransport {
         }
     }
 
-    async fn session_start(
+    fn session_start(
         &self,
         input: RuntimeSessionStartInput,
     ) -> anyhow::Result<RuntimeSessionHandle> {
-        let resume_mode = match input.resume {
-            lionclaw_runtime_api::RuntimeResume::Native { ready, .. } if ready.is_ready() => {
-                RuntimeResumeMode::Resumed
-            }
-            _ => RuntimeResumeMode::Reconstructed,
-        };
-        Ok(RuntimeSessionHandle {
-            runtime_session_id: input.session_id.to_string(),
-            resume_mode,
-        })
+        let mode = observed_start_mode(input.resume, "transport-session", "test native transport")?;
+        let runtime_session_id = input.session_id.to_string();
+        self.sessions.start(&runtime_session_id, mode);
+        Ok(RuntimeSessionHandle { runtime_session_id })
+    }
+
+    fn native_session_observation(
+        &self,
+        handle: &RuntimeSessionHandle,
+    ) -> anyhow::Result<Option<RuntimeNativeSessionObservation>> {
+        Ok(self.sessions.observation(&handle.runtime_session_id))
     }
 
     async fn turn(
@@ -580,10 +649,13 @@ impl RuntimeAdapter for NativeTransport {
             .unwrap()
             .push(execution.input.prompt.clone());
         let runtime = execution.context.runtime_state.expect("native state root");
-        std::fs::write(
-            runtime.path().join("transport-session"),
-            b"durable-native-id",
+        lionclaw_runtime_api::save_state_value(
+            &runtime,
+            "transport-session",
+            "durable-native-id",
+            "test native transport",
         )?;
+        self.sessions.establish(&execution.input.runtime_session_id);
         let conversation = runtime.marker_path().parent().expect("conversation root");
         let mission = conversation
             .parent()
@@ -636,7 +708,7 @@ impl RuntimeAdapter for NativeTransport {
         Ok(RuntimeCancellation::Acknowledged)
     }
 
-    async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+    fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -654,6 +726,7 @@ impl RuntimeDriverProvider for NativeProvider {
         assert_eq!(config.runtime_id, "codex");
         Arc::new(NativeTransport {
             turns: self.turns.clone(),
+            sessions: ObservedNativeSessions::default(),
         })
     }
 }
@@ -3913,10 +3986,22 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         assert_eq!(sessions[1].0, sessions[2].0, "workspace changed on repair");
         assert!(!sessions[0].1);
         assert!(
-            sessions[1].1,
-            "native session was not eligible after restart"
+            !sessions[1].1,
+            "a launch refusal before native establishment must force reconstruction"
         );
         assert!(sessions[2].1, "native session was not eligible for repair");
+        assert!(
+            sessions[3].1,
+            "the interrupted turn must consume the last committed session"
+        );
+        assert!(
+            !sessions[4].1,
+            "an interrupted turn cannot republish readiness without an observation"
+        );
+        assert!(
+            !sessions[5].1,
+            "the terminal reviewer owns a separate conversation"
+        );
     }
     {
         let prompts = prompts.lock().unwrap();

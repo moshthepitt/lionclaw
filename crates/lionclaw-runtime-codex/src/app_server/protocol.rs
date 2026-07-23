@@ -1,4 +1,3 @@
-use anyhow::Result;
 use lionclaw_runtime_api::{NetworkMode, TypedFailure};
 use serde_json::{json, Value};
 
@@ -33,7 +32,10 @@ pub(crate) fn response_id(message: &Value) -> Option<u64> {
     message.get("id").and_then(Value::as_u64)
 }
 
-pub(crate) fn parse_app_server_response(message: Value, method: &str) -> Result<Value> {
+pub(crate) fn parse_app_server_response(
+    message: Value,
+    method: &str,
+) -> std::result::Result<Value, TypedFailure> {
     if let Some(error) = message.get("error") {
         let code = error
             .get("code")
@@ -49,8 +51,7 @@ pub(crate) fn parse_app_server_response(message: Value, method: &str) -> Result<
                 "codex app-server {method} failed: {}",
                 app_server_error_text(error)
             ),
-        )
-        .into());
+        ));
     }
     Ok(message.get("result").cloned().unwrap_or(Value::Null))
 }
@@ -166,7 +167,6 @@ mod tests {
             "turn/start",
         )
         .unwrap_err();
-        let failure = error.downcast_ref::<TypedFailure>().unwrap();
-        assert_eq!(failure.evidence().code.as_deref(), Some("capacity"));
+        assert_eq!(error.evidence().code.as_deref(), Some("capacity"));
     }
 }

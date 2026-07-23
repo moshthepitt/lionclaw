@@ -40,9 +40,10 @@ mod state;
 mod turn;
 
 pub use adapter::{
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCancellation, RuntimeNativeReopenOutcome,
-    RuntimeNativeReopenRecovery, RuntimeResume, RuntimeResumeMode, RuntimeSessionHandle,
-    RuntimeSessionStartInput, RuntimeTerminalProgramInput, TurnExecution, TurnInput,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCancellation, RuntimeNativeReopenRecovery,
+    RuntimeNativeSessionObservation, RuntimeNativeStateAvailability, RuntimeResume,
+    RuntimeResumeMode, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+    TurnExecution, TurnInput,
 };
 pub use auth::{
     RuntimeAuthContext, RuntimeAuthKind, RuntimeAuthPreparation, RuntimeAuthProvider,
@@ -71,9 +72,9 @@ pub use program::{
     RuntimeProgramStdoutSender, RUNTIME_PROGRAM_STDOUT_LINE_LIMIT,
 };
 pub use state::{
-    clear_state_value, load_ready_state_value, load_state_value, record_runtime_resume_mode,
-    recorded_runtime_resume_mode, recorded_runtime_resume_mode_at,
-    runtime_session_ready_marker_exists, save_state_value, RuntimeSessionReady, RuntimeStateDir,
-    RUNTIME_SESSION_READY_MARKER, RUNTIME_STATE_VALUE_LIMIT,
+    begin_runtime_session_attempt, clear_state_value, load_ready_state_value, load_state_value,
+    recorded_runtime_resume_mode, recorded_runtime_resume_mode_at, save_state_value,
+    RuntimeSessionAttempt, RuntimeSessionReady, RuntimeStateDir, RUNTIME_SESSION_READY_MARKER,
+    RUNTIME_STATE_VALUE_LIMIT,
 };
 pub use turn::TurnResult;

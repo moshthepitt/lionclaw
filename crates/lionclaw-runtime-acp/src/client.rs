@@ -17,17 +17,41 @@ use crate::policy::{acp_error_response, acp_permission_denial};
 use crate::program::acp_mcp_servers;
 use crate::protocol::{
     acp_is_server_request, acp_response_id, parse_acp_response, AcpMessage, AcpOpenedSession,
-    AcpResponse, AcpSelectionSet, AcpSessionCapabilities, AcpSessionSelections,
+    AcpResponse, AcpResponseOutcome, AcpSelectionSet, AcpSessionCapabilities, AcpSessionSelections,
 };
 use crate::state::{
-    forget_acp_session_id, normalize_acp_session_id, remember_acp_session_id, AcpCancelRequest,
-    AcpSessionState,
+    forget_acp_session_id, normalize_acp_session_id, record_native_session_observation,
+    remember_acp_session_id, AcpCancelRequest, AcpSessionState,
 };
 
 pub(crate) struct AcpClient {
     session: Option<Box<dyn RuntimeProgramSession>>,
     next_id: u64,
     final_response: String,
+}
+
+enum AcpRequestFailure {
+    Rejected(TypedFailure),
+    Other(anyhow::Error),
+}
+
+impl AcpRequestFailure {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Rejected(failure) => failure.into(),
+            Self::Other(error) => error,
+        }
+    }
+}
+
+fn classify_acp_response(
+    message: AcpMessage,
+    method: &str,
+) -> std::result::Result<AcpResponse, AcpRequestFailure> {
+    match parse_acp_response(message, method).map_err(AcpRequestFailure::Other)? {
+        AcpResponseOutcome::Success(response) => Ok(response),
+        AcpResponseOutcome::Rejected(failure) => Err(AcpRequestFailure::Rejected(failure)),
+    }
 }
 
 struct AcpCancelWait<'a> {
@@ -83,8 +107,8 @@ impl AcpClient {
         let mcp_servers = acp_mcp_servers(input.mcp_servers);
         if let Some(session_id) = input.session_state.session_id.as_deref() {
             if let Some(reopen_method) = input.session_capabilities.reopen_method() {
-                let response = self
-                    .request(
+                let response = match self
+                    .request_classified(
                         reopen_method,
                         json!({
                             "sessionId": session_id,
@@ -93,10 +117,26 @@ impl AcpClient {
                         }),
                         None,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(AcpRequestFailure::Rejected(failure)) => {
+                        record_native_session_observation(
+                            input.sessions,
+                            input.runtime_session_id,
+                            lionclaw_runtime_api::RuntimeNativeSessionObservation::ReopenFailed,
+                        )?;
+                        return Err(failure.into());
+                    }
+                    Err(error) => return Err(error.into_anyhow()),
+                };
+                record_native_session_observation(
+                    input.sessions,
+                    input.runtime_session_id,
+                    lionclaw_runtime_api::RuntimeNativeSessionObservation::Resumed,
+                )?;
                 return Ok(AcpOpenedSession {
                     session_id: session_id.to_string(),
-                    resumed_existing: true,
                     selections: AcpSessionSelections::from_session_result(&response.result),
                 });
             } else {
@@ -121,19 +161,36 @@ impl AcpClient {
             .and_then(normalize_acp_session_id)
             .context("ACP session/new response is missing sessionId")?;
         if input.session_capabilities.reopen_method().is_some() {
-            remember_acp_session_id(
+            let persisted = remember_acp_session_id(
                 input.config,
                 input.sessions,
                 input.runtime_session_id,
                 &session_id,
             )?;
+            record_native_session_observation(
+                input.sessions,
+                input.runtime_session_id,
+                lionclaw_runtime_api::RuntimeNativeSessionObservation::Reconstructed {
+                    state: if persisted {
+                        lionclaw_runtime_api::RuntimeNativeStateAvailability::Reopenable
+                    } else {
+                        lionclaw_runtime_api::RuntimeNativeStateAvailability::Unavailable
+                    },
+                },
+            )?;
         } else {
             forget_acp_session_id(input.config, input.sessions, input.runtime_session_id)?;
+            record_native_session_observation(
+                input.sessions,
+                input.runtime_session_id,
+                lionclaw_runtime_api::RuntimeNativeSessionObservation::Reconstructed {
+                    state: lionclaw_runtime_api::RuntimeNativeStateAvailability::Unavailable,
+                },
+            )?;
         }
 
         Ok(AcpOpenedSession {
             session_id,
-            resumed_existing: false,
             selections: AcpSessionSelections::from_session_result(&response.result),
         })
     }
@@ -303,6 +360,7 @@ impl AcpClient {
             }),
         )
         .await
+        .map_err(AcpRequestFailure::into_anyhow)
     }
 
     async fn request(
@@ -311,8 +369,21 @@ impl AcpClient {
         params: Value,
         journal: Option<&RuntimeTurnJournalSender>,
     ) -> Result<AcpResponse> {
+        self.request_classified(method, params, journal)
+            .await
+            .map_err(AcpRequestFailure::into_anyhow)
+    }
+
+    async fn request_classified(
+        &mut self,
+        method: &str,
+        params: Value,
+        journal: Option<&RuntimeTurnJournalSender>,
+    ) -> std::result::Result<AcpResponse, AcpRequestFailure> {
         let id = self.next_request_id();
-        self.send_request(id, method, params).await?;
+        self.send_request(id, method, params)
+            .await
+            .map_err(AcpRequestFailure::Other)?;
         self.wait_for_response(id, method, journal, None).await
     }
 
@@ -322,7 +393,7 @@ impl AcpClient {
         method: &str,
         journal: Option<&RuntimeTurnJournalSender>,
         mut cancel: Option<AcpCancelWait<'_>>,
-    ) -> Result<AcpResponse> {
+    ) -> std::result::Result<AcpResponse, AcpRequestFailure> {
         if let Some(cancel) = cancel.as_mut() {
             loop {
                 tokio::select! {
@@ -335,26 +406,34 @@ impl AcpClient {
                         }
                     }
                     maybe_message = self.recv() => {
-                        let Some(message) = maybe_message? else {
-                            return Err(anyhow!("ACP process closed before responding to {method}"));
+                        let Some(message) = maybe_message.map_err(AcpRequestFailure::Other)? else {
+                            return Err(AcpRequestFailure::Other(anyhow!(
+                                "ACP process closed before responding to {method}"
+                            )));
                         };
                         if acp_response_id(&message.value).is_some_and(|response_id| response_id == id) {
-                            return parse_acp_response(message, method);
+                            return classify_acp_response(message, method);
                         }
-                        self.dispatch_message(message, journal).await?;
+                        self.dispatch_message(message, journal)
+                            .await
+                            .map_err(AcpRequestFailure::Other)?;
                     }
                 }
             }
         }
 
         loop {
-            let Some(message) = self.recv().await? else {
-                return Err(anyhow!("ACP process closed before responding to {method}"));
+            let Some(message) = self.recv().await.map_err(AcpRequestFailure::Other)? else {
+                return Err(AcpRequestFailure::Other(anyhow!(
+                    "ACP process closed before responding to {method}"
+                )));
             };
             if acp_response_id(&message.value).is_some_and(|response_id| response_id == id) {
-                return parse_acp_response(message, method);
+                return classify_acp_response(message, method);
             }
-            self.dispatch_message(message, journal).await?;
+            self.dispatch_message(message, journal)
+                .await
+                .map_err(AcpRequestFailure::Other)?;
         }
     }
 

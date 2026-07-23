@@ -35,9 +35,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use lionclaw_runtime_api::{
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeEvent, RuntimeMessageLane, RuntimeResumeMode,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnJournalSender, TurnEvent,
-    TurnExecution, TurnResult,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeEvent, RuntimeMessageLane, RuntimeSessionHandle,
+    RuntimeSessionStartInput, RuntimeTurnJournalSender, TurnEvent, TurnExecution, TurnResult,
 };
 
 pub struct MockRuntimeAdapter;
@@ -52,13 +51,9 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         }
     }
 
-    async fn session_start(
-        &self,
-        _input: RuntimeSessionStartInput,
-    ) -> Result<RuntimeSessionHandle> {
+    fn session_start(&self, _input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("mock-{}", Uuid::new_v4()),
-            resume_mode: RuntimeResumeMode::Reconstructed,
         })
     }
 
@@ -103,7 +98,7 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         Ok(lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn)
     }
 
-    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+    fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         Ok(())
     }
 }
