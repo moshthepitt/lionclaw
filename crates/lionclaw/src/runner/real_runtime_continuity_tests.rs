@@ -313,7 +313,7 @@ async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) 
                 prompt,
                 base_sha: base_sha.clone(),
                 assignment_epoch,
-                recreate_workspace: false,
+                workspace_preparation: crate::model::WorkspacePreparation::Preserve,
                 deadline_ms,
                 control,
                 updates,

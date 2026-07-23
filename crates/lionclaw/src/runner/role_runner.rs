@@ -365,14 +365,29 @@ async fn prepare_writer_checkout(
     workspace: &std::path::Path,
     observer_index: &lionclaw_durable_fs::RootedDirectory,
     base_sha: &str,
-    recreate_workspace: bool,
+    workspace_preparation: &crate::model::WorkspacePreparation,
+    archive_checkout: Option<&std::path::Path>,
 ) -> Result<(), TypedFailure> {
+    if matches!(
+        workspace_preparation,
+        crate::model::WorkspacePreparation::ArchiveAndReset { .. }
+    ) {
+        let archive_checkout = archive_checkout
+            .ok_or_else(|| launch("workspace recreation has no archive authority".into()))?;
+        workspace::archive_and_replace_checkout(repo, workspace, archive_checkout, base_sha)
+            .await
+            .map_err(|e| launch(format!("failed to archive and recreate checkout: {e}")))?;
+        return workspace::prepare_checkout_observer_index(repo, observer_index, base_sha, true)
+            .await
+            .map_err(|e| launch(format!("failed to prepare workspace observer: {e}")));
+    }
+
     let mut replace = !workspace.exists();
     if workspace.exists() {
         let head = workspace::checkout_head_sha(workspace)
             .await
             .map_err(|e| launch(format!("failed to inspect retained checkout HEAD: {e}")))?;
-        if !recreate_workspace {
+        if !workspace_preparation.resets_workspace() {
             if workspace::checkout_commit_exists(workspace, base_sha).await
                 && workspace::checkout_is_ancestor(workspace, base_sha, &head)
                     .await
@@ -424,7 +439,7 @@ async fn prepare_writer_checkout(
         repo,
         observer_index,
         base_sha,
-        recreate_workspace || replace,
+        workspace_preparation.resets_workspace() || replace,
     )
     .await
     .map_err(|e| launch(format!("failed to prepare workspace observer: {e}")))
@@ -448,7 +463,14 @@ impl RoleRunner for OciRoleRunner {
         let mission_dirs = MissionDirs::new(&request.state_dir, &request.mission_id);
         let dirs = mission_dirs.effect(&request.effect_id).role();
         let lifetime = request.role.output.resource_lifetime();
-        let (role_state, state_observer_index) = match lifetime {
+        if request.workspace_preparation.resets_workspace()
+            && request.role.output != OutputSemantics::ProducesArtifact
+        {
+            return Err(launch(
+                "workspace preparation requires an artifact-producing role".into(),
+            ));
+        }
+        let (role_state, state_observer_index, conversation_dirs) = match lifetime {
             RoleResourceLifetime::Conversation => {
                 let conversation_id = crate::model::ConversationId::for_role_instance(
                     &request.mission_id,
@@ -465,9 +487,10 @@ impl RoleRunner for OciRoleRunner {
                             "invalid conversation resource authority: {error:#}"
                         ))
                     })?),
+                    Some(conversation),
                 )
             }
-            RoleResourceLifetime::Effect => (dirs.role_state().clone(), None),
+            RoleResourceLifetime::Effect => (dirs.role_state().clone(), None, None),
         };
         dirs.prepare()
             .map_err(|e| launch(format!("failed to prepare role effect dirs: {e}")))?;
@@ -497,6 +520,32 @@ impl RoleRunner for OciRoleRunner {
             .prepare()
             .map_err(|e| launch(format!("failed to prepare runtime profile dirs: {e}")))?;
         let runtime_state = runtime_profile.runtime_state().clone();
+        let archive_checkout = request
+            .workspace_preparation
+            .archived_effect()
+            .map(|parked_effect| {
+                let conversation = conversation_dirs.as_ref().ok_or_else(|| {
+                    launch("workspace recreation has no conversation authority".into())
+                })?;
+                conversation
+                    .prepare_workspace_archives()
+                    .map_err(|e| launch(format!("failed to prepare workspace archives: {e}")))?;
+                let canonical = conversation.workspace_archive(parked_effect);
+                let issued = request
+                    .artifact_capture
+                    .as_ref()
+                    .and_then(crate::workspace::ArtifactCapture::archive_checkout)
+                    .ok_or_else(|| {
+                        launch("workspace recreation has no archive authority".into())
+                    })?;
+                if issued != canonical {
+                    return Err(launch(
+                        "artifact capture archive disagrees with conversation resources".into(),
+                    ));
+                }
+                Ok(canonical)
+            })
+            .transpose()?;
 
         let setup = async {
             let skill_mounts = prepare_skill_mounts(
@@ -540,17 +589,11 @@ impl RoleRunner for OciRoleRunner {
                         &workspace_source,
                         observer_index.as_ref().expect("writer observer index"),
                         &request.base_sha,
-                        request.recreate_workspace,
+                        &request.workspace_preparation,
+                        archive_checkout.as_deref(),
                     )
                     .await?;
-                    request
-                        .updates
-                        .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
-                            base_sha: request.base_sha.clone(),
-                            assignment_epoch: request.assignment_epoch,
-                        })
-                        .await
-                        .map_err(|_| launch("kernel role update receiver closed".into()))?;
+                    request.confirm_workspace_prepared().await?;
                 } else {
                     workspace::create_checkout(
                         &request.workspace_dir,
@@ -1681,7 +1724,7 @@ mod tests {
                 .into(),
             base_sha: "unused".into(),
             assignment_epoch: 1,
-            recreate_workspace: false,
+            workspace_preparation: crate::model::WorkspacePreparation::Preserve,
             deadline_ms: i64::MAX,
             control,
             updates,
@@ -1738,6 +1781,37 @@ mod tests {
                 ),
                 "expected {expected}, got {failure:?}"
             );
+        }
+        assert!(!temp.path().join("state").exists());
+    }
+
+    #[tokio::test]
+    async fn non_writer_refuses_workspace_reset_before_resource_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = OciRoleRunner::new(
+            RuntimeProfiles::built_in().unwrap(),
+            "unused-image".into(),
+            AuthorityCeiling::default(),
+        );
+        for preparation in [
+            crate::model::WorkspacePreparation::ResetForAssignment,
+            crate::model::WorkspacePreparation::ArchiveAndReset {
+                parked_effect_id: crate::model::EffectId::for_parts(&["parked-writer"]),
+            },
+        ] {
+            let mut request = fallback_request(temp.path());
+            request.role.output = OutputSemantics::EmitsVerdict;
+            request.workspace_preparation = preparation;
+
+            let failure = runner
+                .run(request)
+                .await
+                .expect_err("non-writers must never receive workspace reset authority");
+
+            assert_eq!(failure.evidence().code.as_deref(), Some("kernel.launch"));
+            assert!(failure
+                .detail()
+                .contains("requires an artifact-producing role"));
         }
         assert!(!temp.path().join("state").exists());
     }
@@ -2790,7 +2864,12 @@ mod tests {
         let observer_root = task_work.parent().expect("test task work has a parent");
         let observer_index =
             lionclaw_durable_fs::RootedDirectory::new(observer_root, observer_root).unwrap();
-        prepare_writer_checkout(repo, task_work, &observer_index, base, recreate).await
+        let preparation = if recreate {
+            crate::model::WorkspacePreparation::ResetForAssignment
+        } else {
+            crate::model::WorkspacePreparation::Preserve
+        };
+        prepare_writer_checkout(repo, task_work, &observer_index, base, &preparation, None).await
     }
 
     #[tokio::test]
@@ -3051,6 +3130,71 @@ mod tests {
             workspace::checkout_head_sha(&task_work).await.unwrap(),
             moved
         );
+    }
+
+    #[tokio::test]
+    async fn production_writer_preparation_uses_the_exact_conversation_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.name", "test"]).await;
+        git(&repo, &["config", "user.email", "test@local"]).await;
+        git(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "base"]).await;
+        let base = git(&repo, &["rev-parse", "HEAD"]).await;
+
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let mission_id = crate::model::MissionId::parse("mabc123def456").unwrap();
+        let task_id = crate::model::TaskId::new("writer").unwrap();
+        let role = crate::model::RoleName::new("implementer").unwrap();
+        let conversation_id = crate::model::ConversationId::for_role_instance(
+            &mission_id,
+            crate::model::TaskNamespace::Execution,
+            &task_id,
+            &role,
+            1,
+        );
+        let mission_dirs = MissionDirs::new(&state_dir, &mission_id);
+        mission_dirs.prepare().unwrap();
+        let conversation = mission_dirs.conversation(&conversation_id);
+        conversation.role_state().prepare().unwrap();
+        workspace::create_checkout(&repo, conversation.work(), &base)
+            .await
+            .unwrap();
+        std::fs::write(conversation.work().join("uncommitted"), "retain me\n").unwrap();
+
+        let parked_effect = crate::model::EffectId::for_parts(&["writer", "parked"]);
+        conversation.prepare_workspace_archives().unwrap();
+        let archive = conversation.workspace_archive(&parked_effect);
+        let observer_index = conversation.files().unwrap();
+        prepare_writer_checkout(
+            &repo,
+            conversation.work(),
+            &observer_index,
+            &base,
+            &crate::model::WorkspacePreparation::ArchiveAndReset {
+                parked_effect_id: parked_effect,
+            },
+            Some(&archive),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(archive.join("uncommitted")).unwrap(),
+            "retain me\n"
+        );
+        assert_eq!(
+            workspace::checkout_head_sha(conversation.work())
+                .await
+                .unwrap(),
+            base
+        );
+        assert!(conversation.observer_index().is_file());
     }
 
     #[tokio::test]

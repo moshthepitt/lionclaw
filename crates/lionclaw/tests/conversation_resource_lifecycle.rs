@@ -67,13 +67,6 @@ async fn awaiting_lead_with_resources(
     let observed_root = Arc::new(Mutex::new(None::<PathBuf>));
     let runner_root = observed_root.clone();
     let runner = MockRoleRunner::new(Box::new(move |request| {
-        request
-            .updates
-            .try_send(lionclaw::ports::RoleRunUpdate::WorkspacePrepared {
-                base_sha: request.base_sha.clone(),
-                assignment_epoch: request.assignment_epoch,
-            })
-            .expect("report prepared workspace");
         let conversation_id = ConversationId::for_role_instance(
             &request.mission_id,
             request.namespace,

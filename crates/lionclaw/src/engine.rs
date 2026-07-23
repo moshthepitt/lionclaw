@@ -207,25 +207,25 @@ impl MissionView {
             .keys()
             .any(|id| self.state.conversation_accepts_message(id));
         let can_decide = !self.state.open_attention.is_empty();
-        let can_continue = self
-            .state
-            .parked_effects
-            .keys()
-            .any(|effect_id| self.state.parked_effect_is_continuable(effect_id));
+        let can_preserve = self.state.parked_effects.keys().any(|effect_id| {
+            self.state
+                .parked_continue_is_legal(effect_id, crate::model::ContinueMode::Preserve)
+        });
+        let can_recreate = self.state.parked_effects.keys().any(|effect_id| {
+            self.state
+                .parked_continue_is_legal(effect_id, crate::model::ContinueMode::RecreateWorkspace)
+        });
+        let continue_action = can_preserve
+            .then_some("mission continue")
+            .or_else(|| can_recreate.then_some("mission continue --recreate"));
         let mut actions = match self.disposition {
             MissionDisposition::Ready => vec!["mission advance"],
             MissionDisposition::Running => vec!["mission status"],
             MissionDisposition::AwaitingLead if can_send => vec!["mission send"],
             MissionDisposition::AwaitingLead => Vec::new(),
             MissionDisposition::AwaitingPlan => vec!["mission plan propose"],
-            MissionDisposition::Parked
-                if self
-                    .state
-                    .parked_effects
-                    .keys()
-                    .any(|effect_id| self.state.parked_effect_is_continuable(effect_id)) =>
-            {
-                vec!["mission continue", "mission decide"]
+            MissionDisposition::Parked if continue_action.is_some() => {
+                vec![continue_action.expect("checked above"), "mission decide"]
             }
             MissionDisposition::Parked => vec!["mission decide"],
             MissionDisposition::CleanupBlocked => vec!["mission advance", "mission log"],
@@ -239,8 +239,10 @@ impl MissionView {
                 actions
             }
         };
-        if self.disposition == MissionDisposition::AwaitingLead && can_continue {
-            actions.push("mission continue");
+        if self.disposition == MissionDisposition::AwaitingLead {
+            if let Some(action) = continue_action {
+                actions.push(action);
+            }
         }
         if self.disposition == MissionDisposition::AwaitingLead && can_decide {
             actions.push("mission decide");
@@ -905,7 +907,10 @@ impl Engine {
             current.head,
             NewEvent::new(MissionEvent::ControlRequested {
                 effect_id: effect_id.clone(),
-                action: crate::model::ControlAction::Continue { automatic: true },
+                action: crate::model::ControlAction::Continue {
+                    automatic: true,
+                    mode: crate::model::ContinueMode::Preserve,
+                },
                 reason: reason.into(),
             }),
         )
@@ -1056,6 +1061,7 @@ impl Engine {
             RoleRunUpdate::WorkspacePrepared {
                 base_sha,
                 assignment_epoch,
+                acknowledge,
             } => {
                 let task_id = match state.inflight.get(effect_id) {
                     Some(InflightEffect::RoleRun {
@@ -1065,17 +1071,33 @@ impl Engine {
                     }) => task_id.clone(),
                     _ => return Ok(()),
                 };
-                self.append_fact(
-                    &state.mission_id,
-                    state.head,
-                    NewEvent::new(MissionEvent::TaskWorkspacePrepared {
-                        task_id,
-                        effect_id: effect_id.clone(),
-                        base_sha,
-                        assignment_epoch,
-                    }),
-                )
-                .await
+                let result = async {
+                    self.append_fact(
+                        &state.mission_id,
+                        state.head,
+                        NewEvent::new(MissionEvent::TaskWorkspacePrepared {
+                            task_id,
+                            effect_id: effect_id.clone(),
+                            base_sha,
+                            assignment_epoch,
+                        }),
+                    )
+                    .await?;
+                    let reloaded = self.load_state(&state.mission_id).await?;
+                    if let Err(reason) = reloaded.active_workspace_conversation(effect_id) {
+                        bail!(
+                            "durable workspace preparation did not establish exact active authority: {reason}"
+                        );
+                    }
+                    Ok(())
+                }
+                .await;
+                let acknowledgement = match &result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                let _ = acknowledge.send(acknowledgement);
+                result
             }
             RoleRunUpdate::RuntimeConfigured(configuration) => {
                 let configuration = configuration.projected();
@@ -1188,7 +1210,7 @@ impl Engine {
             runtime,
             base_sha,
             assignment_epoch,
-            recreate_workspace,
+            workspace_preparation,
             ..
         } = effect
         else {
@@ -1247,16 +1269,19 @@ impl Engine {
         let (updates, update_rx) = tokio::sync::mpsc::channel(8);
         let artifact_capture =
             (*output == crate::model::OutputSemantics::ProducesArtifact).then(|| {
-                let checkout = MissionDirs::new(self.store.lionclaw_dir(), &state.mission_id)
-                    .conversation(conversation_id)
-                    .work()
-                    .to_path_buf();
+                let conversation = MissionDirs::new(self.store.lionclaw_dir(), &state.mission_id)
+                    .conversation(conversation_id);
+                let checkout = conversation.work().to_path_buf();
+                let archive_checkout = workspace_preparation
+                    .archived_effect()
+                    .map(|archived| conversation.workspace_archive(archived));
                 ArtifactCapture::new(
                     state.workspace_dir.clone().into(),
                     checkout,
                     base_sha.to_string(),
                     state.mission_id.clone(),
                     effect_id.clone(),
+                    archive_checkout,
                 )
             });
         let request = RoleRunRequest {
@@ -1272,7 +1297,7 @@ impl Engine {
             prompt: prompt_text,
             base_sha: base_sha.to_string(),
             assignment_epoch: *assignment_epoch,
-            recreate_workspace: *recreate_workspace,
+            workspace_preparation: workspace_preparation.clone(),
             deadline_ms: effect.deadline_ms(),
             control,
             updates,
@@ -1524,7 +1549,7 @@ impl Engine {
             prompt: prompt_text,
             base_sha: judged_sha.clone(),
             assignment_epoch: attempt_no,
-            recreate_workspace: true,
+            workspace_preparation: crate::model::WorkspacePreparation::Preserve,
             deadline_ms: effect.deadline_ms(),
             control,
             updates,
@@ -1882,7 +1907,7 @@ impl Engine {
         let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));
         let base_sha = assignment.base_sha;
         let assignment_epoch = assignment.generation;
-        let recreate_workspace = assignment.recreate_workspace;
+        let workspace_preparation = assignment.workspace_preparation;
         let effect_id = EffectId::for_role_request(
             intent.namespace,
             &state.mission_id,
@@ -1921,7 +1946,7 @@ impl Engine {
             assignment_epoch,
             message_boundary,
             presented_messages,
-            recreate_workspace,
+            workspace_preparation,
             requested_at_ms,
             not_before_ms,
             deadline_ms: resolved_deadline(not_before_ms, initial_secs)?,
@@ -2462,12 +2487,12 @@ pub async fn record_control(
                 bail!("extended deadline must be finite, nondecreasing, and in the future");
             }
         }
-        crate::model::ControlAction::Continue { automatic } => {
+        crate::model::ControlAction::Continue { automatic, mode } => {
             if *automatic {
                 bail!("automatic controls are engine-owned");
             }
-            if !state.parked_effect_is_continuable(effect_id) {
-                bail!("effect '{effect_id}' is not parked; control is stale");
+            if !state.continue_is_legal(effect_id, *automatic, *mode) {
+                bail!("effect '{effect_id}' does not allow the requested continuation mode");
             }
         }
     }
@@ -3046,6 +3071,7 @@ mod assignment_tests {
                 base_sha: base.to_string(),
                 assignment_epoch: epoch,
             }),
+            pending_workspace_recreation: None,
             workspace_provenance: Some(crate::model::TaskWorkspaceProvenance {
                 effect_id: EffectId::for_parts(&["assignment-test", &epoch.to_string()]),
                 conversation_id: crate::model::ConversationId::for_role_instance(
@@ -3057,6 +3083,7 @@ mod assignment_tests {
                 ),
                 base_sha: base.to_string(),
                 assignment_epoch: epoch,
+                archived_effect_id: None,
             }),
         }
     }
@@ -3065,16 +3092,24 @@ mod assignment_tests {
     fn fresh_assignment_rebases_only_when_the_required_deliverable_moved() {
         assert_eq!(
             resolve_task_assignment(None, "h1", 1, 3),
-            ("h1".into(), 1, true)
+            (
+                "h1".into(),
+                1,
+                crate::model::WorkspacePreparation::ResetForAssignment,
+            )
         );
         let pending = task(TaskStatus::Pending, "h1", 1);
         assert_eq!(
             resolve_task_assignment(Some(&pending), "h2", 1, 3),
-            ("h2".into(), 2, true)
+            (
+                "h2".into(),
+                2,
+                crate::model::WorkspacePreparation::ResetForAssignment,
+            )
         );
         assert_eq!(
             resolve_task_assignment(Some(&pending), "h1", 1, 3),
-            ("h1".into(), 1, false)
+            ("h1".into(), 1, crate::model::WorkspacePreparation::Preserve,)
         );
     }
 
@@ -3089,7 +3124,7 @@ mod assignment_tests {
         ));
         assert_eq!(
             resolve_task_assignment(Some(&failed), "h2", 1, 3),
-            ("h1".into(), 4, false)
+            ("h1".into(), 4, crate::model::WorkspacePreparation::Preserve,)
         );
     }
 

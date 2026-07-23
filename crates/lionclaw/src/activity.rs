@@ -926,6 +926,7 @@ mod tests {
             conversation_id: conversation_id.clone(),
             base_sha: base.clone(),
             assignment_epoch: 1,
+            archived_effect_id: None,
         });
         state
             .conversations
@@ -1111,7 +1112,7 @@ mod tests {
                 assignment_epoch: 2,
                 message_boundary: active.head.saturating_sub(1),
                 presented_messages: vec![],
-                recreate_workspace: false,
+                workspace_preparation: crate::model::WorkspacePreparation::Preserve,
                 runtime_configuration: None,
                 requested_at_ms: 0,
                 not_before_ms: 0,
@@ -1146,6 +1147,7 @@ mod tests {
                 conversation_id: replacement_id.clone(),
                 base_sha: base.clone(),
                 assignment_epoch: 2,
+                archived_effect_id: None,
             });
         let reloaded: MissionState = serde_json::from_slice(
             &serde_json::to_vec(&active).expect("serialize valid inflight state"),
@@ -1214,6 +1216,7 @@ mod tests {
             conversation_id: forged_generation_id.clone(),
             base_sha: base.clone(),
             assignment_epoch: forged_generation,
+            archived_effect_id: None,
         });
         let forged_dirs = mission_dirs.conversation(&forged_generation_id);
         workspace::create_checkout(temp.path(), forged_dirs.work(), &base)
@@ -1288,6 +1291,7 @@ mod tests {
             conversation_id: forged_id.clone(),
             base_sha: base,
             assignment_epoch: 2,
+            archived_effect_id: None,
         });
         let replacement = forged.conversations.remove(&replacement_id).unwrap();
         forged.conversations.insert(forged_id, replacement);

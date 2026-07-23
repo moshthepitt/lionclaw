@@ -328,7 +328,7 @@ async fn controlled_effect_log_satisfies_every_prefix_and_snapshot_law() {
                 assignment_epoch: 1,
                 message_boundary: state.head,
                 presented_messages: vec![],
-                recreate_workspace: true,
+                workspace_preparation: lionclaw::model::WorkspacePreparation::ResetForAssignment,
                 requested_at_ms: 1_000,
                 not_before_ms: 1_000,
                 deadline_ms: 2_000,
@@ -373,7 +373,8 @@ async fn controlled_effect_log_satisfies_every_prefix_and_snapshot_law() {
                     prompt_hash: PayloadRef::inline("prompt").content_sha256().unwrap(),
                     prompt_template: lionclaw::model::RolePromptTemplate::Execution,
                     base_sha: BASE_SHA.into(),
-                    recreate_workspace: true,
+                    workspace_preparation:
+                        lionclaw::model::WorkspacePreparation::ResetForAssignment,
                     message_boundary: state.head,
                     presented_messages: vec![],
                 }),

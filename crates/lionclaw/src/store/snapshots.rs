@@ -95,12 +95,12 @@ impl MissionStore {
                             && upto <= log_head
                             && state.mission_id == *mission_id
                             && state.head == upto as u64
+                            && state.is_safe_snapshot_seed()
                     })
                     .map(|s| (upto as u64, s))
             }
             _ => None,
         };
-
         match base {
             Some((upto, mut state)) => {
                 for envelope in self.load_after(mission_id, upto).await? {

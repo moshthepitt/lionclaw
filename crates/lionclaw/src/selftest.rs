@@ -572,13 +572,9 @@ async fn prepare_scripted_writer(request: &RoleRunRequest) -> Result<std::path::
     let checkout = capture.checkout_dir().to_path_buf();
     workspace::create_checkout(&request.workspace_dir, &checkout, &request.base_sha).await?;
     request
-        .updates
-        .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
-            base_sha: request.base_sha.clone(),
-            assignment_epoch: request.assignment_epoch,
-        })
+        .confirm_workspace_prepared()
         .await
-        .context("engine role update receiver closed")?;
+        .map_err(|failure| anyhow::anyhow!(failure.detail().to_string()))?;
     Ok(checkout)
 }
 

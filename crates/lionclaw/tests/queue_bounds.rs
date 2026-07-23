@@ -46,14 +46,9 @@ impl GatedRoleRunner {
 #[async_trait]
 impl RoleRunner for GatedRoleRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
-        request
-            .updates
-            .send(lionclaw::ports::RoleRunUpdate::WorkspacePrepared {
-                base_sha: request.base_sha.clone(),
-                assignment_epoch: request.assignment_epoch,
-            })
-            .await
-            .expect("engine retains the workspace update receiver");
+        if request.role.output == OutputSemantics::ProducesArtifact {
+            lionclaw::testing::prepare_test_workspace(&request).await?;
+        }
         self.prompts.lock().unwrap().push(request.prompt.clone());
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         if self.blocked_calls.contains(&call) {
@@ -397,14 +392,7 @@ async fn production_broadcast_is_atomic_when_one_live_conversation_is_full() {
 #[tokio::test]
 async fn exact_queue_capacity_is_typed_atomic_replay_safe_and_recoverable() {
     let dir = tempfile::tempdir().unwrap();
-    let runner = MockRoleRunner::new(Box::new(|request| {
-        request
-            .updates
-            .try_send(lionclaw::ports::RoleRunUpdate::WorkspacePrepared {
-                base_sha: request.base_sha.clone(),
-                assignment_epoch: request.assignment_epoch,
-            })
-            .unwrap();
+    let runner = MockRoleRunner::new(Box::new(|_request| {
         Ok(lionclaw::ports::RoleRunOutcome {
             handoff: None,
             artifact: None,

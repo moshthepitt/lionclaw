@@ -37,14 +37,7 @@ async fn reject_without_mutation(
 #[tokio::test]
 async fn production_cli_routes_atomically_only_to_explicit_live_conversations() {
     let dir = tempfile::tempdir().unwrap();
-    let runner = MockRoleRunner::new(Box::new(|request| {
-        request
-            .updates
-            .try_send(lionclaw::ports::RoleRunUpdate::WorkspacePrepared {
-                base_sha: request.base_sha.clone(),
-                assignment_epoch: request.assignment_epoch,
-            })
-            .unwrap();
+    let runner = MockRoleRunner::new(Box::new(|_request| {
         Ok(lionclaw::ports::RoleRunOutcome {
             handoff: None,
             artifact: None,

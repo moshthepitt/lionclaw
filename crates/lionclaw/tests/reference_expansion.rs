@@ -13,9 +13,7 @@ use lionclaw::model::{
     DecisionAction, DeliveryMarker, Handoff, MessageReference, MissionEvent, PayloadRef, RoleName,
     TaskId, TaskKind, UnavailableReferenceCause, REDUCER_VERSION, SCHEMA_VERSION,
 };
-use lionclaw::ports::{
-    CapturedArtifact, OracleOutcome, RoleRunOutcome, RoleRunRequest, RoleRunUpdate,
-};
+use lionclaw::ports::{CapturedArtifact, OracleOutcome, RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 use lionclaw_runtime_api::TypedFailure;
@@ -41,14 +39,7 @@ fn send_cli(
     Cli::try_parse_from(args).expect("production mission send parser")
 }
 
-fn checkpoint(request: &RoleRunRequest) -> RoleRunOutcome {
-    request
-        .updates
-        .try_send(RoleRunUpdate::WorkspacePrepared {
-            base_sha: request.base_sha.clone(),
-            assignment_epoch: request.assignment_epoch,
-        })
-        .unwrap();
+fn checkpoint(_request: &RoleRunRequest) -> RoleRunOutcome {
     RoleRunOutcome {
         handoff: None,
         artifact: None,
@@ -169,7 +160,7 @@ async fn accepted_commit_object_fault_settles_once_and_does_not_block_later_mess
 }
 
 async fn prove_commit_object_fault_settles_once(fault: CommitObjectFault) {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (21, 32));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (22, 33));
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let observed = prompts.clone();

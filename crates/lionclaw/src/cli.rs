@@ -176,8 +176,8 @@ pub enum MissionCommand {
     Stop(ControlArgs),
     /// Extend one exact active effect's deadline.
     Extend(ExtendArgs),
-    /// Resume one exact parked effect in its preserved workspace.
-    Continue(ControlArgs),
+    /// Resume one exact parked effect, optionally archiving and rebuilding its workspace.
+    Continue(ContinueArgs),
     /// Inspect mission types.
     #[command(subcommand)]
     Type(TypeCommand),
@@ -381,6 +381,15 @@ pub struct ControlArgs {
 }
 
 #[derive(Args)]
+pub struct ContinueArgs {
+    #[command(flatten)]
+    pub control: ControlArgs,
+    /// Archive the exact retained writer checkout before rebuilding it.
+    #[arg(long)]
+    pub recreate: bool,
+}
+
+#[derive(Args)]
 pub struct ExtendArgs {
     pub mission_id: String,
     pub effect_id: String,
@@ -563,9 +572,9 @@ async fn dispatch_mission(
         MissionCommand::Plan(cmd) => cmd_plan(cmd, transports).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Abort(args) => cmd_abort(args).await.map(|()| ExitCode::SUCCESS),
-        MissionCommand::Stop(args) => cmd_control(args, false).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Stop(args) => cmd_stop(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Extend(args) => cmd_extend(args).await.map(|()| ExitCode::SUCCESS),
-        MissionCommand::Continue(args) => cmd_control(args, true).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Continue(args) => cmd_continue(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Type(cmd) => cmd_type(cmd).await,
         MissionCommand::SelfTest(args) => crate::selftest::run(args.json).await,
     }
@@ -1206,6 +1215,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
                     task_runtime_json(id, task, None)
                 }).collect::<Result<Vec<_>>>()?,
+                "parked_effects": parked_effect_views(state),
                 "conversations": conversation_views(state, &store)?,
                 "unavailable_references": state.unavailable_references,
                 "assertions": rows.iter().map(|row| serde_json::json!({
@@ -1281,6 +1291,8 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         }
     }
     print_task_workspace_observations(state, "  ", &workspace_observations);
+    print_workspace_control_state(state, "  ");
+    print_parked_controls(state, "  ");
     for (task_id, task) in &state.planning.tasks {
         if let Some(failure) = &task.last_failure {
             print_typed_failure(failure, &format!("  planning task {task_id} failure: "));
@@ -1513,15 +1525,11 @@ async fn cmd_send(args: SendArgs) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_control(args: ControlArgs, resume: bool) -> Result<()> {
+async fn cmd_stop(args: ControlArgs) -> Result<()> {
     let mission_id = MissionId::parse(&args.mission_id)?;
     let effect_id = EffectId::parse(&args.effect_id)?;
     let (_repo, store) = open_store(args.repo).await?;
-    let action = if resume {
-        ControlAction::Continue { automatic: false }
-    } else {
-        ControlAction::Stop
-    };
+    let action = ControlAction::Stop;
     record_control(
         &store,
         SystemClock.now_ms(),
@@ -1531,9 +1539,44 @@ async fn cmd_control(args: ControlArgs, resume: bool) -> Result<()> {
         &args.reason,
     )
     .await?;
+    println!("recorded stop for effect {effect_id}");
+    Ok(())
+}
+
+async fn cmd_continue(args: ContinueArgs) -> Result<()> {
+    let ControlArgs {
+        mission_id,
+        effect_id,
+        repo,
+        reason,
+    } = args.control;
+    let mission_id = MissionId::parse(&mission_id)?;
+    let effect_id = EffectId::parse(&effect_id)?;
+    let (_repo, store) = open_store(repo).await?;
+    let mode = if args.recreate {
+        crate::model::ContinueMode::RecreateWorkspace
+    } else {
+        crate::model::ContinueMode::Preserve
+    };
+    record_control(
+        &store,
+        SystemClock.now_ms(),
+        &mission_id,
+        &effect_id,
+        ControlAction::Continue {
+            automatic: false,
+            mode,
+        },
+        &reason,
+    )
+    .await?;
     println!(
         "recorded {} for effect {effect_id}",
-        if resume { "continue" } else { "stop" }
+        if args.recreate {
+            "continue --recreate"
+        } else {
+            "continue"
+        }
     );
     Ok(())
 }
@@ -2040,6 +2083,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
         print_conversations(state, &store, "  ")?;
         print_unavailable_references(state, "  ");
         print_task_workspace_observations(state, "  ", &workspace_observations);
+        print_workspace_control_state(state, "  ");
         if view.disposition == MissionDisposition::Running {
             print_activity(&store, state)?;
         }
@@ -2047,9 +2091,12 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
             println!("driver error: {error}");
         }
         for (effect_id, parked) in &state.parked_effects {
+            let controls = parked_legal_controls(state, effect_id);
             println!(
-                "parked effect {}: {:?}; legal control=continue",
-                effect_id, parked
+                "parked effect {}: {:?}; legal controls={}",
+                effect_id,
+                parked,
+                controls_display(&controls)
             );
         }
         print_planning_input(store.blobs(), state, "")?;
@@ -2567,6 +2614,8 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
             }
             MissionDisposition::Ready => println!("mission {mission_id}: ready to advance"),
         }
+        print_workspace_control_state(state, "  ");
+        print_parked_controls(state, "  ");
         print_unavailable_references(state, "  ");
         if !state.superseded_assertions.is_empty() {
             println!("  superseded assertions:");
@@ -2684,15 +2733,7 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         }).collect::<Result<Vec<_>>>()?,
         "cleanup_failure": cleanup_failure_json(state),
         "oracle_failures": state.oracle_failures,
-        "parked_effects": state.parked_effects.iter().filter(|(effect_id, _)| {
-            state.parked_effect_is_continuable(effect_id)
-        }).map(|(effect_id, parked)| {
-            serde_json::json!({
-                "effect_id": effect_id.as_str(),
-                "kind": parked,
-                "legal_controls": ["continue"],
-            })
-        }).collect::<Vec<_>>(),
+        "parked_effects": parked_effect_views(state),
         "terminal_review": review_summary(state),
     }))
 }
@@ -2714,11 +2755,85 @@ fn task_runtime_json(
             "conversation_id": workspace.conversation_id.as_str(),
             "base_sha": workspace.base_sha,
             "assignment_epoch": workspace.assignment_epoch,
+            "archived_effect_id": workspace.archived_effect_id.as_ref()
+                .map(|effect_id| effect_id.as_str()),
         })),
+        "pending_workspace_recreation": task.pending_workspace_recreation.as_ref()
+            .map(|effect_id| effect_id.as_str()),
         "workspace_observation": workspace_observation,
         "runtime_configuration": task.last_runtime_configuration,
         "failure": task.last_failure,
     }))
+}
+
+fn parked_legal_controls(
+    state: &crate::model::MissionState,
+    effect_id: &crate::model::EffectId,
+) -> Vec<&'static str> {
+    if !state.parked_effect_is_continuable(effect_id) {
+        return Vec::new();
+    }
+    let mut controls = Vec::new();
+    if state.parked_continue_is_legal(effect_id, crate::model::ContinueMode::Preserve) {
+        controls.push("continue");
+    }
+    if state.parked_continue_is_legal(effect_id, crate::model::ContinueMode::RecreateWorkspace) {
+        controls.push("continue --recreate");
+    }
+    controls
+}
+
+fn parked_effect_views(state: &crate::model::MissionState) -> Vec<serde_json::Value> {
+    state
+        .parked_effects
+        .iter()
+        .filter(|(effect_id, _)| state.parked_effect_is_continuable(effect_id))
+        .map(|(effect_id, parked)| {
+            serde_json::json!({
+                "effect_id": effect_id.as_str(),
+                "kind": parked,
+                "legal_controls": parked_legal_controls(state, effect_id),
+            })
+        })
+        .collect()
+}
+
+fn controls_display(controls: &[&str]) -> String {
+    if controls.is_empty() {
+        "none".into()
+    } else {
+        controls.join(", ")
+    }
+}
+
+fn print_parked_controls(state: &crate::model::MissionState, indent: &str) {
+    for (effect_id, parked) in &state.parked_effects {
+        let controls = parked_legal_controls(state, effect_id);
+        println!(
+            "{indent}parked effect {effect_id}: {parked:?}; legal controls={}",
+            controls_display(&controls)
+        );
+    }
+}
+
+fn print_workspace_control_state(state: &crate::model::MissionState, indent: &str) {
+    for line in workspace_control_lines(state) {
+        println!("{indent}{line}");
+    }
+}
+
+fn workspace_control_lines(state: &crate::model::MissionState) -> Vec<String> {
+    state
+        .tasks
+        .iter()
+        .filter_map(|(task_id, task)| {
+            task.pending_workspace_recreation.as_ref().map(|effect_id| {
+                format!(
+                "task {task_id} has pending workspace archive/recreation intent from parked effect {effect_id}"
+                )
+            })
+        })
+        .collect()
 }
 
 fn conversation_views(
@@ -2764,6 +2879,12 @@ fn conversation_views(
                 "invalid_handoff_reworks": conversation.invalid_handoff_reworks,
                 "runtime_resume_mode": resume_mode,
                 "legal_actions": state.conversation_legal_actions(id),
+                "retained_workspace_archives": state.retained_workspace_archives
+                    .get(id)
+                    .into_iter()
+                    .flatten()
+                    .map(|effect_id| effect_id.as_str())
+                    .collect::<Vec<_>>(),
             }))
         })
         .collect()
@@ -2795,6 +2916,14 @@ fn print_conversations(
         );
         if let Some(response) = conversation["final_response"].as_str() {
             println!("{indent}  final response: {response}");
+        }
+        if let Some(archives) = conversation["retained_workspace_archives"].as_array() {
+            for effect_id in archives {
+                println!(
+                    "{indent}  retained workspace archive: {}",
+                    effect_id.as_str().unwrap_or("?")
+                );
+            }
         }
         if let Some(messages) = conversation["queued_messages"].as_array() {
             for message in messages {
@@ -3346,6 +3475,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mission_continue_requires_explicit_workspace_recreation_intent() {
+        let preserved = Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "continue",
+            "mabc123def456",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--reason",
+            "resume retained work",
+        ])
+        .expect("ordinary continue");
+        let Command::Mission(MissionCommand::Continue(args)) = preserved.command else {
+            panic!("expected continue command");
+        };
+        assert!(!args.recreate);
+
+        let recreated = Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "continue",
+            "mabc123def456",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--reason",
+            "archive divergent work",
+            "--recreate",
+        ])
+        .expect("explicit workspace recreation");
+        let Command::Mission(MissionCommand::Continue(args)) = recreated.command else {
+            panic!("expected continue command");
+        };
+        assert!(args.recreate);
+    }
+
     fn mission_type_with_runtime(runtime: Option<&str>) -> MissionType {
         use crate::mission_type::{MissionTypeDefinition, RoleDefinition};
         use crate::model::{OutputSemantics, RoleName, StopBar};
@@ -3631,7 +3794,7 @@ mod tests {
                 assignment_epoch: 1,
                 message_boundary: 3,
                 presented_messages: vec![],
-                recreate_workspace: true,
+                workspace_preparation: crate::model::WorkspacePreparation::ResetForAssignment,
                 requested_at_ms: 0,
                 not_before_ms: 0,
                 deadline_ms: 100_000,
@@ -3663,7 +3826,7 @@ mod tests {
                     prompt_hash: REVIEW_PROMPT_HASH.into(),
                     prompt_template: crate::model::RolePromptTemplate::Execution,
                     base_sha: "base".into(),
-                    recreate_workspace: true,
+                    workspace_preparation: crate::model::WorkspacePreparation::ResetForAssignment,
                     message_boundary: 3,
                     presented_messages: vec![],
                 }),
@@ -3852,6 +4015,7 @@ mod tests {
                 }),
                 role_assignment: None,
                 workspace_provenance: None,
+                pending_workspace_recreation: None,
             },
         );
         state.tasks.insert(
@@ -3866,6 +4030,7 @@ mod tests {
                 last_runtime_configuration: None,
                 role_assignment: None,
                 workspace_provenance: None,
+                pending_workspace_recreation: None,
             },
         );
         state.tasks.insert(
@@ -3880,6 +4045,7 @@ mod tests {
                 last_runtime_configuration: None,
                 role_assignment: None,
                 workspace_provenance: None,
+                pending_workspace_recreation: None,
             },
         );
         let conversation_id = crate::model::ConversationId::for_role_instance(
@@ -3979,12 +4145,33 @@ mod tests {
             conversation_id: conversation_id.clone(),
             base_sha: base.clone(),
             assignment_epoch: 1,
+            archived_effect_id: None,
         });
         view.state
             .conversations
             .get_mut(&conversation_id)
             .unwrap()
             .workspace_base_sha = base.clone();
+        let archived_effect =
+            crate::model::EffectId::for_parts(&["retained", "archived-workspace"]);
+        view.state
+            .retained_workspace_archives
+            .entry(conversation_id.clone())
+            .or_default()
+            .insert(archived_effect.clone());
+        let parked_effect = crate::model::EffectId::for_parts(&["retained", "parked"]);
+        view.state.parked_effects.insert(
+            parked_effect.clone(),
+            crate::model::ParkedEffect::RoleRun {
+                namespace: crate::model::TaskNamespace::Execution,
+                task_id: TaskId::new("retained").unwrap(),
+            },
+        );
+        view.state
+            .tasks
+            .get_mut(&TaskId::new("retained").unwrap())
+            .unwrap()
+            .pending_workspace_recreation = Some(archived_effect.clone());
         std::fs::write(retained_dirs.work().join("partial.txt"), "preserved\n").unwrap();
 
         let unobservable_task = TaskId::new("unobservable").unwrap();
@@ -4004,6 +4191,7 @@ mod tests {
             conversation_id: unobservable_id.clone(),
             base_sha: base.clone(),
             assignment_epoch: 1,
+            archived_effect_id: None,
         });
         view.state.conversations.insert(
             unobservable_id.clone(),
@@ -4039,7 +4227,12 @@ mod tests {
         assert_eq!(json["disposition"], "parked");
         assert_eq!(
             json["next_actions"],
-            serde_json::json!(["mission decide", "mission send", "mission abort"])
+            serde_json::json!([
+                "mission continue --recreate",
+                "mission decide",
+                "mission send",
+                "mission abort"
+            ])
         );
         assert_eq!(json["conversations"][0]["id"], conversation_id.as_str());
         assert_eq!(json["conversations"][0]["lifecycle"], "awaiting_lead");
@@ -4050,6 +4243,26 @@ mod tests {
         assert_eq!(
             json["conversations"][0]["runtime_resume_mode"],
             "canonical_reconstruction"
+        );
+        assert_eq!(
+            json["conversations"][0]["retained_workspace_archives"],
+            serde_json::json!([archived_effect.as_str()])
+        );
+        let parked = json["parked_effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parked| parked["effect_id"] == parked_effect.as_str())
+            .unwrap();
+        assert_eq!(
+            parked["legal_controls"],
+            serde_json::json!(["continue --recreate"])
+        );
+        assert_eq!(
+            workspace_control_lines(&view.state),
+            vec![format!(
+                "task retained has pending workspace archive/recreation intent from parked effect {archived_effect}"
+            )]
         );
         assert_eq!(json["planning_input"], serde_json::Value::Null);
         assert_eq!(json["cleanup_failure"], serde_json::Value::Null);
@@ -4074,6 +4287,10 @@ mod tests {
         assert_eq!(retained["assignment_epoch"], 2);
         assert_eq!(retained["workspace_provenance"]["base_sha"], base);
         assert_eq!(retained["workspace_provenance"]["assignment_epoch"], 1);
+        assert_eq!(
+            retained["pending_workspace_recreation"],
+            archived_effect.as_str()
+        );
         let unobservable = json["tasks"]
             .as_array()
             .unwrap()

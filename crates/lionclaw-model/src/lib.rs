@@ -37,13 +37,13 @@ pub mod verdict;
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
     resolve_execution_deadline_ms, role_prompt_template, role_success_contract_error,
-    ArtifactOutcome, BlobRef, ControlAction, ConversationRecipient, DecisionAction,
+    ArtifactOutcome, BlobRef, ContinueMode, ControlAction, ConversationRecipient, DecisionAction,
     EffectEventClass, EffectResource, EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff,
     MessageReference, MissionConfig, MissionEvent, MissionTypeRef, OracleRunSuccess, PayloadRef,
     PreparedInputRef, RecoveryConfig, RolePromptTemplate, RoleRunRequestIdentity, RoleRunSuccess,
     RuntimeConfigurationEvidence, StopBar, TaskNamespace, TerminalReviewConfig,
     TerminalReviewSuccess, UnavailableReferenceCause, ValidationItem, VersionStamps,
-    MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES,
+    WorkspacePreparation, MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES,
     MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES, MAX_QUEUED_MESSAGES_PER_CONVERSATION,
     SCHEMA_VERSION,
 };

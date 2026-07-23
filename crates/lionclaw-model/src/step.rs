@@ -531,7 +531,11 @@ mod tests {
             assignment_epoch: 1,
             message_boundary: 0,
             presented_messages: vec![],
-            recreate_workspace: attempt_no == 1,
+            workspace_preparation: if attempt_no == 1 {
+                crate::WorkspacePreparation::ResetForAssignment
+            } else {
+                crate::WorkspacePreparation::Preserve
+            },
             requested_at_ms: 0,
             not_before_ms: 0,
             deadline_ms: 100_000,
@@ -620,7 +624,11 @@ mod tests {
             prompt_hash: prompt.content_sha256().unwrap(),
             prompt_template: crate::RolePromptTemplate::Execution,
             base_sha: base_sha.into(),
-            recreate_workspace: attempt_no == 1,
+            workspace_preparation: if attempt_no == 1 {
+                crate::WorkspacePreparation::ResetForAssignment
+            } else {
+                crate::WorkspacePreparation::Preserve
+            },
             message_boundary: 0,
             presented_messages: vec![],
         })

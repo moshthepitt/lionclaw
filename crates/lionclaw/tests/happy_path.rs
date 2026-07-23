@@ -30,13 +30,6 @@ async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_complet
     let turns = Arc::new(AtomicUsize::new(0));
     let scripted_turns = turns.clone();
     let role_runner = MockRoleRunner::new(Box::new(move |request| {
-        request
-            .updates
-            .try_send(lionclaw::ports::RoleRunUpdate::WorkspacePrepared {
-                base_sha: request.base_sha.clone(),
-                assignment_epoch: request.assignment_epoch,
-            })
-            .expect("production runner reports prepared workspace before the turn");
         match scripted_turns.fetch_add(1, Ordering::SeqCst) {
             0 => Ok(lionclaw::ports::RoleRunOutcome {
                 handoff: None,

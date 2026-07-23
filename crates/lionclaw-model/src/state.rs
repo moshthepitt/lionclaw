@@ -221,6 +221,10 @@ pub struct TaskRuntimeState {
     pub role_assignment: Option<TaskRoleAssignment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_provenance: Option<TaskWorkspaceProvenance>,
+    /// Exact parked writer effect whose retained checkout the next request must
+    /// archive before rebuilding. Cleared only by matching preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_workspace_recreation: Option<super::EffectId>,
 }
 
 /// The sole folded authority for one task's current role generation.
@@ -240,6 +244,8 @@ pub struct TaskWorkspaceProvenance {
     pub conversation_id: super::ConversationId,
     pub base_sha: String,
     pub assignment_epoch: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_effect_id: Option<super::EffectId>,
 }
 
 /// Resolve one fresh or retry assignment from durable task state. The engine
@@ -250,7 +256,7 @@ pub fn resolve_task_assignment(
     required_base: &str,
     lifecycle_generation: u32,
     max_attempts: u32,
-) -> (String, u32, bool) {
+) -> (String, u32, super::WorkspacePreparation) {
     let retrying_failure =
         previous.is_some_and(|task| task.automatic_retry_remaining(max_attempts));
     let previous_assignment = previous.and_then(|task| task.role_assignment.as_ref());
@@ -261,10 +267,20 @@ pub fn resolve_task_assignment(
     } else {
         required_base.to_string()
     };
-    let recreate = previous
-        .and_then(|task| task.workspace_provenance.as_ref())
-        .map(|workspace| workspace.base_sha.as_str())
-        != Some(base_sha.as_str());
+    let workspace_preparation =
+        match previous.and_then(|task| task.pending_workspace_recreation.as_ref()) {
+            Some(parked_effect_id) => super::WorkspacePreparation::ArchiveAndReset {
+                parked_effect_id: parked_effect_id.clone(),
+            },
+            None if previous
+                .and_then(|task| task.workspace_provenance.as_ref())
+                .map(|workspace| workspace.base_sha.as_str())
+                != Some(base_sha.as_str()) =>
+            {
+                super::WorkspacePreparation::ResetForAssignment
+            }
+            None => super::WorkspacePreparation::Preserve,
+        };
     let generation_floor = lifecycle_generation.max(1);
     let epoch = match previous_assignment {
         None => generation_floor,
@@ -274,7 +290,7 @@ pub fn resolve_task_assignment(
             .max(generation_floor),
         Some(previous) => previous.assignment_epoch.max(generation_floor),
     };
-    (base_sha, epoch, recreate)
+    (base_sha, epoch, workspace_preparation)
 }
 
 /// The single authoritative identity derivation for a role assignment.
@@ -284,7 +300,7 @@ pub fn resolve_task_assignment(
 pub struct RoleAssignment {
     pub base_sha: String,
     pub generation: u32,
-    pub recreate_workspace: bool,
+    pub workspace_preparation: super::WorkspacePreparation,
     pub conversation_id: super::ConversationId,
 }
 
@@ -303,7 +319,7 @@ pub fn resolve_role_assignment(
     role: &RoleName,
     context: RoleAssignmentContext<'_>,
 ) -> RoleAssignment {
-    let (base_sha, generation, recreate_workspace) = resolve_task_assignment(
+    let (base_sha, generation, workspace_preparation) = resolve_task_assignment(
         context.previous,
         context.required_base,
         context.lifecycle_generation,
@@ -315,7 +331,7 @@ pub fn resolve_role_assignment(
         ),
         base_sha,
         generation,
-        recreate_workspace,
+        workspace_preparation,
     }
 }
 
@@ -668,7 +684,7 @@ pub enum InflightEffect {
         assignment_epoch: u32,
         message_boundary: u64,
         presented_messages: Vec<u64>,
-        recreate_workspace: bool,
+        workspace_preparation: super::WorkspacePreparation,
         runtime_configuration: Option<super::RuntimeConfigurationEvidence>,
         requested_at_ms: i64,
         not_before_ms: i64,
@@ -720,7 +736,7 @@ impl InflightEffect {
             assignment_epoch,
             message_boundary,
             presented_messages,
-            recreate_workspace,
+            workspace_preparation,
             ..
         } = self
         else {
@@ -738,7 +754,7 @@ impl InflightEffect {
             prompt_template: *prompt_template,
             prompt_hash: prompt_hash.clone(),
             base_sha: base_sha.clone(),
-            recreate_workspace: *recreate_workspace,
+            workspace_preparation: workspace_preparation.clone(),
             message_boundary: *message_boundary,
             presented_messages: presented_messages.clone(),
         })
@@ -816,7 +832,7 @@ impl InflightEffect {
                 assignment_epoch,
                 message_boundary,
                 presented_messages,
-                recreate_workspace,
+                workspace_preparation,
                 requested_at_ms,
                 not_before_ms,
                 deadline_ms,
@@ -837,7 +853,7 @@ impl InflightEffect {
                     assignment_epoch: *assignment_epoch,
                     message_boundary: *message_boundary,
                     presented_messages: presented_messages.clone(),
-                    recreate_workspace: *recreate_workspace,
+                    workspace_preparation: workspace_preparation.clone(),
                     runtime_configuration: None,
                     requested_at_ms: *requested_at_ms,
                     not_before_ms: *not_before_ms,
@@ -1007,6 +1023,10 @@ pub struct MissionState {
     /// Mission-private dialogue authority, keyed by stable role-instance id.
     #[serde(default)]
     pub conversations: BTreeMap<super::ConversationId, ConversationState>,
+    /// Monotonic evidence of retained writer archives, keyed by the exact
+    /// conversation that owns their resource tree.
+    #[serde(default)]
+    pub retained_workspace_archives: BTreeMap<super::ConversationId, BTreeSet<super::EffectId>>,
     /// Exact fail-closed settlements for references lost after ingress.
     #[serde(default)]
     pub unavailable_references: Vec<UnavailableReferenceEvidence>,
@@ -1252,12 +1272,12 @@ impl MissionState {
         Ok((conversation_id, conversation))
     }
 
-    /// Resolve a live writer checkout only after the exact active effect has
-    /// durably recorded its successful preparation.
-    pub fn active_workspace_conversation(
+    /// Derive the only workspace provenance one exact active writer may
+    /// establish. Preparation folding and later observation share this value.
+    pub fn expected_active_workspace_provenance(
         &self,
         effect_id: &super::EffectId,
-    ) -> Result<(&super::ConversationId, &ConversationState), &'static str> {
+    ) -> Result<(TaskAddress, TaskWorkspaceProvenance), &'static str> {
         let result = self.active_role_conversation(effect_id)?;
         let Some(InflightEffect::RoleRun {
             namespace,
@@ -1265,26 +1285,102 @@ impl MissionState {
             output,
             base_sha,
             assignment_epoch,
+            workspace_preparation,
             ..
         }) = self.inflight.get(effect_id)
         else {
             return Err("effect is not an active role run");
         };
-        let Some(task) = self.tasks_in(*namespace).get(task_id) else {
+        if *output != super::OutputSemantics::ProducesArtifact {
+            return Err("active effect is not an artifact-producing role");
+        }
+        Ok((
+            TaskAddress::new(*namespace, task_id.clone()),
+            TaskWorkspaceProvenance {
+                effect_id: effect_id.clone(),
+                conversation_id: result.0.clone(),
+                base_sha: base_sha.clone(),
+                assignment_epoch: *assignment_epoch,
+                archived_effect_id: workspace_preparation.archived_effect().cloned(),
+            },
+        ))
+    }
+
+    /// Resolve a live writer checkout only after the exact active effect has
+    /// durably recorded its successful preparation.
+    pub fn active_workspace_conversation(
+        &self,
+        effect_id: &super::EffectId,
+    ) -> Result<(&super::ConversationId, &ConversationState), &'static str> {
+        let (address, expected) = self.expected_active_workspace_provenance(effect_id)?;
+        let Some(task) = self.tasks_in(address.namespace).get(&address.task_id) else {
             return Err("active effect task is absent from folded state");
         };
-        if *output != super::OutputSemantics::ProducesArtifact
-            || task.workspace_provenance.as_ref()
-                != Some(&TaskWorkspaceProvenance {
-                    effect_id: effect_id.clone(),
-                    conversation_id: result.0.clone(),
-                    base_sha: base_sha.clone(),
-                    assignment_epoch: *assignment_epoch,
+        if task.workspace_provenance.as_ref() != Some(&expected)
+            || task.pending_workspace_recreation.is_some()
+            || expected
+                .archived_effect_id
+                .as_ref()
+                .is_some_and(|archived| {
+                    !self
+                        .retained_workspace_archives
+                        .get(&expected.conversation_id)
+                        .is_some_and(|archives| archives.contains(archived))
                 })
         {
             return Err("active effect has no exact prepared workspace authority");
         }
-        Ok(result)
+        self.active_role_conversation(effect_id)
+    }
+
+    /// Whether this derived state can safely seed a snapshot tail fold without
+    /// authenticating an event prefix. Active writer authority and unsettled
+    /// writer recovery depend on event history, so those states always rebuild
+    /// from the full log.
+    pub fn is_safe_snapshot_seed(&self) -> bool {
+        if self.has_unsettled_writer_recovery() {
+            return false;
+        }
+        self.inflight.iter().all(|(effect_id, effect)| {
+            let InflightEffect::RoleRun { output, .. } = effect else {
+                return true;
+            };
+            if self.active_role_conversation(effect_id).is_err() {
+                return false;
+            }
+            *output != super::OutputSemantics::ProducesArtifact
+        })
+    }
+
+    /// Writer recovery controls can carry an archive intent across several
+    /// effects. Until that intent is prepared and settled, the event log is
+    /// the only complete authority, so a derived snapshot must not seed a
+    /// tail fold.
+    fn has_unsettled_writer_recovery(&self) -> bool {
+        self.tasks.iter().any(|(task_id, task)| {
+            let is_writer = self.plan.as_ref().is_some_and(|plan| {
+                plan.tasks
+                    .iter()
+                    .any(|planned| planned.id == *task_id && planned.kind == super::TaskKind::Work)
+            });
+            if !is_writer {
+                return false;
+            }
+            task.pending_workspace_recreation.is_some()
+                || (task.status == TaskStatus::Failed
+                    && self.parked_effects.values().any(|parked| {
+                        matches!(
+                            parked,
+                            ParkedEffect::RoleRun {
+                                namespace: super::TaskNamespace::Execution,
+                                task_id: parked_task,
+                            } if parked_task == task_id
+                        )
+                    }))
+                || (task.status == TaskStatus::Pending
+                    && task.attempts > 0
+                    && task.workspace_provenance.is_some())
+        })
     }
 
     pub fn reference_recipient_policy(
@@ -1417,6 +1513,71 @@ impl MissionState {
                 .parked_effects
                 .get(effect_id)
                 .is_some_and(|effect| self.parked_effect_remains_continuable(effect))
+    }
+
+    /// Resolve the one parked effect for which workspace recreation is legal.
+    /// The CLI, fold, and operator projections share this query.
+    pub fn parked_workspace_recreation(&self, effect_id: &super::EffectId) -> Option<TaskAddress> {
+        if !self.parked_effect_is_continuable(effect_id) {
+            return None;
+        }
+        let ParkedEffect::RoleRun {
+            namespace: super::TaskNamespace::Execution,
+            task_id,
+        } = self.parked_effects.get(effect_id)?
+        else {
+            return None;
+        };
+        let address = self
+            .plan
+            .as_ref()?
+            .tasks
+            .iter()
+            .find(|task| &task.id == task_id && task.kind == super::TaskKind::Work)
+            .map(|_| TaskAddress::new(super::TaskNamespace::Execution, task_id.clone()))?;
+        self.task_workspace_conversation(address.namespace, &address.task_id)
+            .ok()
+            .flatten()
+            .map(|_| address)
+    }
+
+    /// Whether one exact continuation mode is legal for a parked effect.
+    /// A pending archive is an irreversible durable intent: later retries may
+    /// repeat it, but cannot silently clear or bind it to another effect.
+    pub fn parked_continue_is_legal(
+        &self,
+        effect_id: &super::EffectId,
+        mode: super::ContinueMode,
+    ) -> bool {
+        match mode {
+            super::ContinueMode::Preserve => {
+                self.parked_effect_is_continuable(effect_id)
+                    && self
+                        .parked_workspace_recreation(effect_id)
+                        .and_then(|address| {
+                            self.tasks_in(address.namespace)
+                                .get(&address.task_id)
+                                .and_then(|task| task.pending_workspace_recreation.as_ref())
+                        })
+                        .is_none()
+            }
+            super::ContinueMode::RecreateWorkspace => {
+                self.parked_workspace_recreation(effect_id).is_some()
+            }
+        }
+    }
+
+    /// Validate the complete durable continue event contract. Automatic
+    /// recovery may preserve an assignment, but destructive recreation is
+    /// always an explicit operator choice.
+    pub fn continue_is_legal(
+        &self,
+        effect_id: &super::EffectId,
+        automatic: bool,
+        mode: super::ContinueMode,
+    ) -> bool {
+        (!automatic || mode == super::ContinueMode::Preserve)
+            && self.parked_continue_is_legal(effect_id, mode)
     }
 
     pub(crate) fn parked_effect_remains_continuable(&self, effect: &ParkedEffect) -> bool {

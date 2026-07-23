@@ -23,7 +23,10 @@ use lionclaw::ports::{
     OracleRunRequest, OracleRunner, RoleRunOutcome, RoleRunRequest, RoleRunner,
 };
 use lionclaw::store::MissionStore;
-use lionclaw::testing::{capture_test_artifact, MockClock, MockOracleRunner, NoopEffectCleaner};
+use lionclaw::testing::{
+    capture_prepared_test_artifact, capture_test_artifact, prepare_test_workspace, MockClock,
+    MockOracleRunner, NoopEffectCleaner,
+};
 use lionclaw_runtime_api::{RuntimeEvent, TurnEvent, TypedFailure, TypedFailureEvidence};
 use tokio::sync::{Barrier, Notify};
 
@@ -103,14 +106,7 @@ impl lionclaw::ports::Clock for ControlledDeadlineClock {
 #[async_trait]
 impl RoleRunner for SettlementRaceRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
-        request
-            .updates
-            .send(lionclaw::ports::RoleRunUpdate::WorkspacePrepared {
-                base_sha: request.base_sha.clone(),
-                assignment_epoch: request.assignment_epoch,
-            })
-            .await
-            .unwrap();
+        prepare_test_workspace(&request).await?;
         if let Some(barrier) = &self.deadline_barrier {
             barrier.runner_ready.notify_one();
             barrier.release_runner.notified().await;
@@ -125,7 +121,7 @@ impl RoleRunner for SettlementRaceRunner {
         };
         match self.outcome {
             SettlementRaceOutcome::Success => {
-                let artifact = capture_test_artifact(&request, HEAD_SHA).await?;
+                let artifact = capture_prepared_test_artifact(&request, HEAD_SHA).await?;
                 Ok(RoleRunOutcome {
                     handoff: Some(Handoff::Work {
                         done: true,
@@ -331,14 +327,7 @@ impl RoleRunner for SleepingRunner {
 #[async_trait]
 impl RoleRunner for ArtifactlessWriter {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
-        request
-            .updates
-            .send(lionclaw::ports::RoleRunUpdate::WorkspacePrepared {
-                base_sha: request.base_sha,
-                assignment_epoch: request.assignment_epoch,
-            })
-            .await
-            .unwrap();
+        prepare_test_workspace(&request).await?;
         Ok(RoleRunOutcome {
             handoff: Some(Handoff::Work {
                 done: true,
@@ -698,7 +687,10 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
         4,
         &mission_id,
         &common::effect_id("successor"),
-        ControlAction::Continue { automatic: false },
+        ControlAction::Continue {
+            automatic: false,
+            mode: lionclaw::model::ContinueMode::Preserve,
+        },
         "wrong generation",
     )
     .await
@@ -709,7 +701,10 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
         5,
         &mission_id,
         &effect_id,
-        ControlAction::Continue { automatic: false },
+        ControlAction::Continue {
+            automatic: false,
+            mode: lionclaw::model::ContinueMode::Preserve,
+        },
         "resume preserved work",
     )
     .await
@@ -737,7 +732,10 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
         6,
         &mission_id,
         &effect_id,
-        ControlAction::Continue { automatic: false },
+        ControlAction::Continue {
+            automatic: false,
+            mode: lionclaw::model::ContinueMode::Preserve,
+        },
         "must not reopen a terminal mission",
     )
     .await
@@ -1487,7 +1485,10 @@ async fn policy_auto_continues_candidate_and_proof_with_recorded_controls() {
             matches!(
                 &event.event,
                 lionclaw::model::MissionEvent::ControlRequested {
-                    action: ControlAction::Continue { automatic: true },
+                    action: ControlAction::Continue {
+                        automatic: true,
+                        ..
+                    },
                     ..
                 }
             )
@@ -1539,7 +1540,10 @@ async fn policy_auto_continues_an_artifactless_writer_success() {
             matches!(
                 &event.event,
                 lionclaw::model::MissionEvent::ControlRequested {
-                    action: ControlAction::Continue { automatic: true },
+                    action: ControlAction::Continue {
+                        automatic: true,
+                        ..
+                    },
                     ..
                 }
             )

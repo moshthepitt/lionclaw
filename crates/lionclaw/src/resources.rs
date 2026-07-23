@@ -76,6 +76,7 @@ pub(crate) struct ConversationDirs {
     root: PathBuf,
     role_state: RoleStateDirs,
     observer_index: PathBuf,
+    workspace_archives: PathBuf,
 }
 
 impl ConversationDirs {
@@ -83,6 +84,7 @@ impl ConversationDirs {
         Self {
             role_state: RoleStateDirs::new(state_dir.clone(), &root),
             observer_index: root.join("observer.index"),
+            workspace_archives: root.join("workspace-archives"),
             state_dir,
             root,
         }
@@ -102,6 +104,14 @@ impl ConversationDirs {
 
     pub(crate) fn role_state(&self) -> &RoleStateDirs {
         &self.role_state
+    }
+
+    pub(crate) fn workspace_archive(&self, effect_id: &EffectId) -> PathBuf {
+        self.workspace_archives.join(effect_id.as_str())
+    }
+
+    pub(crate) fn prepare_workspace_archives(&self) -> std::io::Result<()> {
+        ensure_dirs_beneath(&self.state_dir, [&self.workspace_archives])
     }
 
     /// Remove only disposable build/scratch data after this conversation has

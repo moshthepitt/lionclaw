@@ -20,9 +20,9 @@ use super::plan::{OutputSemantics, PlanInventory, PlanProposal, PlanningDag};
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
 
-/// Version 21 adds exact unavailable-reference settlement. Unreleased older
-/// logs intentionally fail loudly.
-pub const SCHEMA_VERSION: u32 = 21;
+/// Version 22 records typed workspace preparation and explicit continue modes.
+/// Unreleased older logs intentionally fail loudly.
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -546,7 +546,7 @@ pub struct RoleRunRequestIdentity {
     pub prompt_template: RolePromptTemplate,
     pub prompt_hash: String,
     pub base_sha: String,
-    pub recreate_workspace: bool,
+    pub workspace_preparation: WorkspacePreparation,
     pub message_boundary: u64,
     pub presented_messages: Vec<u64>,
 }
@@ -664,8 +664,8 @@ pub enum MissionEvent {
         /// this request. Messages appended later belong to the next turn.
         message_boundary: u64,
         presented_messages: Vec<u64>,
-        /// True only when a fresh assignment moved the required base.
-        recreate_workspace: bool,
+        /// Exact fold-derived handling for the retained conversation checkout.
+        workspace_preparation: WorkspacePreparation,
         requested_at_ms: i64,
         not_before_ms: i64,
         deadline_ms: i64,
@@ -812,7 +812,38 @@ pub enum ControlAction {
     Continue {
         #[serde(default)]
         automatic: bool,
+        mode: ContinueMode,
     },
+}
+
+/// The exact operator intent applied when reopening one parked effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinueMode {
+    Preserve,
+    RecreateWorkspace,
+}
+
+/// Fold-authoritative preparation for one artifact-producing role checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkspacePreparation {
+    Preserve,
+    ResetForAssignment,
+    ArchiveAndReset { parked_effect_id: super::EffectId },
+}
+
+impl WorkspacePreparation {
+    pub const fn resets_workspace(&self) -> bool {
+        !matches!(self, Self::Preserve)
+    }
+
+    pub const fn archived_effect(&self) -> Option<&super::EffectId> {
+        match self {
+            Self::ArchiveAndReset { parked_effect_id } => Some(parked_effect_id),
+            Self::Preserve | Self::ResetForAssignment => None,
+        }
+    }
 }
 
 /// The actions a decision can take on an open attention item.
@@ -1142,7 +1173,7 @@ mod compat_tests {
             assignment_epoch: 1,
             message_boundary: 0,
             presented_messages: vec![],
-            recreate_workspace: true,
+            workspace_preparation: WorkspacePreparation::ResetForAssignment,
             requested_at_ms: 1,
             not_before_ms: 1,
             deadline_ms: 2,

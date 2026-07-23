@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use lionclaw_runtime_api::TypedFailure;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
 use crate::model::{
@@ -48,7 +48,7 @@ pub struct RoleRunRequest {
     /// Commit the role's workspace is created at.
     pub base_sha: String,
     pub assignment_epoch: u32,
-    pub recreate_workspace: bool,
+    pub workspace_preparation: crate::model::WorkspacePreparation,
     pub deadline_ms: i64,
     pub control: watch::Receiver<ExecutionControl>,
     /// Lossless, low-volume facts that may affect durable mission evidence.
@@ -65,11 +65,48 @@ pub struct RoleRunRequest {
     pub artifact_capture: Option<ArtifactCapture>,
 }
 
-#[derive(Debug, Clone)]
+impl RoleRunRequest {
+    /// Block writer launch until the engine durably accepts and reloads the
+    /// exact workspace preparation fact.
+    pub async fn confirm_workspace_prepared(&self) -> Result<(), TypedFailure> {
+        if self.role.output != crate::model::OutputSemantics::ProducesArtifact {
+            return Err(TypedFailure::invalid(
+                "workspace.preparation",
+                "only an artifact-producing role may prepare a retained workspace",
+            ));
+        }
+        let (acknowledge, acknowledged) = oneshot::channel();
+        self.updates
+            .send(RoleRunUpdate::WorkspacePrepared {
+                base_sha: self.base_sha.clone(),
+                assignment_epoch: self.assignment_epoch,
+                acknowledge,
+            })
+            .await
+            .map_err(|_| {
+                TypedFailure::permanent(
+                    "workspace.preparation",
+                    "kernel role update receiver closed before workspace preparation",
+                )
+            })?;
+        acknowledged
+            .await
+            .map_err(|_| {
+                TypedFailure::permanent(
+                    "workspace.preparation",
+                    "kernel closed before acknowledging workspace preparation",
+                )
+            })?
+            .map_err(|detail| TypedFailure::permanent("workspace.preparation", detail))
+    }
+}
+
+#[derive(Debug)]
 pub enum RoleRunUpdate {
     WorkspacePrepared {
         base_sha: String,
         assignment_epoch: u32,
+        acknowledge: oneshot::Sender<Result<(), String>>,
     },
     RuntimeConfigured(lionclaw_runtime_api::AppliedRuntimeConfiguration),
 }

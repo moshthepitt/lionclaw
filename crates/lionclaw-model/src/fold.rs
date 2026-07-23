@@ -14,11 +14,13 @@ use super::event::{
 };
 use super::ids::{AssertionId, TaskId};
 use super::plan::Assertion;
+#[cfg(test)]
+use super::state::TaskWorkspaceProvenance;
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
     MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState, ReviewAcceptance,
     ReviewAcceptanceKind, ReviewOutcome, TaskAddress, TaskRoleAssignment, TaskRuntimeState,
-    TaskStatus, TaskWorkspaceProvenance, TerminalReviewVerdict,
+    TaskStatus, TerminalReviewVerdict,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
 use crate::prelude::*;
@@ -26,10 +28,10 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-/// Version 32 records one folded task role assignment and binds retained
-/// writer workspace provenance to the exact effect whose accepted preparation
-/// established it. Older snapshots must rebuild both authorities from events.
-pub const REDUCER_VERSION: u32 = 32;
+/// Version 33 folds explicit workspace-recreation intent, its exact parked
+/// effect binding, and the resulting archive provenance. Older snapshots must
+/// rebuild those authorities from events.
+pub const REDUCER_VERSION: u32 = 33;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -95,6 +97,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         oracle_attempts: Default::default(),
         inflight: Default::default(),
         conversations: Default::default(),
+        retained_workspace_archives: Default::default(),
         unavailable_references: Default::default(),
         authoritative_receipts: Default::default(),
         reachable_commits: BTreeSet::from([base_sha.clone()]),
@@ -392,40 +395,36 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             base_sha,
             assignment_epoch,
         } => {
-            let prepared =
+            let Ok((address, expected)) = state.expected_active_workspace_provenance(effect_id)
+            else {
+                finish_apply(state, seq);
+                return;
+            };
+            if address.task_id != *task_id
+                || expected.base_sha != *base_sha
+                || expected.assignment_epoch != *assignment_epoch
+                || state
+                    .tasks_in(address.namespace)
+                    .get(task_id)
+                    .is_none_or(|task| {
+                        task.pending_workspace_recreation != expected.archived_effect_id
+                    })
+            {
+                finish_apply(state, seq);
+                return;
+            }
+            let archived = expected.archived_effect_id.clone();
+            let conversation_id = expected.conversation_id.clone();
+            if let Some(task) = state.tasks_in_mut(address.namespace).get_mut(task_id) {
+                task.workspace_provenance = Some(expected);
+                task.pending_workspace_recreation = None;
+            }
+            if let Some(archived_effect_id) = archived {
                 state
-                    .active_role_conversation(effect_id)
-                    .ok()
-                    .and_then(|(conversation_id, _)| {
-                        state
-                            .inflight
-                            .get(effect_id)
-                            .and_then(|effect| match effect {
-                                InflightEffect::RoleRun {
-                                    namespace,
-                                    task_id: active_task,
-                                    output: super::OutputSemantics::ProducesArtifact,
-                                    base_sha: active_base,
-                                    assignment_epoch: active_epoch,
-                                    ..
-                                } if active_task == task_id
-                                    && active_base == base_sha
-                                    && active_epoch == assignment_epoch =>
-                                {
-                                    Some((*namespace, conversation_id.clone()))
-                                }
-                                _ => None,
-                            })
-                    });
-            if let Some((namespace, conversation_id)) = prepared {
-                if let Some(task) = state.tasks_in_mut(namespace).get_mut(task_id) {
-                    task.workspace_provenance = Some(TaskWorkspaceProvenance {
-                        effect_id: effect_id.clone(),
-                        conversation_id,
-                        base_sha: base_sha.clone(),
-                        assignment_epoch: *assignment_epoch,
-                    });
-                }
+                    .retained_workspace_archives
+                    .entry(conversation_id)
+                    .or_default()
+                    .insert(archived_effect_id);
             }
         }
         MissionEvent::EffectRuntimeConfigured {
@@ -771,8 +770,8 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     }
                 }
             }
-            ControlAction::Continue { .. } => {
-                if state.parked_effect_is_continuable(effect_id) {
+            ControlAction::Continue { automatic, mode } => {
+                if state.continue_is_legal(effect_id, *automatic, *mode) {
                     let parked = state
                         .parked_effects
                         .remove(effect_id)
@@ -782,6 +781,11 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                             if let Some(task) = state.tasks_in_mut(namespace).get_mut(&task_id) {
                                 task.status = TaskStatus::Pending;
                                 task.consecutive_failures = 0;
+                                if *mode == super::ContinueMode::RecreateWorkspace
+                                    && task.pending_workspace_recreation.is_none()
+                                {
+                                    task.pending_workspace_recreation = Some(effect_id.clone());
+                                }
                             }
                         }
                         ParkedEffect::OracleRun { oracle } => {
@@ -1225,7 +1229,7 @@ fn validated_role_dispatch(
         conversation_id,
         message_boundary,
         presented_messages,
-        recreate_workspace,
+        workspace_preparation,
         ..
     } = &envelope.event
     else {
@@ -1264,7 +1268,7 @@ fn validated_role_dispatch(
         && &intent.role == role
         && expected_assignment.base_sha == *base_sha
         && expected_assignment.generation == *assignment_epoch
-        && expected_assignment.recreate_workspace == *recreate_workspace
+        && expected_assignment.workspace_preparation == *workspace_preparation
         && expected_conversation == conversation_id
         && expected_presented == *presented_messages)
         .then_some(ValidatedRoleDispatch {
@@ -1521,6 +1525,7 @@ fn pending_task() -> TaskRuntimeState {
         last_runtime_configuration: None,
         role_assignment: None,
         workspace_provenance: None,
+        pending_workspace_recreation: None,
     }
 }
 
@@ -2565,7 +2570,7 @@ mod tests {
                         assignment_epoch: request.assignment_epoch,
                         message_boundary: 0,
                         presented_messages: vec![],
-                        recreate_workspace: true,
+                        workspace_preparation: crate::WorkspacePreparation::ResetForAssignment,
                         requested_at_ms: 0,
                         not_before_ms: 0,
                         deadline_ms: 100_000,
@@ -2677,7 +2682,7 @@ mod tests {
                     assignment_epoch,
                     message_boundary,
                     presented_messages,
-                    recreate_workspace,
+                    workspace_preparation,
                     ..
                 } => {
                     *conversation_id = crate::ConversationId::for_role_instance(
@@ -2703,7 +2708,7 @@ mod tests {
                             prompt_template: *prompt_template,
                             prompt_hash: prompt_hash.clone(),
                             base_sha: base_sha.clone(),
-                            recreate_workspace: *recreate_workspace,
+                            workspace_preparation: workspace_preparation.clone(),
                             message_boundary: *message_boundary,
                             presented_messages: presented_messages.clone(),
                         },
@@ -3139,7 +3144,7 @@ mod tests {
             assignment_epoch: 1,
             message_boundary: 0,
             presented_messages: vec![],
-            recreate_workspace: true,
+            workspace_preparation: crate::WorkspacePreparation::ResetForAssignment,
             requested_at_ms: 0,
             not_before_ms: 0,
             deadline_ms: 100_000,
@@ -3291,7 +3296,7 @@ mod tests {
         role: RoleName,
         output: OutputSemantics,
         base_sha: &str,
-        recreate_workspace: bool,
+        reset_workspace: bool,
     ) -> Box<crate::RoleRunRequestIdentity> {
         let prompt = PayloadRef::inline("prompt");
         Box::new(crate::RoleRunRequestIdentity {
@@ -3312,7 +3317,11 @@ mod tests {
             prompt_hash: prompt.content_sha256().unwrap(),
             prompt_template: crate::RolePromptTemplate::Execution,
             base_sha: base_sha.into(),
-            recreate_workspace,
+            workspace_preparation: if reset_workspace {
+                crate::WorkspacePreparation::ResetForAssignment
+            } else {
+                crate::WorkspacePreparation::Preserve
+            },
             message_boundary: 0,
             presented_messages: vec![],
         })
@@ -3567,6 +3576,7 @@ mod tests {
                 ),
                 base_sha: "base".into(),
                 assignment_epoch: 1,
+                archived_effect_id: None,
             })
         );
     }
@@ -3624,7 +3634,7 @@ mod tests {
                 assignment_epoch: 2,
                 message_boundary: 0,
                 presented_messages: vec![],
-                recreate_workspace: true,
+                workspace_preparation: crate::WorkspacePreparation::ResetForAssignment,
                 requested_at_ms: 1,
                 not_before_ms: 1,
                 deadline_ms: 100_001,
@@ -5020,7 +5030,10 @@ mod tests {
             execution_role_completed_at_generation("same-id", work_handoff(true, false), 2),
             MissionEvent::ControlRequested {
                 effect_id: parked_effect,
-                action: super::super::event::ControlAction::Continue { automatic: false },
+                action: super::super::event::ControlAction::Continue {
+                    automatic: false,
+                    mode: crate::ContinueMode::Preserve,
+                },
                 reason: "resume the planning effect".into(),
             },
         ])
@@ -5044,6 +5057,496 @@ mod tests {
         assert!(state
             .conversation_legal_actions(&parked_conversation)
             .is_empty());
+    }
+
+    #[test]
+    fn explicit_workspace_recreation_is_bound_to_one_parked_writer_and_preparation() {
+        let parked_effect = role_effect(crate::TaskNamespace::Execution, "writer", 1, 1);
+        let mut state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("writer")]),
+            role_requested("writer", "initial"),
+            MissionEvent::TaskWorkspacePrepared {
+                task_id: tid("writer"),
+                effect_id: parked_effect.clone(),
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+            },
+            MissionEvent::RoleRunCompleted {
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "writer",
+                    1,
+                    1,
+                    RoleName::new("implementer").unwrap(),
+                    OutputSemantics::ProducesArtifact,
+                    "base",
+                    true,
+                ),
+                effect_id: parked_effect.clone(),
+                outcome: Err(TypedFailure::permanent(
+                    "workspace.history",
+                    "retained checkout diverged",
+                )),
+            },
+        ])
+        .expect("parked writer");
+        assert!(state.parked_workspace_recreation(&parked_effect).is_some());
+
+        let forged_seq = state.head + 1;
+        let before_forged = state.clone();
+        apply(
+            &mut state,
+            &envelope(
+                forged_seq,
+                MissionEvent::ControlRequested {
+                    effect_id: parked_effect.clone(),
+                    action: crate::ControlAction::Continue {
+                        automatic: true,
+                        mode: crate::ContinueMode::RecreateWorkspace,
+                    },
+                    reason: "forged automatic destructive control".into(),
+                },
+            ),
+        );
+        assert_eq!(state.tasks, before_forged.tasks);
+        assert_eq!(state.parked_effects, before_forged.parked_effects);
+
+        let control_seq = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(
+                control_seq,
+                MissionEvent::ControlRequested {
+                    effect_id: parked_effect.clone(),
+                    action: crate::ControlAction::Continue {
+                        automatic: false,
+                        mode: crate::ContinueMode::RecreateWorkspace,
+                    },
+                    reason: "archive the divergent checkout".into(),
+                },
+            ),
+        );
+        let task = &state.tasks[&tid("writer")];
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(
+            task.pending_workspace_recreation.as_ref(),
+            Some(&parked_effect)
+        );
+        assert_eq!(
+            task.workspace_provenance
+                .as_ref()
+                .and_then(|workspace| workspace.archived_effect_id.as_ref()),
+            None
+        );
+
+        let intent = match super::super::step::step(&state) {
+            super::super::step::StepDecision::DispatchRole(intent) => intent,
+            other => panic!("expected writer redispatch, got {other:?}"),
+        };
+        let assignment = expected_role_assignment(&state, &intent);
+        assert_eq!(assignment.generation, 1);
+        assert_eq!(
+            assignment.workspace_preparation,
+            crate::WorkspacePreparation::ArchiveAndReset {
+                parked_effect_id: parked_effect.clone(),
+            }
+        );
+
+        let mut request = role_requested("writer", "recreate");
+        let retry_effect;
+        if let MissionEvent::RoleRunRequested {
+            attempt_no,
+            effect_id,
+            role,
+            output,
+            base_sha,
+            assignment_epoch,
+            conversation_id,
+            message_boundary,
+            workspace_preparation,
+            ..
+        } = &mut request
+        {
+            *attempt_no = intent.attempt_no;
+            *effect_id = role_effect(
+                crate::TaskNamespace::Execution,
+                "writer",
+                intent.attempt_no,
+                assignment.generation,
+            );
+            retry_effect = effect_id.clone();
+            *role = intent.role;
+            *output = OutputSemantics::ProducesArtifact;
+            *base_sha = assignment.base_sha.clone();
+            *assignment_epoch = assignment.generation;
+            *conversation_id = assignment.conversation_id.clone();
+            *message_boundary = state.head;
+            *workspace_preparation = assignment.workspace_preparation.clone();
+        } else {
+            unreachable!("role_requested builds a request");
+        }
+        let request_seq = state.head + 1;
+        apply(&mut state, &envelope(request_seq, request));
+        assert!(state.inflight.contains_key(&retry_effect));
+        assert_eq!(
+            state.tasks[&tid("writer")]
+                .pending_workspace_recreation
+                .as_ref(),
+            Some(&parked_effect)
+        );
+
+        let prepared_seq = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(
+                prepared_seq,
+                MissionEvent::TaskWorkspacePrepared {
+                    task_id: tid("writer"),
+                    effect_id: retry_effect.clone(),
+                    base_sha: "base".into(),
+                    assignment_epoch: 1,
+                },
+            ),
+        );
+        let task = &state.tasks[&tid("writer")];
+        assert_eq!(task.pending_workspace_recreation, None);
+        let conversation_id = crate::ConversationId::for_role_instance(
+            &mission_id(),
+            crate::TaskNamespace::Execution,
+            &tid("writer"),
+            &RoleName::new("implementer").unwrap(),
+            1,
+        );
+        assert_eq!(
+            task.workspace_provenance,
+            Some(TaskWorkspaceProvenance {
+                effect_id: retry_effect,
+                conversation_id: conversation_id.clone(),
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+                archived_effect_id: Some(parked_effect.clone()),
+            })
+        );
+        assert!(state.retained_workspace_archives[&conversation_id].contains(&parked_effect));
+        assert!(state
+            .active_workspace_conversation(
+                &state.tasks[&tid("writer")]
+                    .workspace_provenance
+                    .as_ref()
+                    .unwrap()
+                    .effect_id
+            )
+            .is_ok());
+
+        let mut wrong_archive = state.clone();
+        wrong_archive
+            .tasks
+            .get_mut(&tid("writer"))
+            .unwrap()
+            .workspace_provenance
+            .as_mut()
+            .unwrap()
+            .archived_effect_id = None;
+        assert!(wrong_archive
+            .active_workspace_conversation(
+                &state.tasks[&tid("writer")]
+                    .workspace_provenance
+                    .as_ref()
+                    .unwrap()
+                    .effect_id
+            )
+            .is_err());
+
+        let mut uncleared = state;
+        uncleared
+            .tasks
+            .get_mut(&tid("writer"))
+            .unwrap()
+            .pending_workspace_recreation = Some(parked_effect);
+        assert!(uncleared
+            .active_workspace_conversation(
+                &uncleared.tasks[&tid("writer")]
+                    .workspace_provenance
+                    .as_ref()
+                    .unwrap()
+                    .effect_id
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn pending_recreation_cannot_be_downgraded_or_rebound_after_a_preparation_failure() {
+        let parked_effect = role_effect(crate::TaskNamespace::Execution, "writer", 1, 1);
+        let mut state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("writer")]),
+            role_requested("writer", "initial"),
+            MissionEvent::TaskWorkspacePrepared {
+                task_id: tid("writer"),
+                effect_id: parked_effect.clone(),
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+            },
+            MissionEvent::RoleRunCompleted {
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "writer",
+                    1,
+                    1,
+                    RoleName::new("implementer").unwrap(),
+                    OutputSemantics::ProducesArtifact,
+                    "base",
+                    true,
+                ),
+                effect_id: parked_effect.clone(),
+                outcome: Err(TypedFailure::permanent(
+                    "workspace.history",
+                    "retained checkout diverged",
+                )),
+            },
+        ])
+        .expect("parked writer");
+        let seq = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(
+                seq,
+                MissionEvent::ControlRequested {
+                    effect_id: parked_effect.clone(),
+                    action: crate::ControlAction::Continue {
+                        automatic: false,
+                        mode: crate::ContinueMode::RecreateWorkspace,
+                    },
+                    reason: "archive the divergent checkout".into(),
+                },
+            ),
+        );
+
+        let intent = match super::super::step::step(&state) {
+            super::super::step::StepDecision::DispatchRole(intent) => intent,
+            other => panic!("expected writer redispatch, got {other:?}"),
+        };
+        let assignment = expected_role_assignment(&state, &intent);
+        let mut request = role_requested("writer", "recreate");
+        let retry_effect;
+        if let MissionEvent::RoleRunRequested {
+            attempt_no,
+            effect_id,
+            role,
+            base_sha,
+            assignment_epoch,
+            conversation_id,
+            message_boundary,
+            workspace_preparation,
+            ..
+        } = &mut request
+        {
+            *attempt_no = intent.attempt_no;
+            *effect_id = role_effect(
+                crate::TaskNamespace::Execution,
+                "writer",
+                intent.attempt_no,
+                assignment.generation,
+            );
+            retry_effect = effect_id.clone();
+            *role = intent.role;
+            *base_sha = assignment.base_sha;
+            *assignment_epoch = assignment.generation;
+            *conversation_id = assignment.conversation_id;
+            *message_boundary = state.head;
+            *workspace_preparation = assignment.workspace_preparation;
+        } else {
+            unreachable!("role_requested builds a request");
+        }
+        let request_seq = state.head + 1;
+        apply(&mut state, &envelope(request_seq, request));
+        let request = state.inflight[&retry_effect]
+            .role_request_identity()
+            .expect("exact retry request");
+        let failure_seq = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(
+                failure_seq,
+                MissionEvent::RoleRunCompleted {
+                    effect_id: retry_effect.clone(),
+                    request: Box::new(request),
+                    outcome: Err(TypedFailure::permanent(
+                        "runtime.setup",
+                        "failed before workspace preparation",
+                    )),
+                },
+            ),
+        );
+        assert_eq!(
+            state.tasks[&tid("writer")]
+                .pending_workspace_recreation
+                .as_ref(),
+            Some(&parked_effect)
+        );
+
+        let preserve_seq = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(
+                preserve_seq,
+                MissionEvent::ControlRequested {
+                    effect_id: retry_effect.clone(),
+                    action: crate::ControlAction::Continue {
+                        automatic: false,
+                        mode: crate::ContinueMode::Preserve,
+                    },
+                    reason: "keep the retained checkout".into(),
+                },
+            ),
+        );
+        let task = &state.tasks[&tid("writer")];
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            task.pending_workspace_recreation.as_ref(),
+            Some(&parked_effect)
+        );
+        assert!(state.parked_effects.contains_key(&retry_effect));
+
+        let recreate_seq = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(
+                recreate_seq,
+                MissionEvent::ControlRequested {
+                    effect_id: retry_effect,
+                    action: crate::ControlAction::Continue {
+                        automatic: false,
+                        mode: crate::ContinueMode::RecreateWorkspace,
+                    },
+                    reason: "retry the durable archive operation".into(),
+                },
+            ),
+        );
+        assert_eq!(
+            state.tasks[&tid("writer")]
+                .pending_workspace_recreation
+                .as_ref(),
+            Some(&parked_effect)
+        );
+        let intent = match super::super::step::step(&state) {
+            super::super::step::StepDecision::DispatchRole(intent) => intent,
+            other => panic!("expected writer redispatch, got {other:?}"),
+        };
+        assert_eq!(
+            expected_role_assignment(&state, &intent).workspace_preparation,
+            crate::WorkspacePreparation::ArchiveAndReset {
+                parked_effect_id: parked_effect,
+            }
+        );
+    }
+
+    #[test]
+    fn forged_recreation_for_a_non_writer_is_inert() {
+        let parked_effect = role_effect(crate::TaskNamespace::Execution, "validator", 1, 1);
+        let mut state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![validate_task("validator")]),
+            role_requested_in(
+                crate::TaskNamespace::Execution,
+                "validator",
+                "validator",
+                RoleName::new("reviewer").unwrap(),
+                OutputSemantics::EmitsVerdict,
+            ),
+            MissionEvent::RoleRunCompleted {
+                request: role_identity(
+                    crate::TaskNamespace::Execution,
+                    "validator",
+                    1,
+                    1,
+                    RoleName::new("reviewer").unwrap(),
+                    OutputSemantics::EmitsVerdict,
+                    "base",
+                    true,
+                ),
+                effect_id: parked_effect.clone(),
+                outcome: Err(TypedFailure::permanent("runtime.failed", "failed")),
+            },
+        ])
+        .expect("parked validator");
+        let before = state.clone();
+        let seq = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(
+                seq,
+                MissionEvent::ControlRequested {
+                    effect_id: parked_effect,
+                    action: crate::ControlAction::Continue {
+                        automatic: false,
+                        mode: crate::ContinueMode::RecreateWorkspace,
+                    },
+                    reason: "forged".into(),
+                },
+            ),
+        );
+        assert_eq!(state.head, seq);
+        assert_eq!(state.tasks, before.tasks);
+        assert_eq!(state.parked_effects, before.parked_effects);
+    }
+
+    #[test]
+    fn recreation_requires_a_retained_writer_workspace() {
+        let parked_effect = role_effect(crate::TaskNamespace::Execution, "writer", 1, 1);
+        let mut state = fold_test_log(
+            vec![
+                created(),
+                plan_proposed(vec![], vec![work_task("writer")]),
+                role_requested("writer", "initial"),
+                MissionEvent::RoleRunCompleted {
+                    request: role_identity(
+                        crate::TaskNamespace::Execution,
+                        "writer",
+                        1,
+                        1,
+                        RoleName::new("implementer").unwrap(),
+                        OutputSemantics::ProducesArtifact,
+                        "base",
+                        true,
+                    ),
+                    effect_id: parked_effect.clone(),
+                    outcome: Err(TypedFailure::permanent(
+                        "runtime.profile",
+                        "failed before checkout preparation",
+                    )),
+                },
+            ],
+            false,
+        )
+        .expect("parked writer without a prepared checkout");
+
+        assert!(state.parked_effect_is_continuable(&parked_effect));
+        assert!(state.parked_workspace_recreation(&parked_effect).is_none());
+        assert!(state.parked_continue_is_legal(&parked_effect, crate::ContinueMode::Preserve));
+        assert!(
+            !state.parked_continue_is_legal(&parked_effect, crate::ContinueMode::RecreateWorkspace)
+        );
+
+        let before = state.clone();
+        let seq = state.head + 1;
+        apply(
+            &mut state,
+            &envelope(
+                seq,
+                MissionEvent::ControlRequested {
+                    effect_id: parked_effect,
+                    action: crate::ControlAction::Continue {
+                        automatic: false,
+                        mode: crate::ContinueMode::RecreateWorkspace,
+                    },
+                    reason: "forged recreation without a retained checkout".into(),
+                },
+            ),
+        );
+        assert_eq!(state.tasks, before.tasks);
+        assert_eq!(state.parked_effects, before.parked_effects);
     }
 
     #[test]
@@ -5262,7 +5765,7 @@ mod tests {
                 assignment_epoch: 2,
                 message_boundary: 0,
                 presented_messages: vec![],
-                recreate_workspace: false,
+                workspace_preparation: crate::WorkspacePreparation::Preserve,
                 requested_at_ms: 0,
                 not_before_ms: 0,
                 deadline_ms: 100_000,
@@ -5381,7 +5884,14 @@ mod tests {
                 8 => request.prompt_template = crate::RolePromptTemplate::Planning,
                 9 => request.prompt_hash = "0".repeat(64),
                 10 => request.base_sha = "other-base".into(),
-                11 => request.recreate_workspace = !request.recreate_workspace,
+                11 => {
+                    request.workspace_preparation = match request.workspace_preparation {
+                        crate::WorkspacePreparation::Preserve => {
+                            crate::WorkspacePreparation::ResetForAssignment
+                        }
+                        _ => crate::WorkspacePreparation::Preserve,
+                    }
+                }
                 12 => request.message_boundary += 1,
                 13 => request.presented_messages.push(999),
                 14 => completed_effect_id = EffectId::for_parts(&["forged", "effect"]),
@@ -5777,7 +6287,10 @@ mod tests {
             },
             MissionEvent::ControlRequested {
                 effect_id: parked_effect.clone(),
-                action: super::super::event::ControlAction::Continue { automatic: false },
+                action: super::super::event::ControlAction::Continue {
+                    automatic: false,
+                    mode: crate::ContinueMode::Preserve,
+                },
                 reason: "stale operator view".into(),
             },
         ])
@@ -7210,13 +7723,13 @@ mod tests {
         if let MissionEvent::RoleRunRequested {
             attempt_no,
             effect_id,
-            recreate_workspace,
+            workspace_preparation,
             ..
         } = &mut request
         {
             *attempt_no = 2;
             *effect_id = role_effect(crate::TaskNamespace::Execution, "w", 2, 1);
-            *recreate_workspace = false;
+            *workspace_preparation = crate::WorkspacePreparation::Preserve;
         }
         events.push(request);
         events.push(MissionEvent::MessageSent {
@@ -7523,13 +8036,13 @@ mod tests {
             if let MissionEvent::RoleRunRequested {
                 attempt_no,
                 effect_id,
-                recreate_workspace,
+                workspace_preparation,
                 ..
             } = &mut request
             {
                 *attempt_no = 2;
                 *effect_id = role_effect(crate::TaskNamespace::Execution, "w", 2, 1);
-                *recreate_workspace = false;
+                *workspace_preparation = crate::WorkspacePreparation::Preserve;
             }
             events.push(request);
             events.push(MissionEvent::MessageSent {

@@ -163,6 +163,7 @@ pub struct ArtifactCapture {
     required_base: String,
     mission_id: crate::model::MissionId,
     effect_id: EffectId,
+    archive_checkout: Option<PathBuf>,
 }
 
 impl ArtifactCapture {
@@ -172,6 +173,7 @@ impl ArtifactCapture {
         required_base: String,
         mission_id: crate::model::MissionId,
         effect_id: EffectId,
+        archive_checkout: Option<PathBuf>,
     ) -> Self {
         Self {
             repo,
@@ -179,11 +181,16 @@ impl ArtifactCapture {
             required_base,
             mission_id,
             effect_id,
+            archive_checkout,
         }
     }
 
     pub fn checkout_dir(&self) -> &Path {
         &self.checkout
+    }
+
+    pub(crate) fn archive_checkout(&self) -> Option<&Path> {
+        self.archive_checkout.as_deref()
     }
 
     pub async fn capture(&self) -> Result<CapturedArtifact, CaptureError> {
@@ -199,16 +206,43 @@ impl ArtifactCapture {
 
     #[cfg(any(test, feature = "testing"))]
     #[doc(hidden)]
-    pub async fn prepare_for_testing(&self, recreate: bool) -> Result<()> {
-        if recreate || !self.checkout.is_dir() {
-            replace_checkout(&self.repo, &self.checkout, &self.required_base).await?;
-        } else {
-            let head = head_sha(&self.checkout).await?;
-            if !is_ancestor(&self.checkout, &self.required_base, &head).await? {
-                bail!(
-                    "retained test checkout HEAD {head} diverges from required base {}",
-                    self.required_base
-                );
+    pub async fn prepare_for_testing(
+        &self,
+        preparation: &crate::model::WorkspacePreparation,
+    ) -> Result<()> {
+        match preparation {
+            crate::model::WorkspacePreparation::ArchiveAndReset { .. } => {
+                let archive = self
+                    .archive_checkout
+                    .as_ref()
+                    .context("artifact capture has no archive authority")?;
+                std::fs::create_dir_all(
+                    archive
+                        .parent()
+                        .context("artifact capture archive has no parent")?,
+                )?;
+                archive_and_replace_checkout(
+                    &self.repo,
+                    &self.checkout,
+                    archive,
+                    &self.required_base,
+                )
+                .await?;
+            }
+            crate::model::WorkspacePreparation::ResetForAssignment => {
+                replace_checkout(&self.repo, &self.checkout, &self.required_base).await?;
+            }
+            crate::model::WorkspacePreparation::Preserve if !self.checkout.is_dir() => {
+                replace_checkout(&self.repo, &self.checkout, &self.required_base).await?;
+            }
+            crate::model::WorkspacePreparation::Preserve => {
+                let head = head_sha(&self.checkout).await?;
+                if !is_ancestor(&self.checkout, &self.required_base, &head).await? {
+                    bail!(
+                        "retained test checkout HEAD {head} diverges from required base {}",
+                        self.required_base
+                    );
+                }
             }
         }
         Ok(())
@@ -427,6 +461,77 @@ pub async fn replace_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()>
     }
     remove_dir(&previous).await?;
     Ok(())
+}
+
+/// Archive a retained checkout whole, including its Git metadata and uncommitted
+/// work, then publish a fresh checkout at the required base. The archive path is
+/// bound to the exact parked effect by the resource model.
+pub async fn archive_and_replace_checkout(
+    repo: &Path,
+    dest: &Path,
+    archive: &Path,
+    sha: &str,
+) -> Result<()> {
+    let parent = dest.parent().context("checkout dest has no parent")?;
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("checkout dest has no UTF-8 file name")?;
+    let archive_name = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("workspace archive has no UTF-8 file name")?;
+    let staging = parent.join(format!(".{name}.recreate-{archive_name}"));
+    if dest == archive || archive == staging {
+        bail!("workspace recreation paths must be distinct");
+    }
+    let archive_exists = plain_directory_exists(archive, "workspace archive")?;
+    let dest_exists = plain_directory_exists(dest, "retained checkout")?;
+    plain_directory_exists(&staging, "workspace recreation staging")?;
+
+    if archive_exists {
+        if dest_exists {
+            let expected = resolve_managed_commit(repo, sha)
+                .await
+                .with_context(|| format!("resolving recreated checkout commit '{sha}'"))?;
+            let head = checkout_head_sha(dest)
+                .await
+                .context("published recreated checkout is invalid")?;
+            if head != expected.trim() || checkout_is_dirty(dest).await? {
+                bail!("workspace recreation has contradictory published state");
+            }
+            remove_dir(&staging).await?;
+            return Ok(());
+        }
+        create_checkout(repo, &staging, sha).await?;
+        std::fs::rename(&staging, dest)
+            .context("publishing recreated checkout after interrupted archival")?;
+        return Ok(());
+    }
+    if !dest_exists {
+        bail!("retained checkout is absent; there is nothing to archive");
+    }
+
+    create_checkout(repo, &staging, sha).await?;
+    std::fs::rename(dest, archive).context("archiving retained checkout")?;
+    if let Err(error) = std::fs::rename(&staging, dest) {
+        if !dest.exists() {
+            let _ = std::fs::rename(archive, dest);
+        }
+        return Err(error).context("publishing recreated checkout");
+    }
+    Ok(())
+}
+
+fn plain_directory_exists(path: &Path, label: &str) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(true)
+        }
+        Ok(_) => bail!("{label} '{}' is not a plain directory", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("reading {label} '{}'", path.display())),
+    }
 }
 
 /// Materialize the immutable index used by live workspace observation. The
@@ -1633,6 +1738,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_recreation_archives_the_complete_dirty_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let resources = tempfile::tempdir().unwrap();
+        let checkout = resources.path().join("work");
+        let archive_root = resources.path().join("workspace-archives");
+        let archive = archive_root.join("eparked123");
+        std::fs::create_dir(&archive_root).unwrap();
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+
+        std::fs::write(checkout.join("f.txt"), "uncommitted\n").unwrap();
+        std::fs::write(checkout.join("untracked.txt"), "retained\n").unwrap();
+        std::fs::write(checkout.join("private-object"), "private object\n").unwrap();
+        git(
+            &checkout,
+            &["config", "lionclaw.archive-proof", "preserved"],
+        )
+        .await
+        .unwrap();
+        git(&checkout, &["update-ref", "refs/lionclaw/private", &base])
+            .await
+            .unwrap();
+        let private_object = git(&checkout, &["hash-object", "-w", "private-object"])
+            .await
+            .unwrap();
+        std::fs::remove_file(checkout.join("private-object")).unwrap();
+
+        archive_and_replace_checkout(repo.path(), &checkout, &archive, &base)
+            .await
+            .unwrap();
+
+        assert_eq!(checkout_head_sha(&checkout).await.unwrap(), base);
+        assert!(!checkout_is_dirty(&checkout).await.unwrap());
+        assert_eq!(
+            std::fs::read_to_string(archive.join("f.txt")).unwrap(),
+            "uncommitted\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(archive.join("untracked.txt")).unwrap(),
+            "retained\n"
+        );
+        assert_eq!(
+            git(&archive, &["config", "--get", "lionclaw.archive-proof"])
+                .await
+                .unwrap()
+                .trim(),
+            "preserved"
+        );
+        assert_eq!(
+            git(&archive, &["rev-parse", "refs/lionclaw/private"])
+                .await
+                .unwrap()
+                .trim(),
+            base
+        );
+        git(&archive, &["cat-file", "-e", private_object.trim()])
+            .await
+            .expect("private Git objects remain materializable from the archive");
+
+        archive_and_replace_checkout(repo.path(), &checkout, &archive, &base)
+            .await
+            .expect("the exact completed recreation is idempotent");
+        assert_eq!(
+            std::fs::read_to_string(archive.join("untracked.txt")).unwrap(),
+            "retained\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_recreation_recovers_after_archival_before_publication() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let resources = tempfile::tempdir().unwrap();
+        let checkout = resources.path().join("work");
+        let archive_root = resources.path().join("workspace-archives");
+        let archive = archive_root.join("eparked123");
+        std::fs::create_dir(&archive_root).unwrap();
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        std::fs::write(checkout.join("untracked.txt"), "retained\n").unwrap();
+
+        std::fs::rename(&checkout, &archive).unwrap();
+        archive_and_replace_checkout(repo.path(), &checkout, &archive, &base)
+            .await
+            .unwrap();
+
+        assert_eq!(checkout_head_sha(&checkout).await.unwrap(), base);
+        assert!(!checkout_is_dirty(&checkout).await.unwrap());
+        assert_eq!(
+            std::fs::read_to_string(archive.join("untracked.txt")).unwrap(),
+            "retained\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_recreation_treats_archived_worker_metadata_as_opaque_evidence() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let resources = tempfile::tempdir().unwrap();
+        let checkout = resources.path().join("work");
+        let archive_root = resources.path().join("workspace-archives");
+        let archive = archive_root.join("eparked123");
+        std::fs::create_dir(&archive_root).unwrap();
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        std::fs::write(checkout.join("untracked.txt"), "retained\n").unwrap();
+
+        archive_and_replace_checkout(repo.path(), &checkout, &archive, &base)
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(archive.join(".git")).unwrap();
+
+        archive_and_replace_checkout(repo.path(), &checkout, &archive, &base)
+            .await
+            .expect("opaque retained evidence must not be reinterpreted as trusted Git state");
+        assert_eq!(
+            std::fs::read_to_string(archive.join("untracked.txt")).unwrap(),
+            "retained\n"
+        );
+        assert_eq!(checkout_head_sha(&checkout).await.unwrap(), base);
+        assert!(!checkout_is_dirty(&checkout).await.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_recreation_rejects_a_symlinked_archive_entry() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let resources = tempfile::tempdir().unwrap();
+        let checkout = resources.path().join("work");
+        let archive_root = resources.path().join("workspace-archives");
+        let archive = archive_root.join("eparked123");
+        let outside = resources.path().join("outside");
+        std::fs::create_dir(&archive_root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        std::fs::write(checkout.join("untracked.txt"), "must remain\n").unwrap();
+        symlink(&outside, &archive).unwrap();
+
+        archive_and_replace_checkout(repo.path(), &checkout, &archive, &base)
+            .await
+            .expect_err("archive symlinks must fail closed");
+
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("untracked.txt")).unwrap(),
+            "must remain\n"
+        );
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_recreation_rejects_contradictory_published_state() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let resources = tempfile::tempdir().unwrap();
+        let checkout = resources.path().join("work");
+        let archive_root = resources.path().join("workspace-archives");
+        let archive = archive_root.join("eparked123");
+        std::fs::create_dir(&archive_root).unwrap();
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        create_checkout(repo.path(), &archive, &base).await.unwrap();
+        std::fs::write(checkout.join("uncommitted.txt"), "must remain\n").unwrap();
+        std::fs::write(archive.join("archive.txt"), "must remain\n").unwrap();
+
+        archive_and_replace_checkout(repo.path(), &checkout, &archive, &base)
+            .await
+            .expect_err("an archive and dirty published checkout are contradictory");
+
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("uncommitted.txt")).unwrap(),
+            "must remain\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(archive.join("archive.txt")).unwrap(),
+            "must remain\n"
+        );
+    }
+
+    #[tokio::test]
     async fn observer_index_publication_is_atomic() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
@@ -1775,6 +2069,7 @@ mod tests {
             base.clone(),
             mission_id.clone(),
             effect_id.clone(),
+            None,
         );
         let captured = capture.capture().await.unwrap();
 

@@ -55,6 +55,13 @@ pub async fn capture_test_artifact(
     request: &RoleRunRequest,
     head_sha: &str,
 ) -> Result<CapturedArtifact, TypedFailure> {
+    prepare_test_workspace(request).await?;
+    capture_prepared_test_artifact(request, head_sha).await
+}
+
+/// Prepare a deterministic writer checkout and cross the same durable
+/// authority barrier as a production runner.
+pub async fn prepare_test_workspace(request: &RoleRunRequest) -> Result<(), TypedFailure> {
     let capture = request.artifact_capture.as_ref().ok_or_else(|| {
         TypedFailure::permanent(
             "testing.capture_authority",
@@ -62,22 +69,24 @@ pub async fn capture_test_artifact(
         )
     })?;
     capture
-        .prepare_for_testing(request.recreate_workspace)
+        .prepare_for_testing(&request.workspace_preparation)
         .await
         .map_err(|error| TypedFailure::permanent("testing.workspace", error.to_string()))?;
-    request
-        .updates
-        .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
-            base_sha: request.base_sha.clone(),
-            assignment_epoch: request.assignment_epoch,
-        })
-        .await
-        .map_err(|_| {
-            TypedFailure::permanent(
-                "testing.workspace_update",
-                "engine role update receiver closed",
-            )
-        })?;
+    request.confirm_workspace_prepared().await
+}
+
+/// Capture a deterministic artifact after [`prepare_test_workspace`] has
+/// established authority.
+pub async fn capture_prepared_test_artifact(
+    request: &RoleRunRequest,
+    head_sha: &str,
+) -> Result<CapturedArtifact, TypedFailure> {
+    let capture = request.artifact_capture.as_ref().ok_or_else(|| {
+        TypedFailure::permanent(
+            "testing.capture_authority",
+            "artifact-producing test request has no capture authority",
+        )
+    })?;
     if head_sha == request.base_sha {
         capture.capture().await
     } else {
@@ -165,6 +174,11 @@ impl RoleRunner for MockRoleRunner {
             .expect("lock")
             .entry(request.effect_id.to_string())
             .or_insert(0) += 1;
+        if request.role.output == crate::model::OutputSemantics::ProducesArtifact
+            && request.artifact_capture.is_some()
+        {
+            prepare_test_workspace(&request).await?;
+        }
         let mut outcome = (self.script)(&request)?;
         if let Some(test_request) = outcome
             .artifact
@@ -180,7 +194,7 @@ impl RoleRunner for MockRoleRunner {
             }
             if request.artifact_capture.is_some() {
                 outcome.artifact =
-                    Some(capture_test_artifact(&request, &test_request.head_sha).await?);
+                    Some(capture_prepared_test_artifact(&request, &test_request.head_sha).await?);
             }
         }
         Ok(outcome)
