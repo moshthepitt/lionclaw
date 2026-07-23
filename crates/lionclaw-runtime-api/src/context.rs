@@ -48,17 +48,9 @@ impl RuntimeExecutionContext {
         }
 
         match best_match {
-            Some(RuntimePathProjectionResolution::Resolved(host_path)) => return Some(host_path),
-            Some(RuntimePathProjectionResolution::Blocked) => return None,
-            None => {}
+            Some(RuntimePathProjectionResolution::Resolved(host_path)) => Some(host_path),
+            Some(RuntimePathProjectionResolution::Blocked) | None => None,
         }
-
-        let runtime_state_root = self.runtime_state.as_ref()?.path();
-        if runtime_path == Path::new("/runtime") {
-            return Some(runtime_state_root.to_path_buf());
-        }
-        let relative_path = runtime_path.strip_prefix("/runtime").ok()?;
-        Some(runtime_state_root.join(safe_relative_path(relative_path)?))
     }
 }
 
@@ -216,5 +208,42 @@ impl RuntimeNativeHomeArtifactDir {
 
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RuntimeStateDir;
+
+    #[test]
+    fn host_runtime_state_is_never_an_implicit_runtime_path_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let control_root = root.path().join("session-control");
+        let runtime_state = RuntimeStateDir::new(
+            root.path(),
+            &control_root,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let mut context = RuntimeExecutionContext {
+            network_mode: NetworkMode::None,
+            working_dir: None,
+            environment: Vec::new(),
+            runtime_state: Some(runtime_state),
+            runtime_path_projections: Vec::new(),
+            mcp_servers: Vec::new(),
+        };
+
+        assert_eq!(context.host_path_for_runtime_path("/runtime/private"), None);
+
+        let projected = root.path().join("projected-runtime");
+        context.runtime_path_projections =
+            vec![RuntimePathProjection::directory("/runtime", &projected).unwrap()];
+        assert_eq!(
+            context.host_path_for_runtime_path("/runtime/private"),
+            Some(projected.join("private"))
+        );
+        assert!(!projected.starts_with(control_root));
     }
 }

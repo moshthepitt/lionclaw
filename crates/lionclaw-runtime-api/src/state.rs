@@ -1,7 +1,7 @@
 use std::{ffi::OsStr, path::Path};
 
 use anyhow::{anyhow, Context, Result};
-use lionclaw_durable_fs::RootedDirectory;
+use lionclaw_durable_fs::{BoundedRead, RootedDirectory};
 
 pub const RUNTIME_SESSION_READY_MARKER: &str = ".lionclaw-runtime-session";
 pub const RUNTIME_STATE_VALUE_LIMIT: usize = 4 * 1024;
@@ -14,24 +14,39 @@ const RESUMED_RESUME_MODE: &str = "resumed";
 /// security boundary by walking parents from the runtime leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeStateDir {
-    files: RootedDirectory,
+    marker_files: RootedDirectory,
+    profile_files: RootedDirectory,
+    profile_key: String,
 }
 
 impl RuntimeStateDir {
     pub fn new(
         state_anchor: impl AsRef<Path>,
-        runtime_state_root: impl AsRef<Path>,
+        marker_root: impl AsRef<Path>,
+        profile_key: impl Into<String>,
     ) -> Result<Self> {
+        let profile_key = profile_key.into();
+        validate_profile_key(&profile_key)?;
+        let marker_root = marker_root.as_ref();
         Ok(Self {
-            files: RootedDirectory::new(
+            marker_files: RootedDirectory::new(
                 state_anchor.as_ref().to_path_buf(),
-                runtime_state_root.as_ref().to_path_buf(),
+                marker_root.to_path_buf(),
             )?,
+            profile_files: RootedDirectory::new(
+                state_anchor.as_ref().to_path_buf(),
+                marker_root.join("profiles").join(&profile_key),
+            )?,
+            profile_key,
         })
     }
 
     pub fn path(&self) -> &Path {
-        self.files.path()
+        self.profile_files.path()
+    }
+
+    pub fn marker_path(&self) -> &Path {
+        self.marker_files.path()
     }
 }
 
@@ -71,14 +86,8 @@ pub fn load_ready_state_value(
 }
 
 pub fn runtime_session_ready_marker_exists(runtime_state: &RuntimeStateDir) -> Result<bool> {
-    Ok(runtime_state
-        .files
-        .read_bounded(
-            OsStr::new(RUNTIME_SESSION_READY_MARKER),
-            RUNTIME_STATE_VALUE_LIMIT,
-            "runtime session marker",
-        )?
-        .is_some())
+    Ok(read_marker(runtime_state)?
+        .is_some_and(|marker| marker.profile_key == runtime_state.profile_key))
 }
 
 /// Records the adapter-observed mode in mission-private conversation state.
@@ -92,10 +101,10 @@ pub fn record_runtime_resume_mode(
         crate::RuntimeResumeMode::Reconstructed => RECONSTRUCTED_RESUME_MODE,
         crate::RuntimeResumeMode::Resumed => RESUMED_RESUME_MODE,
     };
-    save_state_value(
-        runtime_state,
+    write_value(
+        &runtime_state.marker_files,
         RUNTIME_SESSION_READY_MARKER,
-        value,
+        &format!("{} {value}", runtime_state.profile_key),
         "runtime resume mode",
     )
 }
@@ -104,18 +113,18 @@ pub fn record_runtime_resume_mode(
 pub fn recorded_runtime_resume_mode(
     runtime_state: &RuntimeStateDir,
 ) -> Result<Option<crate::RuntimeResumeMode>> {
-    match load_state_value(
-        runtime_state,
-        RUNTIME_SESSION_READY_MARKER,
-        "runtime resume mode",
-    )?
-    .as_deref()
-    {
-        None => Ok(None),
-        Some(RECONSTRUCTED_RESUME_MODE) => Ok(Some(crate::RuntimeResumeMode::Reconstructed)),
-        Some(RESUMED_RESUME_MODE) => Ok(Some(crate::RuntimeResumeMode::Resumed)),
-        Some(value) => Err(anyhow!("unknown recorded runtime resume mode '{value}'")),
-    }
+    Ok(read_marker_files(&runtime_state.marker_files)?.map(|marker| marker.mode))
+}
+
+pub fn recorded_runtime_resume_mode_at(
+    state_anchor: impl AsRef<Path>,
+    marker_root: impl AsRef<Path>,
+) -> Result<Option<crate::RuntimeResumeMode>> {
+    let files = RootedDirectory::new(
+        state_anchor.as_ref().to_path_buf(),
+        marker_root.as_ref().to_path_buf(),
+    )?;
+    Ok(read_marker_files(&files)?.map(|marker| marker.mode))
 }
 
 pub fn load_state_value(
@@ -123,7 +132,7 @@ pub fn load_state_value(
     file_name: &str,
     label: &str,
 ) -> Result<Option<String>> {
-    let Some(contents) = runtime_state.files.read_bounded(
+    let Some(contents) = runtime_state.profile_files.read_bounded(
         OsStr::new(file_name),
         RUNTIME_STATE_VALUE_LIMIT,
         &format!("{label} state file"),
@@ -152,7 +161,7 @@ pub fn save_state_value(
     };
     let mut contents = value.into_bytes();
     contents.push(b'\n');
-    runtime_state.files.write_private_atomic(
+    runtime_state.profile_files.write_private_atomic(
         OsStr::new(file_name),
         &contents,
         RUNTIME_STATE_VALUE_LIMIT,
@@ -166,8 +175,74 @@ pub fn clear_state_value(
     label: &str,
 ) -> Result<()> {
     let _removed = runtime_state
-        .files
+        .profile_files
         .remove_file(OsStr::new(file_name), &format!("{label} state file"))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeMarker {
+    profile_key: String,
+    mode: crate::RuntimeResumeMode,
+}
+
+fn read_marker(runtime_state: &RuntimeStateDir) -> Result<Option<RuntimeMarker>> {
+    read_marker_files(&runtime_state.marker_files)
+}
+
+fn read_marker_files(files: &RootedDirectory) -> Result<Option<RuntimeMarker>> {
+    let contents = match files.read_bounded_status(
+        OsStr::new(RUNTIME_SESSION_READY_MARKER),
+        RUNTIME_STATE_VALUE_LIMIT,
+        "runtime session marker",
+    )? {
+        BoundedRead::Missing | BoundedRead::TooLarge => return Ok(None),
+        BoundedRead::Contents(contents) => contents,
+    };
+    let Ok(contents) = String::from_utf8(contents) else {
+        return Ok(None);
+    };
+    let mut fields = contents.split_whitespace();
+    let (Some(profile_key), Some(mode), None) = (fields.next(), fields.next(), fields.next())
+    else {
+        return Ok(None);
+    };
+    if validate_profile_key(profile_key).is_err() {
+        return Ok(None);
+    }
+    let mode = match mode {
+        RECONSTRUCTED_RESUME_MODE => crate::RuntimeResumeMode::Reconstructed,
+        RESUMED_RESUME_MODE => crate::RuntimeResumeMode::Resumed,
+        _ => return Ok(None),
+    };
+    Ok(Some(RuntimeMarker {
+        profile_key: profile_key.to_string(),
+        mode,
+    }))
+}
+
+fn write_value(files: &RootedDirectory, file_name: &str, value: &str, label: &str) -> Result<()> {
+    let value = normalize_state_value(value, label)?.ok_or_else(|| anyhow!("{label} is empty"))?;
+    let mut contents = value.into_bytes();
+    contents.push(b'\n');
+    files.write_private_atomic(
+        OsStr::new(file_name),
+        &contents,
+        RUNTIME_STATE_VALUE_LIMIT,
+        &format!("{label} state file"),
+    )
+}
+
+fn validate_profile_key(profile_key: &str) -> Result<()> {
+    if profile_key.len() != 64
+        || !profile_key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(anyhow!(
+            "runtime profile key must be a 64-character lowercase hexadecimal digest"
+        ));
+    }
     Ok(())
 }
 
@@ -187,16 +262,26 @@ mod tests {
     use super::*;
     use crate::RuntimeResumeMode;
 
+    const PROFILE_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn runtime_state(root: &tempfile::TempDir) -> RuntimeStateDir {
-        RuntimeStateDir::new(root.path(), root.path().join("missions/m1/runtime")).unwrap()
+        RuntimeStateDir::new(
+            root.path(),
+            root.path().join("missions/m1/session-control"),
+            PROFILE_KEY,
+        )
+        .unwrap()
     }
 
     fn prepare(runtime_state: &RuntimeStateDir) {
+        std::fs::create_dir_all(runtime_state.marker_path()).unwrap();
         std::fs::create_dir_all(runtime_state.path()).unwrap();
     }
 
     #[test]
     fn recorded_resume_mode_is_truthful_and_replaces_prior_observation() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = tempfile::tempdir().unwrap();
         let runtime_state = runtime_state(&root);
         prepare(&runtime_state);
@@ -214,6 +299,18 @@ mod tests {
             recorded_runtime_resume_mode(&runtime_state).unwrap(),
             Some(RuntimeResumeMode::Resumed)
         );
+        assert_eq!(
+            std::fs::metadata(
+                runtime_state
+                    .marker_path()
+                    .join(RUNTIME_SESSION_READY_MARKER)
+            )
+            .unwrap()
+            .permissions()
+            .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -222,15 +319,79 @@ mod tests {
         let runtime_state = runtime_state(&root);
         prepare(&runtime_state);
         std::fs::write(
-            runtime_state.path().join(RUNTIME_SESSION_READY_MARKER),
+            runtime_state
+                .marker_path()
+                .join(RUNTIME_SESSION_READY_MARKER),
             b"pretend\n",
         )
         .unwrap();
 
-        let error = recorded_runtime_resume_mode(&runtime_state).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("unknown recorded runtime resume mode 'pretend'"));
+        assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
+        assert!(!runtime_session_ready_marker_exists(&runtime_state).unwrap());
+    }
+
+    #[test]
+    fn ready_marker_is_bound_to_the_exact_profile_key() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+        record_runtime_resume_mode(&runtime_state, RuntimeResumeMode::Resumed).unwrap();
+
+        let other_profile = RuntimeStateDir::new(
+            root.path(),
+            runtime_state.marker_path(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap();
+        std::fs::create_dir_all(other_profile.path()).unwrap();
+
+        assert!(RuntimeSessionReady::from_state_dir(&runtime_state)
+            .unwrap()
+            .is_ready());
+        assert!(!RuntimeSessionReady::from_state_dir(&other_profile)
+            .unwrap()
+            .is_ready());
+        assert_eq!(
+            recorded_runtime_resume_mode(&other_profile).unwrap(),
+            Some(RuntimeResumeMode::Resumed),
+            "operator projection reports the last observation without granting another profile readiness"
+        );
+    }
+
+    #[test]
+    fn corrupt_marker_content_degrades_to_reconstruction() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+        let marker = runtime_state
+            .marker_path()
+            .join(RUNTIME_SESSION_READY_MARKER);
+
+        for contents in [
+            Vec::new(),
+            vec![0xff, 0xfe],
+            vec![b'x'; RUNTIME_STATE_VALUE_LIMIT + 1],
+        ] {
+            std::fs::write(&marker, contents).unwrap();
+            assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
+            assert!(!RuntimeSessionReady::from_state_dir(&runtime_state)
+                .unwrap()
+                .is_ready());
+        }
+    }
+
+    #[test]
+    fn runtime_profile_key_must_be_a_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let error = RuntimeStateDir::new(root.path(), root.path(), "profile-name").unwrap_err();
+        assert!(error.to_string().contains("lowercase hexadecimal"));
+        let error = RuntimeStateDir::new(
+            root.path(),
+            root.path(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("lowercase hexadecimal"));
     }
 
     #[test]
@@ -277,5 +438,26 @@ mod tests {
 
         let error = load_state_value(&runtime_state, "session", "test").unwrap_err();
         assert!(error.to_string().contains("must be a real directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_runtime_marker_is_an_authority_error() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+        symlink(
+            outside.path(),
+            runtime_state
+                .marker_path()
+                .join(RUNTIME_SESSION_READY_MARKER),
+        )
+        .unwrap();
+
+        let error = recorded_runtime_resume_mode(&runtime_state).unwrap_err();
+        assert!(error.to_string().contains("cannot be a symlink"));
     }
 }

@@ -167,17 +167,6 @@ impl CodexThreadState {
             .clone())
     }
 
-    pub(crate) fn runtime_state(&self) -> Result<Option<RuntimeStateDir>> {
-        Ok(self
-            .sessions
-            .read()
-            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
-            .get(&self.runtime_session_id)
-            .ok_or_else(|| anyhow!("runtime session '{}' not found", self.runtime_session_id))?
-            .runtime_state
-            .clone())
-    }
-
     pub(crate) fn persist_thread_id(&self, thread_id: &str) -> Result<()> {
         validate_protocol_id(thread_id)?;
         let root = self

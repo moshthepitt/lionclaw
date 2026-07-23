@@ -6,9 +6,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw_confinement::{
-    execute_captured, execute_streaming, map_host_path_into_runtime_mount,
-    runtime_state_mount_source, spawn_interactive, EffectiveExecutionPlan, ExecutionRequest,
-    RuntimeExecutionSession, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
+    execute_captured, execute_streaming, map_host_path_into_runtime_mount, spawn_interactive,
+    EffectiveExecutionPlan, ExecutionRequest, RuntimeExecutionSession, RUNTIME_HOME_MOUNT_TARGET,
+    RUNTIME_MOUNT_TARGET,
 };
 use lionclaw_runtime_api::{
     ExecutionOutput, RuntimeAuthContext, RuntimeAuthRegistry, RuntimeExecutionContext,
@@ -93,7 +93,7 @@ impl RuntimeProgramExecutor for MissionProgramExecutor {
 /// The runtime-visible execution context for a compiled plan.
 pub fn mission_execution_context(
     plan: &EffectiveExecutionPlan,
-    state_anchor: &std::path::Path,
+    runtime_state: Option<RuntimeStateDir>,
 ) -> Result<RuntimeExecutionContext> {
     let projections = plan
         .mounts
@@ -114,9 +114,7 @@ pub fn mission_execution_context(
             .map(|dir| map_host_path_into_runtime_mount(dir, &plan.mounts, "working directory"))
             .transpose()?,
         environment: plan.environment.clone(),
-        runtime_state: runtime_state_mount_source(&plan.mounts)
-            .map(|root| RuntimeStateDir::new(state_anchor, root))
-            .transpose()?,
+        runtime_state,
         runtime_path_projections: projections,
         mcp_servers: Vec::new(),
     })

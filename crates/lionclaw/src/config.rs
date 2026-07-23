@@ -3,11 +3,13 @@
 //! confinement mechanisms.
 
 use std::collections::BTreeMap;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use lionclaw_confinement::{ConfinementConfig, ExecutionLimits, OciConfinementConfig};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::mission_type::Home;
 
@@ -55,6 +57,90 @@ pub struct MissionRuntimeProfile {
     /// Whether this profile can retain and reopen a native conversation.
     pub native_resume: bool,
     pub confinement: ConfinementConfig,
+}
+
+impl MissionRuntimeProfile {
+    /// Stable non-secret identity for native state that may be reopened.
+    /// Changing an execution or auth coordinate selects a fresh state scope.
+    pub(crate) fn native_state_key(&self) -> String {
+        let mut digest = Sha256::new();
+        digest_field(&mut digest, b"name", self.name.as_bytes());
+        digest_field(&mut digest, b"driver", self.driver.as_bytes());
+        digest_field(&mut digest, b"command", self.command.as_bytes());
+        for arg in &self.args {
+            digest_field(&mut digest, b"arg", arg.as_bytes());
+        }
+        let mut environment = self.environment.iter().collect::<Vec<_>>();
+        environment.sort();
+        for (name, value) in environment {
+            digest_field(&mut digest, b"env-name", name.as_bytes());
+            digest_field(&mut digest, b"env-value", value.as_bytes());
+        }
+        digest_optional(&mut digest, b"model", self.model.as_deref());
+        digest_optional(&mut digest, b"mode", self.mode.as_deref());
+        digest_field(
+            &mut digest,
+            b"native-resume",
+            if self.native_resume {
+                b"true"
+            } else {
+                b"false"
+            },
+        );
+        match &self.auth {
+            None => digest_field(&mut digest, b"auth", b"none"),
+            Some(RuntimeAuthConfig::Provider(kind)) => {
+                digest_field(&mut digest, b"auth-kind", kind.as_bytes());
+            }
+            Some(RuntimeAuthConfig::NativeHome(config)) => {
+                digest_field(&mut digest, b"auth-kind", b"native-home");
+                digest_field(
+                    &mut digest,
+                    b"auth-source",
+                    config.source.as_os_str().as_bytes(),
+                );
+                digest_field(
+                    &mut digest,
+                    b"auth-target",
+                    config.target.as_os_str().as_bytes(),
+                );
+                digest_paths(&mut digest, b"auth-required", &config.required_files);
+                digest_paths(&mut digest, b"auth-optional", &config.optional_files);
+            }
+        }
+        digest_optional(
+            &mut digest,
+            b"image",
+            self.confinement.oci().image.as_deref(),
+        );
+        hex::encode(digest.finalize())
+    }
+}
+
+fn digest_field(digest: &mut Sha256, label: &[u8], value: &[u8]) {
+    digest.update(label.len().to_be_bytes());
+    digest.update(label);
+    digest.update(value.len().to_be_bytes());
+    digest.update(value);
+}
+
+fn digest_optional(digest: &mut Sha256, label: &[u8], value: Option<&str>) {
+    match value {
+        Some(value) => digest_field(digest, label, value.as_bytes()),
+        None => digest_field(digest, label, b"<none>"),
+    }
+}
+
+fn digest_paths(digest: &mut Sha256, label: &[u8], paths: &[PathBuf]) {
+    let mut paths = paths.iter().collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        left.as_os_str()
+            .as_bytes()
+            .cmp(right.as_os_str().as_bytes())
+    });
+    for path in paths {
+        digest_field(digest, label, path.as_os_str().as_bytes());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -678,5 +764,47 @@ mod tests {
                 .expect_err("unknown nested field");
             assert!(format!("{err:#}").contains("unknown field"), "got {err:#}");
         }
+    }
+
+    #[test]
+    fn native_state_key_tracks_effective_reopen_compatibility() {
+        let profiles = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.example]
+            driver = "acp"
+            command = "agent-a"
+            args = ["serve"]
+            environment = { B = "two", A = "one" }
+            native-resume = true
+            auth = { kind = "native-home", source = "/auth/a", target = ".agent", required-files = ["auth.json", "config.json"], optional-files = ["token.json", "oauth.json"] }
+            "#,
+            Path::new("/home/alice"),
+        )
+        .unwrap();
+        let original = profiles.get("example").unwrap();
+        let mut changed = original.clone();
+        changed.command = "agent-b".to_string();
+
+        assert_eq!(original.native_state_key().len(), 64);
+        assert_ne!(original.native_state_key(), changed.native_state_key());
+
+        changed = original.clone();
+        let Some(RuntimeAuthConfig::NativeHome(auth)) = changed.auth.as_mut() else {
+            panic!("native-home auth");
+        };
+        auth.source = PathBuf::from("/auth/b");
+        assert_ne!(original.native_state_key(), changed.native_state_key());
+
+        changed = original.clone();
+        changed.environment.reverse();
+        assert_eq!(original.native_state_key(), changed.native_state_key());
+
+        changed = original.clone();
+        let Some(RuntimeAuthConfig::NativeHome(auth)) = changed.auth.as_mut() else {
+            panic!("native-home auth");
+        };
+        auth.required_files.reverse();
+        auth.optional_files.reverse();
+        assert_eq!(original.native_state_key(), changed.native_state_key());
     }
 }

@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -16,7 +16,7 @@ use lionclaw_runtime_api::{
     RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
     RuntimeProgramStdoutSender, RuntimeResume, RuntimeResumeMode, RuntimeSessionHandle,
     RuntimeSessionReady, RuntimeSessionStartInput, RuntimeStateDir, RuntimeTerminalProgramInput,
-    TurnEvent, TurnExecution, TurnInput, TypedFailure, RUNTIME_SESSION_READY_MARKER,
+    TurnEvent, TurnExecution, TurnInput, TypedFailure,
 };
 
 use crate::codex_runtime_auth_kind;
@@ -29,19 +29,31 @@ use super::{
     CodexAppServerClient, CodexRuntimeAdapter, CodexRuntimeConfig, CODEX_THREAD_ID_STATE_FILE,
 };
 
+const TEST_PROFILE_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 fn runtime_not_ready() -> RuntimeSessionReady {
     RuntimeSessionReady::not_ready()
 }
 
 fn runtime_state(runtime_state_root: PathBuf) -> RuntimeStateDir {
-    RuntimeStateDir::new(&runtime_state_root, &runtime_state_root)
+    let state = RuntimeStateDir::new(&runtime_state_root, &runtime_state_root, TEST_PROFILE_KEY)
+        .expect("test-owned runtime state must be rooted");
+    std::fs::create_dir_all(state.marker_path()).expect("create test runtime control");
+    std::fs::create_dir_all(state.path()).expect("create test runtime profile state");
+    state
+}
+
+fn runtime_state_value_path(runtime_state_root: &Path, file_name: &str) -> PathBuf {
+    RuntimeStateDir::new(runtime_state_root, runtime_state_root, TEST_PROFILE_KEY)
         .expect("test-owned runtime state must be rooted")
+        .path()
+        .join(file_name)
 }
 
 fn mark_runtime_ready(runtime_state: &RuntimeStateDir) -> RuntimeSessionReady {
-    std::fs::write(
-        runtime_state.path().join(RUNTIME_SESSION_READY_MARKER),
-        "ready\n",
+    lionclaw_runtime_api::record_runtime_resume_mode(
+        runtime_state,
+        RuntimeResumeMode::Reconstructed,
     )
     .expect("write runtime ready marker");
     RuntimeSessionReady::from_state_dir(runtime_state)
@@ -56,7 +68,7 @@ fn runtime_home_projection_context(
         network_mode: NetworkMode::On,
         working_dir: None,
         environment: Vec::new(),
-        runtime_state: Some(runtime_state(runtime_state_root.clone())),
+        runtime_state: None,
         runtime_path_projections: vec![
             RuntimePathProjection::directory("/runtime", runtime_state_root)
                 .expect("runtime projection"),
@@ -725,7 +737,7 @@ async fn app_server_rejects_oversized_thread_id_from_start_response() {
         .expect_err("oversized response thread id must fail closed");
 
     assert!(error.to_string().contains("identifier"));
-    assert!(!runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE).exists());
+    assert!(!runtime_state_value_path(&runtime_state_root, CODEX_THREAD_ID_STATE_FILE).exists());
 }
 
 #[tokio::test]
@@ -774,12 +786,12 @@ async fn codex_session_rejects_oversized_restored_thread_id() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root);
     std::fs::write(
-        runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
+        runtime_state.path().join(CODEX_THREAD_ID_STATE_FILE),
         format!("{}\n", "x".repeat(2_048)),
     )
     .expect("write oversized thread state");
-    let runtime_state = runtime_state(runtime_state_root);
     let ready = mark_runtime_ready(&runtime_state);
     let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
 
@@ -1019,8 +1031,11 @@ async fn codex_app_server_protocol_streams_turn_and_saves_thread_id() {
         RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "Hello"
     )));
     assert_eq!(
-        std::fs::read_to_string(runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE))
-            .expect("thread state"),
+        std::fs::read_to_string(runtime_state_value_path(
+            &runtime_state_root,
+            CODEX_THREAD_ID_STATE_FILE,
+        ))
+        .expect("thread state"),
         "thr_1\n"
     );
 
@@ -1084,11 +1099,15 @@ async fn assert_image_generation_event_emits_runtime_artifact(event_message: Val
         .join(".codex")
         .join("generated_images")
         .join("thr_1");
+    let runtime_context = runtime_home_projection_context(
+        runtime_state_root.clone(),
+        runtime_state_root.join("home"),
+    );
     assert_image_generation_event_emits_runtime_artifact_at(
         event_message,
         runtime_state_root,
         generated_dir,
-        None,
+        Some(runtime_context),
     )
     .await;
 }
@@ -1112,12 +1131,9 @@ async fn assert_image_generation_event_emits_runtime_artifact_at(
         event_message,
         json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
     ]);
-    let mut client = match runtime_context {
-        Some(runtime_context) => {
-            CodexAppServerClient::new_with_runtime_context(transport, runtime_context)
-        }
-        None => CodexAppServerClient::new(transport),
-    };
+    let runtime_context =
+        runtime_context.expect("artifact tests require explicit path projections");
+    let mut client = CodexAppServerClient::new_with_runtime_context(transport, runtime_context);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let response = client
@@ -1288,37 +1304,37 @@ async fn codex_app_server_image_generation_default_path_maps_runtime_home_projec
 #[test]
 fn codex_generated_image_path_rejects_runtime_root_traversal() {
     let runtime_state_root = PathBuf::from("/host/runtime-state");
+    let context = runtime_home_projection_context(
+        runtime_state_root.clone(),
+        runtime_state_root.join("home"),
+    );
 
     assert_eq!(
         super::codex_generated_image_path(
             "/runtime/./home/.codex/generated_images/thr_1/ig_1.png",
-            &runtime_state_root,
-            None,
+            &context,
         ),
         Some(PathBuf::from(
             "/host/runtime-state/home/.codex/generated_images/thr_1/ig_1.png"
         ))
     );
     assert_eq!(
-        super::codex_generated_image_path("/runtime/../outside.png", &runtime_state_root, None),
+        super::codex_generated_image_path("/runtime/../outside.png", &context),
         None
     );
     assert_eq!(
-        super::codex_generated_image_path("../outside.png", &runtime_state_root, None),
+        super::codex_generated_image_path("../outside.png", &context),
         None
     );
     assert_eq!(
-        super::codex_generated_image_path("/tmp/outside.png", &runtime_state_root, None),
+        super::codex_generated_image_path("/tmp/outside.png", &context),
         None
     );
     assert_eq!(
-        super::codex_generated_image_path("/runtime", &runtime_state_root, None),
+        super::codex_generated_image_path("/runtime", &context),
         None
     );
-    assert_eq!(
-        super::codex_generated_image_path(".", &runtime_state_root, None),
-        None
-    );
+    assert_eq!(super::codex_generated_image_path(".", &context), None);
 }
 
 #[test]
@@ -1330,19 +1346,14 @@ fn codex_generated_image_path_uses_runtime_home_projection() {
     assert_eq!(
         super::codex_generated_image_path(
             "/runtime/home/.codex/generated_images/thr_1/ig_1.png",
-            &runtime_state_root,
-            Some(&context),
+            &context,
         ),
         Some(PathBuf::from(
             "/host/runtime-home/.codex/generated_images/thr_1/ig_1.png"
         ))
     );
     assert_eq!(
-        super::codex_generated_image_path(
-            "home/.codex/generated_images/thr_1/ig_1.png",
-            &runtime_state_root,
-            Some(&context),
-        ),
+        super::codex_generated_image_path("home/.codex/generated_images/thr_1/ig_1.png", &context,),
         Some(PathBuf::from(
             "/host/runtime-home/.codex/generated_images/thr_1/ig_1.png"
         ))
@@ -1356,7 +1367,7 @@ fn codex_generated_image_path_respects_blocked_runtime_projection() {
         network_mode: NetworkMode::On,
         working_dir: None,
         environment: Vec::new(),
-        runtime_state: Some(runtime_state(runtime_state_root.clone())),
+        runtime_state: None,
         runtime_path_projections: vec![
             RuntimePathProjection::directory("/runtime", runtime_state_root.clone())
                 .expect("runtime projection"),
@@ -1372,28 +1383,13 @@ fn codex_generated_image_path_respects_blocked_runtime_projection() {
     assert_eq!(
         super::codex_generated_image_path(
             "/runtime/lionclaw/channel-send.sock/hidden.png",
-            &runtime_state_root,
-            Some(&context),
+            &context,
         ),
         None
     );
     assert_eq!(
-        super::codex_generated_image_path(
-            "lionclaw/channel-send.sock/hidden.png",
-            &runtime_state_root,
-            Some(&context),
-        ),
+        super::codex_generated_image_path("lionclaw/channel-send.sock/hidden.png", &context,),
         None
-    );
-    assert_eq!(
-        super::codex_generated_image_path(
-            "/runtime/lionclaw/channel-send.sock/hidden.png",
-            &runtime_state_root,
-            None,
-        ),
-        Some(PathBuf::from(
-            "/host/runtime-state/lionclaw/channel-send.sock/hidden.png"
-        ))
     );
 }
 
@@ -1405,26 +1401,22 @@ fn codex_default_generated_image_path_uses_runtime_home_projection() {
         runtime_home_projection_context(runtime_state_root.clone(), runtime_home_root.clone());
 
     assert_eq!(
-        super::codex_default_generated_image_path(
-            "thr_1",
-            "ig_1.png",
-            &runtime_state_root,
-            Some(&context),
-        ),
-        runtime_home_root
-            .join(".codex")
-            .join("generated_images")
-            .join("thr_1")
-            .join("ig_1.png")
+        super::codex_default_generated_image_path("thr_1", "ig_1.png", &context,),
+        Some(
+            runtime_home_root
+                .join(".codex")
+                .join("generated_images")
+                .join("thr_1")
+                .join("ig_1.png")
+        )
     );
+    let no_projections = RuntimeExecutionContext {
+        runtime_path_projections: Vec::new(),
+        ..context
+    };
     assert_eq!(
-        super::codex_default_generated_image_path("thr_1", "ig_1.png", &runtime_state_root, None,),
-        runtime_state_root
-            .join("home")
-            .join(".codex")
-            .join("generated_images")
-            .join("thr_1")
-            .join("ig_1.png")
+        super::codex_default_generated_image_path("thr_1", "ig_1.png", &no_projections),
+        None
     );
 }
 
@@ -1432,6 +1424,10 @@ fn codex_default_generated_image_path_uses_runtime_home_projection() {
 async fn codex_app_server_image_generation_unsafe_saved_path_does_not_use_default_artifact() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
+    let runtime_context = runtime_home_projection_context(
+        runtime_state_root.clone(),
+        runtime_state_root.join("home"),
+    );
     let generated_dir = runtime_state_root
         .join("home")
         .join(".codex")
@@ -1456,7 +1452,7 @@ async fn codex_app_server_image_generation_unsafe_saved_path_does_not_use_defaul
         }),
         json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
     ]);
-    let mut client = CodexAppServerClient::new(transport);
+    let mut client = CodexAppServerClient::new_with_runtime_context(transport, runtime_context);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let response = client
@@ -1518,6 +1514,10 @@ async fn codex_app_server_response_item_image_generation_emits_runtime_artifact(
 async fn codex_app_server_image_generation_interim_update_does_not_dedupe_completed_path() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
+    let runtime_context = runtime_home_projection_context(
+        runtime_state_root.clone(),
+        runtime_state_root.join("home"),
+    );
     let final_image = runtime_state_root
         .join("home")
         .join(".codex")
@@ -1560,7 +1560,7 @@ async fn codex_app_server_image_generation_interim_update_does_not_dedupe_comple
         }),
         json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
     ]);
-    let mut client = CodexAppServerClient::new(transport);
+    let mut client = CodexAppServerClient::new_with_runtime_context(transport, runtime_context);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let response = client
@@ -1598,8 +1598,9 @@ async fn codex_app_server_protocol_resumes_saved_thread_id() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root.clone());
     std::fs::write(
-        runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
+        runtime_state.path().join(CODEX_THREAD_ID_STATE_FILE),
         "thr_saved\n",
     )
     .expect("write thread id");
@@ -2227,7 +2228,8 @@ async fn missing_or_invalid_thread_file_starts_fresh_codex_thread() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-    std::fs::write(runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE), "\n")
+    let runtime_state = runtime_state(runtime_state_root.clone());
+    std::fs::write(runtime_state.path().join(CODEX_THREAD_ID_STATE_FILE), "\n")
         .expect("write invalid thread id");
 
     let (adapter, handle, _) = start_codex_test_session(Some(runtime_state_root)).await;
@@ -2241,8 +2243,9 @@ async fn saved_thread_file_without_ready_marker_starts_fresh_codex_thread() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root.clone());
     std::fs::write(
-        runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
+        runtime_state.path().join(CODEX_THREAD_ID_STATE_FILE),
         "thread-old\n",
     )
     .expect("write thread id");
@@ -2260,12 +2263,16 @@ async fn symlinked_thread_file_is_rejected() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root);
     let target = temp_dir.path().join("thread-id-target");
     std::fs::write(&target, "thread-old\n").expect("write target");
-    symlink(&target, runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE)).expect("create symlink");
+    symlink(
+        &target,
+        runtime_state.path().join(CODEX_THREAD_ID_STATE_FILE),
+    )
+    .expect("create symlink");
 
     let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-    let runtime_state = runtime_state(runtime_state_root);
     let runtime_session_ready = mark_runtime_ready(&runtime_state);
     let err = adapter
         .session_start(RuntimeSessionStartInput {
@@ -2285,18 +2292,20 @@ async fn symlinked_thread_file_is_rejected() {
 #[tokio::test]
 async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
-    let runtime_a = temp_dir.path().join("runtime-a");
-    let runtime_b = temp_dir.path().join("runtime-b");
-    std::fs::create_dir_all(&runtime_a).expect("create runtime a");
-    std::fs::create_dir_all(&runtime_b).expect("create runtime b");
-    std::fs::write(runtime_a.join(CODEX_THREAD_ID_STATE_FILE), "thread-a\n")
-        .expect("write thread a");
-    std::fs::write(runtime_b.join(CODEX_THREAD_ID_STATE_FILE), "thread-b\n")
-        .expect("write thread b");
+    let runtime_a = runtime_state(temp_dir.path().join("runtime-a"));
+    let runtime_b = runtime_state(temp_dir.path().join("runtime-b"));
+    std::fs::write(
+        runtime_a.path().join(CODEX_THREAD_ID_STATE_FILE),
+        "thread-a\n",
+    )
+    .expect("write thread a");
+    std::fs::write(
+        runtime_b.path().join(CODEX_THREAD_ID_STATE_FILE),
+        "thread-b\n",
+    )
+    .expect("write thread b");
 
     let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-    let runtime_a = runtime_state(runtime_a);
-    let runtime_b = runtime_state(runtime_b);
     let runtime_a_ready = mark_runtime_ready(&runtime_a);
     let runtime_b_ready = mark_runtime_ready(&runtime_b);
     let handle_a = adapter
@@ -2346,8 +2355,9 @@ async fn native_reopen_recovery_durably_forgets_exact_stale_codex_thread() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root.clone());
     std::fs::write(
-        runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
+        runtime_state.path().join(CODEX_THREAD_ID_STATE_FILE),
         "thread-stale\n",
     )
     .expect("write stale thread");
@@ -2382,7 +2392,7 @@ async fn native_reopen_recovery_durably_forgets_exact_stale_codex_thread() {
         None
     );
     assert!(
-        !runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE).exists(),
+        !runtime_state_value_path(&runtime_state_root, CODEX_THREAD_ID_STATE_FILE).exists(),
         "forget confirmation must follow durable removal"
     );
 }

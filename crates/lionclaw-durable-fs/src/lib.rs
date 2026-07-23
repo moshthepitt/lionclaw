@@ -47,6 +47,13 @@ use uuid::Uuid;
 
 const TEMP_CREATE_ATTEMPTS: usize = 4;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedRead {
+    Missing,
+    Contents(Vec<u8>),
+    TooLarge,
+}
+
 /// A directory reached from an explicit trusted anchor without following any
 /// symlink below that anchor.
 ///
@@ -107,12 +114,28 @@ impl RootedDirectory {
         limit: usize,
         label: &str,
     ) -> Result<Option<Vec<u8>>> {
+        match self.read_bounded_status(file_name, limit, label)? {
+            BoundedRead::Missing => Ok(None),
+            BoundedRead::Contents(bytes) => Ok(Some(bytes)),
+            BoundedRead::TooLarge => Err(file_too_large(&self.path, file_name, label, limit)),
+        }
+    }
+
+    /// Read a regular file while distinguishing absent and oversized content.
+    /// Authority violations such as symlinks and non-regular files remain
+    /// errors; callers may safely treat only `TooLarge` as corrupt content.
+    pub fn read_bounded_status(
+        &self,
+        file_name: &OsStr,
+        limit: usize,
+        label: &str,
+    ) -> Result<BoundedRead> {
         ensure_file_name(file_name, label)?;
         let Some(parent) = self.open_existing()? else {
-            return Ok(None);
+            return Ok(BoundedRead::Missing);
         };
         let Some(file) = open_regular_file(&parent, &self.path, file_name, label)? else {
-            return Ok(None);
+            return Ok(BoundedRead::Missing);
         };
         let metadata = file.metadata().with_context(|| {
             format!(
@@ -121,7 +144,7 @@ impl RootedDirectory {
             )
         })?;
         if metadata.len() > limit as u64 {
-            return Err(file_too_large(&self.path, file_name, label, limit));
+            return Ok(BoundedRead::TooLarge);
         }
 
         let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
@@ -135,9 +158,9 @@ impl RootedDirectory {
                 )
             })?;
         if bytes.len() > limit {
-            return Err(file_too_large(&self.path, file_name, label, limit));
+            return Ok(BoundedRead::TooLarge);
         }
-        Ok(Some(bytes))
+        Ok(BoundedRead::Contents(bytes))
     }
 
     /// Atomically replace a private regular file in this directory.

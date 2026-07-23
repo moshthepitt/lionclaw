@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -16,14 +16,15 @@ use lionclaw_runtime_api::{
     RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeResume,
     RuntimeResumeMode, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeStateDir,
     RuntimeTerminalConfig, RuntimeTerminalProgramInput, TurnEvent, TurnExecution, TurnInput,
-    TypedFailure, RUNTIME_SESSION_READY_MARKER, RUNTIME_STATE_VALUE_LIMIT,
-    RUNTIME_TURN_JOURNAL_CAPACITY,
+    TypedFailure, RUNTIME_STATE_VALUE_LIMIT, RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 
 use super::{
     acp_permission_denial, acp_turn_events, AcpMessage, AcpRuntimeAdapter, AcpRuntimeConfig,
     ACP_SESSION_ID_STATE_FILE,
 };
+
+const TEST_PROFILE_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 use crate::client::AcpClient;
 use crate::protocol::AcpSessionSelections;
 
@@ -92,14 +93,24 @@ async fn acp_adapter_preserves_typed_launch_refusal() {
 }
 
 fn runtime_state(runtime_state_root: PathBuf) -> RuntimeStateDir {
-    RuntimeStateDir::new(&runtime_state_root, &runtime_state_root)
+    let state = RuntimeStateDir::new(&runtime_state_root, &runtime_state_root, TEST_PROFILE_KEY)
+        .expect("test-owned runtime state must be rooted");
+    std::fs::create_dir_all(state.marker_path()).expect("create test runtime control");
+    std::fs::create_dir_all(state.path()).expect("create test runtime profile state");
+    state
+}
+
+fn runtime_state_value_path(runtime_state_root: &Path, file_name: &str) -> PathBuf {
+    RuntimeStateDir::new(runtime_state_root, runtime_state_root, TEST_PROFILE_KEY)
         .expect("test-owned runtime state must be rooted")
+        .path()
+        .join(file_name)
 }
 
 fn mark_runtime_ready(runtime_state: &RuntimeStateDir) -> RuntimeSessionReady {
-    std::fs::write(
-        runtime_state.path().join(RUNTIME_SESSION_READY_MARKER),
-        "ready\n",
+    lionclaw_runtime_api::record_runtime_resume_mode(
+        runtime_state,
+        RuntimeResumeMode::Reconstructed,
     )
     .expect("write runtime ready marker");
     RuntimeSessionReady::from_state_dir(runtime_state)
@@ -775,8 +786,11 @@ async fn acp_turn_uses_profile_driver_journal() {
         ]
     );
     assert_eq!(
-        std::fs::read_to_string(runtime_state_root.join(ACP_SESSION_ID_STATE_FILE))
-            .expect("saved session id"),
+        std::fs::read_to_string(runtime_state_value_path(
+            &runtime_state_root,
+            ACP_SESSION_ID_STATE_FILE,
+        ))
+        .expect("saved session id"),
         "ses_program\n"
     );
     let sent = fake_state.lock().expect("fake ACP state").sent.clone();
@@ -1047,13 +1061,13 @@ async fn acp_session_start_resumes_saved_ready_session() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root);
     std::fs::write(
-        runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+        runtime_state.path().join(ACP_SESSION_ID_STATE_FILE),
         "ses_ready\n",
     )
     .expect("write session id");
     let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
-    let runtime_state = runtime_state(runtime_state_root);
     let runtime_session_ready = mark_runtime_ready(&runtime_state);
 
     let handle = adapter
@@ -1076,12 +1090,12 @@ async fn acp_session_start_rejects_oversized_saved_session() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root);
     std::fs::write(
-        runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+        runtime_state.path().join(ACP_SESSION_ID_STATE_FILE),
         vec![b'x'; RUNTIME_STATE_VALUE_LIMIT + 1],
     )
     .expect("write oversized session id");
-    let runtime_state = runtime_state(runtime_state_root);
     let ready = mark_runtime_ready(&runtime_state);
     let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
 
@@ -1106,13 +1120,13 @@ async fn acp_resume_uses_effective_working_directory() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root.clone());
     std::fs::write(
-        runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+        runtime_state.path().join(ACP_SESSION_ID_STATE_FILE),
         "ses_ready\n",
     )
     .expect("write session id");
     let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
-    let runtime_state = runtime_state(runtime_state_root.clone());
     let ready = mark_runtime_ready(&runtime_state);
     let handle = adapter
         .session_start(RuntimeSessionStartInput {
@@ -1182,13 +1196,13 @@ async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root.clone());
     std::fs::write(
-        runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+        runtime_state.path().join(ACP_SESSION_ID_STATE_FILE),
         "ses_ready\n",
     )
     .expect("write session id");
     let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
-    let runtime_state = runtime_state(runtime_state_root.clone());
     let ready = mark_runtime_ready(&runtime_state);
     let handle = adapter
         .session_start(RuntimeSessionStartInput {
@@ -1258,8 +1272,9 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root.clone());
     std::fs::write(
-        runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+        runtime_state.path().join(ACP_SESSION_ID_STATE_FILE),
         "ses_stale\n",
     )
     .expect("write stale session id");
@@ -1270,7 +1285,7 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
             working_dir: None,
             environment: Vec::new(),
             resume: RuntimeResume::Native {
-                state: runtime_state(runtime_state_root.clone()),
+                state: runtime_state,
                 ready: runtime_not_ready(),
             },
         })
@@ -1313,7 +1328,7 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
         vec![RuntimeEvent::Done]
     );
     assert!(
-        !runtime_state_root.join(ACP_SESSION_ID_STATE_FILE).exists(),
+        !runtime_state_value_path(&runtime_state_root, ACP_SESSION_ID_STATE_FILE).exists(),
         "unreopenable ACP sessions must not be advertised as resumable state"
     );
     let sent = fake_state.lock().expect("fake ACP state").sent.clone();
@@ -1330,13 +1345,13 @@ async fn acp_ready_session_without_reopen_capability_uses_canonical_prompt() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root.clone());
     std::fs::write(
-        runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+        runtime_state.path().join(ACP_SESSION_ID_STATE_FILE),
         "ses_stale\n",
     )
     .expect("write stale session id");
     let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
-    let runtime_state = runtime_state(runtime_state_root.clone());
     let ready = mark_runtime_ready(&runtime_state);
     let handle = adapter
         .session_start(RuntimeSessionStartInput {
@@ -1388,7 +1403,7 @@ async fn acp_ready_session_without_reopen_capability_uses_canonical_prompt() {
         vec![RuntimeEvent::Done]
     );
     assert!(
-        !runtime_state_root.join(ACP_SESSION_ID_STATE_FILE).exists(),
+        !runtime_state_value_path(&runtime_state_root, ACP_SESSION_ID_STATE_FILE).exists(),
         "stale ACP session ids must be cleared when the agent cannot reopen them"
     );
     let sent = fake_state.lock().expect("fake ACP state").sent.clone();

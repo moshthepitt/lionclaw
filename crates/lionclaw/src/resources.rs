@@ -100,10 +100,6 @@ impl ConversationDirs {
         &self.observer_index
     }
 
-    pub(crate) fn runtime(&self) -> &Path {
-        self.role_state.runtime()
-    }
-
     pub(crate) fn role_state(&self) -> &RoleStateDirs {
         &self.role_state
     }
@@ -128,6 +124,7 @@ pub(crate) struct RoleStateDirs {
     work: PathBuf,
     scratch: PathBuf,
     runtime: PathBuf,
+    session_control: PathBuf,
 }
 
 impl RoleStateDirs {
@@ -137,11 +134,15 @@ impl RoleStateDirs {
             work: root.join("work"),
             scratch: root.join("scratch"),
             runtime: root.join("runtime"),
+            session_control: root.join("session-control"),
         }
     }
 
     pub(crate) fn prepare(&self) -> std::io::Result<()> {
-        ensure_dirs_beneath(&self.state_dir, [&self.scratch, &self.runtime])
+        ensure_dirs_beneath(
+            &self.state_dir,
+            [&self.scratch, &self.runtime, &self.session_control],
+        )
     }
 
     pub(crate) fn work(&self) -> &Path {
@@ -154,6 +155,42 @@ impl RoleStateDirs {
 
     pub(crate) fn runtime(&self) -> &Path {
         &self.runtime
+    }
+
+    pub(crate) fn session_control_root(&self) -> &Path {
+        &self.session_control
+    }
+
+    pub(crate) fn session_control(&self, profile_key: &str) -> SessionControlDirs {
+        SessionControlDirs {
+            state_dir: self.state_dir.clone(),
+            marker_root: self.session_control.clone(),
+            profile_key: profile_key.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionControlDirs {
+    state_dir: PathBuf,
+    marker_root: PathBuf,
+    profile_key: String,
+}
+
+impl SessionControlDirs {
+    pub(crate) fn prepare(&self) -> std::io::Result<()> {
+        let state = self
+            .state()
+            .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
+        ensure_dirs_beneath(&self.state_dir, [state.marker_path(), state.path()])
+    }
+
+    pub(crate) fn state(&self) -> anyhow::Result<lionclaw_runtime_api::RuntimeStateDir> {
+        lionclaw_runtime_api::RuntimeStateDir::new(
+            &self.state_dir,
+            &self.marker_root,
+            self.profile_key.clone(),
+        )
     }
 }
 
@@ -322,11 +359,12 @@ fn contextual_io(error: Errno, context: String) -> std::io::Error {
     std::io::Error::new(source.kind(), format!("{context}: {source}"))
 }
 
-fn ensure_dirs_beneath<'a>(
+fn ensure_dirs_beneath(
     state_dir: &Path,
-    targets: impl IntoIterator<Item = &'a PathBuf>,
+    targets: impl IntoIterator<Item = impl AsRef<Path>>,
 ) -> std::io::Result<()> {
     for target in targets {
+        let target = target.as_ref();
         let mut parent = open_state_dir(state_dir)?;
         let mut display = state_dir.to_path_buf();
         for name in resource_components(state_dir, target)? {
@@ -559,7 +597,7 @@ mod tests {
         role_effect.prepare().unwrap();
         role_effect.role_state().prepare().unwrap();
         assert!(conversation_dirs.role_state().scratch().is_dir());
-        assert!(conversation_dirs.runtime().is_dir());
+        assert!(conversation_dirs.role_state().runtime().is_dir());
         assert!(role_effect.handoff().is_dir());
         assert!(role_effect.runtime_home().is_dir());
         assert!(role_effect.role_state().scratch().is_dir());
@@ -588,7 +626,7 @@ mod tests {
         );
         assert_eq!(
             source_for(lionclaw_confinement::RUNTIME_MOUNT_TARGET),
-            conversation_dirs.runtime()
+            conversation_dirs.role_state().runtime()
         );
 
         let transient_mounts = crate::runner::effect_mounts(&role_effect, role_effect.role_state());
@@ -707,7 +745,11 @@ mod tests {
         current_dirs.remove().await.unwrap();
         assert!(!current_dirs.role().root().exists());
         assert!(mission_dirs.effect(&adjacent).role().root().is_dir());
-        assert!(mission_dirs.conversation(&conversation).runtime().is_dir());
+        assert!(mission_dirs
+            .conversation(&conversation)
+            .role_state()
+            .runtime()
+            .is_dir());
         assert_eq!(
             std::fs::read_to_string(outside.join("sentinel")).unwrap(),
             "preserve\n"
@@ -744,7 +786,11 @@ mod tests {
         current.role_state().prepare().unwrap();
         std::fs::create_dir_all(current.work()).unwrap();
         std::fs::write(current.work().join("checkout"), "preserve\n").unwrap();
-        std::fs::write(current.runtime().join("native-session"), "preserve\n").unwrap();
+        std::fs::write(
+            current.role_state().runtime().join("native-session"),
+            "preserve\n",
+        )
+        .unwrap();
         std::fs::write(current.observer_index(), "preserve\n").unwrap();
         std::fs::write(current.role_state().scratch().join("build"), "delete\n").unwrap();
         let adjacent = mission_dirs.conversation(&adjacent);
@@ -760,7 +806,8 @@ mod tests {
             "preserve\n"
         );
         assert_eq!(
-            std::fs::read_to_string(current.runtime().join("native-session")).unwrap(),
+            std::fs::read_to_string(current.role_state().runtime().join("native-session"),)
+                .unwrap(),
             "preserve\n"
         );
         assert_eq!(

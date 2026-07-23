@@ -417,6 +417,13 @@ impl RoleRunner for OciRoleRunner {
         role_state
             .prepare()
             .map_err(|e| launch(format!("failed to prepare role state dirs: {e}")))?;
+        let session_control = role_state.session_control(&profile.native_state_key());
+        session_control
+            .prepare()
+            .map_err(|e| launch(format!("failed to prepare runtime control dirs: {e}")))?;
+        let runtime_state = session_control
+            .state()
+            .map_err(|e| launch(format!("invalid runtime state authority: {e:#}")))?;
 
         let setup = async {
             let skill_mounts = prepare_skill_mounts(
@@ -514,7 +521,9 @@ impl RoleRunner for OciRoleRunner {
         // live. Setup and capture use the same engine control, but are simply
         // dropped: child processes are kill-on-drop and retained conversation
         // state stays outside disposable effect resources.
-        let (applied, final_response) = self.run_turn(&profile, &request, plan).await?;
+        let (applied, final_response) = self
+            .run_turn(&profile, &request, plan, runtime_state)
+            .await?;
         let cancellation_configuration = applied.clone();
         let cancellation_response = final_response.clone();
         let finish = async {
@@ -588,9 +597,10 @@ impl OciRoleRunner {
         profile: &MissionRuntimeProfile,
         request: &RoleRunRequest,
         plan: lionclaw_confinement::EffectiveExecutionPlan,
+        runtime_state: lionclaw_runtime_api::RuntimeStateDir,
     ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
         self.run_turn_with_context(profile, request, plan, |plan| {
-            mission_execution_context(plan, &request.state_dir)
+            mission_execution_context(plan, Some(runtime_state.clone()))
         })
         .await
     }
@@ -1362,10 +1372,14 @@ mod tests {
     ) {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
-        std::fs::create_dir_all(temp.path().join("runtime")).unwrap();
-        let runtime_state =
-            lionclaw_runtime_api::RuntimeStateDir::new(temp.path(), temp.path().join("runtime"))
-                .unwrap();
+        let runtime_state = lionclaw_runtime_api::RuntimeStateDir::new(
+            temp.path(),
+            temp.path().join("runtime"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        std::fs::create_dir_all(runtime_state.marker_path()).unwrap();
+        std::fs::create_dir_all(runtime_state.path()).unwrap();
         lionclaw_runtime_api::record_runtime_resume_mode(
             &runtime_state,
             RuntimeResumeMode::Resumed,
@@ -1408,7 +1422,7 @@ mod tests {
         });
         let context_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls = context_calls.clone();
-        let state_anchor = temp.path().to_path_buf();
+        let state = runtime_state.clone();
         let result = runner
             .run_turn_with_context(
                 &profile,
@@ -1419,7 +1433,7 @@ mod tests {
                     if failure_point == FallbackFailurePoint::ReconstructionContext && call == 1 {
                         anyhow::bail!("scripted reconstruction context failure");
                     }
-                    mission_execution_context(plan, &state_anchor)
+                    mission_execution_context(plan, Some(state.clone()))
                 },
             )
             .await;
@@ -1471,6 +1485,7 @@ mod tests {
                 &lionclaw_runtime_api::RuntimeStateDir::new(
                     temp.path(),
                     temp.path().join("runtime"),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 )
                 .unwrap(),
             )
@@ -1643,7 +1658,11 @@ mod tests {
         let conversation = mission_dirs.conversation(&conversation_id);
         conversation.role_state().prepare().unwrap();
         std::fs::create_dir_all(conversation.work()).unwrap();
-        std::fs::write(conversation.runtime().join("opaque-session"), b"private").unwrap();
+        std::fs::write(
+            conversation.role_state().runtime().join("opaque-session"),
+            b"private",
+        )
+        .unwrap();
         std::fs::write(conversation.work().join("workspace-identity"), b"stable").unwrap();
 
         let engine = temp.path().join("fake-oci");
@@ -1670,7 +1689,10 @@ mod tests {
             let reopened = mission_dirs.conversation(&conversation_id);
             reopened.role_state().prepare().unwrap();
             assert_eq!(reopened.work(), conversation.work());
-            assert_eq!(reopened.runtime(), conversation.runtime());
+            assert_eq!(
+                reopened.role_state().runtime(),
+                conversation.role_state().runtime()
+            );
             let effect_id = crate::model::EffectId::for_parts(&["outcome", outcome]);
             let effect = mission_dirs.effect(&effect_id).role();
             effect.prepare().unwrap();
@@ -1698,7 +1720,7 @@ mod tests {
                 .unwrap();
             assert!(!effect.root().exists(), "effect leaked after {outcome}");
             assert_eq!(
-                std::fs::read(conversation.runtime().join("opaque-session")).unwrap(),
+                std::fs::read(conversation.role_state().runtime().join("opaque-session")).unwrap(),
                 b"private"
             );
             assert_eq!(
@@ -1733,10 +1755,18 @@ mod tests {
         // the retry is solely for the still-unsettled external cleanup.
         assert!(!retry_effect.root().exists());
         assert!(!retry_effect.runtime_home().join("credential").exists());
-        assert!(conversation.runtime().join("opaque-session").is_file());
+        assert!(conversation
+            .role_state()
+            .runtime()
+            .join("opaque-session")
+            .is_file());
         retry_cleaner.cleanup(retry_request).await.unwrap();
         assert!(!retry_effect.root().exists());
-        assert!(conversation.runtime().join("opaque-session").is_file());
+        assert!(conversation
+            .role_state()
+            .runtime()
+            .join("opaque-session")
+            .is_file());
         assert!(conversation.work().join("workspace-identity").is_file());
 
         // A replacement assignment is a new role instance and therefore
@@ -1751,8 +1781,38 @@ mod tests {
         assert_ne!(replacement_id, conversation_id);
         let replacement = mission_dirs.conversation(&replacement_id);
         replacement.role_state().prepare().unwrap();
-        assert!(!replacement.runtime().join("opaque-session").exists());
+        assert!(!replacement
+            .role_state()
+            .runtime()
+            .join("opaque-session")
+            .exists());
         assert!(!replacement.work().join("workspace-identity").exists());
+    }
+
+    #[test]
+    fn host_session_control_is_never_projected_into_the_role() {
+        let temp = tempfile::tempdir().unwrap();
+        let mission = crate::model::MissionId::parse("mabc123def456").unwrap();
+        let conversation = crate::model::ConversationId::parse("a".repeat(64)).unwrap();
+        let effect = crate::model::EffectId::for_parts(&["control", "mounts"]);
+        let mission_dirs = MissionDirs::new(temp.path(), &mission);
+        mission_dirs.prepare().unwrap();
+        let conversation_dirs = mission_dirs.conversation(&conversation);
+        conversation_dirs.role_state().prepare().unwrap();
+        let control = conversation_dirs
+            .role_state()
+            .session_control("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        control.prepare().unwrap();
+        let control_state = control.state().unwrap();
+        let effect_dirs = mission_dirs.effect(&effect).role();
+        effect_dirs.prepare().unwrap();
+
+        let mounts = effect_mounts(&effect_dirs, conversation_dirs.role_state());
+
+        assert!(mounts.iter().all(|mount| {
+            !mount.source.starts_with(control_state.marker_path())
+                && !control_state.marker_path().starts_with(&mount.source)
+        }));
     }
 
     #[test]

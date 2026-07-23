@@ -656,27 +656,23 @@ where
         let Some(thread_id) = thread_id else {
             return Ok(None);
         };
-        let Some(runtime_state) = thread_state.runtime_state()? else {
+        let Some(runtime_context) = self.runtime_context.as_ref() else {
             return Ok(None);
         };
 
         let filename = format!("{call_id}.png");
         let path = if let Some(saved_path) = codex_generated_image_saved_path(payload) {
-            let Some(path) = codex_generated_image_path(
-                saved_path,
-                runtime_state.path(),
-                self.runtime_context.as_ref(),
-            ) else {
+            let Some(path) = codex_generated_image_path(saved_path, runtime_context) else {
                 return Ok(None);
             };
             path
         } else {
-            codex_default_generated_image_path(
-                &thread_id,
-                &filename,
-                runtime_state.path(),
-                self.runtime_context.as_ref(),
-            )
+            let Some(path) =
+                codex_default_generated_image_path(&thread_id, &filename, runtime_context)
+            else {
+                return Ok(None);
+            };
+            path
         };
         let artifact_id = format!("codex:image:{thread_id}:{call_id}");
         if !self.emitted_artifact_ids.insert(artifact_id.clone()) {

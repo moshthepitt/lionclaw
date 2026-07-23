@@ -2729,18 +2729,18 @@ fn conversation_views(
         .conversations
         .iter()
         .map(|(id, conversation)| {
-            let runtime_root = crate::resources::MissionDirs::new(
+            let session_control_root = crate::resources::MissionDirs::new(
                 store.lionclaw_dir(),
                 &state.mission_id,
             )
             .conversation(id)
-            .runtime()
+            .role_state()
+            .session_control_root()
             .to_path_buf();
-            let runtime_state = lionclaw_runtime_api::RuntimeStateDir::new(
+            let resume_mode = match lionclaw_runtime_api::recorded_runtime_resume_mode_at(
                 store.lionclaw_dir(),
-                &runtime_root,
-            )?;
-            let resume_mode = match lionclaw_runtime_api::recorded_runtime_resume_mode(&runtime_state)? {
+                &session_control_root,
+            )? {
                 Some(lionclaw_runtime_api::RuntimeResumeMode::Resumed) => "native_session",
                 Some(lionclaw_runtime_api::RuntimeResumeMode::Reconstructed) | None => {
                     "canonical_reconstruction"

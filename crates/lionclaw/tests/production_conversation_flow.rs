@@ -323,16 +323,20 @@ struct DeliveryTransport {
 }
 
 impl DeliveryTransport {
-    fn handoff(execution: &TurnExecution) -> std::path::PathBuf {
-        let runtime = execution
+    fn conversation(execution: &TurnExecution) -> &Path {
+        execution
             .context
             .runtime_state
             .as_ref()
-            .expect("native state root");
-        let mission = runtime
-            .path()
+            .expect("native state root")
+            .marker_path()
             .parent()
-            .and_then(Path::parent)
+            .expect("conversation root")
+    }
+
+    fn handoff(execution: &TurnExecution) -> std::path::PathBuf {
+        let mission = Self::conversation(execution)
+            .parent()
             .and_then(Path::parent)
             .expect("mission state root");
         std::fs::read_dir(mission.join("effects"))
@@ -415,8 +419,7 @@ impl RuntimeAdapter for DeliveryTransport {
                 std::fs::write(Self::handoff(&execution), b"{}")?;
             }
             DeliveryTurn::Complete | DeliveryTurn::CompleteWithOversizedReference => {
-                let runtime = execution.context.runtime_state.as_ref().unwrap();
-                let work = runtime.path().parent().unwrap().join("work");
+                let work = Self::conversation(&execution).join("work");
                 let artifact = work.join("delivery.txt");
                 let contents = if execution.input.prompt.contains("TERMINAL-DIRECT-PROSE") {
                     "reference-bearing retry complete\n"
@@ -581,7 +584,7 @@ impl RuntimeAdapter for NativeTransport {
             runtime.path().join("transport-session"),
             b"durable-native-id",
         )?;
-        let conversation = runtime.path().parent().expect("conversation root");
+        let conversation = runtime.marker_path().parent().expect("conversation root");
         let mission = conversation
             .parent()
             .and_then(Path::parent)

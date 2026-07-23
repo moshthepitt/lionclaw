@@ -88,54 +88,29 @@ pub(crate) fn codex_generated_image_saved_path(payload: &Value) -> Option<&str> 
 pub(crate) fn codex_default_generated_image_path(
     thread_id: &str,
     filename: &str,
-    runtime_state_root: &Path,
-    runtime_context: Option<&RuntimeExecutionContext>,
-) -> PathBuf {
+    runtime_context: &RuntimeExecutionContext,
+) -> Option<PathBuf> {
     let runtime_path = PathBuf::from(CODEX_GENERATED_IMAGES_RUNTIME_DIR)
         .join(thread_id)
         .join(filename);
-    if let Some(path) =
-        runtime_context.and_then(|context| context.host_path_for_runtime_path(&runtime_path))
-    {
-        return path;
-    }
-    runtime_state_root
-        .join("home")
-        .join(".codex")
-        .join("generated_images")
-        .join(thread_id)
-        .join(filename)
+    runtime_context.host_path_for_runtime_path(&runtime_path)
 }
 
 pub(crate) fn codex_generated_image_path(
     raw: &str,
-    runtime_state_root: &Path,
-    runtime_context: Option<&RuntimeExecutionContext>,
+    runtime_context: &RuntimeExecutionContext,
 ) -> Option<PathBuf> {
     let path = Path::new(raw);
     if path.is_absolute() {
-        if let Some(context) = runtime_context {
-            return context.host_path_for_runtime_path(path);
+        let relative = path.strip_prefix("/runtime").ok()?;
+        if safe_relative_path(relative)?.as_os_str().is_empty() {
+            return None;
         }
-        if let Ok(container_relative) = path.strip_prefix("/runtime") {
-            return runtime_state_child_path(runtime_state_root, container_relative);
-        }
-        return None;
+        return runtime_context.host_path_for_runtime_path(path);
     }
     let safe_path = safe_relative_path(path)?;
     if safe_path.as_os_str().is_empty() {
         return None;
     }
-    if let Some(context) = runtime_context {
-        return context.host_path_for_runtime_path(Path::new("/runtime").join(&safe_path));
-    }
-    Some(runtime_state_root.join(safe_path))
-}
-
-fn runtime_state_child_path(runtime_state_root: &Path, relative_path: &Path) -> Option<PathBuf> {
-    let safe_path = safe_relative_path(relative_path)?;
-    if safe_path.as_os_str().is_empty() {
-        return None;
-    }
-    Some(runtime_state_root.join(safe_path))
+    runtime_context.host_path_for_runtime_path(Path::new("/runtime").join(&safe_path))
 }
