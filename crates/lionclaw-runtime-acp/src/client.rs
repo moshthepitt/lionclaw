@@ -17,7 +17,8 @@ use crate::policy::{acp_error_response, acp_permission_denial};
 use crate::program::acp_mcp_servers;
 use crate::protocol::{
     acp_is_server_request, acp_response_id, parse_acp_response, AcpMessage, AcpOpenedSession,
-    AcpResponse, AcpResponseOutcome, AcpSelectionSet, AcpSessionCapabilities, AcpSessionSelections,
+    AcpProviderRejection, AcpResponse, AcpResponseOutcome, AcpSelectionSet, AcpSessionCapabilities,
+    AcpSessionSelections,
 };
 use crate::state::{
     forget_acp_session_id, normalize_acp_session_id, record_native_session_observation,
@@ -31,14 +32,14 @@ pub(crate) struct AcpClient {
 }
 
 enum AcpRequestFailure {
-    Rejected(TypedFailure),
+    ProviderRejected(AcpProviderRejection),
     Other(anyhow::Error),
 }
 
 impl AcpRequestFailure {
     fn into_anyhow(self) -> anyhow::Error {
         match self {
-            Self::Rejected(failure) => failure.into(),
+            Self::ProviderRejected(rejection) => rejection.into_typed_failure().into(),
             Self::Other(error) => error,
         }
     }
@@ -50,7 +51,9 @@ fn classify_acp_response(
 ) -> std::result::Result<AcpResponse, AcpRequestFailure> {
     match parse_acp_response(message, method).map_err(AcpRequestFailure::Other)? {
         AcpResponseOutcome::Success(response) => Ok(response),
-        AcpResponseOutcome::Rejected(failure) => Err(AcpRequestFailure::Rejected(failure)),
+        AcpResponseOutcome::Rejected(rejection) => {
+            Err(AcpRequestFailure::ProviderRejected(rejection))
+        }
     }
 }
 
@@ -120,7 +123,9 @@ impl AcpClient {
                     .await
                 {
                     Ok(response) => response,
-                    Err(AcpRequestFailure::Rejected(failure)) => {
+                    Err(AcpRequestFailure::ProviderRejected(AcpProviderRejection::Permanent(
+                        failure,
+                    ))) => {
                         record_native_session_observation(
                             input.sessions,
                             input.runtime_session_id,

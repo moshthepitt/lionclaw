@@ -23,11 +23,12 @@ use lionclaw::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
 use lionclaw::store::MissionStore;
 use lionclaw::{cli, workspace};
 use lionclaw_runtime_api::{
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthContext, RuntimeAuthPreparation,
-    RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeCancellation, RuntimeDriverConfig,
-    RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeNativeSessionObservation,
-    RuntimeNativeStateAvailability, RuntimeResumeMode, RuntimeSessionHandle,
-    RuntimeSessionStartInput, TurnExecution, TurnResult, TypedFailure,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthIdentity, RuntimeAuthKind,
+    RuntimeAuthMaterialization, RuntimeAuthPreparation, RuntimeAuthProjection, RuntimeAuthProvider,
+    RuntimeAuthRegistry, RuntimeCancellation, RuntimeDriverConfig, RuntimeDriverProvider,
+    RuntimeDriverRegistry, RuntimeNativeSessionObservation, RuntimeNativeStateAvailability,
+    RuntimeResumeMode, RuntimeSessionHandle, RuntimeSessionStartInput, TurnExecution, TurnResult,
+    TypedFailure,
 };
 use lionclaw_runtime_codex::CodexRuntimeDriver;
 
@@ -104,7 +105,9 @@ fn observed_start_mode(
     }
 }
 
-struct TestCodexAuth;
+struct TestCodexAuth {
+    refuse: bool,
+}
 
 #[async_trait]
 impl RuntimeAuthProvider for TestCodexAuth {
@@ -112,15 +115,18 @@ impl RuntimeAuthProvider for TestCodexAuth {
         "codex"
     }
 
-    async fn validate(&self, _context: &RuntimeAuthContext) -> anyhow::Result<()> {
-        Ok(())
-    }
-
     async fn prepare(
         &self,
         _input: RuntimeAuthPreparation<'_>,
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        anyhow::bail!("test codex auth setup refused launch")
+    ) -> anyhow::Result<RuntimeAuthMaterialization> {
+        if self.refuse {
+            anyhow::bail!("test codex auth setup refused launch");
+        }
+        Ok(RuntimeAuthMaterialization::new(
+            RuntimeAuthKind::from_static("codex"),
+            RuntimeAuthIdentity::new("test-codex-principal").unwrap(),
+            RuntimeAuthProjection::default(),
+        ))
     }
 }
 
@@ -389,7 +395,7 @@ impl DeliveryTransport {
             .runtime_state
             .as_ref()
             .expect("native state root")
-            .marker_path()
+            .control_path()
             .parent()
             .expect("conversation root")
     }
@@ -656,7 +662,7 @@ impl RuntimeAdapter for NativeTransport {
             "test native transport",
         )?;
         self.sessions.establish(&execution.input.runtime_session_id);
-        let conversation = runtime.marker_path().parent().expect("conversation root");
+        let conversation = runtime.control_path().parent().expect("conversation root");
         let mission = conversation
             .parent()
             .and_then(Path::parent)
@@ -977,7 +983,9 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             prompts: prompts.clone(),
             launch_failures: Arc::new(Mutex::new(0)),
         }) as Arc<dyn RuntimeDriverProvider>]),
-        RuntimeAuthRegistry::new([Arc::new(TestCodexAuth) as Arc<dyn RuntimeAuthProvider>]),
+        RuntimeAuthRegistry::new([
+            Arc::new(TestCodexAuth { refuse: false }) as Arc<dyn RuntimeAuthProvider>
+        ]),
         Arc::new(ExternalOracleTransport {
             calls: Arc::new(Mutex::new(Vec::new())),
         }),
@@ -3034,7 +3042,9 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             prompts: prompts.clone(),
             launch_failures: launch_failures.clone(),
         }) as Arc<dyn RuntimeDriverProvider>]),
-        RuntimeAuthRegistry::new([Arc::new(TestCodexAuth) as Arc<dyn RuntimeAuthProvider>]),
+        RuntimeAuthRegistry::new([
+            Arc::new(TestCodexAuth { refuse: false }) as Arc<dyn RuntimeAuthProvider>
+        ]),
         Arc::new(ExternalOracleTransport {
             calls: oracle_calls.clone(),
         }),
@@ -3242,15 +3252,17 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     )
     .await
     .unwrap();
-    // Use the real Codex provider for this one failure. Its test auth provider
-    // refuses setup inside MissionProgramExecutor's interactive launch, before
-    // an app-server transport exists and without disrupting OCI cleanup.
+    // Use the real Codex driver for this one failure. Its test auth provider
+    // refuses the exact pre-session materialization boundary, before an
+    // app-server transport or native-session attempt exists.
     let launch_transports = cli::MissionTransports::external(
         profiles.clone(),
         RuntimeDriverRegistry::new(
             [Arc::new(CodexRuntimeDriver) as Arc<dyn RuntimeDriverProvider>],
         ),
-        RuntimeAuthRegistry::new([Arc::new(TestCodexAuth) as Arc<dyn RuntimeAuthProvider>]),
+        RuntimeAuthRegistry::new([
+            Arc::new(TestCodexAuth { refuse: true }) as Arc<dyn RuntimeAuthProvider>
+        ]),
         Arc::new(ExternalOracleTransport {
             calls: oracle_calls.clone(),
         }),
@@ -3986,8 +3998,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         assert_eq!(sessions[1].0, sessions[2].0, "workspace changed on repair");
         assert!(!sessions[0].1);
         assert!(
-            !sessions[1].1,
-            "a launch refusal before native establishment must force reconstruction"
+            sessions[1].1,
+            "pre-session auth refusal must preserve committed native readiness"
         );
         assert!(sessions[2].1, "native session was not eligible for repair");
         assert!(

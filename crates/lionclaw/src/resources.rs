@@ -11,7 +11,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 
 use lionclaw_durable_fs::RootedDirectory;
-use rustix::fs::{mkdirat, open, openat, unlinkat, AtFlags, Dir, Mode, OFlags};
+use rustix::fs::{chmodat, fchmod, mkdirat, open, openat, unlinkat, AtFlags, Dir, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::model::{ConversationId, EffectId, MissionId};
@@ -161,36 +161,70 @@ impl RoleStateDirs {
         &self.session_control
     }
 
-    pub(crate) fn session_control(&self, profile_key: &str) -> SessionControlDirs {
-        SessionControlDirs {
-            state_dir: self.state_dir.clone(),
-            marker_root: self.session_control.clone(),
-            profile_key: profile_key.to_string(),
-        }
+    pub(crate) fn runtime_profile(&self, profile_key: &str) -> anyhow::Result<RuntimeProfileDirs> {
+        RuntimeProfileDirs::new(self.clone(), profile_key)
     }
 }
 
+/// Retained runtime-owned state for one exact role-state and compatible runtime
+/// profile. Only `native_home` is projected into the confined runtime; control
+/// files remain host-owned siblings.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SessionControlDirs {
-    state_dir: PathBuf,
-    marker_root: PathBuf,
-    profile_key: String,
+pub(crate) struct RuntimeProfileDirs {
+    role_state: RoleStateDirs,
+    runtime_state: lionclaw_runtime_api::RuntimeStateDir,
+    native_home: PathBuf,
 }
 
-impl SessionControlDirs {
-    pub(crate) fn prepare(&self) -> std::io::Result<()> {
-        let state = self
-            .state()
-            .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
-        ensure_dirs_beneath(&self.state_dir, [state.marker_path(), state.path()])
+impl RuntimeProfileDirs {
+    fn new(role_state: RoleStateDirs, profile_key: &str) -> anyhow::Result<Self> {
+        let runtime_state = lionclaw_runtime_api::RuntimeStateDir::new(
+            &role_state.state_dir,
+            &role_state.session_control,
+            profile_key,
+        )?;
+        let native_home = runtime_state.path().join("native-home");
+        Ok(Self {
+            role_state,
+            runtime_state,
+            native_home,
+        })
     }
 
-    pub(crate) fn state(&self) -> anyhow::Result<lionclaw_runtime_api::RuntimeStateDir> {
-        lionclaw_runtime_api::RuntimeStateDir::new(
-            &self.state_dir,
-            &self.marker_root,
-            self.profile_key.clone(),
-        )
+    pub(crate) fn prepare(&self) -> std::io::Result<()> {
+        ensure_private_dirs_beneath(
+            &self.role_state.state_dir,
+            [self.runtime_state.control_path(), self.runtime_state.path()],
+        )?;
+        ensure_dirs_beneath(&self.role_state.state_dir, [&self.native_home])
+    }
+
+    pub(crate) fn runtime_state(&self) -> &lionclaw_runtime_api::RuntimeStateDir {
+        &self.runtime_state
+    }
+
+    pub(crate) fn role_state(&self) -> &RoleStateDirs {
+        &self.role_state
+    }
+
+    pub(crate) fn native_home(&self) -> &Path {
+        &self.native_home
+    }
+
+    pub(crate) fn prepare_native_home_dir(&self, relative: &Path) -> anyhow::Result<PathBuf> {
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            anyhow::bail!(
+                "runtime native-home directory '{}' must be a non-empty relative path",
+                relative.display()
+            );
+        }
+        let path = self.native_home.join(relative);
+        ensure_dirs_beneath(&self.role_state.state_dir, [&path])?;
+        Ok(path)
     }
 }
 
@@ -231,7 +265,7 @@ pub(crate) struct RoleEffectDirs {
     state_dir: PathBuf,
     root: PathBuf,
     handoff: PathBuf,
-    runtime_home: PathBuf,
+    auth_staging: PathBuf,
     role_state: RoleStateDirs,
 }
 
@@ -239,7 +273,7 @@ impl RoleEffectDirs {
     fn new(state_dir: PathBuf, root: PathBuf) -> Self {
         Self {
             handoff: root.join("handoff"),
-            runtime_home: root.join("runtime-home"),
+            auth_staging: root.join("auth-staging"),
             role_state: RoleStateDirs::new(state_dir.clone(), &root),
             state_dir,
             root,
@@ -247,7 +281,7 @@ impl RoleEffectDirs {
     }
 
     pub(crate) fn prepare(&self) -> std::io::Result<()> {
-        ensure_dirs_beneath(&self.state_dir, [&self.handoff, &self.runtime_home])
+        ensure_dirs_beneath(&self.state_dir, [&self.handoff, &self.auth_staging])
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -258,8 +292,8 @@ impl RoleEffectDirs {
         &self.handoff
     }
 
-    pub(crate) fn runtime_home(&self) -> &Path {
-        &self.runtime_home
+    pub(crate) fn auth_staging(&self) -> &Path {
+        &self.auth_staging
     }
 
     pub(crate) fn role_state(&self) -> &RoleStateDirs {
@@ -343,7 +377,7 @@ fn resource_components<'a>(state_dir: &Path, target: &'a Path) -> std::io::Resul
 }
 
 fn open_state_dir(state_dir: &Path) -> std::io::Result<OwnedFd> {
-    open(state_dir, directory_flags(), Mode::empty()).map_err(|error| {
+    let directory = open(state_dir, directory_flags(), Mode::empty()).map_err(|error| {
         contextual_io(
             error,
             format!(
@@ -351,7 +385,17 @@ fn open_state_dir(state_dir: &Path) -> std::io::Result<OwnedFd> {
                 state_dir.display()
             ),
         )
-    })
+    })?;
+    fchmod(&directory, Mode::from_raw_mode(0o700)).map_err(|error| {
+        contextual_io(
+            error,
+            format!(
+                "failed to protect state directory '{}'",
+                state_dir.display()
+            ),
+        )
+    })?;
+    Ok(directory)
 }
 
 fn contextual_io(error: Errno, context: String) -> std::io::Error {
@@ -363,20 +407,49 @@ fn ensure_dirs_beneath(
     state_dir: &Path,
     targets: impl IntoIterator<Item = impl AsRef<Path>>,
 ) -> std::io::Result<()> {
+    ensure_dirs_beneath_with_policy(state_dir, targets, false)
+}
+
+fn ensure_private_dirs_beneath(
+    state_dir: &Path,
+    targets: impl IntoIterator<Item = impl AsRef<Path>>,
+) -> std::io::Result<()> {
+    ensure_dirs_beneath_with_policy(state_dir, targets, true)
+}
+
+fn ensure_dirs_beneath_with_policy(
+    state_dir: &Path,
+    targets: impl IntoIterator<Item = impl AsRef<Path>>,
+    protect_existing: bool,
+) -> std::io::Result<()> {
     for target in targets {
         let target = target.as_ref();
         let mut parent = open_state_dir(state_dir)?;
         let mut display = state_dir.to_path_buf();
         for name in resource_components(state_dir, target)? {
             display.push(name);
-            match mkdirat(&parent, name, Mode::from_raw_mode(0o777)) {
-                Ok(()) | Err(Errno::EXIST) => {}
+            let created = match mkdirat(&parent, name, Mode::from_raw_mode(0o700)) {
+                Ok(()) => true,
+                Err(Errno::EXIST) => false,
                 Err(error) => {
                     return Err(contextual_io(
                         error,
                         format!("failed to create mission resource '{}'", display.display()),
                     ))
                 }
+            };
+            if created {
+                // An adversarial umask may create the directory with no search
+                // permission, so make the exact new entry openable before
+                // validating and hardening its descriptor below.
+                chmodat(&parent, name, Mode::from_raw_mode(0o700), AtFlags::empty()).map_err(
+                    |error| {
+                        contextual_io(
+                            error,
+                            format!("failed to protect mission resource '{}'", display.display()),
+                        )
+                    },
+                )?;
             }
             parent = openat(&parent, name, directory_flags(), Mode::empty()).map_err(|error| {
                 contextual_io(
@@ -387,6 +460,14 @@ fn ensure_dirs_beneath(
                     ),
                 )
             })?;
+            if created || protect_existing {
+                fchmod(&parent, Mode::from_raw_mode(0o700)).map_err(|error| {
+                    contextual_io(
+                        error,
+                        format!("failed to protect mission resource '{}'", display.display()),
+                    )
+                })?;
+            }
         }
     }
     Ok(())
@@ -544,7 +625,7 @@ fn resource_tree_limit(display: &Path, dimension: &str) -> std::io::Error {
 mod tests {
     use super::*;
     use crate::model::{RoleName, TaskId, TaskNamespace};
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     #[test]
     fn one_mission_graph_separates_conversation_and_effect_lifetimes() {
@@ -596,10 +677,51 @@ mod tests {
         conversation_dirs.role_state().prepare().unwrap();
         role_effect.prepare().unwrap();
         role_effect.role_state().prepare().unwrap();
+        let profile_key_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let profile_key_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let retained_profile = conversation_dirs
+            .role_state()
+            .runtime_profile(profile_key_a)
+            .unwrap();
+        let replacement_profile = mission_dirs
+            .conversation(&replacement)
+            .role_state()
+            .runtime_profile(profile_key_a)
+            .unwrap();
+        let changed_profile = conversation_dirs
+            .role_state()
+            .runtime_profile(profile_key_b)
+            .unwrap();
+        let transient_profile = role_effect
+            .role_state()
+            .runtime_profile(profile_key_a)
+            .unwrap();
+        retained_profile.prepare().unwrap();
+        transient_profile.prepare().unwrap();
         assert!(conversation_dirs.role_state().scratch().is_dir());
         assert!(conversation_dirs.role_state().runtime().is_dir());
+        assert!(retained_profile.native_home().is_dir());
+        assert_eq!(
+            retained_profile,
+            conversation_dirs
+                .role_state()
+                .runtime_profile(profile_key_a)
+                .unwrap()
+        );
+        assert_ne!(
+            retained_profile.native_home(),
+            replacement_profile.native_home()
+        );
+        assert_ne!(
+            retained_profile.native_home(),
+            changed_profile.native_home()
+        );
+        assert_ne!(
+            retained_profile.native_home(),
+            transient_profile.native_home()
+        );
         assert!(role_effect.handoff().is_dir());
-        assert!(role_effect.runtime_home().is_dir());
+        assert!(role_effect.auth_staging().is_dir());
         assert!(role_effect.role_state().scratch().is_dir());
         assert!(role_effect.role_state().runtime().is_dir());
         assert!(!oracle_effect.work().exists());
@@ -610,9 +732,10 @@ mod tests {
         assert!(oracle_effect.scratch().is_dir());
         assert!(oracle_effect.program().is_dir());
         assert!(!role_effect.handoff().exists());
-        assert!(!role_effect.runtime_home().exists());
+        assert!(!role_effect.auth_staging().exists());
+        assert!(retained_profile.native_home().is_dir());
 
-        let mounts = crate::runner::effect_mounts(&role_effect, conversation_dirs.role_state());
+        let mounts = crate::runner::effect_mounts(&role_effect, &retained_profile);
         let source_for = |target: &str| {
             mounts
                 .iter()
@@ -629,7 +752,7 @@ mod tests {
             conversation_dirs.role_state().runtime()
         );
 
-        let transient_mounts = crate::runner::effect_mounts(&role_effect, role_effect.role_state());
+        let transient_mounts = crate::runner::effect_mounts(&role_effect, &transient_profile);
         let transient_source_for = |target: &str| {
             transient_mounts
                 .iter()
@@ -651,8 +774,108 @@ mod tests {
         );
         assert_eq!(
             source_for(lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET),
-            role_effect.runtime_home()
+            retained_profile.native_home()
         );
+    }
+
+    #[test]
+    fn runtime_profile_paths_require_a_lowercase_sha256_digest() {
+        let state = tempfile::tempdir().unwrap();
+        let mission = MissionId::for_creation("/workspace", "profile-path", 1);
+        let conversation = ConversationId::parse("f".repeat(64)).unwrap();
+        let mission_dirs = MissionDirs::new(state.path(), &mission);
+        let role_state = mission_dirs
+            .conversation(&conversation)
+            .role_state()
+            .clone();
+
+        for key in [
+            "../escape",
+            "profile-name",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(role_state.runtime_profile(key).is_err(), "accepted {key}");
+        }
+    }
+
+    #[test]
+    fn preparation_protects_new_resources_without_rewriting_retained_runtime_modes() {
+        let state = tempfile::tempdir().unwrap();
+        let mission = MissionId::for_creation("/workspace", "resource-modes", 1);
+        let conversation = ConversationId::parse("f".repeat(64)).unwrap();
+        let profile = MissionDirs::new(state.path(), &mission)
+            .conversation(&conversation)
+            .role_state()
+            .clone()
+            .runtime_profile("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+        std::fs::create_dir_all(profile.native_home()).unwrap();
+        std::fs::set_permissions(
+            profile.native_home(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        profile.prepare().unwrap();
+
+        assert_eq!(
+            std::fs::metadata(state.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(profile.native_home())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "LionClaw must not normalize existing runtime-owned state"
+        );
+        assert_eq!(
+            std::fs::metadata(profile.runtime_state().control_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn newly_created_resources_are_owner_only_under_restrictive_umask() {
+        const CHILD_ROOT: &str = "LIONCLAW_RESOURCE_MODE_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            rustix::process::umask(Mode::from_raw_mode(0o777));
+            let state = PathBuf::from(root);
+            let mission = MissionId::for_creation("/workspace", "resource-umask", 1);
+            let mission_dirs = MissionDirs::new(&state, &mission);
+            mission_dirs.prepare().unwrap();
+            assert_eq!(
+                std::fs::metadata(mission_dirs.root())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            return;
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "resources::tests::newly_created_resources_are_owner_only_under_restrictive_umask",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ROOT, state.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated umask proof failed");
     }
 
     #[test]

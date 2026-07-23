@@ -95,7 +95,7 @@ async fn acp_adapter_preserves_typed_launch_refusal() {
 fn runtime_state(runtime_state_root: PathBuf) -> RuntimeStateDir {
     let state = RuntimeStateDir::new(&runtime_state_root, &runtime_state_root, TEST_PROFILE_KEY)
         .expect("test-owned runtime state must be rooted");
-    std::fs::create_dir_all(state.marker_path()).expect("create test runtime control");
+    std::fs::create_dir_all(state.control_path()).expect("create test runtime control");
     std::fs::create_dir_all(state.path()).expect("create test runtime profile state");
     state
 }
@@ -183,6 +183,24 @@ fn resume_only_initialize_response(id: u64) -> String {
             },
             "agentInfo": {
                 "name": "ResumeOnly",
+                "version": "1.0.0",
+            },
+        },
+    })
+    .to_string()
+}
+
+fn load_only_initialize_response(id: u64) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "loadSession": true,
+            },
+            "agentInfo": {
+                "name": "LoadOnly",
                 "version": "1.0.0",
             },
         },
@@ -1246,7 +1264,7 @@ async fn acp_session_start_rejects_oversized_saved_session() {
 }
 
 #[tokio::test]
-async fn acp_resume_uses_effective_working_directory() {
+async fn acp_prefers_session_resume_and_uses_effective_working_directory() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
@@ -1311,7 +1329,7 @@ async fn acp_resume_uses_effective_working_directory() {
         sent.iter()
             .filter_map(|message| message.get("method").and_then(Value::as_str))
             .collect::<Vec<_>>(),
-        vec!["initialize", "session/load", "session/prompt"]
+        vec!["initialize", "session/resume", "session/prompt"]
     );
     assert_eq!(sent[1]["params"]["sessionId"], json!("ses_ready"));
     assert_eq!(
@@ -1326,7 +1344,7 @@ async fn acp_resume_uses_effective_working_directory() {
 }
 
 #[tokio::test]
-async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
+async fn acp_uses_session_load_when_resume_is_unsupported() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
@@ -1352,7 +1370,7 @@ async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
     let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
     let executor = FakeAcpProgramExecutor {
         inbound: VecDeque::from([
-            resume_only_initialize_response(1),
+            load_only_initialize_response(1),
             r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#.to_string(),
             r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
         ]),
@@ -1391,7 +1409,7 @@ async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
         sent.iter()
             .filter_map(|message| message.get("method").and_then(Value::as_str))
             .collect::<Vec<_>>(),
-        vec!["initialize", "session/resume", "session/prompt"]
+        vec!["initialize", "session/load", "session/prompt"]
     );
     assert_eq!(sent[1]["params"]["sessionId"], json!("ses_ready"));
     assert_eq!(
@@ -1598,7 +1616,7 @@ async fn matching_json_rpc_reopen_rejection_is_observed_without_forgetting_ident
     };
     let (journal, _journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
-    adapter
+    let error = adapter
         .turn(
             TurnExecution {
                 input: TurnInput {
@@ -1611,14 +1629,93 @@ async fn matching_json_rpc_reopen_rejection_is_observed_without_forgetting_ident
             journal,
         )
         .await
-        .expect_err("matching session/load rejection must fail");
+        .expect_err("matching session/resume rejection must fail");
 
+    assert!(matches!(
+        error.downcast_ref::<TypedFailure>(),
+        Some(TypedFailure::PermanentRuntime { .. })
+    ));
     assert_native_observation(
         &adapter,
         &handle,
         Some(RuntimeNativeSessionObservation::ReopenFailed),
     );
     assert_acp_session_id(&runtime_state_root, "ses_ready");
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RetryableReopenMethod {
+    Load,
+    Resume,
+}
+
+async fn assert_retryable_reopen_failure_retains_identity(method: RetryableReopenMethod) {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root.clone());
+    write_acp_session_id(&runtime_state, "ses_ready");
+    let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+    let handle = start_ready_acp_session(&adapter, runtime_state).await;
+    let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+    let (initialize, reopen_method) = match method {
+        RetryableReopenMethod::Load => (load_only_initialize_response(1), "session/load"),
+        RetryableReopenMethod::Resume => (resume_only_initialize_response(1), "session/resume"),
+    };
+    let executor = FakeAcpProgramExecutor {
+        inbound: VecDeque::from([
+            initialize,
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"provider temporarily unavailable","data":{"retryable":true,"retryAfterMs":25}}}"#.to_string(),
+        ]),
+        expected_auth: None,
+        state: Arc::clone(&fake_state),
+    };
+    let (journal, _journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+
+    let error = adapter
+        .turn(
+            TurnExecution {
+                input: TurnInput {
+                    runtime_session_id: handle.runtime_session_id.clone(),
+                    prompt: "continue".to_string(),
+                },
+                context: acp_driver_context(runtime_state_root.clone()),
+                executor: Box::new(executor),
+            },
+            journal,
+        )
+        .await
+        .expect_err("retryable reopen failure must fail the attempt");
+
+    assert!(matches!(
+        error.downcast_ref::<TypedFailure>(),
+        Some(TypedFailure::TransientRuntime {
+            retry_after_ms: Some(25),
+            ..
+        })
+    ));
+    assert_native_observation(&adapter, &handle, None);
+    assert_acp_session_id(&runtime_state_root, "ses_ready");
+    assert_eq!(
+        fake_state
+            .lock()
+            .expect("fake ACP state")
+            .sent
+            .iter()
+            .filter_map(|message| message.get("method").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        vec!["initialize", reopen_method]
+    );
+}
+
+#[tokio::test]
+async fn retryable_session_load_failure_retains_native_identity() {
+    assert_retryable_reopen_failure_retains_identity(RetryableReopenMethod::Load).await;
+}
+
+#[tokio::test]
+async fn retryable_session_resume_failure_retains_native_identity() {
+    assert_retryable_reopen_failure_retains_identity(RetryableReopenMethod::Resume).await;
 }
 
 #[derive(Debug, Clone, Copy)]

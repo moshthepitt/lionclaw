@@ -5,7 +5,6 @@ use serde_json::Value;
 
 use super::event_mapping::app_server_event_payload;
 
-pub(crate) const CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR: &str = ".codex/generated_images";
 const CODEX_GENERATED_IMAGES_RUNTIME_DIR: &str = "/runtime/home/.codex/generated_images";
 
 pub(crate) fn codex_generated_image_payload<'a>(

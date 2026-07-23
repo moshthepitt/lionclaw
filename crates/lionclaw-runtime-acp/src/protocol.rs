@@ -127,10 +127,10 @@ impl AcpSessionCapabilities {
     }
 
     pub(crate) fn reopen_method(self) -> Option<&'static str> {
-        if self.load_session {
-            Some("session/load")
-        } else if self.resume_session {
+        if self.resume_session {
             Some("session/resume")
+        } else if self.load_session {
+            Some("session/load")
         } else {
             None
         }
@@ -151,9 +151,22 @@ pub(crate) struct AcpResponse {
     pub(crate) result: Value,
 }
 
+pub(crate) enum AcpProviderRejection {
+    Permanent(TypedFailure),
+    Retryable(TypedFailure),
+}
+
+impl AcpProviderRejection {
+    pub(crate) fn into_typed_failure(self) -> TypedFailure {
+        match self {
+            Self::Permanent(failure) | Self::Retryable(failure) => failure,
+        }
+    }
+}
+
 pub(crate) enum AcpResponseOutcome {
     Success(AcpResponse),
-    Rejected(TypedFailure),
+    Rejected(AcpProviderRejection),
 }
 
 pub(crate) fn acp_response_id(message: &Value) -> Option<u64> {
@@ -190,7 +203,7 @@ pub(crate) fn parse_acp_response(
             if error.get("code").and_then(Value::as_i64).is_some()
                 && error.get("message").and_then(Value::as_str).is_some() =>
         {
-            Ok(AcpResponseOutcome::Rejected(acp_typed_failure(
+            Ok(AcpResponseOutcome::Rejected(acp_provider_rejection(
                 method, error,
             )))
         }
@@ -206,7 +219,7 @@ pub(crate) fn parse_acp_response(
     }
 }
 
-pub(crate) fn acp_typed_failure(method: &str, error: &Value) -> TypedFailure {
+fn acp_provider_rejection(method: &str, error: &Value) -> AcpProviderRejection {
     let code = error
         .get("code")
         .and_then(Value::as_i64)
@@ -214,13 +227,13 @@ pub(crate) fn acp_typed_failure(method: &str, error: &Value) -> TypedFailure {
     let detail = format!("ACP {method} failed: {}", acp_error_text(error));
     let data = error.get("data").unwrap_or(&Value::Null);
     if data.get("retryable").and_then(Value::as_bool) == Some(true) {
-        TypedFailure::transient(
+        AcpProviderRejection::Retryable(TypedFailure::transient(
             code,
             detail,
             data.get("retryAfterMs").and_then(Value::as_u64),
-        )
+        ))
     } else {
-        TypedFailure::permanent(code, detail)
+        AcpProviderRejection::Permanent(TypedFailure::permanent(code, detail))
     }
 }
 
@@ -245,18 +258,18 @@ mod failure_tests {
     fn retryability_uses_structured_json_rpc_evidence_not_prose() {
         let prose = "rate limited, retry later";
         assert!(matches!(
-            acp_typed_failure("session/prompt", &json!({"code": -32000, "message": prose})),
-            TypedFailure::PermanentRuntime { .. }
+            acp_provider_rejection("session/prompt", &json!({"code": -32000, "message": prose})),
+            AcpProviderRejection::Permanent(TypedFailure::PermanentRuntime { .. })
         ));
         assert!(matches!(
-            acp_typed_failure(
+            acp_provider_rejection(
                 "session/prompt",
                 &json!({"code": -32000, "message": prose, "data": {"retryable": true, "retryAfterMs": 25}})
             ),
-            TypedFailure::TransientRuntime {
+            AcpProviderRejection::Retryable(TypedFailure::TransientRuntime {
                 retry_after_ms: Some(25),
                 ..
-            }
+            })
         ));
     }
 
@@ -268,8 +281,8 @@ mod failure_tests {
             "data": {"service": "session", "errorName": "APIError"}
         });
         assert!(matches!(
-            acp_typed_failure("session/prompt", &error),
-            TypedFailure::PermanentRuntime { .. }
+            acp_provider_rejection("session/prompt", &error),
+            AcpProviderRejection::Permanent(TypedFailure::PermanentRuntime { .. })
         ));
     }
 }

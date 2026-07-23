@@ -39,7 +39,7 @@ fn runtime_not_ready() -> RuntimeSessionReady {
 fn runtime_state(runtime_state_root: PathBuf) -> RuntimeStateDir {
     let state = RuntimeStateDir::new(&runtime_state_root, &runtime_state_root, TEST_PROFILE_KEY)
         .expect("test-owned runtime state must be rooted");
-    std::fs::create_dir_all(state.marker_path()).expect("create test runtime control");
+    std::fs::create_dir_all(state.control_path()).expect("create test runtime control");
     std::fs::create_dir_all(state.path()).expect("create test runtime profile state");
     state
 }
@@ -2601,6 +2601,63 @@ async fn native_reopen_transport_failure_does_not_claim_resume_rejection() {
     assert!(error
         .to_string()
         .contains("closed before responding to thread/resume"));
+    assert_eq!(
+        adapter
+            .native_session_observation(&handle)
+            .expect("native observation"),
+        None
+    );
+    assert_eq!(
+        adapter
+            .current_thread_id(&handle.runtime_session_id)
+            .expect("thread identity"),
+        Some("thread-saved".to_string())
+    );
+    assert_eq!(
+        std::fs::read_to_string(runtime_state_value_path(
+            &runtime_state_root,
+            CODEX_THREAD_ID_STATE_FILE,
+        ))
+        .expect("saved thread identity"),
+        "thread-saved\n"
+    );
+}
+
+#[tokio::test]
+async fn native_reopen_retryable_rejection_retains_identity() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let runtime_state = runtime_state(runtime_state_root.clone());
+    std::fs::write(
+        runtime_state.path().join(CODEX_THREAD_ID_STATE_FILE),
+        "thread-saved\n",
+    )
+    .expect("write saved thread");
+
+    let (adapter, handle, thread_state) =
+        start_codex_ready_test_session(runtime_state_root.clone()).await;
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(vec![json!({
+        "id": 1,
+        "error": {
+            "code": "capacity",
+            "message": "temporarily unavailable",
+            "data": {"retryable": true, "retryAfterMs": 25}
+        }
+    })]));
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = adapter
+        .ensure_app_server_thread(&mut client, Some("thread-saved"), &event_tx, &thread_state)
+        .await
+        .expect_err("retryable rejection must fail the current attempt");
+    assert!(matches!(
+        error.downcast_ref::<TypedFailure>(),
+        Some(TypedFailure::TransientRuntime {
+            retry_after_ms: Some(25),
+            ..
+        })
+    ));
     assert_eq!(
         adapter
             .native_session_observation(&handle)

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
-use lionclaw_runtime_api::{RuntimeAuthRegistry, RuntimeProgramExecutor};
+use lionclaw_runtime_api::RuntimeProgramExecutor;
 use tokio::io::AsyncReadExt;
 
 use crate::authority::{
@@ -422,11 +422,7 @@ async fn run_preparation_program(
         stdin: String::new(),
         auth: None,
     };
-    let mut executor = MissionProgramExecutor::new(
-        compiled.plan().clone(),
-        RuntimeAuthRegistry::empty(),
-        effect_id,
-    );
+    let mut executor = MissionProgramExecutor::new(compiled.plan().clone(), None, effect_id, None);
     let run = executor.execute_captured(program).await?;
     if run.exit_code != Some(0) || run.exit_signal.is_some() {
         let stdout = crate::evidence::excerpt(&String::from_utf8_lossy(&run.stdout));

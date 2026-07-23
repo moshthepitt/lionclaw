@@ -46,12 +46,14 @@ pub use adapter::{
     TurnExecution, TurnInput,
 };
 pub use auth::{
-    RuntimeAuthContext, RuntimeAuthKind, RuntimeAuthPreparation, RuntimeAuthProvider,
-    RuntimeAuthRegistry,
+    RuntimeAuthContext, RuntimeAuthIdentity, RuntimeAuthKind, RuntimeAuthMaterialization,
+    RuntimeAuthPreparation, RuntimeAuthProjection, RuntimeAuthProvider, RuntimeAuthRegistry,
+    RuntimeCredentialProjection, MAX_RUNTIME_CREDENTIAL_AGGREGATE_BYTES,
+    MAX_RUNTIME_CREDENTIAL_BYTES, MAX_RUNTIME_CREDENTIAL_PROJECTIONS,
 };
 pub use context::{
-    safe_relative_path, RuntimeExecutionContext, RuntimeMcpServerSpec,
-    RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimePathProjectionKind,
+    safe_relative_path, RuntimeExecutionContext, RuntimeMcpServerSpec, RuntimePathProjection,
+    RuntimePathProjectionKind,
 };
 pub use driver::{
     RuntimeDriverConfig, RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeTerminalConfig,

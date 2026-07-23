@@ -184,33 +184,6 @@ pub fn safe_relative_path(path: impl AsRef<Path>) -> Option<PathBuf> {
     Some(safe_path)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeNativeHomeArtifactDir {
-    relative_path: PathBuf,
-}
-
-impl RuntimeNativeHomeArtifactDir {
-    pub fn new(relative_path: impl AsRef<Path>) -> Result<Self> {
-        let raw_path = relative_path.as_ref();
-        let relative_path = safe_relative_path(raw_path).ok_or_else(|| {
-            anyhow!(
-                "native-home artifact directory '{}' must be relative and stay within the native home",
-                raw_path.display()
-            )
-        })?;
-        if relative_path.as_os_str().is_empty() {
-            return Err(anyhow!(
-                "native-home artifact directory must not be the native home root"
-            ));
-        }
-        Ok(Self { relative_path })
-    }
-
-    pub fn relative_path(&self) -> &Path {
-        &self.relative_path
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,9 +1,24 @@
-use std::io::ErrorKind;
-use std::path::{Component, Path};
+use std::{
+    ffi::OsStr,
+    fs::File,
+    io::Read,
+    os::unix::ffi::OsStrExt,
+    path::{Component, Path, PathBuf},
+};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use lionclaw_runtime_api::{RuntimeAuthContext, RuntimeAuthPreparation, RuntimeAuthProvider};
+use lionclaw_durable_fs::RootedDirectory;
+use lionclaw_runtime_api::{
+    RuntimeAuthIdentity, RuntimeAuthKind, RuntimeAuthMaterialization, RuntimeAuthPreparation,
+    RuntimeAuthProjection, RuntimeAuthProvider, RuntimeCredentialProjection,
+    MAX_RUNTIME_CREDENTIAL_AGGREGATE_BYTES, MAX_RUNTIME_CREDENTIAL_BYTES,
+};
+use rustix::{
+    fs::{open, openat, FileType, Mode, OFlags},
+    io::Errno,
+};
+use sha2::{Digest, Sha256};
 
 use crate::config::NativeHomeAuthConfig;
 
@@ -19,61 +34,13 @@ impl NativeHomeAuthProvider {
         Self { config }
     }
 
-    async fn validate_source(&self) -> Result<()> {
-        validate_source_root(&self.config.source).await?;
-        for path in &self.config.required_files {
-            validate_source_file(&self.config.source, path, true).await?;
-        }
-        for path in &self.config.optional_files {
-            validate_source_file(&self.config.source, path, false).await?;
-        }
-        Ok(())
+    async fn materialize(&self, staging_root: &Path) -> Result<RuntimeAuthMaterialization> {
+        let config = self.config.clone();
+        let staging_root = staging_root.to_path_buf();
+        tokio::task::spawn_blocking(move || materialize_native_home(&config, &staging_root))
+            .await
+            .context("failed to join native-home credential materialization task")?
     }
-
-    async fn project(&self, runtime_home: &Path) -> Result<()> {
-        validate_source_root(&self.config.source).await?;
-        let target_root = runtime_home.join(&self.config.target);
-        create_private_dir(&target_root).await?;
-
-        for (path, required) in self
-            .config
-            .required_files
-            .iter()
-            .map(|path| (path, true))
-            .chain(self.config.optional_files.iter().map(|path| (path, false)))
-        {
-            if !validate_source_file(&self.config.source, path, required).await? {
-                continue;
-            }
-            let source = self.config.source.join(path);
-            let target = target_root.join(path);
-            if let Some(parent) = target.parent() {
-                create_private_dir(parent).await?;
-            }
-            tokio::fs::copy(&source, &target).await.with_context(|| {
-                format!(
-                    "failed to project native-home file '{}' to '{}'",
-                    source.display(),
-                    target.display()
-                )
-            })?;
-            set_private_file_permissions(&target).await?;
-        }
-        Ok(())
-    }
-}
-
-async fn validate_source_root(source: &Path) -> Result<()> {
-    let metadata = tokio::fs::symlink_metadata(source)
-        .await
-        .with_context(|| format!("failed to inspect native home '{}'", source.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!(
-            "native home '{}' must be a directory and not a symlink",
-            source.display()
-        );
-    }
-    Ok(())
 }
 
 #[async_trait]
@@ -82,102 +49,287 @@ impl RuntimeAuthProvider for NativeHomeAuthProvider {
         NATIVE_HOME_AUTH_KIND
     }
 
-    async fn validate(&self, _context: &RuntimeAuthContext) -> Result<()> {
-        self.validate_source().await
-    }
-
-    async fn prepare(&self, input: RuntimeAuthPreparation<'_>) -> Result<Vec<(String, String)>> {
-        let runtime_home = input.runtime_home_root.ok_or_else(|| {
-            anyhow::anyhow!(
-                "runtime '{}' has no writable runtime home for native-home auth",
+    async fn prepare(
+        &self,
+        input: RuntimeAuthPreparation<'_>,
+    ) -> Result<RuntimeAuthMaterialization> {
+        let staging_root = input.auth_staging_root.ok_or_else(|| {
+            anyhow!(
+                "runtime '{}' has no effect-owned auth staging root for native-home auth",
                 input.runtime_id
             )
         })?;
-        self.project(runtime_home).await?;
-        Ok(Vec::new())
+        self.materialize(staging_root).await
     }
 }
 
-async fn validate_source_file(root: &Path, relative: &Path, required: bool) -> Result<bool> {
-    let mut current = root.to_path_buf();
-    let components = relative.components().collect::<Vec<_>>();
-    for (index, component) in components.iter().enumerate() {
-        let Component::Normal(name) = component else {
-            bail!(
-                "native-home file '{}' must be a clean relative path",
-                relative.display()
+fn materialize_native_home(
+    config: &NativeHomeAuthConfig,
+    staging_root: &Path,
+) -> Result<RuntimeAuthMaterialization> {
+    let staged_files = RootedDirectory::new(staging_root, staging_root)?;
+    let declarations = canonical_declarations(config);
+    let result = (|| {
+        let mut digest = Sha256::new();
+        digest_field(
+            &mut digest,
+            b"domain",
+            b"lionclaw-native-home-auth-identity-v1",
+        );
+        digest_field(&mut digest, b"source", config.source.as_os_str().as_bytes());
+        let mut aggregate_bytes = 0_usize;
+        let mut credentials = Vec::new();
+
+        for (index, (relative, required)) in declarations.iter().enumerate() {
+            digest_field(
+                &mut digest,
+                b"declaration",
+                if *required { b"required" } else { b"optional" },
             );
-        };
-        current.push(name);
-        let metadata = match tokio::fs::symlink_metadata(&current).await {
-            Ok(metadata) => metadata,
-            Err(err) if !required && err.kind() == ErrorKind::NotFound => return Ok(false),
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("failed to inspect native-home file '{}'", current.display())
-                })
+            digest_field(&mut digest, b"path", relative.as_os_str().as_bytes());
+            let staged_name = format!("native-home-credential-{index:04}");
+            let Some(source) = open_source_file(&config.source, relative, *required)? else {
+                digest_field(&mut digest, b"presence", b"absent");
+                staged_files.remove_file(
+                    OsStr::new(&staged_name),
+                    "stale staged native-home credential",
+                )?;
+                continue;
+            };
+            let contents = read_open_file_bounded(source, &config.source.join(relative))?;
+            aggregate_bytes = aggregate_bytes
+                .checked_add(contents.len())
+                .ok_or_else(|| anyhow!("native-home credential aggregate size overflow"))?;
+            if aggregate_bytes > MAX_RUNTIME_CREDENTIAL_AGGREGATE_BYTES {
+                bail!(
+                    "native-home credentials exceed the {} byte aggregate limit",
+                    MAX_RUNTIME_CREDENTIAL_AGGREGATE_BYTES
+                );
             }
-        };
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "native-home file path '{}' contains symlink '{}'",
-                relative.display(),
-                current.display()
+
+            digest_field(&mut digest, b"presence", b"present");
+            digest_field(&mut digest, b"content", &contents);
+            staged_files.write_private_atomic(
+                OsStr::new(&staged_name),
+                &contents,
+                MAX_RUNTIME_CREDENTIAL_BYTES,
+                "staged native-home credential",
+            )?;
+            credentials.push(
+                RuntimeCredentialProjection::new(&staged_name, config.target.join(relative))
+                    .map_err(anyhow::Error::msg)?,
             );
         }
-        let is_leaf = index + 1 == components.len();
-        if (is_leaf && !metadata.is_file()) || (!is_leaf && !metadata.is_dir()) {
-            bail!(
-                "native-home file path '{}' has invalid component '{}'",
-                relative.display(),
-                current.display()
-            );
+
+        let identity = RuntimeAuthIdentity::new(format!(
+            "native-home-auth:v1:{}",
+            hex::encode(digest.finalize())
+        ))
+        .map_err(anyhow::Error::msg)?;
+        Ok(RuntimeAuthMaterialization::new(
+            RuntimeAuthKind::from_static(NATIVE_HOME_AUTH_KIND),
+            identity,
+            RuntimeAuthProjection::new(Vec::new(), credentials),
+        ))
+    })();
+
+    match result {
+        Ok(materialization) => Ok(materialization),
+        Err(error) => {
+            if let Err(cleanup_error) = clear_staged_credentials(&staged_files, declarations.len())
+            {
+                return Err(error.context(format!(
+                    "failed to clear incomplete native-home credentials: {cleanup_error:#}"
+                )));
+            }
+            Err(error)
         }
     }
-    Ok(true)
 }
 
-async fn create_private_dir(path: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(path).await.with_context(|| {
-        format!(
-            "failed to create native-home directory '{}'",
-            path.display()
+fn canonical_declarations(config: &NativeHomeAuthConfig) -> Vec<(PathBuf, bool)> {
+    let mut required = config.required_files.clone();
+    required.sort_by(|left, right| {
+        left.as_os_str()
+            .as_bytes()
+            .cmp(right.as_os_str().as_bytes())
+    });
+    let mut optional = config.optional_files.clone();
+    optional.sort_by(|left, right| {
+        left.as_os_str()
+            .as_bytes()
+            .cmp(right.as_os_str().as_bytes())
+    });
+    required
+        .into_iter()
+        .map(|path| (path, true))
+        .chain(optional.into_iter().map(|path| (path, false)))
+        .collect()
+}
+
+fn clear_staged_credentials(staged_files: &RootedDirectory, count: usize) -> Result<()> {
+    for index in 0..count {
+        staged_files.remove_file(
+            OsStr::new(&format!("native-home-credential-{index:04}")),
+            "incomplete staged native-home credential",
+        )?;
+    }
+    Ok(())
+}
+
+fn digest_field(digest: &mut Sha256, label: &[u8], value: &[u8]) {
+    digest.update(label.len().to_be_bytes());
+    digest.update(label);
+    digest.update(value.len().to_be_bytes());
+    digest.update(value);
+}
+
+fn open_source_file(root: &Path, relative: &Path, required: bool) -> Result<Option<File>> {
+    validate_relative_path(relative)?;
+    let mut directory = open(root, directory_flags(), Mode::empty()).map_err(|error| {
+        anyhow!(
+            "native home '{}' must be an exact real directory: {error}",
+            root.display()
         )
     })?;
-    set_private_dir_permissions(path).await
+    let components = relative.components().collect::<Vec<_>>();
+    let mut display = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            unreachable!("native-home path was validated");
+        };
+        display.push(name);
+        let is_leaf = index + 1 == components.len();
+        let flags = if is_leaf {
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK
+        } else {
+            directory_flags()
+        };
+        let descriptor = match openat(&directory, *name, flags, Mode::empty()) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::NOENT) if !required => return Ok(None),
+            Err(Errno::LOOP | Errno::NOTDIR) => {
+                bail!(
+                    "native-home file path '{}' contains symlink or invalid directory '{}'",
+                    relative.display(),
+                    display.display()
+                )
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to open native-home file '{}': {error}",
+                    display.display()
+                ))
+            }
+        };
+        if is_leaf {
+            let stat = rustix::fs::fstat(&descriptor)
+                .with_context(|| format!("failed to inspect '{}'", display.display()))?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                bail!(
+                    "native-home file '{}' must be a regular file",
+                    display.display()
+                );
+            }
+            return Ok(Some(File::from(descriptor)));
+        }
+        directory = descriptor;
+    }
+    unreachable!("relative path validation requires a component")
 }
 
-#[cfg(unix)]
-async fn set_private_dir_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn validate_relative_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!(
+            "native-home file '{}' must be a clean relative path",
+            path.display()
+        );
+    }
+    Ok(())
+}
 
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .await
-        .with_context(|| {
+fn directory_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK
+}
+
+fn read_open_file_bounded(mut source: File, source_path: &Path) -> Result<Vec<u8>> {
+    let mut contents = Vec::new();
+    consume_open_file_bounded(&mut source, source_path, |chunk| {
+        contents.extend_from_slice(chunk);
+    })?;
+    Ok(contents)
+}
+
+fn consume_open_file_bounded(
+    source: &mut File,
+    source_path: &Path,
+    mut consume: impl FnMut(&[u8]),
+) -> Result<()> {
+    let before = rustix::fs::fstat(&source).with_context(|| {
+        format!(
+            "failed to inspect native-home file '{}'",
+            source_path.display()
+        )
+    })?;
+    if before.st_size > MAX_RUNTIME_CREDENTIAL_BYTES as i64 {
+        bail!(
+            "native-home credential '{}' exceeds the {} byte limit",
+            source_path.display(),
+            MAX_RUNTIME_CREDENTIAL_BYTES
+        );
+    }
+    let mut total = 0;
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut bounded = source.take((MAX_RUNTIME_CREDENTIAL_BYTES + 1) as u64);
+    loop {
+        let read = bounded.read(&mut buffer).with_context(|| {
             format!(
-                "failed to protect native-home directory '{}'",
-                path.display()
+                "failed to read native-home credential '{}'",
+                source_path.display()
             )
-        })
-}
-
-#[cfg(not(unix))]
-async fn set_private_dir_permissions(_path: &Path) -> Result<()> {
+        })?;
+        if read == 0 {
+            break;
+        }
+        total += read;
+        if total > MAX_RUNTIME_CREDENTIAL_BYTES {
+            bail!(
+                "native-home credential '{}' exceeds the {} byte limit",
+                source_path.display(),
+                MAX_RUNTIME_CREDENTIAL_BYTES
+            );
+        }
+        consume(&buffer[..read]);
+    }
+    let after = rustix::fs::fstat(source).with_context(|| {
+        format!(
+            "failed to reinspect native-home file '{}'",
+            source_path.display()
+        )
+    })?;
+    if source_identity(&before) != source_identity(&after) {
+        bail!(
+            "native-home credential '{}' changed while it was read",
+            source_path.display()
+        );
+    }
     Ok(())
 }
 
-#[cfg(unix)]
-async fn set_private_file_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .await
-        .with_context(|| format!("failed to protect native-home file '{}'", path.display()))
-}
-
-#[cfg(not(unix))]
-async fn set_private_file_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+fn source_identity(stat: &rustix::fs::Stat) -> (u64, u64, i64, i64, u64, i64, u64) {
+    (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime,
+        stat.st_mtime_nsec,
+        stat.st_ctime,
+        stat.st_ctime_nsec,
+    )
 }
 
 #[cfg(test)]
@@ -195,10 +347,167 @@ mod tests {
         }
     }
 
+    async fn materialize(
+        provider: &NativeHomeAuthProvider,
+        staging: &Path,
+    ) -> RuntimeAuthMaterialization {
+        let context = RuntimeAuthContext::default();
+        provider
+            .prepare(RuntimeAuthPreparation {
+                runtime_id: "example",
+                network_mode: NetworkMode::On,
+                auth_staging_root: Some(staging),
+                host_context: &context,
+            })
+            .await
+            .expect("materialize native-home auth")
+    }
+
     #[tokio::test]
-    async fn projects_only_declared_files_into_the_ephemeral_home() {
+    async fn identity_tracks_credential_rotation_at_the_same_source_path() {
         let source = tempfile::tempdir().expect("source");
-        let runtime = tempfile::tempdir().expect("runtime");
+        let staging = tempfile::tempdir().expect("staging");
+        std::fs::write(source.path().join("config.toml"), b"token-a").unwrap();
+        let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
+        let first = materialize(&provider, staging.path())
+            .await
+            .identity()
+            .as_str()
+            .to_string();
+
+        std::fs::write(source.path().join("config.toml"), b"token-b").unwrap();
+        let second = materialize(&provider, staging.path())
+            .await
+            .identity()
+            .as_str()
+            .to_string();
+
+        assert_ne!(first, second);
+        assert_eq!(
+            std::fs::read(staging.path().join("native-home-credential-0000")).unwrap(),
+            b"token-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_is_stable_for_unchanged_credential_bytes() {
+        let source = tempfile::tempdir().expect("source");
+        let staging = tempfile::tempdir().expect("staging");
+        std::fs::write(source.path().join("config.toml"), b"stable-token").unwrap();
+        let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
+
+        assert_eq!(
+            materialize(&provider, staging.path()).await.identity(),
+            materialize(&provider, staging.path()).await.identity()
+        );
+    }
+
+    #[tokio::test]
+    async fn declaration_order_does_not_change_identity_or_projection() {
+        let source = tempfile::tempdir().expect("source");
+        let first_staging = tempfile::tempdir().expect("first staging");
+        let second_staging = tempfile::tempdir().expect("second staging");
+        std::fs::create_dir(source.path().join("auth")).unwrap();
+        for (path, contents) in [
+            ("a.toml", b"required-a".as_slice()),
+            ("z.toml", b"required-z".as_slice()),
+            ("auth/a.json", b"optional-a".as_slice()),
+            ("auth/z.json", b"optional-z".as_slice()),
+        ] {
+            std::fs::write(source.path().join(path), contents).unwrap();
+        }
+        let config = |reverse| {
+            let mut required_files = vec![PathBuf::from("a.toml"), PathBuf::from("z.toml")];
+            let mut optional_files =
+                vec![PathBuf::from("auth/a.json"), PathBuf::from("auth/z.json")];
+            if reverse {
+                required_files.reverse();
+                optional_files.reverse();
+            }
+            NativeHomeAuthConfig {
+                source: source.path().to_path_buf(),
+                target: PathBuf::from(".example"),
+                required_files,
+                optional_files,
+            }
+        };
+        let first = materialize(
+            &NativeHomeAuthProvider::new(config(false)),
+            first_staging.path(),
+        )
+        .await;
+        let second = materialize(
+            &NativeHomeAuthProvider::new(config(true)),
+            second_staging.path(),
+        )
+        .await;
+
+        assert_eq!(first.identity(), second.identity());
+        assert_eq!(first.projection(), second.projection());
+        assert_eq!(
+            first
+                .projection()
+                .credentials()
+                .iter()
+                .map(|credential| credential.native_home_target())
+                .collect::<Vec<_>>(),
+            vec![
+                Path::new(".example/a.toml"),
+                Path::new(".example/z.toml"),
+                Path::new(".example/auth/a.json"),
+                Path::new(".example/auth/z.json"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_tracks_optional_credential_presence() {
+        let source = tempfile::tempdir().expect("source");
+        let staging = tempfile::tempdir().expect("staging");
+        std::fs::write(source.path().join("config.toml"), b"config").unwrap();
+        let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
+        let absent = materialize(&provider, staging.path())
+            .await
+            .identity()
+            .clone();
+
+        std::fs::create_dir(source.path().join("auth")).unwrap();
+        std::fs::write(source.path().join("auth/session.json"), b"session").unwrap();
+        let present = materialize(&provider, staging.path())
+            .await
+            .identity()
+            .clone();
+
+        assert_ne!(absent, present);
+    }
+
+    #[tokio::test]
+    async fn identity_does_not_retain_credential_text() {
+        let source = tempfile::tempdir().expect("source");
+        let staging = tempfile::tempdir().expect("staging");
+        let credential = "credential-text-that-must-not-appear";
+        std::fs::write(source.path().join("config.toml"), credential).unwrap();
+        let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
+
+        let identity = materialize(&provider, staging.path())
+            .await
+            .identity()
+            .as_str()
+            .to_string();
+
+        assert!(!identity.contains(credential));
+        assert_eq!(
+            identity.len(),
+            "native-home-auth:v1:".len() + Sha256::output_size() * 2
+        );
+    }
+
+    #[tokio::test]
+    async fn stages_only_declared_files_and_returns_exact_native_home_targets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::tempdir().expect("source");
+        let staging = tempfile::tempdir().expect("staging");
         tokio::fs::create_dir_all(source.path().join("auth"))
             .await
             .unwrap();
@@ -214,43 +523,75 @@ mod tests {
         let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
         let context = RuntimeAuthContext::default();
 
-        let environment = provider
+        let materialization = provider
             .prepare(RuntimeAuthPreparation {
                 runtime_id: "example",
                 network_mode: NetworkMode::On,
-                runtime_home_root: Some(runtime.path()),
+                auth_staging_root: Some(staging.path()),
                 host_context: &context,
             })
             .await
-            .expect("project native home");
+            .expect("stage native-home auth");
+        let projection = materialization.projection();
 
-        assert!(environment.is_empty());
+        assert_eq!(materialization.kind().as_str(), NATIVE_HOME_AUTH_KIND);
+        assert!(projection.environment().is_empty());
         assert_eq!(
-            tokio::fs::read_to_string(runtime.path().join(".example/config.toml"))
+            projection
+                .credentials()
+                .iter()
+                .map(|credential| (
+                    credential.staged_source().to_path_buf(),
+                    credential.native_home_target().to_path_buf()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    PathBuf::from("native-home-credential-0000"),
+                    PathBuf::from(".example/config.toml"),
+                ),
+                (
+                    PathBuf::from("native-home-credential-0001"),
+                    PathBuf::from(".example/auth/session.json"),
+                ),
+            ]
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(staging.path().join("native-home-credential-0000"))
                 .await
                 .unwrap(),
             "model = 'x'\n"
         );
         assert_eq!(
-            tokio::fs::read(runtime.path().join(".example/auth/session.json"))
+            tokio::fs::read(staging.path().join("native-home-credential-0001"))
                 .await
                 .unwrap(),
             b"secret"
         );
-        assert!(!runtime.path().join(".example/unlisted.txt").exists());
+        assert!(!staging.path().join("unlisted.txt").exists());
+        for credential in projection.credentials() {
+            assert_eq!(
+                std::fs::metadata(staging.path().join(credential.staged_source()))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[tokio::test]
     async fn rejects_missing_required_files_and_source_symlinks() {
         let source = tempfile::tempdir().expect("source");
-        let runtime = tempfile::tempdir().expect("runtime");
+        let staging = tempfile::tempdir().expect("staging");
         let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
         let context = RuntimeAuthContext::default();
         let err = provider
             .prepare(RuntimeAuthPreparation {
                 runtime_id: "example",
                 network_mode: NetworkMode::On,
-                runtime_home_root: Some(runtime.path()),
+                auth_staging_root: Some(staging.path()),
                 host_context: &context,
             })
             .await
@@ -266,11 +607,76 @@ mod tests {
                 .unwrap();
             symlink("real.toml", source.path().join("config.toml")).unwrap();
             let err = provider
-                .validate(&context)
+                .prepare(RuntimeAuthPreparation {
+                    runtime_id: "example",
+                    network_mode: NetworkMode::On,
+                    auth_staging_root: Some(staging.path()),
+                    host_context: &context,
+                })
                 .await
                 .expect_err("symlinked auth input");
             assert!(err.to_string().contains("contains symlink"), "got {err:#}");
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_credentials_before_staging() {
+        let source = tempfile::tempdir().expect("source");
+        let staging = tempfile::tempdir().expect("staging");
+        let credential = std::fs::File::create(source.path().join("config.toml")).unwrap();
+        credential
+            .set_len((MAX_RUNTIME_CREDENTIAL_BYTES + 1) as u64)
+            .unwrap();
+        let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
+        let context = RuntimeAuthContext::default();
+
+        let error = provider
+            .prepare(RuntimeAuthPreparation {
+                runtime_id: "example",
+                network_mode: NetworkMode::On,
+                auth_staging_root: Some(staging.path()),
+                host_context: &context,
+            })
+            .await
+            .expect_err("oversized credential must fail before publication");
+
+        assert!(format!("{error:#}").contains("exceeds"));
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_aggregate_overflow_and_removes_partial_staging() {
+        let source = tempfile::tempdir().expect("source");
+        let staging = tempfile::tempdir().expect("staging");
+        let required_files = (0..5)
+            .map(|index| PathBuf::from(format!("credential-{index}")))
+            .collect::<Vec<_>>();
+        for path in &required_files {
+            std::fs::File::create(source.path().join(path))
+                .unwrap()
+                .set_len(MAX_RUNTIME_CREDENTIAL_BYTES as u64)
+                .unwrap();
+        }
+        let provider = NativeHomeAuthProvider::new(NativeHomeAuthConfig {
+            source: source.path().to_path_buf(),
+            target: PathBuf::from(".example"),
+            required_files,
+            optional_files: Vec::new(),
+        });
+        let context = RuntimeAuthContext::default();
+
+        let error = provider
+            .prepare(RuntimeAuthPreparation {
+                runtime_id: "example",
+                network_mode: NetworkMode::On,
+                auth_staging_root: Some(staging.path()),
+                host_context: &context,
+            })
+            .await
+            .expect_err("aggregate overflow must fail before publication");
+
+        assert!(format!("{error:#}").contains("aggregate limit"));
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
@@ -289,11 +695,63 @@ mod tests {
         symlink(outside.path(), source.path().join("auth")).unwrap();
         let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
 
+        let context = RuntimeAuthContext::default();
+        let staging = tempfile::tempdir().expect("staging");
         let err = provider
-            .validate(&RuntimeAuthContext::default())
+            .prepare(RuntimeAuthPreparation {
+                runtime_id: "example",
+                network_mode: NetworkMode::On,
+                auth_staging_root: Some(staging.path()),
+                host_context: &context,
+            })
             .await
             .expect_err("intermediate symlink must not escape the source");
 
         assert!(err.to_string().contains("contains symlink"), "got {err:#}");
+    }
+
+    #[tokio::test]
+    async fn removes_a_stale_optional_staged_credential_when_the_source_disappears() {
+        let source = tempfile::tempdir().expect("source");
+        let staging = tempfile::tempdir().expect("staging");
+        tokio::fs::create_dir_all(source.path().join("auth"))
+            .await
+            .unwrap();
+        tokio::fs::write(source.path().join("config.toml"), b"config")
+            .await
+            .unwrap();
+        let optional = source.path().join("auth/session.json");
+        tokio::fs::write(&optional, b"secret").await.unwrap();
+        let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
+        let context = RuntimeAuthContext::default();
+        let input = || RuntimeAuthPreparation {
+            runtime_id: "example",
+            network_mode: NetworkMode::On,
+            auth_staging_root: Some(staging.path()),
+            host_context: &context,
+        };
+
+        assert_eq!(
+            provider
+                .prepare(input())
+                .await
+                .unwrap()
+                .projection()
+                .credentials()
+                .len(),
+            2
+        );
+        tokio::fs::remove_file(optional).await.unwrap();
+        assert_eq!(
+            provider
+                .prepare(input())
+                .await
+                .unwrap()
+                .projection()
+                .credentials()
+                .len(),
+            1
+        );
+        assert!(!staging.path().join("native-home-credential-0001").exists());
     }
 }

@@ -23,7 +23,7 @@ use super::{
         run_process_attached, run_process_streaming, spawn_process_session, ProcessInvocation,
         ProcessSession,
     },
-    runtime_auth::prepare_runtime_auth,
+    runtime_auth::{prepare_runtime_auth, PreparedCredentialMount, PreparedRuntimeAuth},
     OciConfinementConfig, RuntimeTmpfsEntry,
 };
 use crate::RuntimeSecretsMount;
@@ -110,14 +110,15 @@ impl ExecutionBackend for OciExecutionBackend {
 
     async fn spawn_interactive(&self, request: ExecutionRequest) -> Result<ExecutionSession> {
         let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
-        let runtime_auth_environment = prepare_runtime_auth(&request).await?;
-        let prepared = prepare_oci_process_launch(
+        let runtime_auth = prepare_runtime_auth(&request)?;
+        let prepared = prepare_oci_process_launch_with_runtime_auth(
             &request,
             runtime_secrets
                 .as_ref()
                 .map(|secrets| secrets.secret_name.as_str()),
+            &runtime_auth,
         )?;
-        let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
+        let invocation = build_oci_process_invocation(prepared, runtime_auth.environment());
         let process = spawn_process_session(&invocation).await?;
         Ok(ExecutionSession::Oci(OciExecutionSession {
             process,
@@ -127,14 +128,16 @@ impl ExecutionBackend for OciExecutionBackend {
 
     async fn execute_attached(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
         let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
-        let runtime_auth_environment = prepare_runtime_auth(&request).await?;
-        let prepared = prepare_oci_process_launch(
+        let runtime_auth = prepare_runtime_auth(&request)?;
+        let prepared = prepare_oci_process_launch_with_runtime_auth(
             &request,
             runtime_secrets
                 .as_ref()
                 .map(|secrets| secrets.secret_name.as_str()),
+            &runtime_auth,
         )?;
-        let invocation = build_oci_attached_process_invocation(prepared, &runtime_auth_environment);
+        let invocation =
+            build_oci_attached_process_invocation(prepared, runtime_auth.environment());
         let result = run_process_attached(&invocation).await;
         let runtime_secrets_cleanup_result = match runtime_secrets {
             Some(cleanup) => cleanup.shutdown().await,
@@ -155,14 +158,15 @@ async fn execute_oci_process(
     cleanup_context: &'static str,
 ) -> Result<ExecutionOutput> {
     let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
-    let runtime_auth_environment = prepare_runtime_auth(&request).await?;
-    let prepared = prepare_oci_process_launch(
+    let runtime_auth = prepare_runtime_auth(&request)?;
+    let prepared = prepare_oci_process_launch_with_runtime_auth(
         &request,
         runtime_secrets
             .as_ref()
             .map(|secrets| secrets.secret_name.as_str()),
+        &runtime_auth,
     )?;
-    let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
+    let invocation = build_oci_process_invocation(prepared, runtime_auth.environment());
     let result = run_process_streaming(&invocation, stdout.as_ref()).await;
     let runtime_secrets_cleanup_result = match runtime_secrets {
         Some(cleanup) => cleanup.shutdown().await,
@@ -288,9 +292,22 @@ pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str)
     Ok(identity)
 }
 
+#[cfg(test)]
 fn prepare_oci_process_launch(
     request: &ExecutionRequest,
     runtime_secret_name: Option<&str>,
+) -> Result<PreparedOciProcessLaunch> {
+    prepare_oci_process_launch_with_runtime_auth(
+        request,
+        runtime_secret_name,
+        &PreparedRuntimeAuth::empty(),
+    )
+}
+
+fn prepare_oci_process_launch_with_runtime_auth(
+    request: &ExecutionRequest,
+    runtime_secret_name: Option<&str>,
+    runtime_auth: &PreparedRuntimeAuth,
 ) -> Result<PreparedOciProcessLaunch> {
     let config = request.plan.confinement.oci();
     let image = config.image.as_deref().ok_or_else(|| {
@@ -331,7 +348,17 @@ fn prepare_oci_process_launch(
     }
 
     for mount in &request.plan.mounts {
+        let mount = if mount.target == RUNTIME_HOME_MOUNT_TARGET {
+            runtime_auth.runtime_home_mount().unwrap_or(mount)
+        } else {
+            mount
+        };
         let (flag, spec) = format_bind_mount_arg(mount)?;
+        args.push(flag.to_string());
+        args.push(spec);
+    }
+    for mount in runtime_auth.credential_mounts() {
+        let (flag, spec) = format_private_bind_mount_arg(mount)?;
         args.push(flag.to_string());
         args.push(spec);
     }
@@ -856,28 +883,43 @@ impl BindMountRelabel {
     }
 }
 
-fn format_volume_spec(source: &str, mount: &MountSpec) -> String {
+fn format_volume_spec(source: &str, mount: &MountSpec, relabel: BindMountRelabel) -> String {
     let access = bind_mount_volume_access_option(mount.access);
-    let relabel = bind_mount_relabel(mount).volume_option();
+    let relabel = relabel.volume_option();
     format!("{source}:{}:{access},{relabel}", mount.target)
 }
 
 fn format_bind_mount_arg(mount: &MountSpec) -> Result<(&'static str, String)> {
+    format_bind_mount_arg_with_relabel(mount, bind_mount_relabel(mount))
+}
+
+fn format_private_bind_mount_arg(
+    mount: &PreparedCredentialMount,
+) -> Result<(&'static str, String)> {
+    format_bind_mount_arg_with_relabel(mount.mount_spec(), BindMountRelabel::Private)
+}
+
+fn format_bind_mount_arg_with_relabel(
+    mount: &MountSpec,
+    relabel: BindMountRelabel,
+) -> Result<(&'static str, String)> {
     let argument =
         podman_bind_mount_argument(&mount.source, &mount.target).map_err(anyhow::Error::msg)?;
     match argument.form {
-        PodmanBindMountArgumentForm::Volume => {
-            Ok(("--volume", format_volume_spec(argument.source, mount)))
-        }
-        PodmanBindMountArgumentForm::Mount => {
-            Ok(("--mount", format_mount_spec(argument.source, mount)))
-        }
+        PodmanBindMountArgumentForm::Volume => Ok((
+            "--volume",
+            format_volume_spec(argument.source, mount, relabel),
+        )),
+        PodmanBindMountArgumentForm::Mount => Ok((
+            "--mount",
+            format_mount_spec(argument.source, mount, relabel),
+        )),
     }
 }
 
-fn format_mount_spec(source: &str, mount: &MountSpec) -> String {
+fn format_mount_spec(source: &str, mount: &MountSpec, relabel: BindMountRelabel) -> String {
     let access = bind_mount_mount_access_option(mount.access);
-    let relabel = bind_mount_relabel(mount).mount_option();
+    let relabel = relabel.mount_option();
     format!(
         "type=bind,src={source},target={},{access},{relabel}",
         mount.target
@@ -971,10 +1013,11 @@ mod tests {
 
     use super::{
         build_oci_attached_process_invocation, build_oci_process_invocation,
-        prepare_oci_process_launch, private_network_probe_reached_process_exec,
-        OciExecutionBackend,
+        prepare_oci_process_launch, prepare_oci_process_launch_with_runtime_auth,
+        private_network_probe_reached_process_exec, OciExecutionBackend,
     };
     use crate::backend::{ExecutionBackend, RUNTIME_SECRETS_NAME_PREFIX};
+    use crate::runtime_auth::PreparedRuntimeAuth;
     use crate::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest,
         InstallPolicy, NetworkMode, OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount,
@@ -1309,6 +1352,43 @@ mod tests {
     }
 
     #[test]
+    fn oci_backend_mounts_credentials_after_home_with_private_relabeling() {
+        let request = sample_execution_request();
+        let auth = PreparedRuntimeAuth::for_test(
+            Some(MountSpec {
+                source: "/validated/runtime/home".into(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            }),
+            vec![MountSpec {
+                source: "/host/effect/auth/codex-auth".into(),
+                target: "/runtime/home/.codex/auth.json".to_string(),
+                access: MountAccess::ReadOnly,
+            }],
+        );
+
+        let prepared = prepare_oci_process_launch_with_runtime_auth(&request, None, &auth)
+            .expect("prepare auth overlay");
+        let home = prepared
+            .args
+            .iter()
+            .position(|arg| arg == "/validated/runtime/home:/runtime/home:rw,z")
+            .expect("validated persistent home mount");
+        let credential = prepared
+            .args
+            .iter()
+            .position(|arg| {
+                arg == "/host/effect/auth/codex-auth:/runtime/home/.codex/auth.json:ro,Z"
+            })
+            .expect("private credential mount");
+
+        assert!(
+            credential > home,
+            "credential overlay must follow home mount"
+        );
+    }
+
+    #[test]
     fn oci_backend_emits_channel_send_socket_mount() {
         let mut request = sample_execution_request();
         request.plan.mounts.push(MountSpec {
@@ -1417,8 +1497,8 @@ mod tests {
             },
             resource_name: None,
             runtime_secrets_mount: None,
-            runtime_auth_provider: None,
-            runtime_auth_context: Default::default(),
+            auth_staging_root: None,
+            runtime_auth: None,
         };
 
         let invocation = build_oci_process_invocation(
@@ -1490,8 +1570,8 @@ mod tests {
             program: RuntimeProgramSpec::default(),
             resource_name: None,
             runtime_secrets_mount: None,
-            runtime_auth_provider: None,
-            runtime_auth_context: Default::default(),
+            auth_staging_root: None,
+            runtime_auth: None,
         };
 
         let invocation = build_oci_process_invocation(
@@ -1521,8 +1601,8 @@ mod tests {
             },
             resource_name: None,
             runtime_secrets_mount: None,
-            runtime_auth_provider: None,
-            runtime_auth_context: Default::default(),
+            auth_staging_root: None,
+            runtime_auth: None,
         };
 
         let invocation = build_oci_process_invocation(
@@ -1579,8 +1659,8 @@ mod tests {
                 program: RuntimeProgramSpec::default(),
                 resource_name: None,
                 runtime_secrets_mount: None,
-                runtime_auth_provider: None,
-                runtime_auth_context: Default::default(),
+                auth_staging_root: None,
+                runtime_auth: None,
             },
             None,
         )
@@ -1617,8 +1697,8 @@ mod tests {
                 program: RuntimeProgramSpec::default(),
                 resource_name: None,
                 runtime_secrets_mount: None,
-                runtime_auth_provider: None,
-                runtime_auth_context: Default::default(),
+                auth_staging_root: None,
+                runtime_auth: None,
             },
             None,
         )
@@ -1679,8 +1759,8 @@ esac
             runtime_secrets_mount: Some(RuntimeSecretsMount {
                 source: temp_dir.path().join("runtime-secrets.env"),
             }),
-            runtime_auth_provider: None,
-            runtime_auth_context: Default::default(),
+            auth_staging_root: None,
+            runtime_auth: None,
         };
         fs::write(
             request
@@ -1774,8 +1854,8 @@ esac
             runtime_secrets_mount: Some(RuntimeSecretsMount {
                 source: temp_dir.path().join("runtime-secrets.env"),
             }),
-            runtime_auth_provider: None,
-            runtime_auth_context: Default::default(),
+            auth_staging_root: None,
+            runtime_auth: None,
         };
         fs::write(
             request
@@ -1879,8 +1959,8 @@ esac
             },
             resource_name: None,
             runtime_secrets_mount: None,
-            runtime_auth_provider: None,
-            runtime_auth_context: Default::default(),
+            auth_staging_root: None,
+            runtime_auth: None,
         }
     }
 

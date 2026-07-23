@@ -5,6 +5,8 @@ mod executor;
 mod handoff;
 mod native_home_auth;
 mod prepared_input;
+#[cfg(test)]
+mod real_runtime_continuity_tests;
 mod role_runner;
 
 pub use executor::MissionProgramExecutor;
@@ -23,7 +25,7 @@ use lionclaw_confinement::{
 use crate::config::RuntimeSkillsDir;
 use crate::mission_type::SkillPackage;
 use crate::ports::ExecutionControl;
-use crate::resources::{RoleEffectDirs, RoleStateDirs};
+use crate::resources::{RoleEffectDirs, RuntimeProfileDirs};
 
 pub(crate) async fn await_controlled<T, F, M>(
     mut future: std::pin::Pin<Box<F>>,
@@ -58,12 +60,16 @@ where
 pub const HANDOFF_MOUNT_TARGET: &str = "/mission/handoff";
 pub const SCRATCH_MOUNT_TARGET: &str = "/scratch";
 
-pub(crate) fn effect_mounts(effect: &RoleEffectDirs, role_state: &RoleStateDirs) -> Vec<MountSpec> {
+pub(crate) fn effect_mounts(
+    effect: &RoleEffectDirs,
+    runtime_profile: &RuntimeProfileDirs,
+) -> Vec<MountSpec> {
+    let role_state = runtime_profile.role_state();
     vec![
         rw(effect.handoff(), HANDOFF_MOUNT_TARGET),
         rw(role_state.scratch(), SCRATCH_MOUNT_TARGET),
         rw(role_state.runtime(), RUNTIME_MOUNT_TARGET),
-        rw(effect.runtime_home(), RUNTIME_HOME_MOUNT_TARGET),
+        rw(runtime_profile.native_home(), RUNTIME_HOME_MOUNT_TARGET),
     ]
 }
 
@@ -76,7 +82,7 @@ fn rw(source: &Path, target: &str) -> MountSpec {
 }
 
 pub(crate) fn prepare_skill_mounts(
-    runtime_home: &Path,
+    runtime_profile: &RuntimeProfileDirs,
     skills: &[SkillPackage],
     skills_dir: Option<&RuntimeSkillsDir>,
 ) -> Result<Vec<MountSpec>> {
@@ -89,13 +95,9 @@ pub(crate) fn prepare_skill_mounts(
     skills
         .iter()
         .map(|skill| {
-            let mountpoint = skills_dir.host_mountpoint(runtime_home, &skill.name)?;
-            std::fs::create_dir_all(&mountpoint).with_context(|| {
-                format!(
-                    "creating native skill mountpoint '{}'",
-                    mountpoint.display()
-                )
-            })?;
+            runtime_profile
+                .prepare_native_home_dir(&skills_dir.relative_skill_path(&skill.name)?)
+                .with_context(|| format!("preparing native skill mountpoint '{}'", skill.name))?;
             Ok(MountSpec {
                 source: skill.root.clone(),
                 target: skills_dir.mount_target(&skill.name)?,

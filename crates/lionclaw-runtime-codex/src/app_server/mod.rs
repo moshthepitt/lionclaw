@@ -6,7 +6,6 @@ mod sink;
 mod transport;
 
 pub(crate) use client::{finish_app_server_session, AppServerRequestFailure, CodexAppServerClient};
-pub(crate) use generated_artifacts::CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR;
 pub(crate) use protocol::{
     extract_app_server_model, extract_app_server_thread_id, extract_app_server_turn_id,
     thread_resume_params, thread_start_params, turn_start_params,

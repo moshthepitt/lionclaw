@@ -8,9 +8,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
-use lionclaw_runtime_api::{
-    RuntimeAuthRegistry, RuntimeProgramExecutor, TypedFailure, TypedFailureEvidence,
-};
+use lionclaw_runtime_api::{RuntimeProgramExecutor, TypedFailure, TypedFailureEvidence};
 use tokio::sync::Mutex;
 
 use crate::authority::{compile_role_plan, oracle_authority, MissionMounts, RolePlanRequest};
@@ -183,8 +181,9 @@ impl OracleRunner for OciOracleRunner {
             };
             let mut executor = MissionProgramExecutor::new(
                 compiled.plan().clone(),
-                RuntimeAuthRegistry::empty(),
+                None,
                 &request.effect_id,
+                None,
             );
             // Wall-clock duration is recorded evidence, not fold state; measuring
             // it here is a runner concern that never threatens fold purity.

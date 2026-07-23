@@ -35,13 +35,14 @@ use crate::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, OracleOutcome, OracleRunRequest,
     OracleRunner, RoleRunOutcome, RoleRunRequest, RoleRunner, SystemClock,
 };
+use crate::resources::MissionDirs;
 use crate::runner::MissionProgramExecutor;
 use crate::store::MissionStore;
 use crate::workspace;
 use lionclaw_runtime_api::TypedFailure;
 
 use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
-use lionclaw_runtime_api::{ExecutionOutput, RuntimeAuthRegistry, RuntimeProgramExecutor};
+use lionclaw_runtime_api::{ExecutionOutput, RuntimeProgramExecutor};
 
 const RUNTIME_IMAGE: &str = "localhost/lionclaw-runtime-dev:v1";
 
@@ -606,8 +607,9 @@ async fn run_confined_sh(
     .map_err(|e| anyhow::anyhow!("plan refused to compile: {e}"))?;
     let mut executor = MissionProgramExecutor::new(
         compiled.plan().clone(),
-        RuntimeAuthRegistry::empty(),
+        None,
         &EffectId::for_parts(&["selftest", "confined-command"]),
+        None,
     );
     executor
         .execute_captured(RuntimeProgramSpec {
@@ -1105,20 +1107,36 @@ async fn check_confinement_erofs() -> Result<()> {
 /// (7) Mission skills are mounted read-only at the runtime's native skill path.
 async fn check_runtime_skill_mount() -> Result<()> {
     let workspace = tempfile::tempdir().context("tempdir")?;
-    let runtime_home = tempfile::tempdir().context("tempdir")?;
+    let state = tempfile::tempdir().context("tempdir")?;
     let skill = tempfile::tempdir().context("tempdir")?;
     std::fs::write(skill.path().join("SKILL.md"), "mission-skill-probe\n")
         .context("writing skill probe")?;
 
     let mut profile = RuntimeProfiles::built_in()?.get("codex")?;
     profile.confinement.oci_mut().image = Some(RUNTIME_IMAGE.to_string());
+    let mission = MissionId::for_creation("/workspace", "runtime-skill-mount", 1);
+    let conversation = crate::model::ConversationId::for_role_instance(
+        &mission,
+        crate::model::TaskNamespace::Execution,
+        &TaskId::new("runtime-skill-mount")?,
+        &RoleName::new("validator")?,
+        1,
+    );
+    let mission_dirs = MissionDirs::new(state.path(), &mission);
+    let role_state = mission_dirs
+        .conversation(&conversation)
+        .role_state()
+        .clone();
+    role_state.prepare()?;
+    let runtime_profile = role_state.runtime_profile(&profile.native_state_key(None))?;
+    runtime_profile.prepare()?;
     let mut extras = vec![MountSpec {
-        source: runtime_home.path().to_path_buf(),
+        source: runtime_profile.native_home().to_path_buf(),
         target: lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET.to_string(),
         access: MountAccess::ReadWrite,
     }];
     extras.extend(crate::runner::prepare_skill_mounts(
-        runtime_home.path(),
+        &runtime_profile,
         &[crate::mission_type::SkillPackage {
             name: "mission-probe".to_string(),
             root: skill.path().to_path_buf(),
@@ -1145,8 +1163,9 @@ async fn check_runtime_skill_mount() -> Result<()> {
     .map_err(|err| anyhow::anyhow!("plan refused to compile: {err}"))?;
     let mut executor = MissionProgramExecutor::new(
         compiled.plan().clone(),
-        RuntimeAuthRegistry::empty(),
+        None,
         &EffectId::for_parts(&["selftest", "readonly-inspection"]),
+        None,
     );
     let output = executor
         .execute_captured(RuntimeProgramSpec {
@@ -1169,7 +1188,7 @@ async fn check_runtime_skill_mount() -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    std::fs::remove_dir_all(runtime_home.path().join(".agents"))
+    std::fs::remove_dir_all(runtime_profile.native_home().join(".agents"))
         .context("native skill mountpoints were not removable after the container exited")?;
     Ok(())
 }

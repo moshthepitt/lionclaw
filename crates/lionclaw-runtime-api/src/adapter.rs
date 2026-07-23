@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::{
-    context::{RuntimeExecutionContext, RuntimeNativeHomeArtifactDir},
+    context::RuntimeExecutionContext,
     event::RuntimeTurnJournalSender,
     program::{RuntimeProgramExecutor, RuntimeProgramSpec},
     state::{RuntimeSessionReady, RuntimeStateDir},
@@ -126,9 +126,6 @@ pub enum RuntimeCancellation {
 #[async_trait]
 pub trait RuntimeAdapter: Send + Sync {
     async fn info(&self) -> RuntimeAdapterInfo;
-    fn native_home_artifact_dirs(&self) -> Result<Vec<RuntimeNativeHomeArtifactDir>> {
-        Ok(Vec::new())
-    }
     fn native_reopen_recovery(&self) -> RuntimeNativeReopenRecovery {
         RuntimeNativeReopenRecovery::Unsupported
     }

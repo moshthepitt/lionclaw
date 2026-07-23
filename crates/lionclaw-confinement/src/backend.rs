@@ -1,9 +1,9 @@
-use std::{fmt, path::PathBuf, sync::Arc};
+use std::{fmt, path::PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw_runtime_api::{
-    RuntimeAuthContext, RuntimeAuthProvider, RuntimeProgramSession, RuntimeProgramStdoutSender,
+    RuntimeAuthMaterialization, RuntimeProgramSession, RuntimeProgramStdoutSender,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -52,8 +52,10 @@ pub struct ExecutionRequest {
     /// effects set this so a later process can reap resources after a crash.
     pub resource_name: Option<String>,
     pub runtime_secrets_mount: Option<RuntimeSecretsMount>,
-    pub runtime_auth_provider: Option<Arc<dyn RuntimeAuthProvider>>,
-    pub runtime_auth_context: RuntimeAuthContext,
+    /// Exact effect-owned root where the selected auth provider may stage
+    /// credentials for confinement-controlled projection.
+    pub auth_staging_root: Option<PathBuf>,
+    pub runtime_auth: Option<RuntimeAuthMaterialization>,
 }
 
 impl fmt::Debug for ExecutionRequest {
@@ -63,14 +65,8 @@ impl fmt::Debug for ExecutionRequest {
             .field("program", &self.program)
             .field("resource_name", &self.resource_name)
             .field("runtime_secrets_mount", &self.runtime_secrets_mount)
-            .field(
-                "runtime_auth_provider",
-                &self
-                    .runtime_auth_provider
-                    .as_ref()
-                    .map(|provider| provider.kind()),
-            )
-            .field("runtime_auth_context", &self.runtime_auth_context)
+            .field("auth_staging_root", &self.auth_staging_root)
+            .field("runtime_auth", &self.runtime_auth)
             .finish()
     }
 }
@@ -174,9 +170,6 @@ pub async fn execute_attached(request: ExecutionRequest) -> Result<ExecutionOutp
 
 #[cfg(test)]
 mod tests {
-
-    use lionclaw_runtime_api::RuntimeAuthContext;
-
     use super::{ExecutionRequest, RuntimeSecretsMount, RUNTIME_SECRETS_NAME_PREFIX};
     use crate::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, NetworkMode,
@@ -215,15 +208,15 @@ mod tests {
                 runtime_secrets_mount: Some(super::RuntimeSecretsMount {
                     source: "/tmp/runtime-secrets.env".into(),
                 }),
-                runtime_auth_provider: None,
-                runtime_auth_context: RuntimeAuthContext::default(),
+                auth_staging_root: Some("/tmp/runtime-auth".into()),
+                runtime_auth: None,
             }
         );
 
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("sk-secret"));
         assert!(!debug.contains("hello"));
-        assert!(debug.contains("runtime_auth_context"));
+        assert!(debug.contains("runtime_auth"));
     }
 
     #[test]

@@ -1,8 +1,7 @@
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
-    fs::{File, Metadata},
-    io::{ErrorKind, Write},
+    ffi::OsStr,
+    fmt::Write as _,
     path::{Path, PathBuf},
     time::Duration as StdDuration,
 };
@@ -12,18 +11,21 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use lionclaw_runtime_api::{
-    NetworkMode, RuntimeAuthContext, RuntimeAuthPreparation, RuntimeAuthProvider,
+    NetworkMode, RuntimeAuthContext, RuntimeAuthIdentity, RuntimeAuthKind,
+    RuntimeAuthMaterialization, RuntimeAuthPreparation, RuntimeAuthProjection, RuntimeAuthProvider,
+    RuntimeCredentialProjection, MAX_RUNTIME_CREDENTIAL_BYTES,
 };
 use reqwest::StatusCode;
 use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uuid::Uuid;
+use sha2::{Digest, Sha256};
 
-use lionclaw_durable_fs::write_file_atomically;
+use lionclaw_durable_fs::RootedDirectory;
 
 const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const CODEX_AUTH_FILE_NAME: &str = "auth.json";
+const STAGED_CODEX_AUTH_FILE_NAME: &str = "codex-auth.json";
 const CODEX_AUTH_LOCK_FILE_NAME: &str = ".lionclaw-auth.lock";
 const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -42,30 +44,17 @@ impl RuntimeAuthProvider for CodexRuntimeAuthProvider {
         crate::CODEX_RUNTIME_AUTH_KIND
     }
 
-    async fn validate(&self, context: &RuntimeAuthContext) -> Result<()> {
-        ensure_codex_host_auth_ready(codex_home_override(context)).await
-    }
-
-    async fn prepare(&self, input: RuntimeAuthPreparation<'_>) -> Result<Vec<(String, String)>> {
+    async fn prepare(
+        &self,
+        input: RuntimeAuthPreparation<'_>,
+    ) -> Result<RuntimeAuthMaterialization> {
         prepare_codex_runtime_auth(
             input.runtime_id,
             input.network_mode == NetworkMode::On,
-            input.runtime_home_root,
+            input.auth_staging_root,
             codex_home_override(input.host_context),
         )
         .await
-    }
-
-    fn host_home_override_env(&self) -> Option<&'static str> {
-        Some(CODEX_HOME_ENV)
-    }
-
-    fn identity(&self, context: &RuntimeAuthContext) -> Result<Option<String>> {
-        codex_home_identity(codex_home_override(context))
-    }
-
-    fn guidance(&self) -> Option<&'static str> {
-        Some("Codex auth is checked at launch; run `codex login` on the host if launch reports missing auth.")
     }
 }
 
@@ -75,8 +64,8 @@ fn codex_home_override(context: &RuntimeAuthContext) -> Option<&Path> {
 
 #[derive(Debug, Clone)]
 struct CodexAuthStore {
-    auth_path: PathBuf,
-    lock_path: PathBuf,
+    home: PathBuf,
+    files: RootedDirectory,
 }
 
 struct CodexAuthStoreLock {
@@ -94,86 +83,69 @@ impl CodexAuthStore {
             })
             .or_else(default_codex_home)
             .ok_or_else(|| anyhow!("could not resolve host Codex home; HOME is not set"))?;
+        let files = RootedDirectory::new(codex_home.clone(), codex_home.clone())?;
         Ok(Self {
-            auth_path: codex_home.join(CODEX_AUTH_FILE_NAME),
-            lock_path: codex_home.join(CODEX_AUTH_LOCK_FILE_NAME),
+            home: codex_home,
+            files,
         })
     }
 
     async fn lock(&self) -> Result<CodexAuthStoreLock> {
-        let lock_path = self.lock_path.clone();
-        tokio::task::spawn_blocking(move || acquire_codex_auth_lock(&lock_path))
+        let files = self.files.clone();
+        tokio::task::spawn_blocking(move || acquire_codex_auth_lock(&files))
             .await
             .context("failed to join Codex auth lock task")?
     }
 
     async fn read(&self) -> Result<(CodexAuthFile, Option<DateTime<Utc>>)> {
-        let metadata = self.auth_metadata().await?;
-        let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
-        let raw = tokio::fs::read_to_string(&self.auth_path)
-            .await
-            .with_context(|| format!("failed to read {}", self.auth_path.display()))?;
-        let auth = serde_json::from_str::<CodexAuthFile>(&raw)
-            .with_context(|| format!("failed to parse {}", self.auth_path.display()))?;
-        Ok((auth, modified_at))
+        let files = self.files.clone();
+        let auth_path = self.auth_path();
+        tokio::task::spawn_blocking(move || {
+            let Some((raw, metadata)) = files.read_private_bounded_with_metadata(
+                OsStr::new(CODEX_AUTH_FILE_NAME),
+                MAX_RUNTIME_CREDENTIAL_BYTES,
+                "host Codex auth",
+            )?
+            else {
+                bail!(
+                    "no usable host Codex auth found at '{}'; sign in locally with `codex login`",
+                    auth_path.display()
+                );
+            };
+            let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
+            let auth = serde_json::from_slice::<CodexAuthFile>(&raw)
+                .with_context(|| format!("failed to parse {}", auth_path.display()))?;
+            Ok((auth, modified_at))
+        })
+        .await
+        .context("failed to join Codex auth read task")?
     }
 
     async fn write(&self, auth: &CodexAuthFile) -> Result<()> {
-        let metadata = self.auth_metadata().await?;
         let encoded =
             serde_json::to_vec_pretty(auth).context("failed to encode refreshed Codex auth")?;
-        let temp_path = self.auth_path.with_file_name(format!(
-            ".lionclaw-codex-auth-{}.tmp",
-            Uuid::new_v4().simple()
-        ));
-        write_private_temp_file(&temp_path, encoded, metadata.permissions()).await?;
-        if let Err(err) = tokio::fs::rename(&temp_path, &self.auth_path).await {
-            drop(tokio::fs::remove_file(&temp_path).await);
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to replace refreshed Codex auth at {}",
-                    self.auth_path.display()
-                )
-            });
-        }
-        Ok(())
+        let files = self.files.clone();
+        tokio::task::spawn_blocking(move || {
+            files.write_private_atomic(
+                OsStr::new(CODEX_AUTH_FILE_NAME),
+                &encoded,
+                MAX_RUNTIME_CREDENTIAL_BYTES,
+                "host Codex auth",
+            )
+        })
+        .await
+        .context("failed to join Codex auth write task")?
     }
 
-    async fn auth_metadata(&self) -> Result<Metadata> {
-        let metadata = match tokio::fs::symlink_metadata(&self.auth_path).await {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                bail!(
-                    "no usable host Codex auth found at '{}'; sign in locally with `codex login`",
-                    self.auth_path.display()
-                );
-            }
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to stat {}", self.auth_path.display()));
-            }
-        };
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "host Codex auth file '{}' must not be a symlink",
-                self.auth_path.display()
-            );
-        }
-        if !metadata.file_type().is_file() {
-            bail!(
-                "host Codex auth file '{}' must be a regular file",
-                self.auth_path.display()
-            );
-        }
-        harden_private_file_permissions(&self.auth_path, &metadata, "host Codex auth").await?;
-        tokio::fs::symlink_metadata(&self.auth_path)
-            .await
-            .with_context(|| format!("failed to stat {}", self.auth_path.display()))
+    fn auth_path(&self) -> PathBuf {
+        self.home.join(CODEX_AUTH_FILE_NAME)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexAuthFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_mode: Option<String>,
     #[serde(rename = "OPENAI_API_KEY", default)]
     openai_api_key: Option<String>,
     #[serde(default)]
@@ -205,67 +177,60 @@ struct OpenAiRefreshResponse {
     refresh_token: Option<String>,
 }
 
-pub async fn ensure_codex_host_auth_ready(codex_home_override: Option<&Path>) -> Result<()> {
-    load_ready_codex_home(codex_home_override, OPENAI_OAUTH_TOKEN_URL)
-        .await
-        .map(|_| ())
-}
-
-pub async fn sync_codex_home_into_runtime_home(
-    runtime_home_root: &Path,
-    codex_home_override: Option<&Path>,
-) -> Result<()> {
-    let ready = load_ready_codex_home(codex_home_override, OPENAI_OAUTH_TOKEN_URL).await?;
-    ensure_runtime_codex_directory(runtime_home_root).await?;
-    write_runtime_codex_file(
-        runtime_home_root,
-        CODEX_AUTH_FILE_NAME,
-        serde_json::to_vec_pretty(&ready.auth).context("failed to encode synced Codex auth")?,
-        private_file_permissions(),
+async fn stage_ready_codex_auth(
+    auth_staging_root: &Path,
+    contents: Vec<u8>,
+) -> Result<RuntimeCredentialProjection> {
+    let staging_root = auth_staging_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let files = RootedDirectory::new(staging_root.clone(), staging_root)?;
+        files.write_private_atomic(
+            OsStr::new(STAGED_CODEX_AUTH_FILE_NAME),
+            &contents,
+            MAX_RUNTIME_CREDENTIAL_BYTES,
+            "staged Codex auth",
+        )
+    })
+    .await
+    .context("failed to join Codex auth staging task")??;
+    RuntimeCredentialProjection::new(
+        STAGED_CODEX_AUTH_FILE_NAME,
+        Path::new(".codex").join(CODEX_AUTH_FILE_NAME),
     )
-    .await?;
-    Ok(())
+    .map_err(anyhow::Error::msg)
 }
 
-pub async fn prepare_codex_runtime_auth(
+async fn prepare_codex_runtime_auth(
     runtime_id: &str,
     network_enabled: bool,
-    runtime_home_root: Option<&Path>,
+    auth_staging_root: Option<&Path>,
     codex_home_override: Option<&Path>,
-) -> Result<Vec<(String, String)>> {
+) -> Result<RuntimeAuthMaterialization> {
     if !network_enabled {
         bail!(
             "runtime '{runtime_id}' requires network-mode 'on' when Codex runtime auth is enabled"
         );
     }
 
-    let runtime_home_root = runtime_home_root.ok_or_else(|| {
+    let auth_staging_root = auth_staging_root.ok_or_else(|| {
         anyhow!(
-            "runtime '{runtime_id}' requires a /runtime/home mount when Codex runtime auth is enabled"
+            "runtime '{runtime_id}' requires an effect-owned auth staging root when Codex runtime auth is enabled"
         )
     })?;
-    sync_codex_home_into_runtime_home(runtime_home_root, codex_home_override).await?;
+    let ready = load_ready_codex_home(codex_home_override, OPENAI_OAUTH_TOKEN_URL).await?;
+    let contents = ready.serialized_auth()?;
+    let identity = ready.identity(&contents)?;
+    let credential = stage_ready_codex_auth(auth_staging_root, contents).await?;
+    let projection = RuntimeAuthProjection::new(
+        vec![(CODEX_HOME_ENV.to_string(), CONTAINER_CODEX_HOME.to_string())],
+        vec![credential],
+    );
 
-    Ok(vec![(
-        CODEX_HOME_ENV.to_string(),
-        CONTAINER_CODEX_HOME.to_string(),
-    )])
-}
-
-pub fn codex_home_identity(codex_home_override: Option<&Path>) -> Result<Option<String>> {
-    let path = match codex_home_override {
-        Some(path) => path.to_path_buf(),
-        None => {
-            let Some(home) = std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-            else {
-                return Ok(None);
-            };
-            home.join(".codex")
-        }
-    };
-    normalize_identity_path(&path).map(Some)
+    Ok(RuntimeAuthMaterialization::new(
+        RuntimeAuthKind::from_static(crate::CODEX_RUNTIME_AUTH_KIND),
+        identity,
+        projection,
+    ))
 }
 
 fn normalize_identity_path(path: &Path) -> Result<String> {
@@ -280,7 +245,66 @@ fn normalize_identity_path(path: &Path) -> Result<String> {
 
 #[derive(Debug, Clone)]
 struct ReadyCodexHome {
+    home: PathBuf,
     auth: CodexAuthFile,
+}
+
+impl ReadyCodexHome {
+    fn serialized_auth(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec_pretty(&self.auth).context("failed to encode staged Codex auth")
+    }
+
+    fn identity(&self, serialized_auth: &[u8]) -> Result<RuntimeAuthIdentity> {
+        let home = normalize_identity_path(&self.home)?;
+        let scope = match effective_auth_mode(&self.auth)? {
+            EffectiveCodexAuthMode::ApiKey => {
+                let api_key = nonempty(self.auth.openai_api_key.as_deref())
+                    .ok_or_else(|| anyhow!("host Codex API-key auth has no API key"))?;
+                format!("api-key-sha256:{}", sha256_hex(api_key.as_bytes())?)
+            }
+            EffectiveCodexAuthMode::Chatgpt => self
+                .auth
+                .tokens
+                .as_ref()
+                .and_then(|tokens| nonempty(tokens.account_id.as_deref()))
+                .map_or_else(
+                    || {
+                        sha256_hex(serialized_auth)
+                            .map(|digest| format!("credential-sha256:{digest}"))
+                    },
+                    |account_id| Ok(format!("account:{account_id}")),
+                )?,
+        };
+        RuntimeAuthIdentity::new(format!("lionclaw-codex-auth-v1\n{home}\n{scope}"))
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveCodexAuthMode {
+    ApiKey,
+    Chatgpt,
+}
+
+fn effective_auth_mode(auth: &CodexAuthFile) -> Result<EffectiveCodexAuthMode> {
+    match auth.auth_mode.as_deref() {
+        Some("apikey") => Ok(EffectiveCodexAuthMode::ApiKey),
+        Some("chatgpt") => Ok(EffectiveCodexAuthMode::Chatgpt),
+        Some(mode) => bail!("unsupported host Codex auth mode '{mode}'"),
+        None if nonempty(auth.openai_api_key.as_deref()).is_some() => {
+            Ok(EffectiveCodexAuthMode::ApiKey)
+        }
+        None => Ok(EffectiveCodexAuthMode::Chatgpt),
+    }
+}
+
+fn sha256_hex(input: &[u8]) -> Result<String> {
+    let digest = Sha256::digest(input);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").context("failed to encode credential digest")?;
+    }
+    Ok(encoded)
 }
 
 async fn load_ready_codex_home(
@@ -290,13 +314,19 @@ async fn load_ready_codex_home(
     let store = CodexAuthStore::resolve(codex_home_override)?;
     let (auth, modified_at) = store.read().await?;
     if !codex_auth_needs_refresh(&store, &auth, modified_at)? {
-        return Ok(ReadyCodexHome { auth });
+        return Ok(ReadyCodexHome {
+            home: store.home.clone(),
+            auth,
+        });
     }
 
     let _lock = store.lock().await?;
     let (mut auth, modified_at) = store.read().await?;
     if !codex_auth_needs_refresh(&store, &auth, modified_at)? {
-        return Ok(ReadyCodexHome { auth });
+        return Ok(ReadyCodexHome {
+            home: store.home.clone(),
+            auth,
+        });
     }
 
     let refresh_token = auth
@@ -309,13 +339,16 @@ async fn load_ready_codex_home(
     let refreshed = refresh_codex_tokens(refresh_url, &refresh_token).await?;
     apply_refreshed_codex_tokens(&mut auth, refreshed)?;
     store.write(&auth).await?;
-    Ok(ReadyCodexHome { auth })
+    Ok(ReadyCodexHome {
+        home: store.home,
+        auth,
+    })
 }
 
 fn missing_codex_auth(store: &CodexAuthStore) -> anyhow::Error {
     anyhow!(
         "no usable host Codex auth found at '{}'; sign in locally with `codex login`",
-        store.auth_path.display()
+        store.auth_path().display()
     )
 }
 
@@ -324,8 +357,10 @@ fn codex_auth_needs_refresh(
     auth: &CodexAuthFile,
     modified_at: Option<DateTime<Utc>>,
 ) -> Result<bool> {
-    if nonempty(auth.openai_api_key.as_deref()).is_some() {
-        return Ok(false);
+    if effective_auth_mode(auth)? == EffectiveCodexAuthMode::ApiKey {
+        return nonempty(auth.openai_api_key.as_deref())
+            .map(|_| false)
+            .ok_or_else(|| missing_codex_auth(store));
     }
 
     let access_token = auth
@@ -449,297 +484,18 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-fn acquire_codex_auth_lock(lock_path: &Path) -> Result<CodexAuthStoreLock> {
-    if let Ok(metadata) = std::fs::symlink_metadata(lock_path) {
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "Codex auth lock file '{}' must not be a symlink",
-                lock_path.display()
-            );
-        }
-        if !metadata.file_type().is_file() {
-            bail!(
-                "Codex auth lock file '{}' must be a regular file",
-                lock_path.display()
-            );
-        }
-    }
-
-    let file = open_private_file(lock_path, true)
-        .with_context(|| format!("failed to open {}", lock_path.display()))?;
-    flock(&file, FlockOperation::LockExclusive)
-        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
-    Ok(CodexAuthStoreLock { _file: file })
-}
-
-async fn write_private_temp_file(
-    path: &Path,
-    contents: Vec<u8>,
-    permissions: std::fs::Permissions,
-) -> Result<()> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        write_private_temp_file_blocking(&path, contents, permissions)
-    })
-    .await
-    .context("failed to join Codex auth temp-file write task")?
-}
-
-fn write_private_temp_file_blocking(
-    path: &Path,
-    contents: Vec<u8>,
-    permissions: std::fs::Permissions,
-) -> Result<()> {
-    let mut file = open_private_file(path, false)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    file.write_all(&contents)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync {}", path.display()))?;
-    set_private_file_permissions(path, permissions)
-        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_private_file(path: &Path, create: bool) -> Result<std::fs::File> {
-    use rustix::fs::{open, Mode, OFlags};
-
-    let mut flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    if create {
-        flags |= OFlags::CREATE;
-    } else {
-        flags |= OFlags::CREATE | OFlags::EXCL;
-    }
-
-    open(path, flags, Mode::from_raw_mode(0o600))
-        .map(std::fs::File::from)
-        .map_err(Into::into)
-}
-
-#[cfg(not(unix))]
-fn open_private_file(path: &Path, create: bool) -> Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true);
-    if create {
-        options.create(true);
-    } else {
-        options.create_new(true);
-    }
-    options.open(path).map_err(Into::into)
-}
-
-#[cfg(unix)]
-fn set_private_file_permissions(path: &Path, permissions: std::fs::Permissions) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = permissions;
-    permissions.set_mode(permissions.mode() & 0o700);
-    std::fs::set_permissions(path, permissions).map_err(Into::into)
-}
-
-#[cfg(not(unix))]
-fn set_private_file_permissions(path: &Path, permissions: std::fs::Permissions) -> Result<()> {
-    std::fs::set_permissions(path, permissions).map_err(Into::into)
-}
-
-async fn harden_private_file_permissions(
-    path: &Path,
-    metadata: &Metadata,
-    label: &str,
-) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let file_mode = metadata.permissions().mode();
-        if file_mode & 0o077 != 0 {
-            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .await
-                .with_context(|| format!("failed to chmod {} '{}'", label, path.display()))?;
-        }
-    }
-
-    #[cfg(not(unix))]
-    let _ = (path, metadata, label);
-
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn ensure_runtime_codex_directory(runtime_home_root: &Path) -> Result<()> {
-    let runtime_home_root = runtime_home_root.to_path_buf();
-    tokio::task::spawn_blocking(move || ensure_runtime_codex_directory_blocking(&runtime_home_root))
-        .await
-        .context("failed to join runtime Codex directory task")?
-}
-
-#[cfg(unix)]
-fn ensure_runtime_codex_directory_blocking(runtime_home_root: &Path) -> Result<()> {
-    let root = open_runtime_home_root(runtime_home_root)?;
-    let codex_home_path = runtime_codex_home_path(runtime_home_root);
-    let _codex_home = ensure_runtime_codex_child_dir(&root, ".codex", &codex_home_path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn ensure_runtime_codex_child_dir(parent: &File, name: &str, display_path: &Path) -> Result<File> {
-    use rustix::{
-        fs::{mkdirat, openat, Mode, OFlags},
-        io::Errno,
-    };
-    use std::os::unix::fs::PermissionsExt;
-
-    match mkdirat(parent, name, Mode::from_raw_mode(0o755)) {
-        Ok(()) | Err(Errno::EXIST) => {}
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to create {}", display_path.display()))
-        }
-    }
-    let dir = openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .with_context(|| format!("failed to open {}", display_path.display()))?;
-    let dir = File::from(dir);
-    dir.set_permissions(std::fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("failed to chmod {}", display_path.display()))?;
-    Ok(dir)
-}
-
-#[cfg(unix)]
-fn open_runtime_home_root(runtime_home_root: &Path) -> Result<File> {
-    use rustix::fs::{open, Mode, OFlags};
-
-    let root = open(
-        runtime_home_root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .with_context(|| format!("failed to open {}", runtime_home_root.display()))?;
-    Ok(File::from(root))
-}
-
-#[cfg(unix)]
-fn open_runtime_codex_home(runtime_home_root: &Path) -> Result<File> {
-    use rustix::fs::{openat, Mode, OFlags};
-
-    let root = open_runtime_home_root(runtime_home_root)?;
-    let codex_home = openat(
-        &root,
-        ".codex",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .with_context(|| {
+fn acquire_codex_auth_lock(files: &RootedDirectory) -> Result<CodexAuthStoreLock> {
+    let file = files.open_private_lock_file(
+        OsStr::new(CODEX_AUTH_LOCK_FILE_NAME),
+        "Codex auth lock file",
+    )?;
+    flock(&file, FlockOperation::LockExclusive).with_context(|| {
         format!(
-            "failed to open {}",
-            runtime_codex_home_path(runtime_home_root).display()
+            "failed to lock {}",
+            files.path().join(CODEX_AUTH_LOCK_FILE_NAME).display()
         )
     })?;
-    Ok(File::from(codex_home))
-}
-
-#[cfg(not(unix))]
-async fn ensure_runtime_codex_directory(runtime_home_root: &Path) -> Result<()> {
-    let path = runtime_codex_home_path(runtime_home_root);
-    tokio::fs::create_dir_all(&path)
-        .await
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn write_runtime_codex_file(
-    runtime_home_root: &Path,
-    file_name: &str,
-    contents: Vec<u8>,
-    permissions: std::fs::Permissions,
-) -> Result<()> {
-    let runtime_home_root = runtime_home_root.to_path_buf();
-    let file_name = file_name.to_string();
-    tokio::task::spawn_blocking(move || {
-        write_runtime_codex_file_blocking(&runtime_home_root, &file_name, contents, permissions)
-    })
-    .await
-    .context("failed to join runtime Codex file write task")?
-}
-
-#[cfg(unix)]
-fn write_runtime_codex_file_blocking(
-    runtime_home_root: &Path,
-    file_name: &str,
-    contents: Vec<u8>,
-    permissions: std::fs::Permissions,
-) -> Result<()> {
-    let target_name = runtime_codex_file_name(file_name)?;
-    let runtime_codex_home = open_runtime_codex_home(runtime_home_root)?;
-    let runtime_codex_home_path = runtime_codex_home_path(runtime_home_root);
-    write_file_atomically(
-        &runtime_codex_home,
-        &runtime_codex_home_path,
-        &target_name,
-        &contents,
-        0o600,
-        Some(permissions),
-        "runtime Codex file",
-    )
-}
-
-#[cfg(unix)]
-fn runtime_codex_file_name(file_name: &str) -> Result<OsString> {
-    let path = Path::new(file_name);
-    let mut components = path.components();
-    let Some(std::path::Component::Normal(name)) = components.next() else {
-        bail!("runtime Codex file name '{file_name}' is invalid");
-    };
-    if components.next().is_some() {
-        bail!("runtime Codex file name '{file_name}' is invalid");
-    }
-    Ok(OsString::from(name))
-}
-
-#[cfg(not(unix))]
-async fn write_runtime_codex_file(
-    runtime_home_root: &Path,
-    file_name: &str,
-    contents: Vec<u8>,
-    permissions: std::fs::Permissions,
-) -> Result<()> {
-    let runtime_codex_home = runtime_codex_home_path(runtime_home_root);
-    let path = runtime_codex_home.join(file_name);
-    let temp_path = runtime_codex_home.join(format!(
-        ".lionclaw-runtime-codex-{}.tmp",
-        Uuid::new_v4().simple()
-    ));
-    write_private_temp_file(&temp_path, contents, private_file_permissions()).await?;
-    if let Err(err) = tokio::fs::rename(&temp_path, &path).await {
-        drop(tokio::fs::remove_file(&temp_path).await);
-        return Err(err).with_context(|| format!("failed to replace {}", path.display()));
-    }
-    tokio::fs::set_permissions(&path, permissions)
-        .await
-        .with_context(|| format!("failed to chmod {}", path.display()))
-}
-
-fn runtime_codex_home_path(runtime_home_root: &Path) -> PathBuf {
-    runtime_home_root.join(".codex")
-}
-
-#[cfg(unix)]
-fn private_file_permissions() -> std::fs::Permissions {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::Permissions::from_mode(0o600)
-}
-
-#[cfg(not(unix))]
-fn private_file_permissions() -> std::fs::Permissions {
-    std::fs::metadata(".")
-        .map(|metadata| metadata.permissions())
-        .unwrap_or_else(|_| std::fs::Permissions::readonly())
+    Ok(CodexAuthStoreLock { _file: file })
 }
 
 #[cfg(test)]
@@ -775,6 +531,200 @@ mod tests {
         .expect("write auth file");
     }
 
+    async fn materialize_auth(
+        root: &Path,
+        codex_home: &Path,
+        staging_name: &str,
+    ) -> RuntimeAuthMaterialization {
+        let staging = root.join(staging_name);
+        tokio::fs::create_dir(&staging)
+            .await
+            .expect("create staging");
+        try_materialize_auth(&staging, codex_home)
+            .await
+            .expect("prepare Codex auth")
+    }
+
+    async fn try_materialize_auth(
+        staging: &Path,
+        codex_home: &Path,
+    ) -> Result<RuntimeAuthMaterialization> {
+        let context = RuntimeAuthContext::new()
+            .with_home_override(crate::CODEX_RUNTIME_AUTH_KIND, codex_home);
+        CodexRuntimeAuthProvider
+            .prepare(RuntimeAuthPreparation {
+                runtime_id: "codex",
+                network_mode: NetworkMode::On,
+                auth_staging_root: Some(staging),
+                host_context: &context,
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn materialization_keeps_account_identity_stable_across_token_refresh() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let codex_home = root.path().join(".codex");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "tokens": {
+                    "account_id": "account-a",
+                    "access_token": fake_jwt(Utc::now() + Duration::minutes(30))
+                }
+            }),
+        )
+        .await;
+        let first = materialize_auth(root.path(), &codex_home, "first-staging").await;
+
+        write_auth_file(
+            &codex_home,
+            json!({
+                "tokens": {
+                    "account_id": "account-a",
+                    "access_token": fake_jwt(Utc::now() + Duration::minutes(45))
+                }
+            }),
+        )
+        .await;
+        let second = materialize_auth(root.path(), &codex_home, "second-staging").await;
+
+        assert_eq!(first.kind().as_str(), crate::CODEX_RUNTIME_AUTH_KIND);
+        assert_eq!(
+            first.identity(),
+            second.identity(),
+            "token refresh for one stable account must preserve its native profile"
+        );
+        assert!(first.identity().as_str().contains("account:account-a"));
+    }
+
+    #[tokio::test]
+    async fn materialization_rotates_identity_with_the_effective_api_key() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let codex_home = root.path().join(".codex");
+        write_auth_file(&codex_home, json!({ "OPENAI_API_KEY": "sk-first" })).await;
+        let first = materialize_auth(root.path(), &codex_home, "first-staging").await;
+
+        write_auth_file(&codex_home, json!({ "OPENAI_API_KEY": "sk-second" })).await;
+        let second = materialize_auth(root.path(), &codex_home, "second-staging").await;
+
+        assert_ne!(
+            first.identity(),
+            second.identity(),
+            "credential rotation without a non-secret account ID must select a fresh profile"
+        );
+        assert!(first.identity().as_str().ends_with(&format!(
+            "api-key-sha256:{}",
+            sha256_hex(b"sk-first").expect("first digest")
+        )));
+        assert!(second.identity().as_str().ends_with(&format!(
+            "api-key-sha256:{}",
+            sha256_hex(b"sk-second").expect("second digest")
+        )));
+    }
+
+    #[tokio::test]
+    async fn api_key_mode_ignores_stale_token_principal_and_rotates_with_the_key() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let codex_home = root.path().join(".codex");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": "sk-first",
+                "tokens": {
+                    "account_id": "stale-account",
+                    "access_token": fake_jwt(Utc::now() + Duration::minutes(30))
+                }
+            }),
+        )
+        .await;
+        let first = materialize_auth(root.path(), &codex_home, "first-staging").await;
+
+        write_auth_file(
+            &codex_home,
+            json!({
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": "sk-second",
+                "tokens": {
+                    "account_id": "stale-account",
+                    "access_token": fake_jwt(Utc::now() + Duration::minutes(30))
+                }
+            }),
+        )
+        .await;
+        let second = materialize_auth(root.path(), &codex_home, "second-staging").await;
+
+        assert_ne!(first.identity(), second.identity());
+        assert!(!first.identity().as_str().contains("stale-account"));
+        assert!(first.identity().as_str().ends_with(&format!(
+            "api-key-sha256:{}",
+            sha256_hex(b"sk-first").expect("first key digest")
+        )));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_mode_uses_the_selected_account_when_an_api_key_is_co_present() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let codex_home = root.path().join(".codex");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": "stale-api-key",
+                "tokens": {
+                    "account_id": "account-a",
+                    "access_token": fake_jwt(Utc::now() + Duration::minutes(30))
+                }
+            }),
+        )
+        .await;
+
+        let materialized = materialize_auth(root.path(), &codex_home, "staging").await;
+        assert!(materialized
+            .identity()
+            .as_str()
+            .contains("account:account-a"));
+        assert!(!materialized.identity().as_str().contains("api-key-sha256"));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_account_change_selects_a_fresh_native_profile() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let codex_home = root.path().join(".codex");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": null,
+                "tokens": {
+                    "account_id": "account-a",
+                    "access_token": fake_jwt(Utc::now() + Duration::minutes(30))
+                }
+            }),
+        )
+        .await;
+        let first = materialize_auth(root.path(), &codex_home, "first-staging").await;
+
+        write_auth_file(
+            &codex_home,
+            json!({
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": null,
+                "tokens": {
+                    "account_id": "account-b",
+                    "access_token": fake_jwt(Utc::now() + Duration::minutes(30))
+                }
+            }),
+        )
+        .await;
+        let second = materialize_auth(root.path(), &codex_home, "second-staging").await;
+
+        assert_ne!(first.identity(), second.identity());
+        assert!(first.identity().as_str().contains("account:account-a"));
+        assert!(second.identity().as_str().contains("account:account-b"));
+    }
+
     #[tokio::test]
     async fn ensures_openai_api_key_auth_is_ready() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -791,7 +741,7 @@ mod tests {
         )
         .await;
 
-        ensure_codex_host_auth_ready(Some(&codex_home))
+        load_ready_codex_home(Some(&codex_home), OPENAI_OAUTH_TOKEN_URL)
             .await
             .expect("auth should validate");
     }
@@ -818,7 +768,7 @@ mod tests {
         std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o500))
             .expect("chmod codex home");
 
-        ensure_codex_host_auth_ready(Some(&codex_home))
+        load_ready_codex_home(Some(&codex_home), OPENAI_OAUTH_TOKEN_URL)
             .await
             .expect("auth should validate");
         assert!(!codex_home.join(CODEX_AUTH_LOCK_FILE_NAME).exists());
@@ -841,7 +791,7 @@ mod tests {
         )
         .await;
 
-        ensure_codex_host_auth_ready(Some(&codex_home))
+        load_ready_codex_home(Some(&codex_home), OPENAI_OAUTH_TOKEN_URL)
             .await
             .expect("auth should validate");
     }
@@ -872,7 +822,7 @@ mod tests {
         std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o500))
             .expect("chmod codex home");
 
-        ensure_codex_host_auth_ready(Some(&codex_home))
+        load_ready_codex_home(Some(&codex_home), OPENAI_OAUTH_TOKEN_URL)
             .await
             .expect("auth should validate");
         assert!(!codex_home.join(CODEX_AUTH_LOCK_FILE_NAME).exists());
@@ -999,6 +949,7 @@ mod tests {
     #[test]
     fn applies_rotated_refresh_token_to_existing_auth_store() {
         let mut auth = CodexAuthFile {
+            auth_mode: Some("chatgpt".to_string()),
             openai_api_key: None,
             last_refresh: Some("2026-04-14T00:00:00Z".to_string()),
             tokens: Some(CodexAuthTokens {
@@ -1047,7 +998,7 @@ mod tests {
         )
         .expect("chmod auth");
 
-        ensure_codex_host_auth_ready(Some(&codex_home))
+        load_ready_codex_home(Some(&codex_home), OPENAI_OAUTH_TOKEN_URL)
             .await
             .expect("auth should validate");
         let mode = std::fs::metadata(codex_home.join(CODEX_AUTH_FILE_NAME))
@@ -1087,24 +1038,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn private_file_open_rejects_symlink_leaf() {
-        use std::os::unix::fs::symlink;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let outside = temp_dir.path().join("outside");
-        let link = temp_dir.path().join("link");
-        std::fs::write(&outside, "outside").expect("write outside");
-        symlink(&outside, &link).expect("symlink");
-
-        open_private_file(&link, true).expect_err("symlink leaf should fail");
-        assert_eq!(
-            std::fs::read_to_string(&outside).expect("outside contents"),
-            "outside"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn rejects_symlinked_auth_file() {
         use std::os::unix::fs::symlink;
 
@@ -1119,10 +1052,10 @@ mod tests {
             .expect("write real auth");
         symlink(&real, codex_home.join(CODEX_AUTH_FILE_NAME)).expect("symlink auth");
 
-        let err = ensure_codex_host_auth_ready(Some(&codex_home))
+        let err = load_ready_codex_home(Some(&codex_home), OPENAI_OAUTH_TOKEN_URL)
             .await
             .expect_err("symlinked auth should fail");
-        assert!(err.to_string().contains("must not be a symlink"));
+        assert!(err.to_string().contains("symlink"));
     }
 
     #[tokio::test]
@@ -1130,7 +1063,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let codex_home = temp_dir.path().join(".codex");
 
-        let err = ensure_codex_host_auth_ready(Some(&codex_home))
+        let err = load_ready_codex_home(Some(&codex_home), OPENAI_OAUTH_TOKEN_URL)
             .await
             .expect_err("missing auth should fail");
         assert!(err.to_string().contains("codex login"));
@@ -1139,12 +1072,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn syncs_host_auth_without_rewriting_runtime_config() {
+    async fn stages_exact_auth_without_writing_the_persistent_runtime_home() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let codex_home = temp_dir.path().join(".codex");
+        let staging = temp_dir.path().join("auth-staging");
         let runtime_home = temp_dir.path().join("runtime-home");
+        std::fs::create_dir(&staging).expect("staging");
         write_auth_file(
             &codex_home,
             json!({
@@ -1174,54 +1109,53 @@ command = "/host/tool"
         .await
         .expect("write runtime config");
 
-        sync_codex_home_into_runtime_home(&runtime_home, Some(&codex_home))
+        let materialization = try_materialize_auth(&staging, &codex_home)
             .await
-            .expect("sync runtime home");
+            .expect("stage auth");
+        let projection = materialization
+            .projection()
+            .credentials()
+            .first()
+            .expect("Codex credential projection");
 
-        let copied_auth = tokio::fs::read_to_string(runtime_codex_home.join(CODEX_AUTH_FILE_NAME))
+        let staged_auth = tokio::fs::read_to_string(staging.join(STAGED_CODEX_AUTH_FILE_NAME))
             .await
-            .expect("read copied auth");
+            .expect("read staged auth");
         let preserved_config = tokio::fs::read_to_string(runtime_codex_home.join("config.toml"))
             .await
             .expect("read preserved config");
-        assert!(copied_auth.contains("\"OPENAI_API_KEY\": \"sk-test\""));
+        assert!(staged_auth.contains("\"OPENAI_API_KEY\": \"sk-test\""));
         assert_eq!(preserved_config, "model = \"gpt-5.5\"\n");
+        assert_eq!(
+            projection.staged_source(),
+            Path::new(STAGED_CODEX_AUTH_FILE_NAME)
+        );
+        assert_eq!(
+            projection.native_home_target(),
+            Path::new(".codex/auth.json")
+        );
+        assert!(
+            !runtime_codex_home.join(CODEX_AUTH_FILE_NAME).exists(),
+            "credentials must not be copied into the persistent home"
+        );
 
-        let auth_mode = std::fs::metadata(runtime_codex_home.join(CODEX_AUTH_FILE_NAME))
-            .expect("runtime auth metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        let dir_mode = std::fs::metadata(&runtime_codex_home)
-            .expect("runtime dir metadata")
+        let auth_mode = std::fs::metadata(staging.join(STAGED_CODEX_AUTH_FILE_NAME))
+            .expect("staged auth metadata")
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(auth_mode, 0o600);
-        assert_eq!(dir_mode, 0o755);
-
-        tokio::fs::remove_file(runtime_codex_home.join("config.toml"))
-            .await
-            .expect("remove runtime config");
-
-        sync_codex_home_into_runtime_home(&runtime_home, Some(&codex_home))
-            .await
-            .expect("resync runtime home");
-        assert!(
-            !runtime_codex_home.join("config.toml").exists(),
-            "Codex sync must not create user-owned runtime config"
-        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runtime_codex_sync_rejects_symlinked_runtime_home() {
+    async fn codex_auth_staging_rejects_symlinked_staging_root() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let codex_home = temp_dir.path().join(".codex");
-        let outside_runtime_home = temp_dir.path().join("outside-runtime-home");
-        let runtime_home = temp_dir.path().join("runtime-home");
+        let outside = temp_dir.path().join("outside");
+        let staging = temp_dir.path().join("auth-staging");
         write_auth_file(
             &codex_home,
             json!({
@@ -1229,28 +1163,28 @@ command = "/host/tool"
             }),
         )
         .await;
-        std::fs::create_dir(&outside_runtime_home).expect("outside runtime home");
-        symlink(&outside_runtime_home, &runtime_home).expect("runtime home symlink");
+        std::fs::create_dir(&outside).expect("outside");
+        symlink(&outside, &staging).expect("staging symlink");
 
-        let err = sync_codex_home_into_runtime_home(&runtime_home, Some(&codex_home))
+        let err = try_materialize_auth(&staging, &codex_home)
             .await
-            .expect_err("symlinked runtime home should fail");
+            .expect_err("symlinked staging root should fail");
 
-        assert!(err.to_string().contains("failed to open"));
+        assert!(format!("{err:#}").contains("must be a real directory"));
         assert!(
-            !outside_runtime_home.join(".codex").exists(),
-            "runtime sync must not create files through a symlinked runtime home"
+            !outside.join(STAGED_CODEX_AUTH_FILE_NAME).exists(),
+            "staging must not write through a symlinked root"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runtime_codex_sync_replaces_symlinked_auth_without_following() {
+    async fn codex_auth_staging_rejects_symlinked_credential_leaf() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let codex_home = temp_dir.path().join(".codex");
-        let runtime_home = temp_dir.path().join("runtime-home");
+        let staging = temp_dir.path().join("auth-staging");
         let outside_auth = temp_dir.path().join("outside-auth.json");
         write_auth_file(
             &codex_home,
@@ -1259,28 +1193,19 @@ command = "/host/tool"
             }),
         )
         .await;
-        std::fs::create_dir_all(runtime_home.join(".codex")).expect("runtime codex home");
+        std::fs::create_dir(&staging).expect("staging");
         std::fs::write(&outside_auth, "{\"outside\":true}\n").expect("outside auth");
-        symlink(
-            &outside_auth,
-            runtime_home.join(".codex").join(CODEX_AUTH_FILE_NAME),
-        )
-        .expect("runtime auth symlink");
+        symlink(&outside_auth, staging.join(STAGED_CODEX_AUTH_FILE_NAME))
+            .expect("staged auth symlink");
 
-        sync_codex_home_into_runtime_home(&runtime_home, Some(&codex_home))
+        let err = try_materialize_auth(&staging, &codex_home)
             .await
-            .expect("sync runtime home");
+            .expect_err("symlinked credential leaf must fail");
 
+        assert!(format!("{err:#}").contains("cannot be a symlink"));
         assert_eq!(
             std::fs::read_to_string(&outside_auth).expect("outside auth"),
             "{\"outside\":true}\n"
         );
-        let runtime_auth = runtime_home.join(".codex").join(CODEX_AUTH_FILE_NAME);
-        let metadata = std::fs::symlink_metadata(&runtime_auth).expect("runtime auth metadata");
-        assert!(metadata.is_file());
-        assert!(!metadata.file_type().is_symlink());
-        assert!(std::fs::read_to_string(&runtime_auth)
-            .expect("runtime auth")
-            .contains("\"OPENAI_API_KEY\": \"sk-test\""));
     }
 }

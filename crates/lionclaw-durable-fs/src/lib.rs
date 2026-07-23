@@ -32,14 +32,14 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    fs::{File, Permissions},
+    fs::{File, Metadata, Permissions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
 
 use anyhow::{anyhow, Context, Result};
 use rustix::{
-    fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags},
+    fs::{fchmod, openat, renameat, unlinkat, AtFlags, Mode, OFlags},
     io::Errno,
 };
 use tracing::warn;
@@ -119,6 +119,61 @@ impl RootedDirectory {
             BoundedRead::Contents(bytes) => Ok(Some(bytes)),
             BoundedRead::TooLarge => Err(file_too_large(&self.path, file_name, label, limit)),
         }
+    }
+
+    /// Read one owner-only regular file and return metadata from the same
+    /// descriptor used for the bounded read.
+    pub fn read_private_bounded_with_metadata(
+        &self,
+        file_name: &OsStr,
+        limit: usize,
+        label: &str,
+    ) -> Result<Option<(Vec<u8>, Metadata)>> {
+        ensure_file_name(file_name, label)?;
+        let Some(parent) = self.open_existing()? else {
+            return Ok(None);
+        };
+        let Some(file) = open_regular_file(&parent, &self.path, file_name, label)? else {
+            return Ok(None);
+        };
+        harden_private_file(&file, &self.path, file_name, label)?;
+        let (contents, metadata) =
+            read_open_file_bounded_with_metadata(file, &self.path, file_name, limit, label)?;
+        match contents {
+            BoundedRead::Contents(contents) => Ok(Some((contents, metadata))),
+            BoundedRead::TooLarge => Err(file_too_large(&self.path, file_name, label, limit)),
+            BoundedRead::Missing => unreachable!("an open file cannot become missing"),
+        }
+    }
+
+    /// Open or create an owner-only regular file for a caller-owned advisory
+    /// lock. The returned descriptor, not its pathname, is the lock identity.
+    pub fn open_private_lock_file(&self, file_name: &OsStr, label: &str) -> Result<File> {
+        ensure_file_name(file_name, label)?;
+        let parent = self.open_required()?;
+        let file = match openat(
+            &parent,
+            file_name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(file) => File::from(file),
+            Err(Errno::LOOP) => {
+                return Err(anyhow!(
+                    "{label} '{}' cannot be a symlink",
+                    self.path.join(file_name).display()
+                ))
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to open {label} '{}': {error}",
+                    self.path.join(file_name).display()
+                ))
+            }
+        };
+        ensure_regular_file(&file, &self.path, file_name, label)?;
+        harden_private_file(&file, &self.path, file_name, label)?;
+        Ok(file)
     }
 
     /// Read a regular file while distinguishing absent and oversized content.
@@ -257,6 +312,17 @@ fn read_open_file_bounded(
     limit: usize,
     label: &str,
 ) -> Result<BoundedRead> {
+    read_open_file_bounded_with_metadata(file, parent_path, file_name, limit, label)
+        .map(|(contents, _metadata)| contents)
+}
+
+fn read_open_file_bounded_with_metadata(
+    file: File,
+    parent_path: &Path,
+    file_name: &OsStr,
+    limit: usize,
+    label: &str,
+) -> Result<(BoundedRead, Metadata)> {
     let metadata = file.metadata().with_context(|| {
         format!(
             "failed to stat {label} '{}'",
@@ -264,7 +330,7 @@ fn read_open_file_bounded(
         )
     })?;
     if metadata.len() > limit as u64 {
-        return Ok(BoundedRead::TooLarge);
+        return Ok((BoundedRead::TooLarge, metadata));
     }
 
     let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
@@ -278,9 +344,9 @@ fn read_open_file_bounded(
             )
         })?;
     if bytes.len() > limit {
-        return Ok(BoundedRead::TooLarge);
+        return Ok((BoundedRead::TooLarge, metadata));
     }
-    Ok(BoundedRead::Contents(bytes))
+    Ok((BoundedRead::Contents(bytes), metadata))
 }
 
 fn directory_flags() -> OFlags {
@@ -326,6 +392,16 @@ fn open_regular_file(
             ))
         }
     };
+    ensure_regular_file(&file, parent_path, file_name, label)?;
+    Ok(Some(file))
+}
+
+fn ensure_regular_file(
+    file: &File,
+    parent_path: &Path,
+    file_name: &OsStr,
+    label: &str,
+) -> Result<()> {
     if !file
         .metadata()
         .with_context(|| {
@@ -341,7 +417,36 @@ fn open_regular_file(
             parent_path.join(file_name).display()
         ));
     }
-    Ok(Some(file))
+    Ok(())
+}
+
+fn harden_private_file(
+    file: &File,
+    parent_path: &Path,
+    file_name: &OsStr,
+    label: &str,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = file.metadata().with_context(|| {
+            format!(
+                "failed to stat {label} '{}'",
+                parent_path.join(file_name).display()
+            )
+        })?;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!(
+                        "failed to protect {label} '{}'",
+                        parent_path.join(file_name).display()
+                    )
+                })?;
+        }
+    }
+    Ok(())
 }
 
 fn file_too_large(parent: &Path, file_name: &OsStr, label: &str, limit: usize) -> anyhow::Error {
@@ -506,7 +611,23 @@ fn create_temp_file(
                 | OFlags::NOFOLLOW,
             Mode::from_raw_mode(mode),
         ) {
-            Ok(file) => return Ok((temp_name, File::from(file))),
+            Ok(file) => {
+                let file = File::from(file);
+                if let Err(error) = fchmod(&file, Mode::from_raw_mode(mode)) {
+                    if let Err(cleanup_error) = unlinkat(parent, &temp_name, AtFlags::empty()) {
+                        warn!(
+                            ?cleanup_error,
+                            path = %parent_path.join(&temp_name).display(),
+                            "failed to remove unprotected temporary file"
+                        );
+                    }
+                    return Err(anyhow!(
+                        "failed to protect temporary {label} file in '{}': {error}",
+                        parent_path.display()
+                    ));
+                }
+                return Ok((temp_name, file));
+            }
             Err(Errno::EXIST) => continue,
             Err(err) => {
                 return Err(anyhow!(
@@ -571,6 +692,49 @@ mod tests {
         assert!(!directory
             .contains_regular_file(OsStr::new("session"), "session state")
             .unwrap());
+    }
+
+    #[test]
+    fn private_read_and_lock_use_exact_owner_only_regular_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = rooted(&root);
+        std::fs::create_dir_all(directory.path()).unwrap();
+        let secret = directory.path().join("secret");
+        std::fs::write(&secret, b"private").unwrap();
+        std::fs::set_permissions(&secret, Permissions::from_mode(0o644)).unwrap();
+
+        let (contents, metadata) = directory
+            .read_private_bounded_with_metadata(OsStr::new("secret"), 32, "secret")
+            .unwrap()
+            .unwrap();
+        assert_eq!(contents, b"private");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        let lock = directory
+            .open_private_lock_file(OsStr::new("lock"), "lock")
+            .unwrap();
+        assert_eq!(lock.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, directory.path().join("linked-lock")).unwrap();
+        assert!(directory
+            .open_private_lock_file(OsStr::new("linked-lock"), "lock")
+            .is_err());
+
+        let fifo = directory.path().join("fifo-lock");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let error = directory
+            .open_private_lock_file(OsStr::new("fifo-lock"), "lock")
+            .expect_err("a FIFO cannot become lock authority");
+        assert!(error.to_string().contains("must be a regular file"));
     }
 
     #[test]

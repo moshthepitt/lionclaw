@@ -42,10 +42,7 @@ pub use driver::{
     codex_runtime_auth_kind, CodexRuntimeConfig, CodexRuntimeDriver, CODEX_DEFAULT_EXECUTABLE,
     CODEX_RUNTIME_AUTH_KIND, CODEX_RUNTIME_DRIVER, CODEX_SKILL_PROJECTION_ROOT,
 };
-pub use host_auth::{
-    codex_home_identity, ensure_codex_host_auth_ready, prepare_codex_runtime_auth,
-    sync_codex_home_into_runtime_home, CodexRuntimeAuthProvider,
-};
+pub use host_auth::CodexRuntimeAuthProvider;
 
 #[cfg(test)]
 pub(crate) use app_server::{

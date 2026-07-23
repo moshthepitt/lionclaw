@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use lionclaw_confinement::{ConfinementConfig, ExecutionLimits, OciConfinementConfig};
+use lionclaw_runtime_api::MAX_RUNTIME_CREDENTIAL_PROJECTIONS;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -26,7 +27,9 @@ confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,s
 driver = "acp"
 command = "opencode"
 args = ["acp"]
+native-resume = true
 environment = { OPENCODE_DISABLE_AUTOUPDATE = "1", OPENCODE_CONFIG_CONTENT = '{"permission":{"*":"allow"}}' }
+model = "opencode/big-pickle"
 mode = "build"
 auth = { kind = "native-home", source = "~/.local/share/opencode", target = ".local/share/opencode", required-files = ["auth.json"] }
 skills-dir = ".agents/skills"
@@ -62,7 +65,7 @@ pub struct MissionRuntimeProfile {
 impl MissionRuntimeProfile {
     /// Stable non-secret identity for native state that may be reopened.
     /// Changing an execution or auth coordinate selects a fresh state scope.
-    pub(crate) fn native_state_key(&self) -> String {
+    pub(crate) fn native_state_key(&self, auth_identity: Option<&str>) -> String {
         let mut digest = Sha256::new();
         digest_field(&mut digest, b"name", self.name.as_bytes());
         digest_field(&mut digest, b"driver", self.driver.as_bytes());
@@ -78,6 +81,14 @@ impl MissionRuntimeProfile {
         }
         digest_optional(&mut digest, b"model", self.model.as_deref());
         digest_optional(&mut digest, b"mode", self.mode.as_deref());
+        match &self.skills_dir {
+            Some(skills_dir) => digest_field(
+                &mut digest,
+                b"skills-dir",
+                skills_dir.0.as_os_str().as_bytes(),
+            ),
+            None => digest_field(&mut digest, b"skills-dir", b"<none>"),
+        }
         digest_field(
             &mut digest,
             b"native-resume",
@@ -108,6 +119,7 @@ impl MissionRuntimeProfile {
                 digest_paths(&mut digest, b"auth-optional", &config.optional_files);
             }
         }
+        digest_optional(&mut digest, b"auth-identity", auth_identity);
         digest_optional(
             &mut digest,
             b"image",
@@ -180,7 +192,7 @@ impl RuntimeSkillsDir {
         Ok(Self(path))
     }
 
-    fn relative_skill_path(&self, skill_name: &str) -> Result<PathBuf> {
+    pub(crate) fn relative_skill_path(&self, skill_name: &str) -> Result<PathBuf> {
         lionclaw_confinement::validate_skill_alias(skill_name)?;
         Ok(self.0.join(skill_name))
     }
@@ -190,10 +202,6 @@ impl RuntimeSkillsDir {
             .join(self.relative_skill_path(skill_name)?)
             .to_string_lossy()
             .into_owned())
-    }
-
-    pub(crate) fn host_mountpoint(&self, runtime_home: &Path, skill_name: &str) -> Result<PathBuf> {
-        Ok(runtime_home.join(self.relative_skill_path(skill_name)?))
     }
 }
 
@@ -363,6 +371,15 @@ impl RuntimeAuthConfigFile {
                 required_files,
                 optional_files,
             }) => {
+                let declared_files = required_files
+                    .len()
+                    .checked_add(optional_files.len())
+                    .ok_or_else(|| anyhow!("native-home auth credential file count overflowed"))?;
+                if declared_files > MAX_RUNTIME_CREDENTIAL_PROJECTIONS {
+                    return Err(anyhow!(
+                        "native-home auth declares {declared_files} credential files; limit is {MAX_RUNTIME_CREDENTIAL_PROJECTIONS}"
+                    ));
+                }
                 let source = expand_home(&source, user_home, "native-home auth source")?;
                 validate_relative_path(&target, "native-home auth target")?;
                 if required_files.is_empty() && optional_files.is_empty() {
@@ -447,16 +464,15 @@ fn expand_home(path: &Path, home: Option<&Path>, label: &str) -> Result<PathBuf>
 fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
     use std::path::Component;
 
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        return Err(anyhow!("{label} must be a non-empty relative path"));
-    }
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        return Err(anyhow!("{label} '{}' contains traversal", path.display()));
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(anyhow!(
+            "{label} '{}' must be a clean non-empty relative path without traversal",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -605,6 +621,42 @@ mod tests {
     }
 
     #[test]
+    fn native_home_auth_enforces_the_declared_credential_count_boundary() {
+        let declared_files = |count: usize| {
+            (0..count)
+                .map(|index| format!(r#""credential-{index}""#))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let profile = |count: usize| {
+            format!(
+                "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\nauth = {{ kind = \"native-home\", source = \"~/.example\", target = \".example\", required-files = [{}] }}\n",
+                declared_files(count)
+            )
+        };
+
+        RuntimeProfiles::from_toml(
+            &profile(MAX_RUNTIME_CREDENTIAL_PROJECTIONS),
+            Path::new("/home/alice"),
+        )
+        .expect("the exact credential projection count limit must be accepted");
+
+        let error = RuntimeProfiles::from_toml(
+            &profile(MAX_RUNTIME_CREDENTIAL_PROJECTIONS + 1),
+            Path::new("/home/alice"),
+        )
+        .expect_err("a native-home declaration above the projection limit must fail");
+        assert!(
+            error.to_string().contains(&format!(
+                "declares {} credential files; limit is {}",
+                MAX_RUNTIME_CREDENTIAL_PROJECTIONS + 1,
+                MAX_RUNTIME_CREDENTIAL_PROJECTIONS
+            )),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn native_home_auth_rejects_paths_outside_its_roots() {
         for auth in [
             r#"{ kind = "native-home", source = "~/.example", target = "../escape", required-files = ["config.toml"] }"#,
@@ -639,7 +691,9 @@ mod tests {
         assert_eq!(hermes.mode.as_deref(), Some("dont_ask"));
         let opencode = profiles.get("opencode").unwrap();
         assert_eq!(opencode.driver, "acp");
+        assert_eq!(opencode.model.as_deref(), Some("opencode/big-pickle"));
         assert_eq!(opencode.mode.as_deref(), Some("build"));
+        assert!(opencode.native_resume);
         assert!(opencode.environment.contains(&(
             "OPENCODE_CONFIG_CONTENT".to_string(),
             r#"{"permission":{"*":"allow"}}"#.to_string(),
@@ -657,17 +711,16 @@ mod tests {
 
     #[test]
     fn invalid_skills_dir_is_rejected_while_loading_configuration() {
-        let err = RuntimeProfiles::from_toml(
-            r#"
-            [runtimes.bad]
-            driver = "acp"
-            command = "bad"
-            skills-dir = "../escape"
-            "#,
-            Path::new("/home/alice"),
-        )
-        .expect_err("invalid root");
-        assert!(err.to_string().contains("traversal"), "got {err:#}");
+        for path in ["../escape", "./skills", "/absolute"] {
+            let err = RuntimeProfiles::from_toml(
+                &format!(
+                    "[runtimes.bad]\ndriver = \"acp\"\ncommand = \"bad\"\nskills-dir = \"{path}\"\n"
+                ),
+                Path::new("/home/alice"),
+            )
+            .expect_err("invalid root");
+            assert!(err.to_string().contains("traversal"), "got {err:#}");
+        }
     }
 
     #[test]
@@ -785,19 +838,35 @@ mod tests {
         let mut changed = original.clone();
         changed.command = "agent-b".to_string();
 
-        assert_eq!(original.native_state_key().len(), 64);
-        assert_ne!(original.native_state_key(), changed.native_state_key());
+        assert_eq!(original.native_state_key(None).len(), 64);
+        assert_ne!(
+            original.native_state_key(None),
+            changed.native_state_key(None)
+        );
 
         changed = original.clone();
         let Some(RuntimeAuthConfig::NativeHome(auth)) = changed.auth.as_mut() else {
             panic!("native-home auth");
         };
         auth.source = PathBuf::from("/auth/b");
-        assert_ne!(original.native_state_key(), changed.native_state_key());
+        assert_ne!(
+            original.native_state_key(None),
+            changed.native_state_key(None)
+        );
 
         changed = original.clone();
         changed.environment.reverse();
-        assert_eq!(original.native_state_key(), changed.native_state_key());
+        assert_eq!(
+            original.native_state_key(None),
+            changed.native_state_key(None)
+        );
+
+        changed = original.clone();
+        changed.skills_dir = Some(RuntimeSkillsDir::new(PathBuf::from(".agent/skills")).unwrap());
+        assert_ne!(
+            original.native_state_key(None),
+            changed.native_state_key(None)
+        );
 
         changed = original.clone();
         let Some(RuntimeAuthConfig::NativeHome(auth)) = changed.auth.as_mut() else {
@@ -805,6 +874,13 @@ mod tests {
         };
         auth.required_files.reverse();
         auth.optional_files.reverse();
-        assert_eq!(original.native_state_key(), changed.native_state_key());
+        assert_eq!(
+            original.native_state_key(None),
+            changed.native_state_key(None)
+        );
+        assert_ne!(
+            original.native_state_key(Some("principal:a")),
+            original.native_state_key(Some("principal:b"))
+        );
     }
 }

@@ -3,6 +3,8 @@
 //! (`core.rs` `KernelRuntimeProgramExecutor` + `runtime_execution_context`),
 //! minus kernel-only concerns (secrets mounts, channel sockets, MCP).
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw_confinement::{
@@ -11,29 +13,30 @@ use lionclaw_confinement::{
     RUNTIME_MOUNT_TARGET,
 };
 use lionclaw_runtime_api::{
-    ExecutionOutput, RuntimeAuthContext, RuntimeAuthRegistry, RuntimeExecutionContext,
-    RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-    RuntimeProgramStdoutSender, RuntimeStateDir, TypedFailure,
+    ExecutionOutput, RuntimeAuthMaterialization, RuntimeExecutionContext, RuntimePathProjection,
+    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
+    RuntimeStateDir, TypedFailure,
 };
 
 pub struct MissionProgramExecutor {
     plan: EffectiveExecutionPlan,
-    auth_registry: RuntimeAuthRegistry,
-    auth_context: RuntimeAuthContext,
+    runtime_auth: Option<RuntimeAuthMaterialization>,
     resource_name: String,
+    auth_staging_root: Option<PathBuf>,
 }
 
 impl MissionProgramExecutor {
     pub fn new(
         plan: EffectiveExecutionPlan,
-        auth_registry: RuntimeAuthRegistry,
+        runtime_auth: Option<RuntimeAuthMaterialization>,
         effect_id: &crate::model::EffectId,
+        auth_staging_root: Option<PathBuf>,
     ) -> Self {
         Self {
             plan,
-            auth_registry,
-            auth_context: RuntimeAuthContext::default(),
+            runtime_auth,
             resource_name: effect_id.resource_name(),
+            auth_staging_root,
         }
     }
 
@@ -41,13 +44,10 @@ impl MissionProgramExecutor {
         ExecutionRequest {
             plan: self.plan.clone(),
             resource_name: Some(self.resource_name.clone()),
-            runtime_auth_provider: program
-                .auth
-                .as_ref()
-                .and_then(|auth| self.auth_registry.get(auth)),
+            runtime_auth: self.runtime_auth.clone(),
             program,
             runtime_secrets_mount: None,
-            runtime_auth_context: self.auth_context.clone(),
+            auth_staging_root: self.auth_staging_root.clone(),
         }
     }
 }

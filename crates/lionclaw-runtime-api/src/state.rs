@@ -5,6 +5,7 @@ use lionclaw_durable_fs::{BoundedRead, RootedDirectory};
 
 pub const RUNTIME_SESSION_READY_MARKER: &str = ".lionclaw-runtime-session";
 pub const RUNTIME_STATE_VALUE_LIMIT: usize = 4 * 1024;
+const RUNTIME_ACTIVE_PROFILE_MARKER: &str = ".lionclaw-active-runtime-profile";
 const RECONSTRUCTED_RESUME_MODE: &str = "reconstructed";
 const RESUMED_RESUME_MODE: &str = "resumed";
 
@@ -14,7 +15,7 @@ const RESUMED_RESUME_MODE: &str = "resumed";
 /// security boundary by walking parents from the runtime leaf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeStateDir {
-    marker_files: RootedDirectory,
+    control_files: RootedDirectory,
     profile_files: RootedDirectory,
     profile_key: String,
 }
@@ -29,7 +30,7 @@ impl RuntimeStateDir {
         validate_profile_key(&profile_key)?;
         let marker_root = marker_root.as_ref();
         Ok(Self {
-            marker_files: RootedDirectory::new(
+            control_files: RootedDirectory::new(
                 state_anchor.as_ref().to_path_buf(),
                 marker_root.to_path_buf(),
             )?,
@@ -45,25 +46,23 @@ impl RuntimeStateDir {
         self.profile_files.path()
     }
 
-    pub fn marker_path(&self) -> &Path {
-        self.marker_files.path()
+    pub fn control_path(&self) -> &Path {
+        self.control_files.path()
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RuntimeSessionReady {
-    marker_present: bool,
+    mode: Option<crate::RuntimeResumeMode>,
 }
 
 impl RuntimeSessionReady {
     pub const fn not_ready() -> Self {
-        Self {
-            marker_present: false,
-        }
+        Self { mode: None }
     }
 
     pub const fn is_ready(self) -> bool {
-        self.marker_present
+        self.mode.is_some()
     }
 }
 
@@ -84,17 +83,33 @@ impl RuntimeSessionAttempt {
         let Some(mode) = observation.committable_mode() else {
             return Ok(());
         };
-        let value = match mode {
-            crate::RuntimeResumeMode::Reconstructed => RECONSTRUCTED_RESUME_MODE,
-            crate::RuntimeResumeMode::Resumed => RESUMED_RESUME_MODE,
-        };
-        write_value(
-            &self.runtime_state.marker_files,
-            RUNTIME_SESSION_READY_MARKER,
-            &format!("{} {value}", self.runtime_state.profile_key),
-            "runtime resume mode",
-        )
+        write_resume_mode(&self.runtime_state, mode)
     }
+
+    /// Restore the consumed ready marker after a settled transient attempt
+    /// that did not invalidate or replace the prior native identity.
+    pub fn restore_previous(self) -> Result<()> {
+        let Some(mode) = self.previous_ready.mode else {
+            return Ok(());
+        };
+        write_resume_mode(&self.runtime_state, mode)
+    }
+}
+
+fn write_resume_mode(
+    runtime_state: &RuntimeStateDir,
+    mode: crate::RuntimeResumeMode,
+) -> Result<()> {
+    let value = match mode {
+        crate::RuntimeResumeMode::Reconstructed => RECONSTRUCTED_RESUME_MODE,
+        crate::RuntimeResumeMode::Resumed => RESUMED_RESUME_MODE,
+    };
+    write_value(
+        &runtime_state.profile_files,
+        RUNTIME_SESSION_READY_MARKER,
+        value,
+        "runtime resume mode",
+    )
 }
 
 /// Begins one native-session attempt by consuming the prior commit marker.
@@ -108,11 +123,16 @@ impl RuntimeSessionAttempt {
 pub fn begin_runtime_session_attempt(
     runtime_state: &RuntimeStateDir,
 ) -> Result<RuntimeSessionAttempt> {
-    let marker_present = take_marker(runtime_state)?
-        .is_some_and(|marker| marker.profile_key == runtime_state.profile_key);
+    write_value(
+        &runtime_state.control_files,
+        RUNTIME_ACTIVE_PROFILE_MARKER,
+        &runtime_state.profile_key,
+        "active runtime profile",
+    )?;
+    let mode = take_marker(runtime_state)?;
     Ok(RuntimeSessionAttempt {
         runtime_state: runtime_state.clone(),
-        previous_ready: RuntimeSessionReady { marker_present },
+        previous_ready: RuntimeSessionReady { mode },
     })
 }
 
@@ -132,7 +152,7 @@ pub fn load_ready_state_value(
 pub fn recorded_runtime_resume_mode(
     runtime_state: &RuntimeStateDir,
 ) -> Result<Option<crate::RuntimeResumeMode>> {
-    Ok(read_marker_files(&runtime_state.marker_files)?.map(|marker| marker.mode))
+    read_marker_files(&runtime_state.profile_files)
 }
 
 pub fn recorded_runtime_resume_mode_at(
@@ -143,7 +163,14 @@ pub fn recorded_runtime_resume_mode_at(
         state_anchor.as_ref().to_path_buf(),
         marker_root.as_ref().to_path_buf(),
     )?;
-    Ok(read_marker_files(&files)?.map(|marker| marker.mode))
+    let Some(profile_key) = load_profile_key(&files)? else {
+        return Ok(None);
+    };
+    let profile_files = RootedDirectory::new(
+        state_anchor.as_ref().to_path_buf(),
+        marker_root.as_ref().join("profiles").join(profile_key),
+    )?;
+    read_marker_files(&profile_files)
 }
 
 pub fn load_state_value(
@@ -199,13 +226,29 @@ pub fn clear_state_value(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RuntimeMarker {
-    profile_key: String,
-    mode: crate::RuntimeResumeMode,
+fn load_profile_key(files: &RootedDirectory) -> Result<Option<String>> {
+    let contents = match files.read_bounded_status(
+        OsStr::new(RUNTIME_ACTIVE_PROFILE_MARKER),
+        RUNTIME_STATE_VALUE_LIMIT,
+        "active runtime profile",
+    )? {
+        BoundedRead::Missing | BoundedRead::TooLarge => return Ok(None),
+        BoundedRead::Contents(contents) => contents,
+    };
+    let Ok(contents) = String::from_utf8(contents) else {
+        return Ok(None);
+    };
+    let profile_key = match normalize_state_value(contents, "active runtime profile") {
+        Ok(Some(profile_key)) => profile_key,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    if validate_profile_key(&profile_key).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(profile_key))
 }
 
-fn read_marker_files(files: &RootedDirectory) -> Result<Option<RuntimeMarker>> {
+fn read_marker_files(files: &RootedDirectory) -> Result<Option<crate::RuntimeResumeMode>> {
     parse_marker(files.read_bounded_status(
         OsStr::new(RUNTIME_SESSION_READY_MARKER),
         RUNTIME_STATE_VALUE_LIMIT,
@@ -213,15 +256,15 @@ fn read_marker_files(files: &RootedDirectory) -> Result<Option<RuntimeMarker>> {
     )?)
 }
 
-fn take_marker(runtime_state: &RuntimeStateDir) -> Result<Option<RuntimeMarker>> {
-    parse_marker(runtime_state.marker_files.take_bounded_status(
+fn take_marker(runtime_state: &RuntimeStateDir) -> Result<Option<crate::RuntimeResumeMode>> {
+    parse_marker(runtime_state.profile_files.take_bounded_status(
         OsStr::new(RUNTIME_SESSION_READY_MARKER),
         RUNTIME_STATE_VALUE_LIMIT,
         "runtime session marker",
     )?)
 }
 
-fn parse_marker(contents: BoundedRead) -> Result<Option<RuntimeMarker>> {
+fn parse_marker(contents: BoundedRead) -> Result<Option<crate::RuntimeResumeMode>> {
     let contents = match contents {
         BoundedRead::Missing | BoundedRead::TooLarge => return Ok(None),
         BoundedRead::Contents(contents) => contents,
@@ -230,22 +273,15 @@ fn parse_marker(contents: BoundedRead) -> Result<Option<RuntimeMarker>> {
         return Ok(None);
     };
     let mut fields = contents.split_whitespace();
-    let (Some(profile_key), Some(mode), None) = (fields.next(), fields.next(), fields.next())
-    else {
+    let (Some(mode), None) = (fields.next(), fields.next()) else {
         return Ok(None);
     };
-    if validate_profile_key(profile_key).is_err() {
-        return Ok(None);
-    }
     let mode = match mode {
         RECONSTRUCTED_RESUME_MODE => crate::RuntimeResumeMode::Reconstructed,
         RESUMED_RESUME_MODE => crate::RuntimeResumeMode::Resumed,
         _ => return Ok(None),
     };
-    Ok(Some(RuntimeMarker {
-        profile_key: profile_key.to_string(),
-        mode,
-    }))
+    Ok(Some(mode))
 }
 
 fn write_value(files: &RootedDirectory, file_name: &str, value: &str, label: &str) -> Result<()> {
@@ -303,7 +339,7 @@ mod tests {
     }
 
     fn prepare(runtime_state: &RuntimeStateDir) {
-        std::fs::create_dir_all(runtime_state.marker_path()).unwrap();
+        std::fs::create_dir_all(runtime_state.control_path()).unwrap();
         std::fs::create_dir_all(runtime_state.path()).unwrap();
     }
 
@@ -348,14 +384,10 @@ mod tests {
             Some(RuntimeResumeMode::Resumed)
         );
         assert_eq!(
-            std::fs::metadata(
-                runtime_state
-                    .marker_path()
-                    .join(RUNTIME_SESSION_READY_MARKER)
-            )
-            .unwrap()
-            .permissions()
-            .mode()
+            std::fs::metadata(runtime_state.path().join(RUNTIME_SESSION_READY_MARKER))
+                .unwrap()
+                .permissions()
+                .mode()
                 & 0o777,
             0o600
         );
@@ -379,6 +411,39 @@ mod tests {
                 .as_deref(),
             Some("native-id")
         );
+    }
+
+    #[test]
+    fn settled_transient_attempt_can_restore_the_exact_consumed_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+        publish(&runtime_state, RuntimeResumeMode::Resumed);
+
+        let attempt = begin_runtime_session_attempt(&runtime_state).unwrap();
+        assert!(attempt.previous_ready().is_ready());
+        assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
+
+        attempt.restore_previous().unwrap();
+
+        assert_eq!(
+            recorded_runtime_resume_mode(&runtime_state).unwrap(),
+            Some(RuntimeResumeMode::Resumed)
+        );
+    }
+
+    #[test]
+    fn unready_attempt_restore_publishes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+
+        begin_runtime_session_attempt(&runtime_state)
+            .unwrap()
+            .restore_previous()
+            .unwrap();
+
+        assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
     }
 
     #[test]
@@ -407,9 +472,7 @@ mod tests {
         let runtime_state = runtime_state(&root);
         prepare(&runtime_state);
         std::fs::write(
-            runtime_state
-                .marker_path()
-                .join(RUNTIME_SESSION_READY_MARKER),
+            runtime_state.path().join(RUNTIME_SESSION_READY_MARKER),
             b"pretend\n",
         )
         .unwrap();
@@ -418,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_marker_is_bound_to_the_exact_profile_key() {
+    fn ready_markers_are_isolated_by_profile_and_operator_projection_tracks_the_active_one() {
         let root = tempfile::tempdir().unwrap();
         let runtime_state = runtime_state(&root);
         prepare(&runtime_state);
@@ -426,20 +489,33 @@ mod tests {
 
         let other_profile = RuntimeStateDir::new(
             root.path(),
-            runtime_state.marker_path(),
+            runtime_state.control_path(),
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         )
         .unwrap();
         std::fs::create_dir_all(other_profile.path()).unwrap();
 
-        assert_eq!(
-            recorded_runtime_resume_mode(&other_profile).unwrap(),
-            Some(RuntimeResumeMode::Resumed),
-            "operator projection reports the last observation without granting another profile readiness"
-        );
+        assert_eq!(recorded_runtime_resume_mode(&other_profile).unwrap(), None);
         let attempt = begin_runtime_session_attempt(&other_profile).unwrap();
         assert!(!attempt.previous_ready().is_ready());
-        assert_eq!(recorded_runtime_resume_mode(&runtime_state).unwrap(), None);
+        assert_eq!(
+            recorded_runtime_resume_mode(&runtime_state).unwrap(),
+            Some(RuntimeResumeMode::Resumed),
+            "selecting another profile must not consume this profile's readiness"
+        );
+        assert_eq!(
+            recorded_runtime_resume_mode_at(root.path(), runtime_state.control_path()).unwrap(),
+            None,
+            "operator projection follows the active profile"
+        );
+
+        let attempt = begin_runtime_session_attempt(&runtime_state).unwrap();
+        assert!(attempt.previous_ready().is_ready());
+        assert_eq!(
+            recorded_runtime_resume_mode_at(root.path(), runtime_state.control_path()).unwrap(),
+            None,
+            "consuming the active profile clears only its ready marker"
+        );
     }
 
     #[test]
@@ -447,9 +523,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let runtime_state = runtime_state(&root);
         prepare(&runtime_state);
-        let marker = runtime_state
-            .marker_path()
-            .join(RUNTIME_SESSION_READY_MARKER);
+        let marker = runtime_state.path().join(RUNTIME_SESSION_READY_MARKER);
 
         for contents in [
             Vec::new(),
@@ -461,6 +535,31 @@ mod tests {
             let attempt = begin_runtime_session_attempt(&runtime_state).unwrap();
             assert!(!attempt.previous_ready().is_ready());
             assert!(!marker.exists(), "corrupt marker must be consumed");
+        }
+    }
+
+    #[test]
+    fn corrupt_active_profile_content_degrades_to_reconstruction() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_state = runtime_state(&root);
+        prepare(&runtime_state);
+        publish(&runtime_state, RuntimeResumeMode::Resumed);
+        let active_profile = runtime_state
+            .control_path()
+            .join(RUNTIME_ACTIVE_PROFILE_MARKER);
+
+        for contents in [
+            Vec::new(),
+            vec![0xff, 0xfe],
+            vec![b'x'; RUNTIME_STATE_VALUE_LIMIT + 1],
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n".to_vec(),
+            b"not-a-profile-key\n".to_vec(),
+        ] {
+            std::fs::write(&active_profile, contents).unwrap();
+            assert_eq!(
+                recorded_runtime_resume_mode_at(root.path(), runtime_state.control_path()).unwrap(),
+                None
+            );
         }
     }
 
@@ -479,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_runtime_root_reads_absent_but_cannot_be_written() {
+    fn missing_runtime_root_reads_absent_but_cannot_begin_or_write() {
         let root = tempfile::tempdir().unwrap();
         let runtime_state = runtime_state(&root);
 
@@ -487,10 +586,10 @@ mod tests {
             load_state_value(&runtime_state, "session", "test").unwrap(),
             None
         );
-        assert!(!begin_runtime_session_attempt(&runtime_state)
-            .unwrap()
-            .previous_ready()
-            .is_ready());
+        assert!(begin_runtime_session_attempt(&runtime_state)
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
         assert!(save_state_value(&runtime_state, "session", "one", "test")
             .unwrap_err()
             .to_string()
@@ -538,9 +637,7 @@ mod tests {
         prepare(&runtime_state);
         symlink(
             outside.path(),
-            runtime_state
-                .marker_path()
-                .join(RUNTIME_SESSION_READY_MARKER),
+            runtime_state.path().join(RUNTIME_SESSION_READY_MARKER),
         )
         .unwrap();
 

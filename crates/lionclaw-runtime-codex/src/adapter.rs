@@ -6,10 +6,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use lionclaw_runtime_api::{
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeExecutionContext, RuntimeMcpServerSpec,
-    RuntimeNativeHomeArtifactDir, RuntimeNativeReopenRecovery, RuntimeNativeSessionObservation,
-    RuntimeProgramExecutor, RuntimeProgramSpec, RuntimeResume, RuntimeSessionHandle,
-    RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTurnJournalSender, TurnExecution,
-    TurnInput, TurnResult, TypedFailure,
+    RuntimeNativeReopenRecovery, RuntimeNativeSessionObservation, RuntimeProgramExecutor,
+    RuntimeProgramSpec, RuntimeResume, RuntimeSessionHandle, RuntimeSessionStartInput,
+    RuntimeTerminalProgramInput, RuntimeTurnJournalSender, TurnExecution, TurnInput, TurnResult,
+    TypedFailure,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -21,7 +21,7 @@ use crate::app_server::{
     extract_app_server_model, extract_app_server_thread_id, extract_app_server_turn_id,
     finish_app_server_session, thread_resume_params, thread_start_params, turn_start_params,
     AppServerRequestFailure, AppServerTransport, CodexAppServerClient, CodexAppServerEventSink,
-    ExecutionSessionTransport, CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR,
+    ExecutionSessionTransport,
 };
 use crate::driver::CodexRuntimeConfig;
 use crate::program::{build_codex_app_server_program, build_codex_terminal_program};
@@ -284,10 +284,12 @@ impl CodexRuntimeAdapter {
         {
             Ok(response) => response,
             Err(AppServerRequestFailure::Rejected(failure)) => {
-                preserve_observation(crate::state::record_native_reopen_failure(
-                    &self.sessions,
-                    &thread_state.runtime_session_id,
-                ));
+                if matches!(&failure, TypedFailure::PermanentRuntime { .. }) {
+                    preserve_observation(crate::state::record_native_reopen_failure(
+                        &self.sessions,
+                        &thread_state.runtime_session_id,
+                    ));
+                }
                 return Err(failure.into());
             }
             Err(error) => return Err(error.into_anyhow()),
@@ -341,12 +343,6 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
             version: "0.1".to_string(),
             healthy: !self.config.executable.trim().is_empty(),
         }
-    }
-
-    fn native_home_artifact_dirs(&self) -> Result<Vec<RuntimeNativeHomeArtifactDir>> {
-        Ok(vec![RuntimeNativeHomeArtifactDir::new(
-            CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR,
-        )?])
     }
 
     fn native_reopen_recovery(&self) -> RuntimeNativeReopenRecovery {

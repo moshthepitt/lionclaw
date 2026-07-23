@@ -45,13 +45,23 @@ pub(crate) fn parse_app_server_response(
                     .or_else(|| code.as_i64().map(|code| code.to_string()))
             })
             .unwrap_or_else(|| "codex.app_server".to_string());
-        return Err(TypedFailure::permanent(
-            code,
-            format!(
-                "codex app-server {method} failed: {}",
-                app_server_error_text(error)
-            ),
-        ));
+        let detail = format!(
+            "codex app-server {method} failed: {}",
+            app_server_error_text(error)
+        );
+        if error.get("willRetry").and_then(Value::as_bool) == Some(true)
+            || error.pointer("/data/retryable").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(TypedFailure::transient(
+                code,
+                detail,
+                error
+                    .get("retryAfterMs")
+                    .or_else(|| error.pointer("/data/retryAfterMs"))
+                    .and_then(Value::as_u64),
+            ));
+        }
+        return Err(TypedFailure::permanent(code, detail));
     }
     Ok(message.get("result").cloned().unwrap_or(Value::Null))
 }
@@ -168,5 +178,34 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.evidence().code.as_deref(), Some("capacity"));
+    }
+
+    #[test]
+    fn response_retryability_uses_only_structured_provider_evidence() {
+        let prose_only = parse_app_server_response(
+            json!({"error": {"code": "capacity", "message": "retry later"}}),
+            "thread/resume",
+        )
+        .unwrap_err();
+        assert!(matches!(prose_only, TypedFailure::PermanentRuntime { .. }));
+
+        let structured = parse_app_server_response(
+            json!({
+                "error": {
+                    "code": "capacity",
+                    "message": "busy",
+                    "data": {"retryable": true, "retryAfterMs": 25}
+                }
+            }),
+            "thread/resume",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            structured,
+            TypedFailure::TransientRuntime {
+                retry_after_ms: Some(25),
+                ..
+            }
+        ));
     }
 }
