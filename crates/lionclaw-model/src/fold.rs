@@ -5,17 +5,17 @@ use super::ids::{AssertionId, RoleInstanceId};
 use super::state::{
     ActiveDelivery, AssertionState, AttentionItem, AttentionKind, ConversationLifecycle,
     ConversationState, DeliveryMarker, InflightEffect, MissionPhase, MissionState, ParkedEffect,
-    PlanningInput, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, RoleAttemptDisposition,
-    RoleAttemptReceipt, SettledHandoff, TaskAttemptOutcome, TaskRoleAssignment, TaskRuntimeState,
-    TaskStatus,
+    PlanningInput, PlanningRefinement, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
+    RoleAttemptDisposition, RoleAttemptReceipt, SettledHandoff, TaskAttemptOutcome,
+    TaskRoleAssignment, TaskRuntimeState, TaskStatus,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 38 preserves superseded assertion receipts across joint plan/team
-/// revision promotion.
-pub const REDUCER_VERSION: u32 = 38;
+/// Reducer 39 restores durable planning refinement input across team-owned
+/// proposal revision and failure-driven replanning.
+pub const REDUCER_VERSION: u32 = 39;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -823,6 +823,8 @@ fn apply_decision(
     match (action, item.kind) {
         (super::DecisionAction::Approve, AttentionKind::PlanProposal) => {
             state.proposal_approved = true;
+            state.planning_input.latest_rejected_proposal = None;
+            state.planning_input.refinement = None;
             if state
                 .proposal
                 .as_ref()
@@ -869,6 +871,15 @@ fn apply_decision(
             state.gap_review = Default::default();
         }
         (super::DecisionAction::Repair, _) => {}
+        (super::DecisionAction::Revise, AttentionKind::PlanProposal) => {
+            state.planning_input.latest_rejected_proposal = state.proposal.take();
+            state.planning_input.refinement =
+                Some(PlanningRefinement::Guidance(justification.to_string()));
+            state.phase = MissionPhase::Planning;
+            state.proposal_approved = false;
+            state.gap_review.accepted = None;
+            ready_planning_conversation(state);
+        }
         (super::DecisionAction::Revise, _) => {
             if item.kind == AttentionKind::NodeFailed {
                 retry_failed_node(state, &item);
@@ -877,6 +888,14 @@ fn apply_decision(
             state.proposal = None;
             state.proposal_approved = false;
             state.gap_review.accepted = None;
+            state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(Box::new(
+                super::FailureFeedback {
+                    summary: item.report,
+                    evidence: item.evidence,
+                    justification: justification.to_string(),
+                },
+            )));
+            ready_planning_conversation(state);
         }
         (super::DecisionAction::Accept, AttentionKind::GapReviewGaps) => {
             let judged_sha = state
@@ -917,6 +936,20 @@ fn apply_decision(
         _ => {}
     }
     state.open_attention.remove(attention_id);
+}
+
+fn ready_planning_conversation(state: &mut MissionState) {
+    let Some(planner) = state
+        .team
+        .as_ref()
+        .map(|team| team.planning_assignment.clone())
+    else {
+        return;
+    };
+    if let Some(conversation) = state.conversations.get_mut(&planner) {
+        conversation.lifecycle = ConversationLifecycle::Ready;
+        conversation.active_delivery = None;
+    }
 }
 
 fn clear_authoritative_verdicts(state: &mut MissionState, assertion_ids: &[AssertionId]) {
@@ -1241,7 +1274,9 @@ fn derive(state: &mut MissionState) {
         state.phase = MissionPhase::AttentionNeeded;
         return;
     }
-    if state.plan.is_none() {
+    if state.plan.is_none()
+        || (state.planning_input.refinement.is_some() && state.proposal.is_none())
+    {
         state.phase = MissionPhase::Planning;
         return;
     }
