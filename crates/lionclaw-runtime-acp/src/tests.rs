@@ -998,6 +998,147 @@ async fn acp_turn_updates_advertised_model_from_runtime_notification() {
 }
 
 #[tokio::test]
+async fn requested_mode_drift_from_runtime_notification_fails_with_observed_evidence() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, Some("plan".into())));
+    let handle = adapter
+        .session_start(RuntimeSessionStartInput {
+            session_id: Uuid::new_v4(),
+            working_dir: None,
+            environment: Vec::new(),
+            resume: RuntimeResume::Native {
+                state: runtime_state(runtime_state_root.clone()),
+                ready: runtime_not_ready(),
+            },
+        })
+        .expect("start");
+    let executor = FakeAcpProgramExecutor {
+        inbound: VecDeque::from([
+            opencode_initialize_response(1),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_mode","modes":{"currentModeId":"build","availableModes":[{"id":"plan","name":"Plan"},{"id":"build","name":"Build"}]}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"result":{"modes":{"currentModeId":"plan","availableModes":[{"id":"plan","name":"Plan"},{"id":"build","name":"Build"}]}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_mode","update":{"sessionUpdate":"current_mode_update","currentModeId":"build"}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
+        ]),
+        expected_auth: None,
+        state: Arc::new(Mutex::new(FakeAcpProgramState::default())),
+    };
+    let (journal_tx, _journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+
+    let error = adapter
+        .turn(
+            TurnExecution {
+                input: TurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "hello".to_string(),
+                },
+                context: acp_driver_context(runtime_state_root),
+                executor: Box::new(executor),
+            },
+            journal_tx,
+        )
+        .await
+        .expect_err("requested mode drift must fail");
+    let failure = error
+        .downcast_ref::<TypedFailure>()
+        .expect("configuration drift is typed");
+
+    assert_eq!(
+        failure.evidence().code.as_deref(),
+        Some("acp.configuration_drift")
+    );
+    assert!(failure.evidence().detail.contains("mode requested 'plan'"));
+    assert_eq!(
+        failure.evidence().configuration.requested_mode.as_deref(),
+        Some("plan")
+    );
+    assert_eq!(
+        failure.evidence().configuration.applied_mode.as_deref(),
+        Some("build")
+    );
+    assert_eq!(
+        failure.evidence().configuration.mode_confirmation,
+        Some(RuntimeConfigurationConfirmation::Observed)
+    );
+}
+
+#[tokio::test]
+async fn partial_configuration_failure_preserves_requested_and_observed_evidence() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let adapter = AcpRuntimeAdapter::new(opencode_acp_config(
+        Some("gpt-5".into()),
+        Some("plan".into()),
+    ));
+    let handle = adapter
+        .session_start(RuntimeSessionStartInput {
+            session_id: Uuid::new_v4(),
+            working_dir: None,
+            environment: Vec::new(),
+            resume: RuntimeResume::Native {
+                state: runtime_state(runtime_state_root.clone()),
+                ready: runtime_not_ready(),
+            },
+        })
+        .expect("start");
+    let executor = FakeAcpProgramExecutor {
+        inbound: VecDeque::from([
+            opencode_initialize_response(1),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_partial","configOptions":[{"id":"model","currentValue":"old","options":[{"value":"gpt-5"}]},{"id":"mode","currentValue":"build","options":[{"value":"plan"},{"value":"build"}]}]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"model","currentValue":"gpt-5"}]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"mode","currentValue":"build"}]}}"#.to_string(),
+        ]),
+        expected_auth: None,
+        state: Arc::new(Mutex::new(FakeAcpProgramState::default())),
+    };
+    let (journal_tx, _journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+
+    let error = adapter
+        .turn(
+            TurnExecution {
+                input: TurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "never reached".to_string(),
+                },
+                context: acp_driver_context(runtime_state_root),
+                executor: Box::new(executor),
+            },
+            journal_tx,
+        )
+        .await
+        .expect_err("mode mismatch must fail during configuration");
+    let failure = error
+        .downcast_ref::<TypedFailure>()
+        .expect("configuration failure is typed");
+
+    assert_eq!(failure.evidence().code.as_deref(), Some("acp.runtime"));
+    assert!(failure
+        .evidence()
+        .detail
+        .contains("applied mode 'build' instead of requested 'plan'"));
+    assert_eq!(
+        failure.evidence().configuration.requested_model.as_deref(),
+        Some("gpt-5")
+    );
+    assert_eq!(
+        failure.evidence().configuration.applied_model.as_deref(),
+        Some("gpt-5")
+    );
+    assert_eq!(
+        failure.evidence().configuration.requested_mode.as_deref(),
+        Some("plan")
+    );
+    assert_eq!(
+        failure.evidence().configuration.applied_mode.as_deref(),
+        Some("build")
+    );
+    assert_eq!(failure.evidence().runtime_usage, RuntimeUsage::NotReported);
+}
+
+#[tokio::test]
 async fn unadvertised_or_unconfirmed_configuration_is_rejected() {
     let selections = AcpSessionSelections::from_session_result(&json!({
         "configOptions": [{

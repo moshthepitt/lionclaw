@@ -213,7 +213,7 @@ impl AcpTurnRunner {
         let session = self.executor.spawn(program).await?;
         let mut client = AcpClient::new(session);
         let mut active_turn = None;
-        let mut applied_configuration = None;
+        let mut applied_configuration = requested_runtime_configuration(&self.config);
 
         let result = async {
             let session_capabilities = client.initialize().await?;
@@ -236,7 +236,7 @@ impl AcpTurnRunner {
                 )
                 .await?
                 .projected();
-            applied_configuration = Some(configuration.clone());
+            applied_configuration = configuration.clone();
             if !configuration.is_empty() {
                 drop(
                     journal
@@ -265,6 +265,7 @@ impl AcpTurnRunner {
                 .await;
             let final_response = prompt_result?;
             configuration.merge_observed(client.observed_configuration());
+            reject_observed_configuration_drift(&applied_configuration, &configuration)?;
             Ok(TurnResult {
                 configuration: configuration.projected(),
                 runtime_usage: client.runtime_usage().clone(),
@@ -279,16 +280,14 @@ impl AcpTurnRunner {
         } else {
             client.take_final_response()
         };
-        let failed_configuration = applied_configuration.as_ref().map(|configuration| {
-            let mut configuration = configuration.clone();
-            configuration.merge_observed(client.observed_configuration());
-            configuration.projected()
-        });
+        let mut failed_configuration = applied_configuration;
+        failed_configuration.merge_observed(client.observed_configuration());
+        let failed_configuration = failed_configuration.projected();
         let failed_runtime_usage = client.runtime_usage().clone().projected();
         let result = finish_acp_session(client, result).await.map_err(|error| {
             let mut error = configured_failure(
                 error,
-                failed_configuration.as_ref(),
+                &failed_configuration,
                 &failed_runtime_usage,
                 "acp.runtime",
             );
@@ -304,7 +303,7 @@ impl AcpTurnRunner {
 
 fn configured_failure(
     error: anyhow::Error,
-    configuration: Option<&lionclaw_runtime_api::AppliedRuntimeConfiguration>,
+    configuration: &lionclaw_runtime_api::AppliedRuntimeConfiguration,
     runtime_usage: &lionclaw_runtime_api::RuntimeUsage,
     code: &str,
 ) -> anyhow::Error {
@@ -312,12 +311,69 @@ fn configured_failure(
         .downcast_ref::<TypedFailure>()
         .cloned()
         .unwrap_or_else(|| TypedFailure::permanent(code, error.to_string()));
-    if let Some(configuration) = configuration {
-        failure.evidence_mut().configuration = configuration.clone();
-    }
+    failure.evidence_mut().configuration = configuration.clone();
     failure
         .evidence_mut()
         .runtime_usage
         .merge_observed(runtime_usage.clone());
     anyhow::Error::new(failure.projected())
+}
+
+fn requested_runtime_configuration(
+    config: &AcpRuntimeConfig,
+) -> lionclaw_runtime_api::AppliedRuntimeConfiguration {
+    lionclaw_runtime_api::AppliedRuntimeConfiguration {
+        requested_model: config.model.clone(),
+        requested_mode: config.mode.clone(),
+        ..Default::default()
+    }
+}
+
+fn reject_observed_configuration_drift(
+    configured: &lionclaw_runtime_api::AppliedRuntimeConfiguration,
+    final_configuration: &lionclaw_runtime_api::AppliedRuntimeConfiguration,
+) -> Result<()> {
+    let mut mismatches = Vec::new();
+    record_observed_drift(
+        "model",
+        configured.requested_model.as_deref(),
+        configured.applied_model.as_deref(),
+        final_configuration.applied_model.as_deref(),
+        &mut mismatches,
+    );
+    record_observed_drift(
+        "mode",
+        configured.requested_mode.as_deref(),
+        configured.applied_mode.as_deref(),
+        final_configuration.applied_mode.as_deref(),
+        &mut mismatches,
+    );
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(TypedFailure::permanent(
+        "acp.configuration_drift",
+        format!(
+            "ACP runtime changed requested configuration after it was applied: {}",
+            mismatches.join(", ")
+        ),
+    )))
+}
+
+fn record_observed_drift(
+    kind: &str,
+    requested: Option<&str>,
+    configured: Option<&str>,
+    observed: Option<&str>,
+    mismatches: &mut Vec<String>,
+) {
+    let (Some(requested), Some(configured), Some(observed)) = (requested, configured, observed)
+    else {
+        return;
+    };
+    if observed != configured {
+        mismatches.push(format!(
+            "{kind} requested '{requested}' was configured as '{configured}' but observed as '{observed}'"
+        ));
+    }
 }

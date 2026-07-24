@@ -318,20 +318,20 @@ impl AcpClient {
                 None,
             )
             .await?;
-        let observed = AcpSessionSelections::from_session_result(&response.result)
+        let response_selections = AcpSessionSelections::from_session_result(&response.result);
+        let observed = response_selections
             .config_options
-            .into_iter()
+            .iter()
             .find(|candidate| candidate.id == kind)
-            .and_then(|candidate| candidate.current)
+            .and_then(|candidate| candidate.current.clone())
             .ok_or_else(|| anyhow!("ACP runtime did not observe applied {kind} '{requested}'"))?;
+        self.observed_configuration
+            .merge_observed(&response_selections.observed_configuration());
         if observed != requested {
             return Err(anyhow!(
                 "ACP runtime applied {kind} '{observed}' instead of requested '{requested}'"
             ));
         }
-        self.observed_configuration.merge_observed(
-            &AcpSessionSelections::from_session_result(&response.result).observed_configuration(),
-        );
         Ok(observed)
     }
 
