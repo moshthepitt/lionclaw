@@ -138,8 +138,25 @@ fn assert_abort_preserves_authority(state: &lionclaw::model::MissionState) {
         let after = &aborted.conversations[id];
         assert_eq!(after.role_instance, before.role_instance);
         assert_eq!(after.final_response, before.final_response);
+        assert_eq!(
+            after.invalid_handoff_reworks,
+            before.invalid_handoff_reworks
+        );
         assert_eq!(after.queued.len(), before.queued.len());
-        assert_eq!(after, before);
+        assert_eq!(
+            after.lifecycle,
+            lionclaw::model::ConversationLifecycle::Retired
+        );
+        assert!(after.active_delivery.is_none());
+        for (after_message, before_message) in after.queued.iter().zip(&before.queued) {
+            assert_eq!(after_message.sequence_no, before_message.sequence_no);
+            assert_eq!(after_message.body, before_message.body);
+            assert_eq!(after_message.references, before_message.references);
+            assert_eq!(
+                after_message.marker,
+                lionclaw::model::DeliveryMarker::Undeliverable
+            );
+        }
     }
     assert_eq!(aborted.authoritative_receipts, state.authoritative_receipts);
     assert_eq!(aborted.reachable_commits, state.reachable_commits);
