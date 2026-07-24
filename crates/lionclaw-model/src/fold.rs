@@ -13,9 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 39 restores durable planning refinement input across team-owned
-/// proposal revision and failure-driven replanning.
-pub const REDUCER_VERSION: u32 = 39;
+/// Reducer 40 carries exact task failure receipts into attention and durable
+/// planning refinement evidence.
+pub const REDUCER_VERSION: u32 = 40;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -1075,6 +1075,14 @@ fn derive(state: &mut MissionState) {
     for (task_id, task) in &state.tasks {
         if task.status == TaskStatus::Failed && !state.task_automatic_retry_remaining(task_id) {
             let id = format!("node_failed:{task_id}");
+            let evidence = match &task.last_outcome {
+                Some(TaskAttemptOutcome::Failed { effect_id }) => {
+                    super::DecisionEvidence::RoleAttempts {
+                        effect_ids: vec![effect_id.clone()],
+                    }
+                }
+                _ => super::DecisionEvidence::None,
+            };
             attention.insert(
                 id.clone(),
                 AttentionItem {
@@ -1083,7 +1091,7 @@ fn derive(state: &mut MissionState) {
                     task_id: Some(task_id.clone()),
                     oracle: None,
                     assertion_ids: Vec::new(),
-                    evidence: super::DecisionEvidence::None,
+                    evidence,
                     report: format!("Task '{task_id}' is parked."),
                 },
             );
