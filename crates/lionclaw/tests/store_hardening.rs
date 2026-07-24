@@ -129,6 +129,7 @@ fn success(handoff: Option<Handoff>) -> NewEvent {
             artifact: None,
             final_response: PayloadRef::inline("role response"),
             runtime_configuration: RuntimeConfigurationEvidence::default(),
+            runtime_usage: Default::default(),
         }),
     })
 }

@@ -75,6 +75,7 @@ fn work_outcome(request: &RoleTurnRequest, head_sha: &str) -> RoleTurnOutcome {
             head_sha,
         )),
         runtime_configuration: Default::default(),
+        runtime_usage: Default::default(),
         final_response: String::new(),
     }
 }
@@ -99,6 +100,7 @@ fn normal_outcome(request: &RoleTurnRequest, head_sha: &str) -> RoleTurnOutcome 
             }),
             artifact: None,
             runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
             final_response: "judged".to_string(),
         }
     } else {
@@ -732,6 +734,7 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "review analysis before the forged verdict".into(),
             })
         } else {
@@ -1006,6 +1009,7 @@ async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: String::new(),
             })
         } else {
@@ -1037,6 +1041,7 @@ async fn an_ordinary_validator_handoff_cannot_seal_the_gap_review() {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: String::new(),
             })
         } else {

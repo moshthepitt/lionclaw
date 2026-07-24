@@ -11,7 +11,7 @@ use super::ids::{AssertionId, MissionId, OracleName, RoleInstanceId, TaskId};
 use super::plan::{Assertion, Plan};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
-use crate::{TypedFailure, TypedFailureEvidence};
+use crate::{RuntimeUsage, TypedFailure, TypedFailureEvidence};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -181,6 +181,8 @@ pub struct RoleAttemptReceipt {
     pub source: RoleEffectSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_configuration: Option<RuntimeConfigurationEvidence>,
+    #[serde(default)]
+    pub runtime_usage: RuntimeUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_response: Option<PayloadRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -907,6 +909,7 @@ impl InflightEffect {
             effect_id: effect_id.clone(),
             source,
             runtime_configuration: None,
+            runtime_usage: RuntimeUsage::NotReported,
             final_response: None,
             handoff: None,
             disposition: RoleAttemptDisposition::Active,

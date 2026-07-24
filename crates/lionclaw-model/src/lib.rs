@@ -48,7 +48,8 @@ pub use event::{
 };
 pub use failure::{
     bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,
-    RuntimeConfigurationConfirmation, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT,
+    RuntimeConfigurationConfirmation, RuntimeUsage, RuntimeUsageCost, RuntimeUsageCostScope,
+    RuntimeUsageDetails, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT,
 };
 pub use fold::{apply, fold, ready_to_finish, REDUCER_VERSION};
 pub use ids::{

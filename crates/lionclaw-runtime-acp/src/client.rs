@@ -8,7 +8,7 @@ use tracing::warn;
 
 use lionclaw_runtime_api::{
     AppliedRuntimeConfiguration, ExecutionOutput, RuntimeEvent, RuntimeMcpServerSpec,
-    RuntimeProgramSession, RuntimeTurnJournalSender, TurnEvent, TypedFailure,
+    RuntimeProgramSession, RuntimeTurnJournalSender, RuntimeUsage, TurnEvent, TypedFailure,
 };
 
 use crate::driver::AcpRuntimeConfig;
@@ -16,9 +16,10 @@ use crate::event_mapping::acp_turn_events;
 use crate::policy::{acp_error_response, acp_permission_denial};
 use crate::program::acp_mcp_servers;
 use crate::protocol::{
-    acp_is_server_request, acp_response_id, parse_acp_response, AcpMessage, AcpOpenedSession,
-    AcpProviderRejection, AcpResponse, AcpResponseOutcome, AcpSelectionSet, AcpSessionCapabilities,
-    AcpSessionSelections,
+    acp_is_server_request, acp_prompt_usage, acp_response_id, acp_session_update,
+    acp_update_observed_configuration, acp_update_usage, parse_acp_response, AcpMessage,
+    AcpOpenedSession, AcpProviderRejection, AcpResponse, AcpResponseOutcome, AcpSelectionSet,
+    AcpSessionCapabilities, AcpSessionSelections,
 };
 use crate::state::{
     forget_acp_session_id, normalize_acp_session_id, record_native_session_observation,
@@ -29,6 +30,8 @@ pub(crate) struct AcpClient {
     session: Option<Box<dyn RuntimeProgramSession>>,
     next_id: u64,
     final_response: String,
+    observed_configuration: AppliedRuntimeConfiguration,
+    runtime_usage: RuntimeUsage,
 }
 
 enum AcpRequestFailure {
@@ -78,6 +81,8 @@ impl AcpClient {
             session: Some(session),
             next_id: 1,
             final_response: String::new(),
+            observed_configuration: AppliedRuntimeConfiguration::default(),
+            runtime_usage: RuntimeUsage::NotReported,
         }
     }
 
@@ -206,13 +211,15 @@ impl AcpClient {
         session_id: &str,
         selections: &AcpSessionSelections,
     ) -> Result<AppliedRuntimeConfiguration> {
+        self.observed_configuration = selections.observed_configuration();
         let mut applied = AppliedRuntimeConfiguration {
             requested_model: config.model.clone(),
             requested_mode: config.mode.clone(),
             ..Default::default()
         };
+        applied.merge_observed(&self.observed_configuration);
         if let Some(model) = config.model.as_deref() {
-            let (selected, confirmation) = self
+            let selected = self
                 .apply_selection(
                     session_id,
                     "model",
@@ -222,11 +229,12 @@ impl AcpClient {
                 )
                 .await?;
             applied.applied_model = Some(selected);
-            applied.model_confirmation = Some(confirmation);
+            applied.model_confirmation =
+                Some(lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed);
         }
 
         if let Some(mode) = config.mode.as_deref() {
-            let (selected, confirmation) = self
+            let selected = self
                 .apply_selection(
                     session_id,
                     "mode",
@@ -236,7 +244,8 @@ impl AcpClient {
                 )
                 .await?;
             applied.applied_mode = Some(selected);
-            applied.mode_confirmation = Some(confirmation);
+            applied.mode_confirmation =
+                Some(lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed);
         }
 
         Ok(applied)
@@ -249,10 +258,7 @@ impl AcpClient {
         requested: &str,
         first_class: Option<&AcpSelectionSet>,
         selections: &AcpSessionSelections,
-    ) -> Result<(
-        String,
-        lionclaw_runtime_api::RuntimeConfigurationConfirmation,
-    )> {
+    ) -> Result<String> {
         if let Some(first_class) = first_class {
             let matches = first_class
                 .values
@@ -273,16 +279,26 @@ impl AcpClient {
                 "mode" => ("session/set_mode", "modeId"),
                 _ => return Err(anyhow!("unsupported ACP selection kind '{kind}'")),
             };
-            self.request(
-                method,
-                json!({"sessionId": session_id, (id_key): selected}),
-                None,
-            )
-            .await?;
-            return Ok((
-                selected,
-                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged,
-            ));
+            let response = self
+                .request(
+                    method,
+                    json!({"sessionId": session_id, (id_key): selected}),
+                    None,
+                )
+                .await?;
+            let observed = AcpSessionSelections::from_session_result(&response.result)
+                .observed_configuration();
+            self.observed_configuration.merge_observed(&observed);
+            let observed =
+                observed_value_for_kind(&self.observed_configuration, kind).ok_or_else(|| {
+                    anyhow!("ACP runtime did not observe applied {kind} '{requested}'")
+                })?;
+            if observed != selected {
+                return Err(anyhow!(
+                    "ACP runtime applied {kind} '{observed}' instead of requested '{requested}'"
+                ));
+            }
+            return Ok(observed);
         }
 
         let option = selections
@@ -307,16 +323,16 @@ impl AcpClient {
             .into_iter()
             .find(|candidate| candidate.id == kind)
             .and_then(|candidate| candidate.current)
-            .ok_or_else(|| anyhow!("ACP runtime did not confirm applied {kind} '{requested}'"))?;
+            .ok_or_else(|| anyhow!("ACP runtime did not observe applied {kind} '{requested}'"))?;
         if observed != requested {
             return Err(anyhow!(
                 "ACP runtime applied {kind} '{observed}' instead of requested '{requested}'"
             ));
         }
-        Ok((
-            observed,
-            lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
-        ))
+        self.observed_configuration.merge_observed(
+            &AcpSessionSelections::from_session_result(&response.result).observed_configuration(),
+        );
+        Ok(observed)
     }
 
     pub(crate) async fn prompt(
@@ -327,20 +343,24 @@ impl AcpClient {
         cancel_rx: &mut mpsc::UnboundedReceiver<AcpCancelRequest>,
     ) -> Result<String> {
         self.final_response.clear();
-        self.request_with_cancel(
-            "session/prompt",
-            json!({
-                "sessionId": session_id,
-                "prompt": [{
-                    "type": "text",
-                    "text": prompt,
-                }],
-            }),
-            Some(journal),
-            session_id,
-            cancel_rx,
-        )
-        .await?;
+        self.runtime_usage = RuntimeUsage::NotReported;
+        let response = self
+            .request_with_cancel(
+                "session/prompt",
+                json!({
+                    "sessionId": session_id,
+                    "prompt": [{
+                        "type": "text",
+                        "text": prompt,
+                    }],
+                }),
+                Some(journal),
+                session_id,
+                cancel_rx,
+            )
+            .await?;
+        self.runtime_usage
+            .merge_observed(acp_prompt_usage(&response.result));
         drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)).await);
         Ok(self.take_final_response())
     }
@@ -484,6 +504,11 @@ impl AcpClient {
             return Ok(());
         }
 
+        if let Some(update) = acp_session_update(&message.value) {
+            self.observed_configuration
+                .merge_observed(&acp_update_observed_configuration(update));
+            self.runtime_usage.merge_observed(acp_update_usage(update));
+        }
         if let Some(journal) = journal {
             for record in acp_turn_events(&message) {
                 lionclaw_runtime_api::observe_final_response(
@@ -494,6 +519,14 @@ impl AcpClient {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn observed_configuration(&self) -> &AppliedRuntimeConfiguration {
+        &self.observed_configuration
+    }
+
+    pub(crate) fn runtime_usage(&self) -> &RuntimeUsage {
+        &self.runtime_usage
     }
 
     pub(crate) fn take_final_response(&mut self) -> String {
@@ -577,6 +610,17 @@ impl AcpClient {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+}
+
+fn observed_value_for_kind(
+    configuration: &AppliedRuntimeConfiguration,
+    kind: &str,
+) -> Option<String> {
+    match kind {
+        "model" => configuration.applied_model.clone(),
+        "mode" => configuration.applied_mode.clone(),
+        _ => None,
     }
 }
 

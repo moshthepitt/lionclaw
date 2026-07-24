@@ -57,6 +57,7 @@ async fn production_cli_routes_atomically_only_to_explicit_live_conversations() 
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "reviewed".into(),
             })
         } else {
@@ -64,6 +65,7 @@ async fn production_cli_routes_atomically_only_to_explicit_live_conversations() 
                 handoff: None,
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "question".into(),
             })
         }

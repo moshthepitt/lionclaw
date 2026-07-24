@@ -18,7 +18,8 @@ use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::PreparedInput;
 use lionclaw::model::{
     Assertion, AssertionId, FinishClass, InputName, MissionPhase, OracleName, OutputSemantics,
-    RoleInstanceId, TaskStatus,
+    RoleInstanceId, RuntimeUsage, RuntimeUsageCost, RuntimeUsageCostScope, RuntimeUsageDetails,
+    TaskStatus,
 };
 use lionclaw::testing::{MockClock, NoopEffectCleaner};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -49,6 +50,7 @@ async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_complet
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "judged".into(),
             });
         }
@@ -57,6 +59,7 @@ async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_complet
                 handoff: None,
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "Which behavior should I preserve?".into(),
             }),
             1 => {
@@ -78,6 +81,7 @@ async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_complet
                     HEAD_SHA,
                 )),
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "Implemented and verified.".into(),
             }),
         }
@@ -396,6 +400,7 @@ async fn durable_role_outcomes_bound_adapter_configuration_evidence() {
                     ..Default::default()
                 }
                 .projected(),
+                runtime_usage: Default::default(),
                 final_response: "done".into(),
             })
         })),
@@ -426,6 +431,79 @@ async fn durable_role_outcomes_bound_adapter_configuration_evidence() {
         .and_then(|configuration| configuration.applied_model.as_ref())
         .expect("applied model evidence");
     assert!(applied_model.len() <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT);
+}
+
+#[tokio::test]
+async fn durable_role_outcomes_preserve_and_report_runtime_usage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::new(Box::new(move |request| {
+            Ok(lionclaw::ports::RoleTurnOutcome {
+                handoff: Some(lionclaw::model::Handoff::Work {
+                    done: true,
+                    report: lionclaw::model::PayloadRef::inline("done"),
+                    request_attention: false,
+                }),
+                artifact: Some(lionclaw::ports::CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    HEAD_SHA,
+                )),
+                runtime_configuration: Default::default(),
+                runtime_usage: RuntimeUsage::from_details(RuntimeUsageDetails {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    total_tokens: Some(12),
+                    cost: Some(RuntimeUsageCost {
+                        amount: "0.0042".to_string(),
+                        currency: "USD".to_string(),
+                        scope: RuntimeUsageCostScope::Turn,
+                    }),
+                    ..Default::default()
+                }),
+                final_response: "done".into(),
+            })
+        })),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "preserve runtime usage",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+    h.engine.advance(&mission_id).await.expect("advance");
+
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    let task_id = state.tasks.keys().next().expect("task");
+    let receipt = state
+        .task_last_role_attempt(task_id)
+        .expect("role attempt receipt");
+    let details = receipt.runtime_usage.details().expect("usage details");
+    assert_eq!(details.input_tokens, Some(10));
+    assert_eq!(details.output_tokens, Some(2));
+    assert_eq!(details.total_tokens, Some(12));
+
+    let json =
+        lionclaw::evidence::role_attempt_receipt_json(h.engine.store().blobs(), &state, receipt);
+    assert_eq!(json["runtime_usage"]["status"], "reported");
+    assert_eq!(json["runtime_usage"]["usage"]["total_tokens"], 12);
+    assert_eq!(json["runtime_usage"]["usage"]["cost"]["scope"], "turn");
+
+    let rendered =
+        lionclaw::evidence::render_role_attempt_receipt(h.engine.store().blobs(), &state, receipt);
+    assert!(rendered.contains("runtime usage: input_tokens=10"));
+    assert!(rendered.contains("total_tokens=12"));
+    assert!(rendered.contains("cost=0.0042 USD (turn)"));
 }
 
 #[tokio::test]
@@ -542,6 +620,7 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
                     }),
                     artifact: None,
                     runtime_configuration: Default::default(),
+                    runtime_usage: Default::default(),
                     final_response: "judged".into(),
                 })
             } else {
@@ -556,6 +635,7 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
                         BASE_SHA,
                     )),
                     runtime_configuration: Default::default(),
+                    runtime_usage: Default::default(),
                     final_response: "already satisfied".into(),
                 })
             }
@@ -655,6 +735,7 @@ async fn worker_reporting_not_done_parks_with_attention() {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: String::new(),
             })
         })),
@@ -704,6 +785,7 @@ async fn role_runner_cannot_inject_a_durable_blob_reference() {
                     HEAD_SHA,
                 )),
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "attempted injection".into(),
             })
         })),
@@ -756,6 +838,7 @@ async fn role_runner_oversized_report_is_a_durable_invalid_output() {
                     HEAD_SHA,
                 )),
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "oversized report".into(),
             })
         })),

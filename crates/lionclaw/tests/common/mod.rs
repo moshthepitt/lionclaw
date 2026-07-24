@@ -443,6 +443,7 @@ pub fn review_runner(verdicts: Vec<(bool, Vec<lionclaw::model::Gap>)>) -> MockRo
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "judged".to_string(),
             })
         } else {
@@ -457,6 +458,7 @@ pub fn review_runner(verdicts: Vec<(bool, Vec<lionclaw::model::Gap>)>) -> MockRo
                     HEAD_SHA,
                 )),
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: String::new(),
             })
         }

@@ -70,6 +70,7 @@ impl RoleRunner for NoopRoleRunner {
             }),
             artifact: None,
             runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
             final_response: "self-test noop worker".to_string(),
         })
     }
@@ -119,6 +120,7 @@ impl RoleRunner for ReviewParkRoleRunner {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "self-test scripted review".to_string(),
             })
         } else if let Some(outcome) = passing_verdict(&request) {
@@ -136,6 +138,7 @@ impl RoleRunner for ReviewParkRoleRunner {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "self-test worker".to_string(),
             })
         }
@@ -616,6 +619,7 @@ impl ScriptedRoleRunner {
             }),
             artifact: Some(artifact),
             runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
             final_response: "self-test scripted fix".to_string(),
         })
     }
@@ -640,6 +644,7 @@ fn passing_verdict(request: &RoleTurnRequest) -> Option<RoleTurnOutcome> {
         }),
         artifact: None,
         runtime_configuration: Default::default(),
+        runtime_usage: Default::default(),
         final_response: "self-test passing judgment".to_string(),
     })
 }

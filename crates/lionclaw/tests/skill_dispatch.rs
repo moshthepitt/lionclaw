@@ -59,6 +59,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "judged".into(),
             });
         }
@@ -81,6 +82,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
                 applied_model: Some("mock".to_string()),
                 ..Default::default()
             },
+            runtime_usage: Default::default(),
             final_response: String::new(),
         })
     }));
@@ -144,6 +146,7 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "judged".into(),
             });
         }
@@ -164,6 +167,7 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
                 applied_model: Some("mock".to_string()),
                 ..Default::default()
             },
+            runtime_usage: Default::default(),
             final_response: String::new(),
         })
     }));

@@ -213,6 +213,7 @@ fn judgment_outcome(request: &RoleTurnRequest) -> Option<RoleTurnOutcome> {
         }),
         artifact: None,
         runtime_configuration: RuntimeConfigurationEvidence::default(),
+        runtime_usage: Default::default(),
         final_response: "judged".into(),
     })
 }
@@ -309,6 +310,7 @@ impl RoleRunner for AdversarialRetentionRunner {
                 handoff: Some(handoff),
                 artifact: Some(artifact),
                 runtime_configuration: configuration,
+                runtime_usage: Default::default(),
                 final_response: RETAINED_RESPONSE.into(),
             }),
             AdversarialRetentionMode::AcceptedThenCrash => {
@@ -364,6 +366,7 @@ impl RoleRunner for MissingValidatorHandoffRunner {
                     handoff: Some(handoff),
                     artifact: Some(artifact),
                     runtime_configuration,
+                    runtime_usage: Default::default(),
                     final_response: "writer completed".into(),
                 })
             }
@@ -409,6 +412,7 @@ impl RoleRunner for MissingValidatorHandoffRunner {
                     handoff: Some(handoff),
                     artifact: None,
                     runtime_configuration,
+                    runtime_usage: Default::default(),
                     final_response: RETAINED_RESPONSE.into(),
                 })
             }
@@ -470,6 +474,7 @@ impl RoleRunner for UnacknowledgedRunner {
             }),
             artifact: None,
             runtime_configuration: RuntimeConfigurationEvidence::default(),
+            runtime_usage: Default::default(),
             final_response: "must not settle".into(),
         })
     }
@@ -618,6 +623,7 @@ impl RoleRunner for BlockingRunner {
             handoff: Some(handoff),
             artifact: Some(artifact),
             runtime_configuration,
+            runtime_usage: Default::default(),
             final_response: String::new(),
         })
     }

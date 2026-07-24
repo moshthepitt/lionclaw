@@ -25,6 +25,7 @@ fn completed_work(base_sha: &str) -> RoleTurnOutcome {
         }),
         artifact: Some(CapturedArtifact::for_testing(base_sha, HEAD_SHA)),
         runtime_configuration: Default::default(),
+        runtime_usage: Default::default(),
         final_response: String::new(),
     }
 }
@@ -48,6 +49,7 @@ fn judgment_outcome(request: &lionclaw::ports::RoleTurnRequest) -> Option<RoleTu
         }),
         artifact: None,
         runtime_configuration: Default::default(),
+        runtime_usage: Default::default(),
         final_response: "recovery reviewed".into(),
     })
 }
@@ -177,6 +179,7 @@ async fn invalid_handoff_is_reworked_automatically_with_exact_feedback() {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: String::new(),
             });
         }
@@ -294,6 +297,7 @@ async fn wrong_handoff_type_is_recorded_as_invalid_and_reworked() {
                     HEAD_SHA,
                 )),
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "wrong schema response".into(),
             });
         }

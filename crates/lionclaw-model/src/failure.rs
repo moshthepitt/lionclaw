@@ -14,6 +14,26 @@ pub struct AppliedRuntimeConfiguration {
 }
 
 impl AppliedRuntimeConfiguration {
+    pub fn is_empty(&self) -> bool {
+        self.requested_model.is_none()
+            && self.applied_model.is_none()
+            && self.model_confirmation.is_none()
+            && self.requested_mode.is_none()
+            && self.applied_mode.is_none()
+            && self.mode_confirmation.is_none()
+    }
+
+    pub fn merge_observed(&mut self, observed: &Self) {
+        if observed.applied_model.is_some() || observed.model_confirmation.is_some() {
+            self.applied_model.clone_from(&observed.applied_model);
+            self.model_confirmation = observed.model_confirmation;
+        }
+        if observed.applied_mode.is_some() || observed.mode_confirmation.is_some() {
+            self.applied_mode.clone_from(&observed.applied_mode);
+            self.mode_confirmation = observed.mode_confirmation;
+        }
+    }
+
     pub fn projected(mut self) -> Self {
         self.requested_model = self.requested_model.map(|value| bounded_text(&value));
         self.applied_model = self.applied_model.map(|value| bounded_text(&value));
@@ -31,6 +51,152 @@ pub enum RuntimeConfigurationConfirmation {
     Acknowledged,
     /// The runtime returned the selected value as its current configuration.
     Observed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeUsageCostScope {
+    Turn,
+    SessionCumulative,
+}
+
+impl RuntimeUsageCostScope {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::SessionCumulative => "session_cumulative",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeUsageCost {
+    pub amount: String,
+    pub currency: String,
+    pub scope: RuntimeUsageCostScope,
+}
+
+impl RuntimeUsageCost {
+    pub fn projected(mut self) -> Self {
+        self.amount = bounded_text(&self.amount);
+        self.currency = bounded_text(&self.currency);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeUsageDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_used_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<RuntimeUsageCost>,
+}
+
+impl RuntimeUsageDetails {
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.total_tokens.is_none()
+            && self.reasoning_tokens.is_none()
+            && self.cached_input_tokens.is_none()
+            && self.context_used_tokens.is_none()
+            && self.context_window_tokens.is_none()
+            && self.cost.is_none()
+    }
+
+    pub fn merge_observed(&mut self, other: Self) {
+        if other.input_tokens.is_some() {
+            self.input_tokens = other.input_tokens;
+        }
+        if other.output_tokens.is_some() {
+            self.output_tokens = other.output_tokens;
+        }
+        if other.total_tokens.is_some() {
+            self.total_tokens = other.total_tokens;
+        }
+        if other.reasoning_tokens.is_some() {
+            self.reasoning_tokens = other.reasoning_tokens;
+        }
+        if other.cached_input_tokens.is_some() {
+            self.cached_input_tokens = other.cached_input_tokens;
+        }
+        if other.context_used_tokens.is_some() {
+            self.context_used_tokens = other.context_used_tokens;
+        }
+        if other.context_window_tokens.is_some() {
+            self.context_window_tokens = other.context_window_tokens;
+        }
+        if other.cost.is_some() {
+            self.cost = other.cost;
+        }
+    }
+
+    pub fn projected(mut self) -> Self {
+        self.cost = self.cost.map(RuntimeUsageCost::projected);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeUsage {
+    #[default]
+    NotReported,
+    Reported {
+        usage: RuntimeUsageDetails,
+    },
+}
+
+impl RuntimeUsage {
+    pub fn from_details(details: RuntimeUsageDetails) -> Self {
+        if details.is_empty() {
+            Self::NotReported
+        } else {
+            Self::Reported { usage: details }
+        }
+    }
+
+    pub fn is_reported(&self) -> bool {
+        matches!(self, Self::Reported { .. })
+    }
+
+    pub fn details(&self) -> Option<&RuntimeUsageDetails> {
+        match self {
+            Self::Reported { usage } => Some(usage),
+            Self::NotReported => None,
+        }
+    }
+
+    pub fn merge_observed(&mut self, other: Self) {
+        let Self::Reported { usage: other } = other else {
+            return;
+        };
+        match self {
+            Self::NotReported => *self = Self::from_details(other),
+            Self::Reported { usage } => usage.merge_observed(other),
+        }
+    }
+
+    pub fn projected(self) -> Self {
+        match self {
+            Self::NotReported => Self::NotReported,
+            Self::Reported { usage } => Self::from_details(usage.projected()),
+        }
+    }
 }
 
 pub const FAILURE_TEXT_LIMIT: usize = 8 * 1024;
@@ -52,6 +218,8 @@ pub struct TypedFailureEvidence {
     pub final_response: String,
     #[serde(default)]
     pub configuration: AppliedRuntimeConfiguration,
+    #[serde(default)]
+    pub runtime_usage: RuntimeUsage,
 }
 
 impl TypedFailureEvidence {
@@ -70,6 +238,7 @@ impl TypedFailureEvidence {
         self.final_response = bounded_text(&self.final_response);
         self.stop_reason = self.stop_reason.map(|reason| bounded_text(&reason));
         self.configuration = self.configuration.projected();
+        self.runtime_usage = self.runtime_usage.projected();
         self
     }
 }

@@ -17,7 +17,7 @@ use tokio::sync::watch;
 use crate::mission_type::{PreparedInput, SkillPackage};
 use crate::model::{
     ConfinementResources, EffectId, EffectResource, Handoff, MissionId, OracleName,
-    PreparedInputRef, RoleInstance, RuntimeConfigurationEvidence, TaskId,
+    PreparedInputRef, RoleInstance, RuntimeConfigurationEvidence, RuntimeUsage, TaskId,
 };
 pub use crate::workspace::{ArtifactCapture, CapturedArtifact};
 
@@ -81,12 +81,14 @@ pub struct RoleTurnOutcome {
     /// an artifact.
     pub artifact: Option<CapturedArtifact>,
     pub runtime_configuration: RuntimeConfigurationEvidence,
+    pub runtime_usage: RuntimeUsage,
     pub final_response: String,
 }
 
 impl RoleTurnOutcome {
     pub(crate) fn projected(mut self) -> Self {
         self.runtime_configuration = self.runtime_configuration.projected();
+        self.runtime_usage = self.runtime_usage.projected();
         self.final_response = lionclaw_runtime_api::bounded_text(&self.final_response);
         self
     }

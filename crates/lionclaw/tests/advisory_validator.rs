@@ -28,6 +28,7 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
                     HEAD_SHA,
                 )),
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "wrote it".to_string(),
             }),
             OutputSemantics::EmitsVerdict => Ok(RoleTurnOutcome {
@@ -48,6 +49,7 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "reviewed".to_string(),
             }),
             other => panic!("unexpected output {other:?}"),
@@ -123,6 +125,7 @@ async fn read_only_validator_artifacts_are_rejected_before_the_fold() {
                     HEAD_SHA,
                 )),
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "wrote it".to_string(),
             });
         }
@@ -147,6 +150,7 @@ async fn read_only_validator_artifacts_are_rejected_before_the_fold() {
                 "forged-validator-head",
             )),
             runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
             final_response: "reviewed".to_string(),
         })
     }));
@@ -208,6 +212,7 @@ async fn replacement_validator_requires_new_receipt_and_retains_prior_evidence()
                     HEAD_SHA,
                 )),
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "wrote it".to_string(),
             }),
             OutputSemantics::EmitsVerdict => {
@@ -231,6 +236,7 @@ async fn replacement_validator_requires_new_receipt_and_retains_prior_evidence()
                     }),
                     artifact: None,
                     runtime_configuration: Default::default(),
+                    runtime_usage: Default::default(),
                     final_response: "reviewed".to_string(),
                 })
             }

@@ -86,6 +86,7 @@ impl RuntimeAdapter for MockRuntimeAdapter {
 
         Ok(TurnResult {
             configuration: Default::default(),
+            runtime_usage: Default::default(),
             final_response,
         })
     }

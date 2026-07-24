@@ -108,6 +108,7 @@ async fn awaiting_lead_with_resources(
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "validated".into(),
             });
         }
@@ -134,6 +135,7 @@ async fn awaiting_lead_with_resources(
             handoff: None,
             artifact: None,
             runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
             final_response: "Which behavior should I preserve?".into(),
         })
     }));
@@ -203,6 +205,7 @@ async fn successful_settlement_removes_only_the_exact_conversation_scratch() {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "validated".into(),
             });
         }
@@ -231,6 +234,7 @@ async fn successful_settlement_removes_only_the_exact_conversation_scratch() {
                 HEAD_SHA,
             )),
             runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
             final_response: "completed".into(),
         })
     }));

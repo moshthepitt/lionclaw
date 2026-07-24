@@ -879,6 +879,7 @@ impl RuntimeAdapter for RetentionLimitTransport {
         Ok(TurnResult {
             final_response: "retained-state response".into(),
             configuration,
+            runtime_usage: Default::default(),
         })
     }
 
@@ -1424,7 +1425,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (26, 52));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (27, 53));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -3298,8 +3299,24 @@ fn materialize_planning_validation_mission_type(root: &Path) {
     .unwrap();
 }
 
-#[tokio::test]
-async fn production_conversation_restarts_and_closes_verified() {
+#[test]
+fn production_conversation_restarts_and_closes_verified() {
+    std::thread::Builder::new()
+        .name("production-conversation-restart-proof".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(production_conversation_restarts_and_closes_verified_inner());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn production_conversation_restarts_and_closes_verified_inner() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;

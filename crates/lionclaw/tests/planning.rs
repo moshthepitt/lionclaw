@@ -52,6 +52,7 @@ fn scripted_runner(
                     }),
                     artifact: None,
                     runtime_configuration: Default::default(),
+                    runtime_usage: Default::default(),
                     final_response: "proposed".to_string(),
                 })
             }
@@ -70,6 +71,7 @@ fn scripted_runner(
                     HEAD_SHA,
                 )),
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "fixed".to_string(),
             }),
             OutputSemantics::EmitsVerdict => Ok(RoleTurnOutcome {
@@ -90,6 +92,7 @@ fn scripted_runner(
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "reviewed".to_string(),
             }),
             other => panic!("unexpected planning fixture output {other:?}"),

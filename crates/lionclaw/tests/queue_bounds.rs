@@ -78,6 +78,7 @@ impl RoleRunner for GatedRoleRunner {
                     }),
                     artifact: None,
                     runtime_configuration,
+                    runtime_usage: Default::default(),
                     final_response: final_response.into(),
                 })
             }
@@ -88,6 +89,7 @@ impl RoleRunner for GatedRoleRunner {
                     handoff: None,
                     artifact: None,
                     runtime_configuration,
+                    runtime_usage: Default::default(),
                     final_response: final_response.into(),
                 })
             }
@@ -423,6 +425,7 @@ async fn exact_queue_capacity_is_typed_atomic_replay_safe_and_recoverable() {
                 }),
                 artifact: None,
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "reviewed".into(),
             });
         }
@@ -430,6 +433,7 @@ async fn exact_queue_capacity_is_typed_atomic_replay_safe_and_recoverable() {
             handoff: None,
             artifact: None,
             runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
             final_response: "question".into(),
         })
     }));

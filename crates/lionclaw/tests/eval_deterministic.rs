@@ -88,6 +88,7 @@ async fn advisory_only_mission_type_never_verifies() {
             handoff: Some(handoff),
             artifact,
             runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
             final_response: String::new(),
         })
     }));

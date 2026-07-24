@@ -148,6 +148,7 @@ impl CodexAppServerTurnRunner<'_> {
                     applied_mode: None,
                     mode_confirmation: None,
                 },
+                runtime_usage: Default::default(),
                 final_response,
             }
             .projected())

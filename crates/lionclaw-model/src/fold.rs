@@ -13,11 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 50 makes Slice 6 closure event-driven and applies typed proof
-/// disposition honesty; 51 validates Slice 7 team resource overrides against
-/// mission resource ceilings during replay; 52 canonicalizes resource-only
-/// tmpfs declarations during replay validation.
-pub const REDUCER_VERSION: u32 = 52;
+/// Reducer 53 preserves Slice 8 runtime usage evidence on role receipts during
+/// replay, including explicit non-reporting.
+pub const REDUCER_VERSION: u32 = 53;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -546,6 +544,7 @@ fn apply_role_outcome(
             }
             if let Some(receipt) = state.role_attempt_receipts.get_mut(effect_id) {
                 receipt.runtime_configuration = Some(success.runtime_configuration.clone());
+                receipt.runtime_usage = success.runtime_usage.clone();
                 receipt.final_response = Some(success.final_response.clone());
                 receipt.handoff = success.handoff.clone();
                 receipt.disposition = RoleAttemptDisposition::Succeeded {
@@ -691,6 +690,7 @@ fn settle_role_failure(
     settle_failed_delivery(state, &request.role_instance, &failure);
     if let Some(receipt) = state.role_attempt_receipts.get_mut(effect_id) {
         receipt.runtime_configuration = Some(failure.evidence().configuration.clone());
+        receipt.runtime_usage = failure.evidence().runtime_usage.clone();
         if !failure.evidence().final_response.is_empty() {
             receipt.final_response = Some(super::PayloadRef::inline(
                 failure.evidence().final_response.clone(),

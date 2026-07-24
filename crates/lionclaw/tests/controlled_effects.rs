@@ -137,6 +137,7 @@ fn judgment_outcome(request: &RoleTurnRequest) -> Option<RoleTurnOutcome> {
         }),
         artifact: None,
         runtime_configuration: Default::default(),
+        runtime_usage: Default::default(),
         final_response: "judged".into(),
     })
 }
@@ -161,6 +162,7 @@ fn happy_team_runner() -> lionclaw::testing::MockRoleRunner {
                 applied_model: Some("mock-model".into()),
                 ..Default::default()
             },
+            runtime_usage: Default::default(),
             final_response: "did the work".into(),
         })
     }))
@@ -199,6 +201,7 @@ impl RoleRunner for SettlementRaceRunner {
                     }),
                     artifact: Some(artifact),
                     runtime_configuration: configuration,
+                    runtime_usage: Default::default(),
                     final_response: final_response.into(),
                 })
             }
@@ -209,6 +212,7 @@ impl RoleRunner for SettlementRaceRunner {
                     handoff: None,
                     artifact: None,
                     runtime_configuration: configuration,
+                    runtime_usage: Default::default(),
                     final_response: final_response.into(),
                 })
             }
@@ -406,6 +410,7 @@ impl RoleRunner for SleepingRunner {
             }),
             artifact: Some(artifact),
             runtime_configuration: configuration,
+            runtime_usage: Default::default(),
             final_response: String::new(),
         })
     }
@@ -430,6 +435,7 @@ impl RoleRunner for ArtifactlessWriter {
             }),
             artifact: None,
             runtime_configuration: configuration,
+            runtime_usage: Default::default(),
             final_response: final_response.into(),
         })
     }
@@ -486,6 +492,7 @@ impl RoleRunner for ControlledRunner {
             }),
             artifact: Some(artifact),
             runtime_configuration: configuration,
+            runtime_usage: Default::default(),
             final_response: final_response.into(),
         })
     }
@@ -512,6 +519,7 @@ impl RoleRunner for RawSuccessAfterStopRunner {
                     }),
                     artifact: None,
                     runtime_configuration: configuration,
+                    runtime_usage: Default::default(),
                     final_response: final_response.into(),
                 });
             }

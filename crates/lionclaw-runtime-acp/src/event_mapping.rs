@@ -1,17 +1,10 @@
 use serde_json::Value;
 
-use crate::protocol::AcpMessage;
+use crate::protocol::{acp_session_update, acp_update_observed_configuration, AcpMessage};
 use lionclaw_runtime_api::{RuntimeEvent, RuntimeMessageLane, TurnEvent};
 
 pub(crate) fn acp_turn_events(message: &AcpMessage) -> Vec<TurnEvent> {
-    if message.value.get("method").and_then(Value::as_str) != Some("session/update") {
-        return Vec::new();
-    }
-    let Some(update) = message
-        .value
-        .pointer("/params/update")
-        .or_else(|| message.value.get("params"))
-    else {
+    let Some(update) = acp_session_update(&message.value) else {
         return Vec::new();
     };
     let Some(session_update) = update.get("sessionUpdate").and_then(Value::as_str) else {
@@ -33,6 +26,10 @@ pub(crate) fn acp_turn_events(message: &AcpMessage) -> Vec<TurnEvent> {
         }
         "tool_call" | "tool_call_update" => {
             acp_tool_status(update).map(|text| RuntimeEvent::Status { code: None, text })
+        }
+        "current_mode_update" | "config_option_update" => {
+            let configuration = acp_update_observed_configuration(update);
+            (!configuration.is_empty()).then_some(RuntimeEvent::Configuration { configuration })
         }
         _ => None,
     };

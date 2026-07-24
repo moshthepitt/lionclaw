@@ -1,5 +1,8 @@
 use anyhow::anyhow;
-use lionclaw_runtime_api::TypedFailure;
+use lionclaw_runtime_api::{
+    AppliedRuntimeConfiguration, RuntimeConfigurationConfirmation, RuntimeUsage, RuntimeUsageCost,
+    RuntimeUsageCostScope, RuntimeUsageDetails, TypedFailure,
+};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +76,127 @@ impl AcpSessionSelections {
                 .collect(),
         }
     }
+
+    pub(crate) fn current_model(&self) -> Option<&str> {
+        self.models
+            .as_ref()
+            .and_then(|models| models.current.as_deref())
+            .or_else(|| self.config_option_current("model"))
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    pub(crate) fn current_mode(&self) -> Option<&str> {
+        self.modes
+            .as_ref()
+            .and_then(|modes| modes.current.as_deref())
+            .or_else(|| self.config_option_current("mode"))
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    pub(crate) fn observed_configuration(&self) -> AppliedRuntimeConfiguration {
+        let mut configuration = AppliedRuntimeConfiguration::default();
+        if let Some(model) = self.current_model() {
+            configuration.applied_model = Some(model.to_string());
+            configuration.model_confirmation = Some(RuntimeConfigurationConfirmation::Observed);
+        }
+        if let Some(mode) = self.current_mode() {
+            configuration.applied_mode = Some(mode.to_string());
+            configuration.mode_confirmation = Some(RuntimeConfigurationConfirmation::Observed);
+        }
+        configuration
+    }
+
+    fn config_option_current(&self, id: &str) -> Option<&str> {
+        self.config_options
+            .iter()
+            .find(|option| option.id == id)
+            .and_then(|option| option.current.as_deref())
+    }
+}
+
+pub(crate) fn acp_session_update(message: &Value) -> Option<&Value> {
+    if message.get("method").and_then(Value::as_str) != Some("session/update") {
+        return None;
+    }
+    message
+        .pointer("/params/update")
+        .or_else(|| message.get("params"))
+}
+
+pub(crate) fn acp_update_observed_configuration(update: &Value) -> AppliedRuntimeConfiguration {
+    match update.get("sessionUpdate").and_then(Value::as_str) {
+        Some("current_mode_update") => {
+            let mut configuration = AppliedRuntimeConfiguration::default();
+            if let Some(mode) = current_mode_update_value(update) {
+                configuration.applied_mode = Some(mode.to_string());
+                configuration.mode_confirmation = Some(RuntimeConfigurationConfirmation::Observed);
+            }
+            configuration
+        }
+        Some("config_option_update") => {
+            AcpSessionSelections::from_session_result(update).observed_configuration()
+        }
+        _ => AppliedRuntimeConfiguration::default(),
+    }
+}
+
+pub(crate) fn acp_update_usage(update: &Value) -> RuntimeUsage {
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("usage_update") {
+        return RuntimeUsage::NotReported;
+    }
+    RuntimeUsage::from_details(RuntimeUsageDetails {
+        context_used_tokens: u64_field(update, "used"),
+        context_window_tokens: u64_field(update, "size"),
+        cost: usage_cost(update.get("cost"), RuntimeUsageCostScope::SessionCumulative),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn acp_prompt_usage(result: &Value) -> RuntimeUsage {
+    let Some(usage) = result.get("usage") else {
+        return RuntimeUsage::NotReported;
+    };
+    RuntimeUsage::from_details(RuntimeUsageDetails {
+        input_tokens: u64_field(usage, "inputTokens"),
+        output_tokens: u64_field(usage, "outputTokens"),
+        total_tokens: u64_field(usage, "totalTokens"),
+        reasoning_tokens: u64_field(usage, "reasoningTokens")
+            .or_else(|| u64_field(usage, "thoughtTokens")),
+        cached_input_tokens: u64_field(usage, "cachedInputTokens")
+            .or_else(|| u64_field(usage, "cacheReadInputTokens")),
+        cost: usage_cost(usage.get("cost"), RuntimeUsageCostScope::Turn),
+        ..Default::default()
+    })
+}
+
+fn current_mode_update_value(update: &Value) -> Option<&str> {
+    text_field(update, "currentModeId").or_else(|| text_field(update, "modeId"))
+}
+
+fn text_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn u64_field(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64)
+}
+
+fn usage_cost(value: Option<&Value>, scope: RuntimeUsageCostScope) -> Option<RuntimeUsageCost> {
+    let value = value?;
+    let amount = match value.get("amount")? {
+        Value::Number(amount) => amount.to_string(),
+        Value::String(amount) if !amount.trim().is_empty() => amount.clone(),
+        _ => return None,
+    };
+    let currency = text_field(value, "currency")?.to_string();
+    Some(RuntimeUsageCost {
+        amount,
+        currency,
+        scope,
+    })
 }
 
 fn selection_set(

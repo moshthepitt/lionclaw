@@ -102,6 +102,7 @@ fn planning_runner(proposal: lionclaw::model::MissionProposal) -> MockRoleRunner
             }),
             artifact: None,
             runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
             final_response: "proposed".to_string(),
         })
     }))

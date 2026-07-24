@@ -228,7 +228,7 @@ impl AcpTurnRunner {
                     mcp_servers: &self.mcp_servers,
                 })
                 .await?;
-            let configuration = client
+            let mut configuration = client
                 .configure_session(
                     &self.config,
                     &opened_session.session_id,
@@ -237,7 +237,7 @@ impl AcpTurnRunner {
                 .await?
                 .projected();
             applied_configuration = Some(configuration.clone());
-            if configuration.requested_model.is_some() || configuration.requested_mode.is_some() {
+            if !configuration.is_empty() {
                 drop(
                     journal
                         .send(lionclaw_runtime_api::TurnEvent::canonical(
@@ -264,8 +264,10 @@ impl AcpTurnRunner {
                 )
                 .await;
             let final_response = prompt_result?;
+            configuration.merge_observed(client.observed_configuration());
             Ok(TurnResult {
-                configuration,
+                configuration: configuration.projected(),
+                runtime_usage: client.runtime_usage().clone(),
                 final_response,
             }
             .projected())
@@ -277,9 +279,19 @@ impl AcpTurnRunner {
         } else {
             client.take_final_response()
         };
+        let failed_configuration = applied_configuration.as_ref().map(|configuration| {
+            let mut configuration = configuration.clone();
+            configuration.merge_observed(client.observed_configuration());
+            configuration.projected()
+        });
+        let failed_runtime_usage = client.runtime_usage().clone().projected();
         let result = finish_acp_session(client, result).await.map_err(|error| {
-            let mut error =
-                configured_failure(error, applied_configuration.as_ref(), "acp.runtime");
+            let mut error = configured_failure(
+                error,
+                failed_configuration.as_ref(),
+                &failed_runtime_usage,
+                "acp.runtime",
+            );
             if let Some(failure) = error.downcast_mut::<TypedFailure>() {
                 failure.evidence_mut().final_response = failed_final_response;
             }
@@ -293,6 +305,7 @@ impl AcpTurnRunner {
 fn configured_failure(
     error: anyhow::Error,
     configuration: Option<&lionclaw_runtime_api::AppliedRuntimeConfiguration>,
+    runtime_usage: &lionclaw_runtime_api::RuntimeUsage,
     code: &str,
 ) -> anyhow::Error {
     let mut failure = error
@@ -302,5 +315,9 @@ fn configured_failure(
     if let Some(configuration) = configuration {
         failure.evidence_mut().configuration = configuration.clone();
     }
+    failure
+        .evidence_mut()
+        .runtime_usage
+        .merge_observed(runtime_usage.clone());
     anyhow::Error::new(failure.projected())
 }

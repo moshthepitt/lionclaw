@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use crate::model::{
     DecisionEvidence, EffectId, FailureEvidence, FailureFeedback, MissionState, PayloadRef,
-    RoleAttemptDisposition, RoleAttemptReceipt, RoleEffectSource,
+    RoleAttemptDisposition, RoleAttemptReceipt, RoleEffectSource, RuntimeUsage,
 };
 use crate::store::BlobStore;
 
@@ -150,6 +150,10 @@ fn render_typed_failure_with_configuration(
             configuration.applied_mode,
         ));
     }
+    if evidence.runtime_usage.is_reported() {
+        rendered.push('\n');
+        rendered.push_str(&render_runtime_usage(&evidence.runtime_usage));
+    }
     rendered
 }
 
@@ -207,6 +211,7 @@ pub fn role_attempt_receipt_json(
         "generation": authority.generation.slug(),
         "source": receipt.source,
         "effective_runtime_configuration": receipt.effective_runtime_configuration(),
+        "runtime_usage": receipt.runtime_usage,
         "turn": turn,
         "handoff": handoff,
         "disposition": disposition,
@@ -240,6 +245,7 @@ pub fn resolved_role_attempt_reference_json(
                 "generation": "unavailable",
                 "source": null,
                 "effective_runtime_configuration": null,
+                "runtime_usage": null,
                 "turn": null,
                 "handoff": null,
                 "disposition": null,
@@ -300,6 +306,8 @@ pub fn render_role_attempt_receipt(
         rendered.push_str("effective ");
         rendered.push_str(&render_runtime_configuration(configuration));
     }
+    rendered.push('\n');
+    rendered.push_str(&render_runtime_usage(&receipt.runtime_usage));
     match &receipt.disposition {
         RoleAttemptDisposition::Active => rendered.push_str("\ndisposition: active"),
         RoleAttemptDisposition::Retired => rendered.push_str("\ndisposition: retired"),
@@ -400,6 +408,47 @@ pub fn render_resolved_role_attempt_reference(
         },
         |receipt| render_role_attempt_receipt(blobs, state, receipt),
     )
+}
+
+fn render_runtime_usage(runtime_usage: &RuntimeUsage) -> String {
+    let RuntimeUsage::Reported { usage } = runtime_usage else {
+        return "runtime usage: not reported".to_string();
+    };
+    let mut fields = Vec::new();
+    if let Some(tokens) = usage.input_tokens {
+        fields.push(format!("input_tokens={tokens}"));
+    }
+    if let Some(tokens) = usage.output_tokens {
+        fields.push(format!("output_tokens={tokens}"));
+    }
+    if let Some(tokens) = usage.total_tokens {
+        fields.push(format!("total_tokens={tokens}"));
+    }
+    if let Some(tokens) = usage.reasoning_tokens {
+        fields.push(format!("reasoning_tokens={tokens}"));
+    }
+    if let Some(tokens) = usage.cached_input_tokens {
+        fields.push(format!("cached_input_tokens={tokens}"));
+    }
+    if let Some(tokens) = usage.context_used_tokens {
+        fields.push(format!("context_used_tokens={tokens}"));
+    }
+    if let Some(tokens) = usage.context_window_tokens {
+        fields.push(format!("context_window_tokens={tokens}"));
+    }
+    if let Some(cost) = &usage.cost {
+        fields.push(format!(
+            "cost={} {} ({})",
+            cost.amount,
+            cost.currency,
+            cost.scope.slug()
+        ));
+    }
+    if fields.is_empty() {
+        "runtime usage: not reported".to_string()
+    } else {
+        format!("runtime usage: {}", fields.join(", "))
+    }
 }
 
 fn render_runtime_configuration(

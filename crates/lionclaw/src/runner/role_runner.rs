@@ -15,7 +15,7 @@ use lionclaw_runtime_api::{
     RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider,
     RuntimeDriverRegistry, RuntimeNativeReopenRecovery, RuntimeNativeSessionObservation,
     RuntimeResume, RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
-    TurnExecution, TurnInput, TypedFailure, TypedFailureEvidence,
+    RuntimeUsage, TurnExecution, TurnInput, TypedFailure, TypedFailureEvidence,
 };
 use lionclaw_runtime_codex::{CodexRuntimeAuthProvider, CodexRuntimeDriver};
 use tokio::sync::Mutex;
@@ -352,12 +352,21 @@ where
 
 fn completed_turn_evidence(
     completed: Option<anyhow::Result<lionclaw_runtime_api::TurnResult>>,
-) -> Option<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String)> {
+) -> Option<(
+    lionclaw_runtime_api::AppliedRuntimeConfiguration,
+    RuntimeUsage,
+    String,
+)> {
     completed.and_then(|completed| match completed {
-        Ok(result) => Some((result.configuration, result.final_response)),
+        Ok(result) => Some((
+            result.configuration,
+            result.runtime_usage,
+            result.final_response,
+        )),
         Err(error) => error.downcast_ref::<TypedFailure>().map(|failure| {
             (
                 failure.evidence().configuration.clone(),
+                failure.evidence().runtime_usage.clone(),
                 failure.evidence().final_response.clone(),
             )
         }),
@@ -678,17 +687,19 @@ impl RoleRunner for OciRoleRunner {
         let turn = self
             .run_turn(&profile, &request, plan, runtime_state, auth)
             .await;
-        let (applied, final_response) = turn?;
+        let (applied, runtime_usage, final_response) = turn?;
         if let Err(error) = role_state.assess_runtime_retention_async().await {
             let mut failure = TypedFailure::permanent(
                 "runtime.native_state_limit",
                 format!("retained runtime state post-turn check refused: {error:#}"),
             );
             failure.evidence_mut().configuration = applied.clone();
+            failure.evidence_mut().runtime_usage = runtime_usage.clone();
             failure.evidence_mut().final_response = final_response.clone();
             return Err(failure);
         }
         let cancellation_configuration = applied.clone();
+        let cancellation_usage = runtime_usage.clone();
         let cancellation_response = final_response.clone();
         let finish = async {
             let handoff = match read_optional_handoff(dirs.handoff(), request.role.output) {
@@ -696,6 +707,7 @@ impl RoleRunner for OciRoleRunner {
                 Err(mut failure) => {
                     failure.evidence_mut().final_response = final_response.clone();
                     failure.evidence_mut().configuration = applied.clone();
+                    failure.evidence_mut().runtime_usage = runtime_usage.clone();
                     return Err(failure);
                 }
             };
@@ -725,6 +737,7 @@ impl RoleRunner for OciRoleRunner {
                         };
                         failure.evidence_mut().final_response = final_response.clone();
                         failure.evidence_mut().configuration = applied.clone();
+                        failure.evidence_mut().runtime_usage = runtime_usage.clone();
                         failure
                     })?;
                 Some(artifact)
@@ -735,12 +748,14 @@ impl RoleRunner for OciRoleRunner {
                 handoff,
                 artifact,
                 runtime_configuration: role_runtime_configuration(&applied),
+                runtime_usage,
                 final_response,
             })
         };
         await_controlled(Box::pin(finish), request.control.clone(), |control| {
             setup_control_failure(&profile, control).map(|mut failure| {
                 failure.evidence_mut().configuration = cancellation_configuration.clone();
+                failure.evidence_mut().runtime_usage = cancellation_usage.clone();
                 failure.evidence_mut().final_response = cancellation_response.clone();
                 failure
             })
@@ -757,7 +772,14 @@ impl OciRoleRunner {
         plan: lionclaw_confinement::EffectiveExecutionPlan,
         runtime_state: lionclaw_runtime_api::RuntimeStateDir,
         auth: RuntimeTurnAuth,
-    ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
+    ) -> Result<
+        (
+            lionclaw_runtime_api::AppliedRuntimeConfiguration,
+            RuntimeUsage,
+            String,
+        ),
+        TypedFailure,
+    > {
         self.run_turn_with_context(profile, request, plan, auth, |plan| {
             mission_execution_context(plan, Some(runtime_state.clone()))
         })
@@ -774,7 +796,14 @@ impl OciRoleRunner {
             &lionclaw_confinement::EffectiveExecutionPlan,
         )
             -> anyhow::Result<lionclaw_runtime_api::RuntimeExecutionContext>,
-    ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
+    ) -> Result<
+        (
+            lionclaw_runtime_api::AppliedRuntimeConfiguration,
+            RuntimeUsage,
+            String,
+        ),
+        TypedFailure,
+    > {
         if let Some(failure) = current_control_failure(profile, request, None, "") {
             return Err(failure);
         }
@@ -1051,6 +1080,7 @@ fn control_failure(
     match observed {
         Some(AttemptEvidence::Success(observed)) => {
             evidence.configuration = observed.configuration.clone().projected();
+            evidence.runtime_usage = observed.runtime_usage.clone().projected();
             evidence.final_response = lionclaw_runtime_api::bounded_text(&observed.final_response);
         }
         Some(AttemptEvidence::Failure(observed)) => {
@@ -1059,6 +1089,7 @@ fn control_failure(
             evidence.stderr.clone_from(&source.stderr);
             evidence.final_response.clone_from(&source.final_response);
             evidence.configuration.clone_from(&source.configuration);
+            evidence.runtime_usage.clone_from(&source.runtime_usage);
         }
         None => {}
     }
@@ -1136,7 +1167,7 @@ async fn execute_turn_attempt(
     ));
     let mut control = request.control.clone();
     enum TurnEnd {
-        Completed(anyhow::Result<lionclaw_runtime_api::TurnResult>),
+        Completed(Box<anyhow::Result<lionclaw_runtime_api::TurnResult>>),
         Cancel {
             reason: String,
             kind: CancellationKind,
@@ -1167,11 +1198,11 @@ async fn execute_turn_attempt(
         tokio::select! {
             biased;
             changed = control.changed() => if changed.is_err() { continue; },
-            completed = &mut turn => break TurnEnd::Completed(completed),
+            completed = &mut turn => break TurnEnd::Completed(Box::new(completed)),
         }
     };
     let result = match end {
-        TurnEnd::Completed(completed) => completed.map_err(|error| {
+        TurnEnd::Completed(completed) => (*completed).map_err(|error| {
             error
                 .downcast_ref::<TypedFailure>()
                 .cloned()
@@ -1190,8 +1221,11 @@ async fn execute_turn_attempt(
                 String::new(),
                 String::new(),
             );
-            if let Some((configuration, final_response)) = completed_turn_evidence(completed) {
+            if let Some((configuration, runtime_usage, final_response)) =
+                completed_turn_evidence(completed)
+            {
                 evidence.configuration = configuration;
+                evidence.runtime_usage = runtime_usage;
                 evidence.final_response = final_response;
             }
             evidence.code = Some(
@@ -1328,9 +1362,17 @@ fn role_runtime_configuration(
 fn validate_completed_turn(
     profile: &MissionRuntimeProfile,
     result: lionclaw_runtime_api::TurnResult,
-) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
+) -> Result<
+    (
+        lionclaw_runtime_api::AppliedRuntimeConfiguration,
+        RuntimeUsage,
+        String,
+    ),
+    TypedFailure,
+> {
     let result = result.projected();
     let configuration = result.configuration;
+    let runtime_usage = result.runtime_usage;
     let final_response = result.final_response;
     if configuration.requested_model != profile.model
         || configuration.requested_mode != profile.mode
@@ -1344,10 +1386,11 @@ fn validate_completed_turn(
             profile.model, profile.mode
         ));
         failure.evidence_mut().configuration = configuration;
+        failure.evidence_mut().runtime_usage = runtime_usage;
         failure.evidence_mut().final_response = final_response;
         return Err(project_turn_failure(profile, failure, ""));
     }
-    Ok((configuration, final_response))
+    Ok((configuration, runtime_usage, final_response))
 }
 
 fn turn_failure_evidence(

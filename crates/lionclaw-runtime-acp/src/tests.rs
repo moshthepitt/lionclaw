@@ -11,13 +11,14 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use lionclaw_runtime_api::{
-    canonical_events, ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAuthKind, RuntimeEvent,
-    RuntimeExecutionContext, RuntimeMcpServerSpec, RuntimeMessageLane,
-    RuntimeNativeSessionObservation, RuntimeNativeStateAvailability, RuntimeProgramExecutor,
-    RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeResume,
-    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeStateDir,
-    RuntimeTerminalConfig, RuntimeTerminalProgramInput, TurnEvent, TurnExecution, TurnInput,
-    TypedFailure, RUNTIME_STATE_VALUE_LIMIT, RUNTIME_TURN_JOURNAL_CAPACITY,
+    canonical_events, ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAuthKind,
+    RuntimeConfigurationConfirmation, RuntimeEvent, RuntimeExecutionContext, RuntimeMcpServerSpec,
+    RuntimeMessageLane, RuntimeNativeSessionObservation, RuntimeNativeStateAvailability,
+    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
+    RuntimeResume, RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+    RuntimeStateDir, RuntimeTerminalConfig, RuntimeTerminalProgramInput, RuntimeUsage,
+    RuntimeUsageCostScope, TurnEvent, TurnExecution, TurnInput, TypedFailure,
+    RUNTIME_STATE_VALUE_LIMIT, RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 
 use super::{
@@ -661,6 +662,97 @@ fn opencode_acp_fixture_projects_to_canonical_runtime_events() {
 }
 
 #[test]
+fn current_mode_update_projects_observed_configuration() {
+    let events = acp_turn_events(&AcpMessage {
+        value: json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "ses_observed",
+                "update": {
+                    "sessionUpdate": "current_mode_update",
+                    "currentModeId": "plan"
+                }
+            }
+        }),
+    })
+    .into_iter()
+    .map(TurnEvent::into_event)
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        events,
+        vec![RuntimeEvent::Configuration {
+            configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                applied_mode: Some("plan".to_string()),
+                mode_confirmation: Some(RuntimeConfigurationConfirmation::Observed),
+                ..Default::default()
+            }
+        }]
+    );
+
+    let legacy_events = acp_turn_events(&AcpMessage {
+        value: json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "ses_observed",
+                "update": {
+                    "sessionUpdate": "current_mode_update",
+                    "modeId": "build"
+                }
+            }
+        }),
+    })
+    .into_iter()
+    .map(TurnEvent::into_event)
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        legacy_events,
+        vec![RuntimeEvent::Configuration {
+            configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                applied_mode: Some("build".to_string()),
+                mode_confirmation: Some(RuntimeConfigurationConfirmation::Observed),
+                ..Default::default()
+            }
+        }]
+    );
+}
+
+#[test]
+fn malformed_current_mode_update_is_ignored() {
+    let missing = acp_turn_events(&AcpMessage {
+        value: json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "ses_observed",
+                "update": {
+                    "sessionUpdate": "current_mode_update"
+                }
+            }
+        }),
+    });
+    let empty = acp_turn_events(&AcpMessage {
+        value: json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "ses_observed",
+                "update": {
+                    "sessionUpdate": "current_mode_update",
+                    "currentModeId": ""
+                }
+            }
+        }),
+    });
+
+    assert!(missing.is_empty());
+    assert!(empty.is_empty());
+}
+
+#[test]
 fn opencode_acp_config_options_fixture_pins_model_and_mode_protocol() {
     let fixture = opencode_acp_config_options_fixture();
     let raw_out = fixture
@@ -711,8 +803,8 @@ async fn advertised_first_class_model_and_mode_are_applied_by_typed_methods() {
     let state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
     let session = FakeAcpProgramSession {
         inbound: VecDeque::from([
-            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string(),
-            r#"{"jsonrpc":"2.0","id":2,"result":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":1,"result":{"models":{"currentModelId":"openrouter:gpt-5.5","availableModels":[{"modelId":"openrouter:gpt-5.5","name":"gpt-5.5"}]}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"modes":{"currentModeId":"dont_ask","availableModes":[{"id":"dont_ask","name":"Don't Ask"}]}}}"#.to_string(),
         ]),
         output: ExecutionOutput::default(),
         state: Arc::clone(&state),
@@ -746,18 +838,163 @@ async fn advertised_first_class_model_and_mode_are_applied_by_typed_methods() {
     assert_eq!(applied.applied_model.as_deref(), Some("openrouter:gpt-5.5"));
     assert_eq!(
         applied.model_confirmation,
-        Some(lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged)
+        Some(RuntimeConfigurationConfirmation::Observed)
     );
     assert_eq!(applied.applied_mode.as_deref(), Some("dont_ask"));
     assert_eq!(
         applied.mode_confirmation,
-        Some(lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged)
+        Some(RuntimeConfigurationConfirmation::Observed)
     );
     let sent = state.lock().unwrap().sent.clone();
     assert_eq!(sent[0]["method"], "session/set_model");
     assert_eq!(sent[0]["params"]["modelId"], "openrouter:gpt-5.5");
     assert_eq!(sent[1]["method"], "session/set_mode");
     assert_eq!(sent[1]["params"]["modeId"], "dont_ask");
+}
+
+#[tokio::test]
+async fn advertised_current_model_is_recorded_without_requested_model() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+    let handle = adapter
+        .session_start(RuntimeSessionStartInput {
+            session_id: Uuid::new_v4(),
+            working_dir: None,
+            environment: Vec::new(),
+            resume: RuntimeResume::Native {
+                state: runtime_state(runtime_state_root.clone()),
+                ready: runtime_not_ready(),
+            },
+        })
+        .expect("start");
+    let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+    let executor = FakeAcpProgramExecutor {
+        inbound: VecDeque::from([
+            opencode_initialize_response(1),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_model","configOptions":[{"id":"model","currentValue":"opencode/big-pickle","options":[{"value":"opencode/big-pickle"}]}]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
+        ]),
+        expected_auth: None,
+        state: Arc::clone(&fake_state),
+    };
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+
+    let result = adapter
+        .turn(
+            TurnExecution {
+                input: TurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "hello".to_string(),
+                },
+                context: acp_driver_context(runtime_state_root),
+                executor: Box::new(executor),
+            },
+            journal_tx,
+        )
+        .await
+        .expect("ACP turn");
+
+    assert_eq!(result.configuration.requested_model, None);
+    assert_eq!(
+        result.configuration.applied_model.as_deref(),
+        Some("opencode/big-pickle")
+    );
+    assert_eq!(
+        result.configuration.model_confirmation,
+        Some(RuntimeConfigurationConfirmation::Observed)
+    );
+    assert_eq!(result.runtime_usage, RuntimeUsage::NotReported);
+
+    let mut journal = Vec::new();
+    while let Some(record) = journal_rx.recv().await {
+        journal.push(record);
+    }
+    assert_eq!(
+        canonical_events(&journal).cloned().collect::<Vec<_>>(),
+        vec![
+            RuntimeEvent::Configuration {
+                configuration: result.configuration.clone(),
+            },
+            RuntimeEvent::Done,
+        ]
+    );
+    let sent = fake_state.lock().expect("fake ACP state").sent.clone();
+    assert_eq!(
+        sent.iter()
+            .filter_map(|message| message.get("method").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        vec!["initialize", "session/new", "session/prompt"]
+    );
+}
+
+#[tokio::test]
+async fn acp_turn_updates_advertised_model_from_runtime_notification() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+    let handle = adapter
+        .session_start(RuntimeSessionStartInput {
+            session_id: Uuid::new_v4(),
+            working_dir: None,
+            environment: Vec::new(),
+            resume: RuntimeResume::Native {
+                state: runtime_state(runtime_state_root.clone()),
+                ready: runtime_not_ready(),
+            },
+        })
+        .expect("start");
+    let executor = FakeAcpProgramExecutor {
+        inbound: VecDeque::from([
+            opencode_initialize_response(1),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_model","configOptions":[{"id":"model","currentValue":"opencode/old","options":[{"value":"opencode/old"},{"value":"opencode/new"}]}]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_model","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","currentValue":"opencode/new","options":[{"value":"opencode/old"},{"value":"opencode/new"}]}]}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
+        ]),
+        expected_auth: None,
+        state: Arc::new(Mutex::new(FakeAcpProgramState::default())),
+    };
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+
+    let result = adapter
+        .turn(
+            TurnExecution {
+                input: TurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "hello".to_string(),
+                },
+                context: acp_driver_context(runtime_state_root),
+                executor: Box::new(executor),
+            },
+            journal_tx,
+        )
+        .await
+        .expect("ACP turn");
+
+    assert_eq!(
+        result.configuration.applied_model.as_deref(),
+        Some("opencode/new")
+    );
+    assert_eq!(
+        result.configuration.model_confirmation,
+        Some(RuntimeConfigurationConfirmation::Observed)
+    );
+
+    let mut configuration_events = Vec::new();
+    while let Some(record) = journal_rx.recv().await {
+        if let RuntimeEvent::Configuration { configuration } = record.into_event() {
+            configuration_events.push(configuration);
+        }
+    }
+    assert_eq!(
+        configuration_events
+            .iter()
+            .map(|configuration| configuration.applied_model.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("opencode/old"), Some("opencode/new")]
+    );
 }
 
 #[tokio::test]
@@ -801,7 +1038,7 @@ async fn unadvertised_or_unconfirmed_configuration_is_rejected() {
         )
         .await
         .expect_err("an ack without applied evidence must fail");
-    assert!(error.to_string().contains("did not confirm applied model"));
+    assert!(error.to_string().contains("did not observe applied model"));
 }
 
 fn acp_response_by_id(messages: &[Value], id: u64) -> Option<&Value> {
@@ -950,6 +1187,118 @@ async fn acp_turn_uses_profile_driver_journal() {
     assert_eq!(sent[2]["params"]["value"], json!("gpt-5"));
     assert_eq!(sent[3]["params"]["configId"], json!("mode"));
     assert_eq!(sent[3]["params"]["value"], json!("plan"));
+}
+
+#[tokio::test]
+async fn acp_turn_captures_reported_runtime_usage() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+    let handle = adapter
+        .session_start(RuntimeSessionStartInput {
+            session_id: Uuid::new_v4(),
+            working_dir: None,
+            environment: Vec::new(),
+            resume: RuntimeResume::Native {
+                state: runtime_state(runtime_state_root.clone()),
+                ready: runtime_not_ready(),
+            },
+        })
+        .expect("start");
+    let executor = FakeAcpProgramExecutor {
+        inbound: VecDeque::from([
+            opencode_initialize_response(1),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_usage","configOptions":[]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_usage","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"OK"}}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_usage","update":{"sessionUpdate":"usage_update","used":9362,"size":200000,"cost":{"amount":0,"currency":"USD"}}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","usage":{"inputTokens":9362,"outputTokens":2,"totalTokens":9376,"thoughtTokens":12},"_meta":{}}}"#.to_string(),
+        ]),
+        expected_auth: None,
+        state: Arc::new(Mutex::new(FakeAcpProgramState::default())),
+    };
+    let (journal_tx, _journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+
+    let result = adapter
+        .turn(
+            TurnExecution {
+                input: TurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "hello".to_string(),
+                },
+                context: acp_driver_context(runtime_state_root),
+                executor: Box::new(executor),
+            },
+            journal_tx,
+        )
+        .await
+        .expect("ACP turn");
+
+    assert_eq!(result.final_response, "OK");
+    let details = result.runtime_usage.details().expect("reported usage");
+    assert_eq!(details.input_tokens, Some(9362));
+    assert_eq!(details.output_tokens, Some(2));
+    assert_eq!(details.total_tokens, Some(9376));
+    assert_eq!(details.reasoning_tokens, Some(12));
+    assert_eq!(details.context_used_tokens, Some(9362));
+    assert_eq!(details.context_window_tokens, Some(200000));
+    let cost = details.cost.as_ref().expect("reported cost");
+    assert_eq!(cost.amount, "0");
+    assert_eq!(cost.currency, "USD");
+    assert_eq!(cost.scope, RuntimeUsageCostScope::SessionCumulative);
+}
+
+#[tokio::test]
+async fn acp_turn_keeps_partial_usage_and_ignores_malformed_fields() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+    let handle = adapter
+        .session_start(RuntimeSessionStartInput {
+            session_id: Uuid::new_v4(),
+            working_dir: None,
+            environment: Vec::new(),
+            resume: RuntimeResume::Native {
+                state: runtime_state(runtime_state_root.clone()),
+                ready: runtime_not_ready(),
+            },
+        })
+        .expect("start");
+    let executor = FakeAcpProgramExecutor {
+        inbound: VecDeque::from([
+            opencode_initialize_response(1),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_usage","configOptions":[]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_usage","update":{"sessionUpdate":"usage_update","used":"bad","size":4096,"cost":{"amount":false,"currency":"USD"}}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","usage":{"inputTokens":5,"outputTokens":"bad","totalTokens":null},"_meta":{}}}"#.to_string(),
+        ]),
+        expected_auth: None,
+        state: Arc::new(Mutex::new(FakeAcpProgramState::default())),
+    };
+    let (journal_tx, _journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+
+    let result = adapter
+        .turn(
+            TurnExecution {
+                input: TurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "hello".to_string(),
+                },
+                context: acp_driver_context(runtime_state_root),
+                executor: Box::new(executor),
+            },
+            journal_tx,
+        )
+        .await
+        .expect("ACP turn");
+
+    let details = result.runtime_usage.details().expect("partial usage");
+    assert_eq!(details.input_tokens, Some(5));
+    assert_eq!(details.output_tokens, None);
+    assert_eq!(details.total_tokens, None);
+    assert_eq!(details.context_used_tokens, None);
+    assert_eq!(details.context_window_tokens, Some(4096));
+    assert_eq!(details.cost, None);
 }
 
 #[tokio::test]

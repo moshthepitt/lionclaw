@@ -19,11 +19,11 @@ use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleInstanceId, 
 use super::plan::{OutputSemantics, PlanProposal};
 use super::verdict::FinishClass;
 use crate::prelude::*;
-use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
+use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailureEvidence};
 
-/// Version 26 is the Slice 7 environment/config surface: mission resource
-/// ceilings plus per-role/per-oracle confinement resource declarations.
-pub const SCHEMA_VERSION: u32 = 26;
+/// Version 27 is the Slice 8 runtime-truth surface: role outcomes carry
+/// provider-reported usage evidence, including explicit non-reporting.
+pub const SCHEMA_VERSION: u32 = 27;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -473,6 +473,8 @@ pub struct RoleTurnSuccess {
     pub artifact: Option<ArtifactOutcome>,
     pub final_response: PayloadRef,
     pub runtime_configuration: RuntimeConfigurationEvidence,
+    #[serde(default)]
+    pub runtime_usage: RuntimeUsage,
 }
 
 /// Immutable authority carried from a role request into its completion.
@@ -843,6 +845,7 @@ impl MissionEvent {
                 Ok(success) => TypedFailureEvidence {
                     final_response: inline_payload(&success.final_response),
                     configuration: success.runtime_configuration.clone(),
+                    runtime_usage: success.runtime_usage.clone(),
                     ..Default::default()
                 },
                 Err(failure) => failure.evidence().clone(),

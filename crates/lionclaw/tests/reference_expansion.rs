@@ -50,6 +50,7 @@ fn checkpoint(_request: &RoleTurnRequest) -> RoleTurnOutcome {
         handoff: None,
         artifact: None,
         runtime_configuration: Default::default(),
+        runtime_usage: Default::default(),
         final_response: "awaiting lead".into(),
     }
 }
@@ -74,6 +75,7 @@ fn judgment_outcome(request: &RoleTurnRequest) -> Option<RoleTurnOutcome> {
             }),
             artifact: None,
             runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
             final_response: "reference behavior reviewed".into(),
         }
     })
@@ -245,7 +247,7 @@ async fn accepted_commit_object_fault_settles_once_and_does_not_block_later_mess
 }
 
 async fn prove_commit_object_fault_settles_once(fault: CommitObjectFault) {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (26, 52));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (27, 53));
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let h = checkpoint_harness(dir.path(), prompts.clone()).await;
@@ -487,6 +489,7 @@ async fn oversized_authoritative_receipt_is_rejected_with_exact_typed_truth() {
                     common::HEAD_SHA.to_string(),
                 )),
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "minted oversized receipt authority".into(),
             })
         } else {
@@ -609,6 +612,7 @@ async fn prove_receipt_blob_fault_settles_once(fault: ReceiptBlobFault) {
                     common::HEAD_SHA.to_string(),
                 )),
                 runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
                 final_response: "minted receipt authority".into(),
             })
         } else {

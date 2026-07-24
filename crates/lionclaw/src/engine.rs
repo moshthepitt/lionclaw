@@ -1486,6 +1486,7 @@ impl Engine {
                 let settlement_evidence = lionclaw_runtime_api::TypedFailureEvidence {
                     final_response: outcome.final_response.clone(),
                     configuration: runtime_configuration_evidence(&outcome.runtime_configuration),
+                    runtime_usage: outcome.runtime_usage.clone(),
                     ..Default::default()
                 };
                 Ok(completed(Ok(RoleTurnSuccess {
@@ -1495,6 +1496,7 @@ impl Engine {
                         .map(crate::ports::CapturedArtifact::into_outcome),
                     final_response,
                     runtime_configuration: outcome.runtime_configuration,
+                    runtime_usage: outcome.runtime_usage,
                 }))
                 .with_settlement_evidence(settlement_evidence))
             }

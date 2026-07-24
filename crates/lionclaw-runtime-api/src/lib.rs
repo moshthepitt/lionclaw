@@ -66,7 +66,8 @@ pub use event::{
 };
 pub use lionclaw_model::{
     bounded_failure_text as bounded_text, AppliedRuntimeConfiguration,
-    RuntimeConfigurationConfirmation, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT,
+    RuntimeConfigurationConfirmation, RuntimeUsage, RuntimeUsageCost, RuntimeUsageCostScope,
+    RuntimeUsageDetails, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT,
 };
 pub use program::{
     ExecutionOutput, NetworkMode, RuntimeProgramExecutor, RuntimeProgramSession,
