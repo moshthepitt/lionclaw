@@ -13,9 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 40 carries exact task failure receipts into attention and durable
-/// planning refinement evidence.
-pub const REDUCER_VERSION: u32 = 46;
+/// Reducer 47 derives successful writer workspace provenance from the accepted
+/// team-owned request before retiring its active delivery.
+pub const REDUCER_VERSION: u32 = 47;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -479,6 +479,24 @@ fn apply_role_outcome(
                 );
                 return;
             }
+            let workspace_provenance = (output == super::OutputSemantics::ProducesArtifact)
+                .then(|| {
+                    request.task_id.as_ref().map(|task_id| {
+                        (
+                            task_id.clone(),
+                            super::TaskWorkspaceProvenance {
+                                effect_id: effect_id.clone(),
+                                base_sha: request.base_sha.clone(),
+                                assignment_epoch: request.assignment_epoch,
+                                archived_effect_id: request
+                                    .workspace_preparation
+                                    .archived_effect()
+                                    .cloned(),
+                            },
+                        )
+                    })
+                })
+                .flatten();
             settle_delivery(state, &request.role_instance, true);
             if let Some(conversation) = state.conversations.get_mut(&request.role_instance) {
                 conversation.final_response = Some(success.final_response.clone());
@@ -497,9 +515,7 @@ fn apply_role_outcome(
                 };
             }
             if output == super::OutputSemantics::ProducesArtifact {
-                if let Ok((task_id, provenance)) =
-                    state.expected_active_workspace_provenance(effect_id)
-                {
+                if let Some((task_id, provenance)) = workspace_provenance {
                     if let Some(archived) = provenance.archived_effect_id.as_ref() {
                         state
                             .retained_workspace_archives
