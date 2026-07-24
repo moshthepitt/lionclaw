@@ -76,7 +76,7 @@ pub use state::{
 };
 pub use step::{step, OracleDispatchIntent, RoleDispatchIntent, StepDecision};
 pub use team::{
-    AuthorityCeilings, AuthorityGrants, MissionGuidance, RoleInstance, TeamRevision,
-    MAX_GUIDANCE_BYTES,
+    validate_environment_entry, AuthorityCeilings, AuthorityGrants, MissionGuidance, RoleInstance,
+    TeamRevision, KERNEL_ENVIRONMENT_KEYS, MAX_GUIDANCE_BYTES,
 };
 pub use verdict::{classify_finish, AuthoritativeVerdict, FinishClass};

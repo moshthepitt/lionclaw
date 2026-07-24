@@ -38,7 +38,9 @@ pub(crate) use skills::load_skill_package;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::model::{AuthorityCeilings, InputName, OracleName, StopBar, TeamRevision};
+use crate::model::{
+    validate_environment_entry, AuthorityCeilings, InputName, OracleName, StopBar, TeamRevision,
+};
 
 /// Aggregate program and declared-key content admitted to one prepared-input
 /// cache identity.
@@ -197,9 +199,22 @@ impl MissionType {
                     anyhow::bail!("role '{}' names missing skill '{skill}'", role.id);
                 }
             }
+            for input in &role.grants.inputs {
+                if !self.inputs.contains_key(input) {
+                    anyhow::bail!("role '{}' names missing prepared input '{input}'", role.id);
+                }
+            }
         }
         prepared_input::validate_prepared_inputs(&self.inputs)
             .map_err(|error| anyhow::anyhow!(error))?;
+        if !self
+            .ceilings
+            .inputs
+            .iter()
+            .all(|input| self.inputs.contains_key(input))
+        {
+            anyhow::bail!("authority ceilings name an undeclared prepared input");
+        }
         if self.requires_gap_review && self.default_team.gap_review_assignment.is_none() {
             anyhow::bail!("[team] requires-gap-review needs a gap-review assignment");
         }
@@ -221,40 +236,6 @@ impl MissionType {
     }
 }
 
-const KERNEL_ENVIRONMENT_KEYS: &[&str] = &[
-    "HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-    "TMPDIR",
-    "GIT_OPTIONAL_LOCKS",
-    "LIONCLAW_WORKSPACE_DIR",
-    "LIONCLAW_OUTPUT",
-    "MISSION_EFFECT",
-];
-
-fn valid_environment_name(name: &str) -> bool {
-    let mut characters = name.chars();
-    characters
-        .next()
-        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
-        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
-}
-
-pub(crate) fn validate_environment_entry(name: &str, value: &str) -> Result<(), String> {
-    if !valid_environment_name(name) {
-        return Err(format!("key '{name}' is invalid"));
-    }
-    if KERNEL_ENVIRONMENT_KEYS.contains(&name) {
-        return Err(format!("key '{name}' is owned by the LionClaw kernel"));
-    }
-    if value.contains('\0') {
-        return Err(format!("value for '{name}' contains NUL"));
-    }
-    Ok(())
-}
-
 fn validate_mission_environment(environment: &BTreeMap<String, String>) -> anyhow::Result<()> {
     for (name, value) in environment {
         validate_environment_entry(name, value)
@@ -263,17 +244,16 @@ fn validate_mission_environment(environment: &BTreeMap<String, String>) -> anyho
     Ok(())
 }
 
-/// Compose one deterministic process environment. The mission type supplies
-/// domain policy; a prepared input may explicitly replace that policy for the
-/// oracle consuming the immutable input.
+/// Compose one deterministic process environment. Prepared inputs may replace
+/// domain policy, while kernel execution coordinates are always final.
 pub(crate) fn execution_environment(
     kernel: impl IntoIterator<Item = (String, String)>,
     mission: &BTreeMap<String, String>,
     prepared_input: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<(String, String)> {
-    let mut environment = BTreeMap::from_iter(kernel);
-    environment.extend(mission.clone());
+    let mut environment = mission.clone();
     environment.extend(prepared_input);
+    environment.extend(kernel);
     environment.into_iter().collect()
 }
 
@@ -290,7 +270,7 @@ mod environment_tests {
 
     #[test]
     fn mission_environment_cannot_override_kernel_coordinates() {
-        for name in KERNEL_ENVIRONMENT_KEYS {
+        for name in crate::model::KERNEL_ENVIRONMENT_KEYS {
             let error = validate_mission_environment(&BTreeMap::from([(
                 (*name).to_string(),
                 "override".to_string(),
@@ -308,7 +288,10 @@ mod environment_tests {
                 ("BUILD_CACHE".to_string(), "/scratch/cache".to_string()),
                 ("TOOL_HOME".to_string(), "/scratch/tool".to_string()),
             ]),
-            [("TOOL_HOME".to_string(), "/inputs/tool".to_string())],
+            [
+                ("HOME".to_string(), "/inputs/escape".to_string()),
+                ("TOOL_HOME".to_string(), "/inputs/tool".to_string()),
+            ],
         );
         let composed = BTreeMap::from_iter(composed);
         assert_eq!(composed["HOME"], "/runtime/home");

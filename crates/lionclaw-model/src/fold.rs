@@ -13,9 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 35 derives dispatch, conversations, and assignments from accepted
-/// team revisions and rebuilds every pre-cutover snapshot.
-pub const REDUCER_VERSION: u32 = 35;
+/// Reducer 36 derives dispatch, conversations, assignments, judgment
+/// obligations, and taskless recovery from accepted team revisions.
+pub const REDUCER_VERSION: u32 = 36;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -455,13 +455,7 @@ fn apply_role_outcome(
             };
             let output = role.output;
             if success.handoff.as_ref().is_some_and(|handoff| {
-                super::role_success_contract_error(
-                    output,
-                    handoff,
-                    success.artifact.as_ref(),
-                    &request.base_sha,
-                )
-                .is_some()
+                !role_handoff_matches_request(&request, output, handoff, success.artifact.as_ref())
             }) || (output.requires_handoff() && success.handoff.is_none())
             {
                 settle_role_failure(
@@ -512,6 +506,25 @@ fn apply_role_outcome(
             apply_success_handoff(state, effect_id, &request, output, success);
         }
     }
+}
+
+fn role_handoff_matches_request(
+    request: &super::RoleTurnProvenance,
+    output: super::OutputSemantics,
+    handoff: &Handoff,
+    artifact: Option<&super::ArtifactOutcome>,
+) -> bool {
+    if super::role_success_contract_error(output, handoff, artifact, &request.base_sha).is_some() {
+        return false;
+    }
+    let Handoff::Validate { items, passed, .. } = handoff else {
+        return true;
+    };
+    let expected: BTreeSet<_> = request.assertion_ids.iter().collect();
+    let actual: BTreeSet<_> = items.iter().map(|item| &item.item_id).collect();
+    items.len() == actual.len()
+        && actual == expected
+        && *passed == items.iter().all(|item| item.passed)
 }
 
 fn apply_success_handoff(
@@ -823,8 +836,14 @@ fn apply_decision(
             }
             state.gap_review.accepted = None;
         }
+        (super::DecisionAction::Retry, AttentionKind::NodeFailed) => {
+            retry_failed_node(state, &item);
+        }
         (super::DecisionAction::Repair, _) => {}
         (super::DecisionAction::Revise, _) => {
+            if item.kind == AttentionKind::NodeFailed {
+                retry_failed_node(state, &item);
+            }
             state.phase = MissionPhase::Planning;
             state.proposal = None;
             state.proposal_approved = false;
@@ -869,6 +888,24 @@ fn apply_decision(
         _ => {}
     }
     state.open_attention.remove(attention_id);
+}
+
+fn retry_failed_node(state: &mut MissionState, item: &AttentionItem) {
+    if let Some(task_id) = &item.task_id {
+        if let Some(task) = state.tasks.get_mut(task_id) {
+            task.status = TaskStatus::Pending;
+            task.consecutive_failures = 0;
+        }
+    }
+    for effect_id in item.evidence.role_attempts() {
+        if let Some(ParkedEffect::RoleTurn { role_instance, .. }) =
+            state.parked_effects.remove(effect_id)
+        {
+            if let Some(conversation) = state.conversations.get_mut(&role_instance) {
+                conversation.lifecycle = ConversationLifecycle::Ready;
+            }
+        }
+    }
 }
 
 fn promote_proposal_plan(state: &mut MissionState) {
@@ -956,6 +993,44 @@ fn derive(state: &mut MissionState) {
                     assertion_ids: Vec::new(),
                     evidence: super::DecisionEvidence::None,
                     report: format!("Task '{task_id}' is parked."),
+                },
+            );
+        }
+    }
+    if let Some(team) = &state.team {
+        let mut assignments = vec![(team.planning_assignment.clone(), Vec::new())];
+        for (assertion_id, panel) in &team.judgment_assignments {
+            for role_instance in panel {
+                assignments.push((role_instance.clone(), vec![assertion_id.clone()]));
+            }
+        }
+        for (role_instance, assertion_ids) in assignments {
+            let Some((effect_id, failure, consecutive)) =
+                state.taskless_assignment_failure(&role_instance, &assertion_ids)
+            else {
+                continue;
+            };
+            if failure.automatically_retryable() && consecutive < state.config.recovery.max_attempts
+            {
+                continue;
+            }
+            let scope = assertion_ids.first().map_or_else(
+                || role_instance.to_string(),
+                |id| format!("{role_instance}:{id}"),
+            );
+            let id = format!("node_failed:{scope}");
+            attention.insert(
+                id.clone(),
+                AttentionItem {
+                    id,
+                    kind: AttentionKind::NodeFailed,
+                    task_id: None,
+                    oracle: None,
+                    assertion_ids,
+                    evidence: super::DecisionEvidence::RoleAttempts {
+                        effect_ids: vec![effect_id.clone()],
+                    },
+                    report: format!("Role instance '{role_instance}' is parked."),
                 },
             );
         }
@@ -1073,12 +1148,20 @@ fn derive(state: &mut MissionState) {
     if tasks_settled
         && state.inflight.is_empty()
         && !oracle_obligation_outstanding(state)
+        && !advisory_obligation_outstanding(state)
         && !gap_review_outstanding(state)
     {
         state.phase = MissionPhase::Done {
             finish: classify_finish(state),
         };
     }
+}
+
+pub(crate) fn advisory_obligation_outstanding(state: &MissionState) -> bool {
+    state
+        .contract
+        .keys()
+        .any(|assertion_id| state.advisory_status(assertion_id) == super::AdvisoryStatus::Pending)
 }
 
 pub(crate) fn oracle_obligation_outstanding(state: &MissionState) -> bool {

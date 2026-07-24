@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use lionclaw_model::{
-    fold, Assertion, AssertionId, AuthorityCeilings, AuthorityGrants, DecisionAction, EffectId,
-    EventEnvelope, ExecutionPolicy, Handoff, MissionConfig, MissionEvent, MissionGuidance,
-    MissionId, MissionProposal, MissionTypeRef, OracleName, OutputSemantics, PayloadRef, Plan,
-    PlanProposal, RecoveryConfig, Requirement, RequirementDisposition, RequirementId,
-    RequirementKind, RoleAttemptDisposition, RoleInstance, RoleInstanceId, RolePromptTemplate,
-    RoleTurnSuccess, RuntimeConfigurationEvidence, StopBar, Task, TaskId, TeamRevision,
-    VersionStamps, WorkspacePreparation, SCHEMA_VERSION,
+    apply, fold, step, AdvisoryStatus, Assertion, AssertionId, AttentionKind, AuthorityCeilings,
+    AuthorityGrants, ConversationLifecycle, ConversationState, DecisionAction, DeliveryMarker,
+    EffectId, EventEnvelope, ExecutionPolicy, Handoff, MissionConfig, MissionEvent,
+    MissionGuidance, MissionId, MissionPhase, MissionProposal, MissionState, MissionTypeRef,
+    OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, QueuedMessage, RecoveryConfig,
+    Requirement, RequirementDisposition, RequirementId, RequirementKind, RoleAttemptDisposition,
+    RoleInstance, RoleInstanceId, RolePromptTemplate, RoleTurnSuccess,
+    RuntimeConfigurationEvidence, StepDecision, StopBar, Task, TaskId, TaskRoleAssignment,
+    TaskRuntimeState, TaskStatus, TeamRevision, TypedFailure, ValidationItem, VersionStamps,
+    WorkspacePreparation, SCHEMA_VERSION,
 };
 
 fn instance(raw: &str) -> RoleInstanceId {
@@ -87,6 +90,21 @@ fn team_owns_contracts_assignments_and_guidance() {
         OutputSemantics::ProducesArtifact
     );
     team.validate_shape().expect("valid team shape");
+}
+
+#[test]
+fn team_role_environment_cannot_override_kernel_coordinates() {
+    let mut proposed = team(0, false);
+    proposed
+        .roles
+        .get_mut(&instance("planner"))
+        .unwrap()
+        .environment
+        .insert("HOME".into(), "/tmp/escape".into());
+    let error = proposed
+        .validate_shape()
+        .expect_err("kernel-owned environment must be rejected");
+    assert!(error.contains("owned by the LionClaw kernel"));
 }
 
 #[test]
@@ -452,4 +470,335 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
         state.tasks[&TaskId::new("implement").unwrap()].status,
         lionclaw_model::TaskStatus::Cleared
     );
+}
+
+fn accepted_advisory_state() -> MissionState {
+    let mut advisory_plan = plan();
+    advisory_plan.assertions[0].oracle = None;
+    let accepted_team = team(1, true);
+    fold([
+        event(
+            1,
+            MissionEvent::MissionCreated {
+                objective: "test advisory closure".into(),
+                mission_type: MissionTypeRef {
+                    name: "test".into(),
+                    digest: "digest".into(),
+                },
+                image_id: "image".into(),
+                workspace_dir: "/workspace".into(),
+                base_sha: "base".into(),
+                config: MissionConfig {
+                    stop: StopBar::Reviewed,
+                    ceilings: AuthorityCeilings {
+                        writes: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            },
+        ),
+        event(
+            2,
+            MissionEvent::TeamConfigured {
+                team: team(0, false),
+            },
+        ),
+        event(
+            3,
+            MissionEvent::ProposalRecorded {
+                proposal: Box::new(MissionProposal {
+                    plan: Some(PlanProposal {
+                        base_revision: 0,
+                        requirement_changes: Vec::new(),
+                        assertion_supersessions: Vec::new(),
+                        plan: advisory_plan,
+                    }),
+                    team: Some(accepted_team.clone()),
+                }),
+                proposal_hash: "proposal".into(),
+            },
+        ),
+        event(
+            4,
+            MissionEvent::DecisionRecorded {
+                attention_id: "plan_proposal:mission".into(),
+                action: DecisionAction::Approve,
+                justification: "ratified".into(),
+                requirement_changes: Vec::new(),
+            },
+        ),
+        event(
+            5,
+            MissionEvent::TeamConfigured {
+                team: accepted_team,
+            },
+        ),
+    ])
+    .unwrap()
+}
+
+fn reviewer_request(
+    sequence_no: u64,
+    attempt_no: u32,
+    prompt_hash: &str,
+) -> (EffectId, EventEnvelope) {
+    let role = instance("reviewer");
+    let assertion = AssertionId::new("A-1").unwrap();
+    let effect_id = EffectId::for_role_turn(
+        &MissionId::parse("mabc123abc123").unwrap(),
+        &role,
+        1,
+        None,
+        attempt_no,
+        1,
+        prompt_hash,
+    );
+    (
+        effect_id.clone(),
+        event(
+            sequence_no,
+            MissionEvent::RoleTurnRequested {
+                role_instance: role,
+                team_revision: 1,
+                task_id: None,
+                assertion_ids: vec![assertion],
+                attempt_no,
+                effect_id,
+                prompt_template: RolePromptTemplate::Judgment,
+                prompt_hash: prompt_hash.into(),
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+                message_boundary: sequence_no - 1,
+                presented_messages: Vec::new(),
+                workspace_preparation: WorkspacePreparation::Preserve,
+                requested_at_ms: sequence_no as i64,
+                deadline_ms: 60,
+                budget_deadline_ms: 120,
+            },
+        ),
+    )
+}
+
+fn validate_success(items: Vec<ValidationItem>, passed: bool) -> RoleTurnSuccess {
+    RoleTurnSuccess {
+        handoff: Some(Handoff::Validate {
+            done: true,
+            report: PayloadRef::inline("judgment"),
+            items,
+            passed,
+            request_attention: false,
+        }),
+        artifact: None,
+        final_response: PayloadRef::inline("done"),
+        runtime_configuration: RuntimeConfigurationEvidence::default(),
+    }
+}
+
+#[test]
+fn reviewed_closure_waits_for_every_assigned_judge() {
+    let mut state = accepted_advisory_state();
+    state
+        .tasks
+        .get_mut(&TaskId::new("implement").unwrap())
+        .unwrap()
+        .status = TaskStatus::Cleared;
+    apply(
+        &mut state,
+        &event(
+            6,
+            MissionEvent::MessageSent {
+                recipients: vec![instance("reviewer")],
+                body: "ignored before a conversation exists".into(),
+                references: Vec::new(),
+            },
+        ),
+    );
+    assert_eq!(
+        state.advisory_status(&AssertionId::new("A-1").unwrap()),
+        AdvisoryStatus::Pending
+    );
+    assert_eq!(state.phase, MissionPhase::Running);
+
+    let (effect_id, request) = reviewer_request(7, 1, "judge");
+    apply(&mut state, &request);
+    apply(
+        &mut state,
+        &event(
+            8,
+            MissionEvent::RoleTurnCompleted {
+                effect_id,
+                outcome: Ok(validate_success(
+                    vec![ValidationItem {
+                        item_id: AssertionId::new("A-1").unwrap(),
+                        passed: true,
+                    }],
+                    true,
+                )),
+            },
+        ),
+    );
+    assert_eq!(
+        state.phase,
+        MissionPhase::Done {
+            finish: lionclaw_model::FinishClass::InternallyConsistent
+        }
+    );
+}
+
+#[test]
+fn validator_handoff_requires_the_exact_assertion_set_and_consistent_summary() {
+    for (suffix, items, passed) in [
+        ("missing", Vec::new(), true),
+        (
+            "duplicate",
+            vec![
+                ValidationItem {
+                    item_id: AssertionId::new("A-1").unwrap(),
+                    passed: true,
+                },
+                ValidationItem {
+                    item_id: AssertionId::new("A-1").unwrap(),
+                    passed: true,
+                },
+            ],
+            true,
+        ),
+        (
+            "summary",
+            vec![ValidationItem {
+                item_id: AssertionId::new("A-1").unwrap(),
+                passed: false,
+            }],
+            true,
+        ),
+    ] {
+        let mut state = accepted_advisory_state();
+        let (effect_id, request) = reviewer_request(6, 1, suffix);
+        apply(&mut state, &request);
+        apply(
+            &mut state,
+            &event(
+                7,
+                MissionEvent::RoleTurnCompleted {
+                    effect_id: effect_id.clone(),
+                    outcome: Ok(validate_success(items, passed)),
+                },
+            ),
+        );
+        assert!(matches!(
+            state.role_attempt_receipts[&effect_id].disposition,
+            RoleAttemptDisposition::Failed { .. }
+        ));
+        assert_eq!(
+            state.advisory_status(&AssertionId::new("A-1").unwrap()),
+            AdvisoryStatus::Pending
+        );
+    }
+}
+
+#[test]
+fn permanent_taskless_role_failure_parks_until_an_explicit_retry() {
+    let mut state = accepted_advisory_state();
+    state
+        .tasks
+        .get_mut(&TaskId::new("implement").unwrap())
+        .unwrap()
+        .status = TaskStatus::Cleared;
+    let (effect_id, request) = reviewer_request(6, 1, "failure");
+    apply(&mut state, &request);
+    apply(
+        &mut state,
+        &event(
+            7,
+            MissionEvent::RoleTurnCompleted {
+                effect_id: effect_id.clone(),
+                outcome: Err(TypedFailure::permanent("judge.failed", "fault injected")),
+            },
+        ),
+    );
+    let attention_id = "node_failed:reviewer:A-1";
+    assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+    assert_eq!(
+        state.open_attention[attention_id].kind,
+        AttentionKind::NodeFailed
+    );
+    assert_eq!(step(&state), StepDecision::Park);
+
+    apply(
+        &mut state,
+        &event(
+            8,
+            MissionEvent::DecisionRecorded {
+                attention_id: attention_id.into(),
+                action: DecisionAction::Retry,
+                justification: "retry after correcting the runtime".into(),
+                requirement_changes: Vec::new(),
+            },
+        ),
+    );
+    assert_eq!(state.phase, MissionPhase::Running);
+    assert!(matches!(step(&state), StepDecision::DispatchRole(_)));
+    assert!(!state.parked_effects.contains_key(&effect_id));
+}
+
+#[test]
+fn queued_continuation_uses_the_roles_running_serial_task() {
+    let mut state = accepted_advisory_state();
+    let earlier = TaskId::new("implement").unwrap();
+    let active = TaskId::new("verify").unwrap();
+    state.tasks.get_mut(&earlier).unwrap().status = TaskStatus::Cleared;
+    state.plan.as_mut().unwrap().tasks.push(Task {
+        id: active.clone(),
+        body: "finish the later serial task".into(),
+        targets: Vec::new(),
+        depends_on: vec![earlier],
+    });
+    state
+        .team
+        .as_mut()
+        .unwrap()
+        .task_assignments
+        .insert(active.clone(), instance("engineer"));
+    state.tasks.insert(
+        active.clone(),
+        TaskRuntimeState {
+            status: TaskStatus::Running,
+            attempts: 1,
+            consecutive_failures: 0,
+            last_outcome: None,
+            feedback: Vec::new(),
+            role_assignment: Some(TaskRoleAssignment {
+                role_instance: instance("engineer"),
+                team_revision: 1,
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+            }),
+            workspace_provenance: None,
+            pending_workspace_recreation: None,
+        },
+    );
+    state.conversations.insert(
+        instance("engineer"),
+        ConversationState {
+            role_instance: instance("engineer"),
+            lifecycle: ConversationLifecycle::AwaitingLead,
+            queued: vec![QueuedMessage {
+                sequence_no: 6,
+                body: "continue".into(),
+                references: Vec::new(),
+                marker: DeliveryMarker::Queued,
+            }],
+            consumed_through: 0,
+            active_delivery: None,
+            final_response: None,
+            invalid_handoff_reworks: 0,
+        },
+    );
+
+    let StepDecision::DispatchRole(intent) = step(&state) else {
+        panic!("queued continuation should dispatch");
+    };
+    assert_eq!(intent.task_id, Some(active));
+    assert_eq!(intent.body, "finish the later serial task");
 }

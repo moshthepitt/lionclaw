@@ -87,6 +87,9 @@ fn step_planning(state: &MissionState) -> StepDecision {
         return StepDecision::Idle;
     };
     let planner = &team.planning_assignment;
+    if !state.taskless_assignment_dispatchable(planner, &[]) {
+        return StepDecision::Idle;
+    }
     if state
         .conversations
         .get(planner)
@@ -125,10 +128,14 @@ fn step_running(state: &MissionState) -> StepDecision {
         let Some(team) = state.team.as_ref() else {
             return StepDecision::Idle;
         };
-        let task = team
-            .task_assignments
-            .iter()
-            .find_map(|(task_id, assigned)| (assigned == role_id).then_some(task_id));
+        let task = state.tasks.iter().find_map(|(task_id, task)| {
+            (task.status == TaskStatus::Running
+                && task.role_assignment.as_ref().is_some_and(|assignment| {
+                    assignment.role_instance == *role_id
+                        && assignment.team_revision == team.revision
+                }))
+            .then_some(task_id)
+        });
         let (task_id, body, targets) = match task.and_then(|id| {
             plan.tasks
                 .iter()
@@ -181,15 +188,12 @@ fn step_running(state: &MissionState) -> StepDecision {
                 .contract
                 .get(assertion_id)
                 .and_then(|assertion| assertion.last_advisory.get(role_id))
-                .and_then(|effect| state.role_attempt_receipts.get(effect))
-                .is_some_and(|receipt| {
-                    matches!(
-                        &receipt.source,
-                        super::RoleEffectSource::Turn { request, .. }
-                            if request.base_sha == state.deliverable_head()
-                    )
-                });
-            if !already_settled {
+                .and_then(|effect| state.advisory_receipt(assertion_id, role_id, effect))
+                .is_some();
+            if !already_settled
+                && state
+                    .taskless_assignment_dispatchable(role_id, core::slice::from_ref(assertion_id))
+            {
                 if let Some(intent) = role_intent(
                     state,
                     role_id,

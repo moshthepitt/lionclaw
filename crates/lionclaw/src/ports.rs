@@ -42,6 +42,8 @@ pub struct RoleTurnRequest {
     pub environment: BTreeMap<String, String>,
     /// Mission-owned skill packages resolved from the pinned mission type.
     pub skills: Vec<SkillPackage>,
+    /// Prepared inputs explicitly granted by the pinned role contract.
+    pub prepared_inputs: Vec<PreparedInput>,
     /// Fully assembled prompt (already persisted in the request event).
     pub prompt: String,
     /// Commit the role's workspace is created at.

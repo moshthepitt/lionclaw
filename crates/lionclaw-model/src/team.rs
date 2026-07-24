@@ -7,6 +7,36 @@ use super::{ids::lowercase_hex, AssertionId, InputName, OutputSemantics, RoleIns
 use crate::prelude::*;
 
 pub const MAX_GUIDANCE_BYTES: usize = 64 * 1024;
+pub const KERNEL_ENVIRONMENT_KEYS: &[&str] = &[
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "TMPDIR",
+    "GIT_OPTIONAL_LOCKS",
+    "LIONCLAW_WORKSPACE_DIR",
+    "LIONCLAW_OUTPUT",
+    "MISSION_EFFECT",
+];
+
+pub fn validate_environment_entry(name: &str, value: &str) -> Result<(), String> {
+    let mut characters = name.chars();
+    let valid_name = characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
+    if !valid_name {
+        return Err(format!("key '{name}' is invalid"));
+    }
+    if KERNEL_ENVIRONMENT_KEYS.contains(&name) {
+        return Err(format!("key '{name}' is owned by the LionClaw kernel"));
+    }
+    if value.contains('\0') {
+        return Err(format!("value for '{name}' contains NUL"));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,6 +173,10 @@ impl TeamRevision {
             }
             if role.deadline_secs == Some(0) {
                 return Err(format!("role instance '{id}' deadline must be positive"));
+            }
+            for (name, value) in &role.environment {
+                validate_environment_entry(name, value)
+                    .map_err(|detail| format!("role instance '{id}' environment {detail}"))?;
             }
             let mut skills = BTreeSet::new();
             for skill in &role.skills {

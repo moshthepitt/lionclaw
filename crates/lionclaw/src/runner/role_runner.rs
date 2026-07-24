@@ -31,7 +31,9 @@ use crate::resources::MissionDirs;
 use super::executor::{mission_execution_context, MissionProgramExecutor};
 use super::handoff::read_optional_handoff;
 use super::native_home_auth::NativeHomeAuthProvider;
-use super::{await_controlled, effect_mounts, prepare_skill_mounts};
+use super::{
+    await_controlled, effect_mounts, prepare_inputs, prepare_skill_mounts, PreparedInputs,
+};
 use crate::workspace;
 
 pub struct OciRoleRunner {
@@ -43,6 +45,7 @@ pub struct OciRoleRunner {
     /// Serializes Git checkout/capture operations inside this process. The
     /// mission driver lock provides cross-process coordination.
     repo_lock: Arc<Mutex<()>>,
+    input_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -90,6 +93,7 @@ impl OciRoleRunner {
             drivers,
             auth_providers,
             repo_lock: Arc::new(Mutex::new(())),
+            input_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -618,7 +622,32 @@ impl RoleRunner for OciRoleRunner {
             // predicate is applied uniformly).
             let mut extras = effect_mounts(&dirs, &runtime_profile);
             extras.extend(skill_mounts);
-            let environment = mission_environment(&dirs, &request.environment);
+            let prepared = if request.prepared_inputs.is_empty() {
+                PreparedInputs {
+                    mounts: Vec::new(),
+                    environment: Vec::new(),
+                    refs: Vec::new(),
+                }
+            } else {
+                let _guard = self.input_lock.lock().await;
+                prepare_inputs(
+                    &profile,
+                    &request.state_dir,
+                    dirs.root(),
+                    &workspace_source,
+                    &request.prepared_inputs,
+                    &request.effect_id,
+                )
+                .await
+                .map_err(|error| {
+                    launch(format!(
+                        "failed to prepare granted mission inputs: {error:#}"
+                    ))
+                })?
+            };
+            extras.extend(prepared.mounts);
+            let environment =
+                mission_environment(&dirs, &request.environment, prepared.environment);
             let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
             let compiled = compile_role_plan(RolePlanRequest {
                 authority: &authority,
@@ -1334,6 +1363,7 @@ fn turn_failure_evidence(
 fn mission_environment(
     dirs: &crate::resources::RoleEffectDirs,
     declared: &std::collections::BTreeMap<String, String>,
+    prepared_input: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<(String, String)> {
     let home = lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET;
     crate::mission_type::execution_environment(
@@ -1355,7 +1385,7 @@ fn mission_environment(
             ),
         ],
         declared,
-        std::iter::empty(),
+        prepared_input,
     )
 }
 

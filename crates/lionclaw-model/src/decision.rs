@@ -78,7 +78,10 @@ pub fn validate_decision(
     let Some(item) = state.open_attention.get(attention_id) else {
         return Err(DecisionError::UnknownItem(attention_id.to_string()));
     };
-    let legal = allowed_actions(item.kind).contains(action);
+    let taskless_role_failure_accept = item.kind == AttentionKind::NodeFailed
+        && item.task_id.is_none()
+        && action == &DecisionAction::Accept;
+    let legal = allowed_actions(item.kind).contains(action) && !taskless_role_failure_accept;
     if !legal {
         return Err(DecisionError::InvalidAction {
             action: action.clone(),

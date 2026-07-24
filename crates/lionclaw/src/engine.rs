@@ -1343,6 +1343,7 @@ impl Engine {
         };
         let mut environment = self.mission_type.environment.clone();
         environment.extend(role.environment.clone());
+        let prepared_inputs = granted_prepared_inputs(role, &self.mission_type.inputs);
         let request = RoleTurnRequest {
             mission_id: state.mission_id.clone(),
             task_id: task_id.clone(),
@@ -1351,6 +1352,7 @@ impl Engine {
             role: role.clone(),
             environment,
             skills,
+            prepared_inputs,
             prompt: prompt_text.clone(),
             base_sha: base_sha.to_string(),
             assignment_epoch: *assignment_epoch,
@@ -2089,6 +2091,63 @@ impl Engine {
         fallback: TypedFailure,
     ) -> TypedFailure {
         fallback.projected()
+    }
+}
+
+fn granted_prepared_inputs(
+    role: &RoleInstance,
+    available: &std::collections::BTreeMap<
+        crate::model::InputName,
+        crate::mission_type::PreparedInput,
+    >,
+) -> Vec<crate::mission_type::PreparedInput> {
+    role.grants
+        .inputs
+        .iter()
+        .filter_map(|name| available.get(name).cloned())
+        .collect()
+}
+
+#[cfg(test)]
+mod prepared_input_grant_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
+
+    fn input(name: &str) -> crate::mission_type::PreparedInput {
+        crate::mission_type::PreparedInput {
+            name: crate::model::InputName::new(name).unwrap(),
+            program: PathBuf::from(format!("/mission/inputs/{name}")),
+            network: false,
+            key_files: Vec::new(),
+            environment: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn role_launch_receives_only_explicitly_granted_prepared_inputs() {
+        let granted = input("granted");
+        let withheld = input("withheld");
+        let role = RoleInstance {
+            id: crate::model::RoleInstanceId::new("worker").unwrap(),
+            purpose: "work".into(),
+            output: crate::model::OutputSemantics::ProducesArtifact,
+            runtime: "codex".into(),
+            instructions: "work".into(),
+            skills: Vec::new(),
+            environment: BTreeMap::new(),
+            grants: crate::model::AuthorityGrants {
+                inputs: BTreeSet::from([granted.name.clone()]),
+                ..Default::default()
+            },
+            deadline_secs: None,
+        };
+        let available = BTreeMap::from([
+            (granted.name.clone(), granted.clone()),
+            (withheld.name.clone(), withheld),
+        ]);
+
+        assert_eq!(granted_prepared_inputs(&role, &available), vec![granted]);
     }
 }
 

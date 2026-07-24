@@ -1320,8 +1320,19 @@ impl MissionState {
         let Some(assertion) = self.contract.get(assertion_id) else {
             return AdvisoryStatus::Pending;
         };
+        let Some(panel) = self
+            .team
+            .as_ref()
+            .and_then(|team| team.judgment_assignments.get(assertion_id))
+            .filter(|panel| !panel.is_empty())
+        else {
+            return AdvisoryStatus::Pending;
+        };
         let mut saw_failure = false;
-        for (validator, effect_id) in &assertion.last_advisory {
+        for validator in panel {
+            let Some(effect_id) = assertion.last_advisory.get(validator) else {
+                return AdvisoryStatus::Pending;
+            };
             match self.advisory_receipt(assertion_id, validator, effect_id) {
                 Some((_, true)) => {}
                 Some((_, false)) => saw_failure = true,
@@ -1333,6 +1344,66 @@ impl MissionState {
         } else {
             AdvisoryStatus::Passed
         }
+    }
+
+    fn taskless_assignment_receipts<'a>(
+        &'a self,
+        role_instance: &RoleInstanceId,
+        assertion_ids: &[AssertionId],
+    ) -> Vec<&'a RoleAttemptReceipt> {
+        let Some(team_revision) = self.team.as_ref().map(|team| team.revision) else {
+            return Vec::new();
+        };
+        let mut receipts: Vec<_> = self
+            .role_attempt_receipts
+            .values()
+            .filter(|receipt| {
+                matches!(
+                    &receipt.source,
+                    RoleEffectSource::Turn { request, .. }
+                        if request.role_instance == *role_instance
+                            && request.team_revision == team_revision
+                            && request.task_id.is_none()
+                            && request.assertion_ids == assertion_ids
+                )
+            })
+            .collect();
+        receipts.sort_by_key(|receipt| match &receipt.source {
+            RoleEffectSource::Turn { request, .. } => request.attempt_no,
+        });
+        receipts
+    }
+
+    pub(crate) fn taskless_assignment_failure(
+        &self,
+        role_instance: &RoleInstanceId,
+        assertion_ids: &[AssertionId],
+    ) -> Option<(&super::EffectId, &TypedFailure, u32)> {
+        let receipts = self.taskless_assignment_receipts(role_instance, assertion_ids);
+        let latest = *receipts.last()?;
+        let failure = latest.failure()?;
+        if !self.parked_effects.contains_key(&latest.effect_id) {
+            return None;
+        }
+        let consecutive = receipts
+            .iter()
+            .rev()
+            .take_while(|receipt| {
+                receipt.failure().is_some() && self.parked_effects.contains_key(&receipt.effect_id)
+            })
+            .count() as u32;
+        Some((&latest.effect_id, failure, consecutive))
+    }
+
+    pub(crate) fn taskless_assignment_dispatchable(
+        &self,
+        role_instance: &RoleInstanceId,
+        assertion_ids: &[AssertionId],
+    ) -> bool {
+        self.taskless_assignment_failure(role_instance, assertion_ids)
+            .is_none_or(|(_, failure, consecutive)| {
+                failure.automatically_retryable() && consecutive < self.config.recovery.max_attempts
+            })
     }
 
     pub fn gap_review_receipt(&self) -> Option<&RoleAttemptReceipt> {
