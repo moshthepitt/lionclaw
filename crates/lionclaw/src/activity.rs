@@ -222,16 +222,14 @@ pub async fn publish_observed(
                     continue;
                 }
                 match state.active_workspace_task(effect_id) {
-                    Ok((task_id, task)) => {
+                    Ok((task_id, _task, provenance)) => {
                         let dirs = mission_dirs.task(task_id);
                         workspace_requests.push((
                             effect_id.clone(),
                             workspace_root.to_path_buf(),
                             dirs.work().to_path_buf(),
                             dirs.observer_index().to_path_buf(),
-                            task.workspace_provenance
-                                .as_ref()
-                                .map(|provenance| provenance.base_sha.clone()),
+                            Some(provenance.base_sha),
                         ));
                     }
                     Err(reason) => {

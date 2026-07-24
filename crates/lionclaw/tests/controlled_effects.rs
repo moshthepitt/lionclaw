@@ -1252,7 +1252,15 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
             assert_eq!(conversation.role_instance, conversation_id);
             assert_eq!(conversation.queued.len(), 1);
             assert!(conversation.queued[0].sequence_no > message_boundary);
-            assert_eq!(conversation.queued[0].marker, DeliveryMarker::Queued);
+            assert_eq!(
+                conversation.queued[0].marker,
+                match cancellation {
+                    SettlementCancellation::Abort => DeliveryMarker::Undeliverable,
+                    SettlementCancellation::Stop | SettlementCancellation::Deadline => {
+                        DeliveryMarker::Queued
+                    }
+                }
+            );
             assert_eq!(
                 conversation.queued[0].body,
                 "arrived beyond the observed delivery boundary"

@@ -1581,29 +1581,25 @@ impl MissionState {
     pub fn active_workspace_task(
         &self,
         effect_id: &super::EffectId,
-    ) -> Result<(&TaskId, &TaskRuntimeState), &'static str> {
+    ) -> Result<(&TaskId, &TaskRuntimeState, TaskWorkspaceProvenance), &'static str> {
         let (task_id, expected) = self.expected_active_workspace_provenance(effect_id)?;
         let task = self
             .tasks
             .get(&task_id)
             .ok_or("active effect task is absent from folded state")?;
-        if task.workspace_provenance.as_ref() != Some(&expected)
-            || task.pending_workspace_recreation.is_some()
-            || expected
-                .archived_effect_id
-                .as_ref()
-                .is_some_and(|archived| {
-                    !self
-                        .retained_workspace_archives
-                        .get(&task_id)
-                        .is_some_and(|archives| archives.contains(archived))
-                })
+        let Some(assignment) = task.role_assignment.as_ref() else {
+            return Err("active effect task has no role assignment authority");
+        };
+        if assignment.base_sha != expected.base_sha
+            || assignment.assignment_epoch != expected.assignment_epoch
+            || task.pending_workspace_recreation.as_ref() != expected.archived_effect_id.as_ref()
         {
-            return Err("active effect has no exact prepared workspace authority");
+            return Err("active effect and task workspace authority disagree");
         }
         Ok((
             self.tasks.get_key_value(&task_id).expect("task exists").0,
             task,
+            expected,
         ))
     }
 

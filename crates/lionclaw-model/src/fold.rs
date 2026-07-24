@@ -13,9 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 48 clears settled cleanup failures and preserves terminal
-/// conversation retirement while inherited role effects settle.
-pub const REDUCER_VERSION: u32 = 48;
+/// Reducer 49 preserves exact message-delivery evidence across atomic role
+/// failures.
+pub const REDUCER_VERSION: u32 = 49;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -651,7 +651,8 @@ fn settle_role_failure(
     request: &super::RoleTurnProvenance,
     failure: TypedFailure,
 ) {
-    settle_delivery(state, &request.role_instance, false);
+    let max_recovery_attempts = state.config.recovery.max_attempts;
+    settle_failed_delivery(state, &request.role_instance, &failure);
     if let Some(receipt) = state.role_attempt_receipts.get_mut(effect_id) {
         receipt.runtime_configuration = Some(failure.evidence().configuration.clone());
         if !failure.evidence().final_response.is_empty() {
@@ -693,8 +694,18 @@ fn settle_role_failure(
         },
     );
     if let Some(conversation) = state.conversations.get_mut(&request.role_instance) {
+        if !failure.evidence().final_response.is_empty() {
+            conversation.final_response = Some(super::PayloadRef::inline(
+                failure.evidence().final_response.clone(),
+            ));
+        }
         if state.phase.is_terminal() {
             retire_conversation(conversation);
+        } else if failure.is_invalid_output()
+            && conversation.invalid_handoff_reworks < max_recovery_attempts
+        {
+            conversation.invalid_handoff_reworks += 1;
+            conversation.lifecycle = ConversationLifecycle::ReworkingInvalidHandoff;
         } else {
             conversation.lifecycle = ConversationLifecycle::Ready;
         }
@@ -725,6 +736,49 @@ fn settle_delivery(state: &mut MissionState, role_instance: &RoleInstanceId, suc
                 || message.sequence_no > delivery.message_boundary
         });
     }
+}
+
+fn settle_failed_delivery(
+    state: &mut MissionState,
+    role_instance: &RoleInstanceId,
+    failure: &TypedFailure,
+) {
+    let Some(conversation) = state.conversations.get_mut(role_instance) else {
+        return;
+    };
+    let Some(delivery) = conversation.active_delivery.take() else {
+        return;
+    };
+    let observation = if failure.evidence().code.as_deref() == Some("kernel.launch") {
+        DeliveryObservation::NotDelivered
+    } else if failure.is_invalid_output() || !failure.evidence().final_response.is_empty() {
+        DeliveryObservation::Delivered
+    } else {
+        DeliveryObservation::Uncertain
+    };
+    for message in conversation
+        .queued
+        .iter_mut()
+        .filter(|message| delivery.presented_messages.contains(&message.sequence_no))
+    {
+        message.marker = match (observation, message.marker) {
+            (DeliveryObservation::Delivered, DeliveryMarker::Queued)
+            | (DeliveryObservation::Delivered, DeliveryMarker::PossiblyDelivered) => {
+                DeliveryMarker::PreviouslyDelivered
+            }
+            (DeliveryObservation::Uncertain, DeliveryMarker::Queued) => {
+                DeliveryMarker::PossiblyDelivered
+            }
+            (_, marker) => marker,
+        };
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DeliveryObservation {
+    NotDelivered,
+    Uncertain,
+    Delivered,
 }
 
 fn settle_unavailable_delivery(state: &mut MissionState, role_instance: &RoleInstanceId) {

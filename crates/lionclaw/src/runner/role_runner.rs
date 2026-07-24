@@ -677,6 +677,15 @@ impl RoleRunner for OciRoleRunner {
             .run_turn(&profile, &request, plan, runtime_state, auth)
             .await;
         let (applied, final_response) = turn?;
+        if let Err(error) = role_state.assess_runtime_retention_async().await {
+            let mut failure = TypedFailure::permanent(
+                "runtime.native_state_limit",
+                format!("retained runtime state post-turn check refused: {error:#}"),
+            );
+            failure.evidence_mut().configuration = applied.clone();
+            failure.evidence_mut().final_response = final_response.clone();
+            return Err(failure);
+        }
         let cancellation_configuration = applied.clone();
         let cancellation_response = final_response.clone();
         let finish = async {
