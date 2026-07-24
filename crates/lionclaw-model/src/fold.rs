@@ -15,7 +15,7 @@ use crate::{TypedFailure, TypedFailureEvidence};
 
 /// Reducer 40 carries exact task failure receipts into attention and durable
 /// planning refinement evidence.
-pub const REDUCER_VERSION: u32 = 41;
+pub const REDUCER_VERSION: u32 = 42;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -409,6 +409,9 @@ fn apply_message(
                 references: references.to_vec(),
                 marker: DeliveryMarker::Queued,
             });
+            if conversation.lifecycle == ConversationLifecycle::AwaitingLead {
+                conversation.lifecycle = ConversationLifecycle::Ready;
+            }
         }
     }
 }
@@ -546,7 +549,11 @@ fn apply_success_handoff(
         | (super::OutputSemantics::ProducesReport, None)
         | (super::OutputSemantics::ProposesPlan, None) => {
             if let Some(conversation) = state.conversations.get_mut(&request.role_instance) {
-                conversation.lifecycle = ConversationLifecycle::AwaitingLead;
+                conversation.lifecycle = if conversation.queued.is_empty() {
+                    ConversationLifecycle::AwaitingLead
+                } else {
+                    ConversationLifecycle::Ready
+                };
             }
         }
         (super::OutputSemantics::ProducesArtifact, Some(Handoff::Work { .. })) => {
@@ -573,7 +580,11 @@ fn apply_success_handoff(
                 }
             }
             if let Some(conversation) = state.conversations.get_mut(&request.role_instance) {
-                conversation.lifecycle = ConversationLifecycle::AwaitingLead;
+                conversation.lifecycle = if conversation.queued.is_empty() {
+                    ConversationLifecycle::AwaitingLead
+                } else {
+                    ConversationLifecycle::Ready
+                };
             }
         }
         (super::OutputSemantics::EmitsVerdict, Some(Handoff::Validate { items, .. })) => {
