@@ -15,7 +15,7 @@ use crate::{TypedFailure, TypedFailureEvidence};
 
 /// Reducer 40 carries exact task failure receipts into attention and durable
 /// planning refinement evidence.
-pub const REDUCER_VERSION: u32 = 45;
+pub const REDUCER_VERSION: u32 = 46;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;

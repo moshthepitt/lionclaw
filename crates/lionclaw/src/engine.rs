@@ -1274,7 +1274,7 @@ impl Engine {
         let completed = |outcome: Result<crate::model::RoleTurnSuccess, TypedFailure>| {
             NewEvent::new(MissionEvent::RoleTurnCompleted {
                 effect_id: effect_id.clone(),
-                outcome: outcome.map_err(without_role_turn_evidence),
+                outcome: outcome.map_err(TypedFailure::projected),
             })
         };
         if let Err(reason) = state.active_role_conversation(effect_id) {
@@ -1410,6 +1410,13 @@ impl Engine {
                             &outcome,
                         ))));
                     }
+                }
+                if matches!(&outcome.handoff, Some(Handoff::Review { done: false, .. })) {
+                    return Ok(completed(Err(invalid_role_outcome(
+                        "handoff.incomplete",
+                        "gap review did not complete",
+                        &outcome,
+                    ))));
                 }
                 if let Some(Handoff::Review { nonce, .. }) = &outcome.handoff {
                     let expected = crate::prompt::handoff_nonce(&prompt_text).unwrap_or_default();
