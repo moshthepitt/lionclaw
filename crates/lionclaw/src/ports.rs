@@ -34,6 +34,8 @@ pub trait RoleRunner: Send + Sync {
 pub struct RoleTurnRequest {
     pub mission_id: MissionId,
     pub task_id: Option<TaskId>,
+    /// Exact assertion set assigned to this turn. Empty for non-judgment roles.
+    pub assertion_ids: Vec<crate::model::AssertionId>,
     pub attempt_no: u32,
     pub effect_id: EffectId,
     pub role: RoleInstance,

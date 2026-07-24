@@ -29,6 +29,7 @@ use crate::model::{
     MissionEvent, MissionId, MissionPhase, MissionProposal, OracleName, PayloadRef, Plan,
     PlanProposal, ProposalError, Requirement, RequirementDisposition, RequirementId,
     RequirementKind, ReviewAcceptanceKind, RoleInstanceId, Task, TaskId, TaskStatus, TeamRevision,
+    ValidationItem,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
@@ -54,6 +55,9 @@ struct NoopRoleRunner;
 #[async_trait]
 impl RoleRunner for NoopRoleRunner {
     async fn run(&self, request: RoleTurnRequest) -> Result<RoleTurnOutcome, TypedFailure> {
+        if let Some(outcome) = passing_verdict(&request) {
+            return Ok(outcome);
+        }
         prepare_scripted_writer(&request)
             .await
             .map_err(|error| TypedFailure::permanent("selftest.runner", format!("{error:#}")))?;
@@ -117,6 +121,8 @@ impl RoleRunner for ReviewParkRoleRunner {
                 runtime_configuration: Default::default(),
                 final_response: "self-test scripted review".to_string(),
             })
+        } else if let Some(outcome) = passing_verdict(&request) {
+            Ok(outcome)
         } else {
             prepare_scripted_writer(&request).await.map_err(|error| {
                 TypedFailure::permanent("selftest.runner", format!("{error:#}"))
@@ -345,7 +351,7 @@ fn manifest_toml(name: &str) -> String {
         "[mission-type]\nname = \"{name}\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n\
          environment = {{ CARGO_HOME = \"/scratch/cargo\", CARGO_TARGET_DIR = \"/scratch/target\" }}\n\
          \n[team]\nplanning-assignment = \"strategist\"\nrequires-gap-review = false\n\
-         \n[ceilings]\nwrites = true\nnetwork = true\ninputs = [\"fixture\"]\n\
+         \n[ceilings]\nwrites = true\nnetwork = true\ninstall = true\n\
          \n[execution]\ndefault-timeout-secs = 1800\nmax-task-time-secs = 1800\n\
          extension-step-secs = 300\nauto-continue-candidate = true\nauto-continue-proof = true\n"
     )
@@ -411,7 +417,10 @@ fn materialize_input_mission_type(root: &Path) -> Result<()> {
         root.join("mission.toml"),
         format!(
             "{}\n[[inputs]]\nname = \"fixture\"\nnetwork = true\nkey-files = [\"Cargo.lock\"]\n",
-            manifest_toml("input-selftest")
+            manifest_toml("input-selftest").replace(
+                "install = true\n",
+                "install = true\ninputs = [\"fixture\"]\n"
+            )
         ),
     )?;
     std::fs::create_dir_all(root.join("inputs"))?;
@@ -572,6 +581,9 @@ impl RoleRunner for ScriptedRoleRunner {
 
 impl ScriptedRoleRunner {
     async fn run_inner(&self, request: RoleTurnRequest) -> Result<RoleTurnOutcome> {
+        if let Some(outcome) = passing_verdict(&request) {
+            return Ok(outcome);
+        }
         let dest = prepare_scripted_writer(&request).await?;
         let capture = request
             .artifact_capture
@@ -607,6 +619,29 @@ impl ScriptedRoleRunner {
             final_response: "self-test scripted fix".to_string(),
         })
     }
+}
+
+fn passing_verdict(request: &RoleTurnRequest) -> Option<RoleTurnOutcome> {
+    (request.role.output == crate::model::OutputSemantics::EmitsVerdict).then(|| RoleTurnOutcome {
+        handoff: Some(Handoff::Validate {
+            done: true,
+            report: PayloadRef::inline("self-test passing judgment"),
+            items: request
+                .assertion_ids
+                .iter()
+                .cloned()
+                .map(|item_id| ValidationItem {
+                    item_id,
+                    passed: true,
+                })
+                .collect(),
+            passed: true,
+            request_attention: false,
+        }),
+        artifact: None,
+        runtime_configuration: Default::default(),
+        final_response: "self-test passing judgment".to_string(),
+    })
 }
 
 /// Prepare the exact checkout authority required by a successful scripted writer.

@@ -1259,6 +1259,7 @@ impl Engine {
             role_instance,
             team_revision,
             task_id,
+            assertion_ids,
             attempt_no,
             output,
             base_sha,
@@ -1347,6 +1348,7 @@ impl Engine {
         let request = RoleTurnRequest {
             mission_id: state.mission_id.clone(),
             task_id: task_id.clone(),
+            assertion_ids: assertion_ids.clone(),
             attempt_no,
             effect_id: effect_id.clone(),
             role: role.clone(),

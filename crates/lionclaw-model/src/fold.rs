@@ -13,9 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 36 derives dispatch, conversations, assignments, judgment
-/// obligations, and taskless recovery from accepted team revisions.
-pub const REDUCER_VERSION: u32 = 36;
+/// Reducer 37 promotes joint plan/team revisions atomically and preserves
+/// explicit recovery paths for authoritative failures and gap acknowledgments.
+pub const REDUCER_VERSION: u32 = 37;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -226,16 +226,20 @@ fn apply_team(state: &mut MissionState, team: &super::TeamRevision) {
         .team
         .as_ref()
         .map_or(0, |current| current.revision.saturating_add(1));
+    let plan = state
+        .proposal
+        .as_ref()
+        .filter(|proposal| state.proposal_approved && proposal.team.as_ref() == Some(team))
+        .and_then(|proposal| proposal.plan.as_ref())
+        .map(|proposal| &proposal.plan)
+        .or(state.plan.as_ref());
     if team.revision != expected
         || team.validate_shape().is_err()
         || team
             .roles
             .values()
             .any(|role| !role.grants.within(&state.config.ceilings))
-        || state
-            .plan
-            .as_ref()
-            .is_some_and(|plan| !super::validate_plan(plan, team, &state.config).is_empty())
+        || plan.is_some_and(|plan| !super::validate_plan(plan, team, &state.config).is_empty())
     {
         return;
     }
@@ -839,6 +843,31 @@ fn apply_decision(
         (super::DecisionAction::Retry, AttentionKind::NodeFailed) => {
             retry_failed_node(state, &item);
         }
+        (super::DecisionAction::Retry, AttentionKind::OracleVerdictFailed) => {
+            clear_authoritative_verdicts(state, &item.assertion_ids);
+        }
+        (super::DecisionAction::Repair, AttentionKind::OracleVerdictFailed) => {
+            let feedback = super::FailureFeedback {
+                summary: item.report.clone(),
+                evidence: item.evidence.clone(),
+                justification: justification.to_string(),
+            };
+            clear_authoritative_verdicts(state, &item.assertion_ids);
+            if let Some(plan) = &state.plan {
+                for task in plan.tasks.iter().filter(|task| {
+                    task.targets
+                        .iter()
+                        .any(|target| item.assertion_ids.contains(target))
+                }) {
+                    if let Some(runtime) = state.tasks.get_mut(&task.id) {
+                        runtime.status = TaskStatus::Pending;
+                        runtime.consecutive_failures = 0;
+                        runtime.feedback.push(feedback.clone());
+                    }
+                }
+            }
+            state.gap_review = Default::default();
+        }
         (super::DecisionAction::Repair, _) => {}
         (super::DecisionAction::Revise, _) => {
             if item.kind == AttentionKind::NodeFailed {
@@ -888,6 +917,14 @@ fn apply_decision(
         _ => {}
     }
     state.open_attention.remove(attention_id);
+}
+
+fn clear_authoritative_verdicts(state: &mut MissionState, assertion_ids: &[AssertionId]) {
+    for assertion_id in assertion_ids {
+        if let Some(assertion) = state.contract.get_mut(assertion_id) {
+            assertion.last_authoritative = None;
+        }
+    }
 }
 
 fn retry_failed_node(state: &mut MissionState, item: &AttentionItem) {
@@ -1052,6 +1089,53 @@ fn derive(state: &mut MissionState) {
             );
         }
     }
+    let mut failed_by_oracle: BTreeMap<
+        super::OracleName,
+        (Vec<AssertionId>, super::FailureEvidence),
+    > = BTreeMap::new();
+    for (assertion_id, assertion) in &state.contract {
+        let Some(verdict) = assertion
+            .last_authoritative
+            .as_ref()
+            .filter(|verdict| verdict.is_fresh_at(state.deliverable_head()) && !verdict.passed())
+        else {
+            continue;
+        };
+        if state.waived_oracles.contains(verdict.oracle()) {
+            continue;
+        }
+        let (stdout, stderr) = verdict.evidence();
+        failed_by_oracle
+            .entry(verdict.oracle().clone())
+            .or_insert_with(|| {
+                (
+                    Vec::new(),
+                    super::FailureEvidence {
+                        exit_code: verdict.exit_code(),
+                        exit_signal: verdict.exit_signal(),
+                        stdout: stdout.clone(),
+                        stderr: stderr.clone(),
+                    },
+                )
+            })
+            .0
+            .push(assertion_id.clone());
+    }
+    for (oracle, (assertion_ids, evidence)) in failed_by_oracle {
+        let id = format!("oracle_verdict_failed:{oracle}");
+        attention.insert(
+            id.clone(),
+            AttentionItem {
+                id,
+                kind: AttentionKind::OracleVerdictFailed,
+                task_id: None,
+                oracle: Some(oracle),
+                assertion_ids,
+                evidence: super::DecisionEvidence::OracleVerdict { evidence },
+                report: "An authoritative oracle verdict failed.".to_string(),
+            },
+        );
+    }
     if state.config.requires_gap_review {
         match &state.gap_review.outcome {
             Some(ReviewOutcome::Failed { effect_id })
@@ -1180,7 +1264,9 @@ pub(crate) fn gap_review_outstanding(state: &MissionState) -> bool {
     if !state.config.requires_gap_review {
         return false;
     }
-    if state.gap_review.waived_at(state.deliverable_head()) {
+    if state.gap_review.waived_at(state.deliverable_head())
+        || state.gap_review.acknowledges_sha(state.deliverable_head())
+    {
         return false;
     }
     let Some(team) = state.team.as_ref() else {
