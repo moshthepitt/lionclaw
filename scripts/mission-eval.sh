@@ -60,7 +60,7 @@ proposal = {
                 "kind": "capability",
                 "prose": "closed intervals that touch overlap",
                 "disposition": {
-                    "type": "covered",
+                    "type": "confined_provable",
                     "assertion_ids": ["TESTS-PASS"],
                 },
             }],

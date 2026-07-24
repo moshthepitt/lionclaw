@@ -9,3 +9,8 @@ verdict with concise evidence.
 Treat claimed metric improvements as unproven unless the measurement command,
 baseline, and final value are inspectable from the workspace or recorded
 evidence.
+
+For `metric-scalar` oracle-backed assertions, check that the assertion text is
+limited to the pinned scalar condition represented by `metric.txt`,
+`metric.expected`, and `metric.operator`; broader improvement claims require
+reviewer-checkable proof.

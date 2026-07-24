@@ -269,7 +269,7 @@ fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
-                delegation: lionclaw_model::DelegationSet::agent_lead_default(),
+                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(
@@ -330,7 +330,7 @@ fn a_skipped_team_revision_is_ignored_during_replay() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
-                delegation: lionclaw_model::DelegationSet::agent_lead_default(),
+                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(
@@ -384,7 +384,7 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
-                delegation: lionclaw_model::DelegationSet::agent_lead_default(),
+                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(
@@ -502,7 +502,7 @@ fn accepted_advisory_state() -> MissionState {
                     },
                     ..Default::default()
                 },
-                delegation: lionclaw_model::DelegationSet::agent_lead_default(),
+                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(

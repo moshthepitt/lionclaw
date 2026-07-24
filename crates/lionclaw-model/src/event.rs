@@ -524,7 +524,17 @@ pub struct DelegationSet {
 }
 
 impl DelegationSet {
-    pub const fn agent_lead_default() -> Self {
+    pub const fn none() -> Self {
+        Self {
+            ratification: false,
+            proof_bar_weakening: false,
+            finish: false,
+            abort: false,
+            apply: false,
+        }
+    }
+
+    pub const fn fully_delegated() -> Self {
         Self {
             ratification: true,
             proof_bar_weakening: true,
@@ -537,7 +547,7 @@ impl DelegationSet {
 
 impl Default for DelegationSet {
     fn default() -> Self {
-        Self::agent_lead_default()
+        Self::none()
     }
 }
 

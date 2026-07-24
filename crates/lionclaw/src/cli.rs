@@ -1158,9 +1158,10 @@ async fn cmd_plan_show(args: PlanShowArgs) -> Result<()> {
     } else {
         bail!("mission {mission_id} has no current or pending plan");
     };
-    // The verified/attested ceiling: a plan is verified-possible iff every
-    // assertion binds an oracle.
-    let ceiling = if plan.all_assertions_bound() {
+    // The verified/attested ceiling follows proof disposition, not only oracle
+    // presence. Reviewer-checkable, host-acceptance, and limitation
+    // requirements can only close honestly at the attested bar.
+    let ceiling = if plan.verified_possible() {
         "verified-possible"
     } else {
         "attested-only"
@@ -1595,11 +1596,29 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         });
     }
     let uncovered: Vec<&str> = state
-        .contract
-        .iter()
-        .filter(|(_, a)| a.oracle.is_none())
-        .map(|(id, _)| id.as_str())
-        .collect();
+        .plan
+        .as_ref()
+        .map(|plan| {
+            let mut assertion_ids = BTreeSet::new();
+            for requirement in &plan.requirements {
+                match &requirement.disposition {
+                    RequirementDisposition::ConfinedProvable { assertion_ids: ids } => {
+                        for assertion_id in ids {
+                            if !plan.assertion_has_oracle(assertion_id) {
+                                assertion_ids.insert(assertion_id.as_str());
+                            }
+                        }
+                    }
+                    RequirementDisposition::ReviewerCheckable { assertion_ids: ids } => {
+                        assertion_ids.extend(ids.iter().map(|id| id.as_str()));
+                    }
+                    RequirementDisposition::HostAcceptance { .. }
+                    | RequirementDisposition::Limitation { .. } => {}
+                }
+            }
+            assertion_ids.into_iter().collect()
+        })
+        .unwrap_or_default();
     let host_acceptance_obligations = state
         .plan
         .as_ref()
@@ -1658,7 +1677,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                     "requirement": requirement.prose,
                     "rationale": rationale,
                 })).collect::<Vec<_>>(),
-                "not_covered_by_an_oracle": uncovered,
+                "not_verified_by_oracle": uncovered,
                 "superseded_assertions": superseded_assertions_json(state, store.blobs()),
                 "waived_oracles": state.waived_oracles.iter().map(|o| o.as_str()).collect::<Vec<_>>(),
                 "acknowledged_gates": state.acknowledged_gates.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
@@ -1845,7 +1864,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     }
     if !uncovered.is_empty() {
         println!(
-            "\n  NOT covered by an oracle (judged proof only): {}",
+            "\n  NOT verified by an oracle (judged proof only or missing oracle): {}",
             uncovered.join(", ")
         );
     }

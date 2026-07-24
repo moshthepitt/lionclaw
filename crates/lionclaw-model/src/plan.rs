@@ -216,13 +216,26 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Whether every assertion binds an oracle — i.e. the plan is
-    /// verified-possible (each claim can be authoritatively judged). Backs the
-    /// CLI `verified-possible`/`attested-only` ceiling display. (The `Verified`
-    /// stop-bar reachability check computes the same condition independently, to
-    /// report the offending assertion ids.)
-    pub fn all_assertions_bound(&self) -> bool {
-        self.assertions.iter().all(|a| a.oracle.is_some())
+    /// Whether the plan can honestly reach a `verified` finish: every
+    /// proof-bearing requirement is confined-provable, and every named
+    /// assertion has an oracle.
+    pub fn verified_possible(&self) -> bool {
+        self.requirements
+            .iter()
+            .all(|requirement| match &requirement.disposition {
+                RequirementDisposition::ConfinedProvable { assertion_ids } => assertion_ids
+                    .iter()
+                    .all(|assertion_id| self.assertion_has_oracle(assertion_id)),
+                RequirementDisposition::ReviewerCheckable { .. }
+                | RequirementDisposition::HostAcceptance { .. }
+                | RequirementDisposition::Limitation { .. } => false,
+            })
+    }
+
+    pub fn assertion_has_oracle(&self, assertion_id: &AssertionId) -> bool {
+        self.assertions
+            .iter()
+            .any(|assertion| assertion.id == *assertion_id && assertion.oracle.is_some())
     }
 
     pub fn assertion_requires_confined_proof(&self, assertion_id: &AssertionId) -> bool {

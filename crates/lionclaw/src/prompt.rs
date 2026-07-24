@@ -420,8 +420,11 @@ team-owned assignments. You do not modify anything; your deliverable is the
 joint proposal itself.
 
 A proposal separates outcomes from proof:
-- requirements decompose the objective; each is covered by assertion ids or
-  records an explicit limitation with a rationale
+- requirements decompose the objective; each has exactly one proof disposition:
+  `confined_provable` with assertion ids for oracle-checkable claims,
+  `reviewer_checkable` with assertion ids for judged claims,
+  `host_acceptance` with a rationale for host-only obligations, or
+  `limitation` with a rationale for accepted limits
 - a task owns one coherent outcome; one task may own multiple assertions
 - assertions are independently provable properties of the resulting mission state
 - each assertion has exactly one active task owner; dependencies express
@@ -435,7 +438,8 @@ Rules the engine enforces (an invalid proposal is rejected):
   least one requirement
 - each assertion is covered by exactly one task (via its `targets`)
 - an assertion an oracle can check should bind that oracle by name; under a
-  `verified` mission type EVERY assertion must bind an oracle
+  `verified` mission type every proof-bearing requirement must be
+  `confined_provable` and every named assertion must bind an oracle
 - the DAG is acyclic and every dependency resolves
 - the team is the complete next revision shown below, not a patch; every task
   has one artifact-producing assignment and every assertion has the required
@@ -458,7 +462,7 @@ When you are finished you MUST write /mission/handoff/handoff.json exactly like:
                  \"assertion_supersessions\": [],
                  \"plan\": {
                      \"requirements\": [{\"id\": \"OBJECTIVE-MET\", \"kind\": \"capability\",
-                       \"prose\": \"...\", \"disposition\": {\"type\": \"covered\",
+                       \"prose\": \"...\", \"disposition\": {\"type\": \"confined_provable\",
                        \"assertion_ids\": [\"OUTCOME-HOLDS\"]}}],
                      \"assertions\": [{\"id\": \"OUTCOME-HOLDS\", \"prose\": \"...\"}],
                      \"tasks\": [{\"id\": \"change\", \"body\": \"...\",

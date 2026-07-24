@@ -1,18 +1,61 @@
 #!/bin/sh
 set -eu
 
-value_file="${LIONCLAW_WORKSPACE_DIR:-/workspace}/metric.txt"
+workspace="${LIONCLAW_WORKSPACE_DIR:-/workspace}"
+value_file="$workspace/metric.txt"
+expected_file="$workspace/metric.expected"
+operator_file="$workspace/metric.operator"
 if [ ! -f "$value_file" ]; then
   echo "metric.value missing: $value_file" >&2
   exit 1
 fi
+if [ ! -f "$expected_file" ]; then
+  echo "metric.expected missing: $expected_file" >&2
+  exit 1
+fi
+if [ ! -f "$operator_file" ]; then
+  echo "metric.operator missing: $operator_file" >&2
+  exit 1
+fi
 
 value="$(tr -d '[:space:]' < "$value_file")"
+expected="$(tr -d '[:space:]' < "$expected_file")"
+operator="$(tr -d '[:space:]' < "$operator_file")"
 case "$value" in
-  ''|*[!0-9.]*|*.*.*)
+  *[!0-9.]*|*.*.*|.*|*.)
     echo "metric.value invalid: $value" >&2
     exit 1
     ;;
 esac
+case "$expected" in
+  *[!0-9.]*|*.*.*|.*|*.)
+    echo "metric.expected invalid: $expected" >&2
+    exit 1
+    ;;
+esac
+if [ -z "$value" ] || [ -z "$expected" ]; then
+  echo "metric values must be non-empty" >&2
+  exit 1
+fi
+case "$operator" in
+  gte|lte|eq) ;;
+  *)
+    echo "metric.operator invalid: $operator" >&2
+    exit 1
+    ;;
+esac
+
+awk -v value="$value" -v expected="$expected" -v operator="$operator" '
+BEGIN {
+  passed = (operator == "gte" && value + 0 >= expected + 0) ||
+           (operator == "lte" && value + 0 <= expected + 0) ||
+           (operator == "eq" && value + 0 == expected + 0)
+  exit passed ? 0 : 1
+}' || {
+  echo "metric condition failed: value=$value operator=$operator expected=$expected" >&2
+  exit 1
+}
 
 printf 'metric.value=%s\n' "$value"
+printf 'metric.operator=%s\n' "$operator"
+printf 'metric.expected=%s\n' "$expected"

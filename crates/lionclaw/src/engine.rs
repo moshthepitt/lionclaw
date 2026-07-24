@@ -514,7 +514,7 @@ impl Engine {
             workspace_dir: workspace_dir.to_string(),
             base_sha: base_sha.to_string(),
             config,
-            delegation: crate::model::DelegationSet::agent_lead_default(),
+            delegation: crate::model::DelegationSet::none(),
         });
         self.store
             .create_mission_with_events(
