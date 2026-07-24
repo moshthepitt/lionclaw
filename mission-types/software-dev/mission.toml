@@ -17,6 +17,12 @@ install = true
 writes = true
 inputs = ["cargo-home"]
 
+[resource-ceilings]
+tmpfs = ["/tmp:rw,size=2g"]
+
+[oracle-resources.cargo-test]
+tmpfs = ["/tmp:rw,size=1536m"]
+
 [recovery]
 max-attempts = 3
 

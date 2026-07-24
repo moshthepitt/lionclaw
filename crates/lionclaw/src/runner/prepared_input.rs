@@ -413,6 +413,8 @@ async fn run_preparation_program(
         },
         judged_roots: &judged_roots,
         environment: preparation_environment(),
+        resources: Default::default(),
+        resource_ceilings: &Default::default(),
     })
     .map_err(|error| anyhow::anyhow!("prepared-input plan refused to compile: {error}"))?;
     let program = RuntimeProgramSpec {

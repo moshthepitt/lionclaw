@@ -17,11 +17,13 @@ use std::path::{Path, PathBuf};
 
 use lionclaw_confinement::{
     parse_runtime_tmpfs_entry, ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset,
-    InstallPolicy, MountAccess, MountSpec, NetworkMode, WorkspaceAccess, RUNTIME_HOME_MOUNT_TARGET,
-    RUNTIME_MOUNT_TARGET, WORKSPACE_MOUNT_TARGET,
+    InstallPolicy, MountAccess, MountSpec, NetworkMode, RuntimeTmpfsEntry, WorkspaceAccess,
+    RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET, WORKSPACE_MOUNT_TARGET,
 };
 
-use crate::model::{OutputSemantics, RoleInstance};
+use crate::model::{
+    parse_confinement_size_bytes, ConfinementResources, OutputSemantics, RoleInstance,
+};
 
 /// Mission targets no mount may shadow.
 const RESERVED_TARGETS: &[&str] = &[
@@ -66,6 +68,12 @@ pub enum MoatViolation {
     ReservedTargetShadowed { target: String },
     #[error("invalid tmpfs entry '{entry}': {detail}")]
     InvalidTmpfs { entry: String, detail: String },
+    #[error("resource override for '{role}' is invalid: {detail}")]
+    InvalidResourceOverride { role: String, detail: String },
+    #[error("resource override for '{role}' exceeds mission ceiling: {detail}")]
+    ResourceExceedsCeiling { role: String, detail: String },
+    #[error("resource override for '{role}' would shrink profile default: {detail}")]
+    ResourceShrinksDefault { role: String, detail: String },
 }
 
 /// The engine-compiled authority of one role: preset + the output axis it
@@ -160,6 +168,13 @@ pub(crate) fn validate_role_authority_request(role: &RoleInstance) -> Result<(),
 /// The authority an engine-run oracle executes under: a verdict node with
 /// no agent — read-only, network off, nothing else.
 pub fn oracle_authority(oracle_name: &str) -> CompiledAuthority {
+    oracle_authority_with_devices(oracle_name, BTreeSet::new())
+}
+
+pub fn oracle_authority_with_devices(
+    oracle_name: &str,
+    devices: BTreeSet<String>,
+) -> CompiledAuthority {
     CompiledAuthority {
         role_name: format!("oracle:{oracle_name}"),
         output: OutputSemantics::EmitsVerdict,
@@ -170,7 +185,7 @@ pub fn oracle_authority(oracle_name: &str) -> CompiledAuthority {
             mount_runtime_secrets: false,
             escape_classes: BTreeSet::new(),
         },
-        devices: BTreeSet::new(),
+        devices,
     }
 }
 
@@ -216,6 +231,8 @@ pub struct RolePlanRequest<'a> {
     /// Canonical roots of the tree(s) any verdict from this node is about.
     pub judged_roots: &'a [PathBuf],
     pub environment: Vec<(String, String)>,
+    pub resources: ConfinementResources,
+    pub resource_ceilings: &'a ConfinementResources,
 }
 
 /// A moat-vetted execution plan. Private field, no other constructor: the
@@ -234,10 +251,18 @@ impl CompiledRolePlan {
 pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePlan, MoatViolation> {
     let authority = request.authority;
     let role = authority.role_name.clone();
+    let mut confinement = request.confinement;
+
+    apply_resource_overrides(
+        &mut confinement,
+        &request.resources,
+        request.resource_ceilings,
+        &role,
+    )?;
 
     // (1) Enforcing rung. Exhaustive: a future non-enforcing backend must
     // be classified here before anything compiles under it.
-    let enforcing = match request.confinement {
+    let enforcing = match &confinement {
         ConfinementConfig::Oci(_) => true,
     };
     if !enforcing {
@@ -250,7 +275,7 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
     // /scratch, /runtime would layer a writable region over the judged tree
     // exactly as a rw bind mount would. `/tmp` is not reserved, so the default
     // scratch tmpfs is unaffected.
-    let oci = request.confinement.oci();
+    let oci = confinement.oci();
     for mount in &oci.additional_mounts {
         if RESERVED_TARGETS
             .iter()
@@ -308,7 +333,7 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
             .mounts
             .extras
             .iter()
-            .chain(request.confinement.oci().additional_mounts.iter())
+            .chain(confinement.oci().additional_mounts.iter())
             .filter(|m| m.access == MountAccess::ReadWrite);
         for mount in rw_mounts {
             let source = canonical_or_lexical(&mount.source);
@@ -338,13 +363,13 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
     let working_dir = workspace.source.to_string_lossy().into_owned();
     let mut mounts = vec![workspace];
     mounts.extend(request.mounts.extras);
-    mounts.extend(request.confinement.oci().additional_mounts.clone());
-    let limits = request.confinement.oci().limits.clone();
+    mounts.extend(confinement.oci().additional_mounts.clone());
+    let limits = confinement.oci().limits.clone();
 
     Ok(CompiledRolePlan(EffectiveExecutionPlan {
         runtime_id: request.runtime_id,
         preset_name: format!("mission-{}", authority.output.slug()),
-        confinement: request.confinement,
+        confinement,
         workspace_access: authority.preset.workspace_access,
         network_mode: authority.preset.network_mode,
         install_policy: authority.preset.install_policy,
@@ -358,6 +383,104 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         escape_classes: authority.preset.escape_classes.clone(),
         limits,
     }))
+}
+
+fn apply_resource_overrides(
+    confinement: &mut ConfinementConfig,
+    overrides: &ConfinementResources,
+    ceilings: &ConfinementResources,
+    role: &str,
+) -> Result<(), MoatViolation> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    overrides
+        .validate()
+        .map_err(|detail| MoatViolation::InvalidResourceOverride {
+            role: role.to_string(),
+            detail,
+        })?;
+    overrides
+        .within(ceilings)
+        .map_err(|detail| MoatViolation::ResourceExceedsCeiling {
+            role: role.to_string(),
+            detail,
+        })?;
+
+    let oci = confinement.oci_mut();
+    let defaults =
+        tmpfs_by_target(&oci.tmpfs).map_err(|detail| MoatViolation::InvalidResourceOverride {
+            role: role.to_string(),
+            detail: format!("profile tmpfs is invalid: {detail}"),
+        })?;
+    let mut effective = defaults
+        .iter()
+        .map(|(target, entry)| (target.clone(), entry.argument().to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for override_entry in &overrides.tmpfs {
+        let parsed = parse_runtime_tmpfs_entry(override_entry).map_err(|detail| {
+            MoatViolation::InvalidResourceOverride {
+                role: role.to_string(),
+                detail: format!("tmpfs entry '{override_entry}': {detail}"),
+            }
+        })?;
+        let override_size =
+            tmpfs_size_bytes(&parsed).map_err(|detail| MoatViolation::InvalidResourceOverride {
+                role: role.to_string(),
+                detail: format!("tmpfs entry '{}': {detail}", parsed.argument()),
+            })?;
+        if let Some(default) = defaults.get(parsed.target()) {
+            let default_size = tmpfs_size_bytes(default).map_err(|detail| {
+                MoatViolation::InvalidResourceOverride {
+                    role: role.to_string(),
+                    detail: format!("profile tmpfs entry '{}': {detail}", default.argument()),
+                }
+            })?;
+            if override_size < default_size {
+                return Err(MoatViolation::ResourceShrinksDefault {
+                    role: role.to_string(),
+                    detail: format!(
+                        "tmpfs target '{}' requests {}, below profile default {}",
+                        parsed.target(),
+                        parsed.argument(),
+                        default.argument()
+                    ),
+                });
+            }
+        }
+        effective.insert(parsed.target().to_string(), parsed.argument().to_string());
+    }
+    oci.tmpfs = effective.into_values().collect();
+    Ok(())
+}
+
+fn tmpfs_by_target(
+    entries: &[String],
+) -> Result<std::collections::BTreeMap<String, RuntimeTmpfsEntry>, String> {
+    let mut parsed = std::collections::BTreeMap::new();
+    for entry in entries {
+        let tmpfs = parse_runtime_tmpfs_entry(entry)?;
+        if parsed.insert(tmpfs.target().to_string(), tmpfs).is_some() {
+            return Err(format!("tmpfs target declared more than once in '{entry}'"));
+        }
+    }
+    Ok(parsed)
+}
+
+fn tmpfs_size_bytes(entry: &RuntimeTmpfsEntry) -> Result<u64, String> {
+    let Some((_, raw_options)) = entry.argument().split_once(':') else {
+        return Err("missing size=<bytes>".to_string());
+    };
+    let mut size = None;
+    for option in raw_options.split(',') {
+        if let Some(raw_size) = option.trim().strip_prefix("size=") {
+            if size.is_some() {
+                return Err("size declared more than once".to_string());
+            }
+            size = Some(parse_confinement_size_bytes(raw_size.trim())?);
+        }
+    }
+    size.ok_or_else(|| "missing size=<bytes>".to_string())
 }
 
 /// Resolve symlinks where possible; fall back to the lexical path for a
@@ -392,6 +515,7 @@ mod team_authority_tests {
             skills: Vec::new(),
             environment: BTreeMap::new(),
             grants,
+            resources: Default::default(),
             deadline_secs: None,
         }
     }
@@ -418,6 +542,34 @@ mod team_authority_tests {
             },
             judged_roots: &["/tmp/work".into()],
             environment: Vec::new(),
+            resources: ConfinementResources::default(),
+            resource_ceilings: &ConfinementResources::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            compiled.plan().devices,
+            BTreeSet::from(["/dev/dri".to_string()])
+        );
+    }
+
+    #[test]
+    fn oracle_device_declarations_reach_the_compiled_plan_without_hardware() {
+        let authority = oracle_authority_with_devices(
+            "metric-scalar",
+            BTreeSet::from(["/dev/dri".to_string()]),
+        );
+        let compiled = compile_role_plan(RolePlanRequest {
+            authority: &authority,
+            runtime_id: "codex".into(),
+            confinement: ConfinementConfig::Oci(Default::default()),
+            mounts: MissionMounts {
+                workspace: "/tmp/work".into(),
+                extras: Vec::new(),
+            },
+            judged_roots: &["/tmp/work".into()],
+            environment: Vec::new(),
+            resources: ConfinementResources::default(),
+            resource_ceilings: &ConfinementResources::default(),
         })
         .unwrap();
         assert_eq!(
@@ -448,5 +600,100 @@ mod team_authority_tests {
             }
         )
         .is_ok());
+    }
+
+    #[test]
+    fn l19_role_resource_override_replaces_profile_tmpfs_within_ceiling() {
+        let mut confinement = ConfinementConfig::Oci(Default::default());
+        confinement.oci_mut().tmpfs = vec!["/tmp:rw,size=512m".to_string()];
+        let authority = compile_authority(
+            &role(
+                OutputSemantics::ProducesArtifact,
+                AuthorityGrants {
+                    writes: true,
+                    ..Default::default()
+                },
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let compiled = compile_role_plan(RolePlanRequest {
+            authority: &authority,
+            runtime_id: "codex".into(),
+            confinement,
+            mounts: MissionMounts {
+                workspace: "/tmp/work".into(),
+                extras: Vec::new(),
+            },
+            judged_roots: &["/tmp/work".into()],
+            environment: Vec::new(),
+            resources: ConfinementResources {
+                tmpfs: vec!["/tmp:rw,size=1536m".to_string()],
+            },
+            resource_ceilings: &ConfinementResources {
+                tmpfs: vec!["/tmp:rw,size=2g".to_string()],
+            },
+        })
+        .unwrap();
+
+        assert_eq!(
+            compiled.plan().confinement.oci().tmpfs,
+            vec!["/tmp:rw,size=1536m".to_string()]
+        );
+    }
+
+    #[test]
+    fn l19_oracle_without_resource_override_keeps_profile_tmpfs_default() {
+        let mut confinement = ConfinementConfig::Oci(Default::default());
+        confinement.oci_mut().tmpfs = vec!["/tmp:rw,size=512m".to_string()];
+        let authority = oracle_authority("cargo-test");
+        let compiled = compile_role_plan(RolePlanRequest {
+            authority: &authority,
+            runtime_id: "codex".into(),
+            confinement,
+            mounts: MissionMounts {
+                workspace: "/tmp/work".into(),
+                extras: Vec::new(),
+            },
+            judged_roots: &["/tmp/work".into()],
+            environment: Vec::new(),
+            resources: ConfinementResources::default(),
+            resource_ceilings: &ConfinementResources {
+                tmpfs: vec!["/tmp:rw,size=2g".to_string()],
+            },
+        })
+        .unwrap();
+
+        assert_eq!(
+            compiled.plan().confinement.oci().tmpfs,
+            vec!["/tmp:rw,size=512m".to_string()]
+        );
+    }
+
+    #[test]
+    fn l19_oracle_resource_override_above_ceiling_refuses_at_compile_role_plan() {
+        let mut confinement = ConfinementConfig::Oci(Default::default());
+        confinement.oci_mut().tmpfs = vec!["/tmp:rw,size=512m".to_string()];
+        let authority = oracle_authority("cargo-test");
+        let err = compile_role_plan(RolePlanRequest {
+            authority: &authority,
+            runtime_id: "codex".into(),
+            confinement,
+            mounts: MissionMounts {
+                workspace: "/tmp/work".into(),
+                extras: Vec::new(),
+            },
+            judged_roots: &["/tmp/work".into()],
+            environment: Vec::new(),
+            resources: ConfinementResources {
+                tmpfs: vec!["/tmp:rw,size=3g".to_string()],
+            },
+            resource_ceilings: &ConfinementResources {
+                tmpfs: vec!["/tmp:rw,size=2g".to_string()],
+            },
+        })
+        .expect_err("over-ceiling resource override must refuse before runtime");
+
+        assert!(matches!(err, MoatViolation::ResourceExceedsCeiling { .. }));
     }
 }

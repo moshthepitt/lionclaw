@@ -2,13 +2,13 @@
 //! compiles through the moat at load time, every oracle is a real executable,
 //! or the mission type does not load and the mission never starts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
 use crate::model::{
-    AuthorityGrants, InputName, OracleName, OutputSemantics, RoleInstance, RoleInstanceId, StopBar,
-    TeamRevision,
+    AuthorityGrants, ConfinementResources, InputName, OracleName, OutputSemantics, RoleInstance,
+    RoleInstanceId, StopBar, TeamRevision,
 };
 
 use super::bounded_tree::{BoundedTree, ControlTextBudget};
@@ -102,6 +102,8 @@ pub(crate) fn load_materialized_mission_type(
     let skills = load_skills(root, &tree, &mut text_budget)?;
     let inputs = load_inputs(root, manifest.inputs)?;
     let oracles = load_oracles(&root.join("oracles"))?;
+    let oracle_resources = load_oracle_resources(manifest.oracle_resources, &oracles)?;
+    let oracle_devices = load_oracle_devices(manifest.oracle_devices, &oracles)?;
     let roles = load_roles(
         root,
         &tree,
@@ -138,6 +140,7 @@ pub(crate) fn load_materialized_mission_type(
         environment: manifest.mission_type.environment,
         default_team: team,
         ceilings: manifest.ceilings,
+        resource_ceilings: manifest.resource_ceilings,
         requires_gap_review: manifest.team.requires_gap_review,
         recovery: manifest.recovery,
         execution: manifest.execution,
@@ -145,6 +148,8 @@ pub(crate) fn load_materialized_mission_type(
         skills,
         inputs,
         oracles,
+        oracle_resources,
+        oracle_devices,
     };
     let mission_type = MissionType::from_loaded(definition, digest);
     mission_type
@@ -239,6 +244,7 @@ fn load_roles(
             writes,
             devices,
             inputs,
+            resources,
             runtime,
             timeout_secs,
             skills,
@@ -295,6 +301,7 @@ fn load_roles(
                         detail: error.to_string(),
                     })?,
             },
+            resources,
             deadline_secs: timeout_secs,
         };
         // Fail-closed moat check at load time: an authority that cannot
@@ -352,6 +359,55 @@ fn load_oracles(dir: &Path) -> Result<BTreeMap<OracleName, PathBuf>, MissionType
         oracles.insert(name, path);
     }
     Ok(oracles)
+}
+
+fn load_oracle_resources(
+    declared: BTreeMap<String, ConfinementResources>,
+    oracles: &BTreeMap<OracleName, PathBuf>,
+) -> Result<BTreeMap<OracleName, ConfinementResources>, MissionTypeError> {
+    let mut resources = BTreeMap::new();
+    for (raw_name, declared_resources) in declared {
+        let name = OracleName::new(&raw_name).map_err(|error| MissionTypeError::Oracle {
+            oracle: raw_name.clone(),
+            detail: error.to_string(),
+        })?;
+        if !oracles.contains_key(&name) {
+            return Err(MissionTypeError::Oracle {
+                oracle: raw_name,
+                detail: "resources declared for missing oracle".to_string(),
+            });
+        }
+        resources.insert(name, declared_resources);
+    }
+    Ok(resources)
+}
+
+fn load_oracle_devices(
+    declared: BTreeMap<String, Vec<String>>,
+    oracles: &BTreeMap<OracleName, PathBuf>,
+) -> Result<BTreeMap<OracleName, BTreeSet<String>>, MissionTypeError> {
+    let mut devices = BTreeMap::new();
+    for (raw_name, declared_devices) in declared {
+        let name = OracleName::new(&raw_name).map_err(|error| MissionTypeError::Oracle {
+            oracle: raw_name.clone(),
+            detail: error.to_string(),
+        })?;
+        if !oracles.contains_key(&name) {
+            return Err(MissionTypeError::Oracle {
+                oracle: raw_name.clone(),
+                detail: "devices declared for missing oracle".to_string(),
+            });
+        }
+        let declared_devices = declared_devices.into_iter().collect::<BTreeSet<_>>();
+        if declared_devices.is_empty() {
+            return Err(MissionTypeError::Oracle {
+                oracle: raw_name,
+                detail: "device declaration must not be empty".to_string(),
+            });
+        }
+        devices.insert(name, declared_devices);
+    }
+    Ok(devices)
 }
 
 fn read(

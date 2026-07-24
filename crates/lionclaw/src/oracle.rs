@@ -11,7 +11,9 @@ use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
 use lionclaw_runtime_api::{RuntimeProgramExecutor, TypedFailure, TypedFailureEvidence};
 use tokio::sync::Mutex;
 
-use crate::authority::{compile_role_plan, oracle_authority, MissionMounts, RolePlanRequest};
+use crate::authority::{
+    compile_role_plan, oracle_authority_with_devices, MissionMounts, RolePlanRequest,
+};
 use crate::config::MissionRuntimeProfile;
 use crate::ports::{ExecutionControl, OracleOutcome, OracleRunRequest, OracleRunner};
 use crate::resources::MissionDirs;
@@ -143,7 +145,8 @@ impl OracleRunner for OciOracleRunner {
                 .map_err(|error| fail(format!("failed to prepare mission inputs: {error:#}")))?
             };
 
-            let authority = oracle_authority(request.oracle.as_str());
+            let authority =
+                oracle_authority_with_devices(request.oracle.as_str(), request.devices.clone());
             let mut extras = vec![
                 MountSpec {
                     source: oracle_dir.clone(),
@@ -169,6 +172,8 @@ impl OracleRunner for OciOracleRunner {
                 },
                 judged_roots: &judged_roots,
                 environment,
+                resources: request.resources.clone(),
+                resource_ceilings: &request.resource_ceilings,
             })
             .map_err(|e| fail(format!("oracle plan refused to compile (moat): {e}")))?;
 
@@ -272,6 +277,9 @@ mod tests {
                 state_dir: temp.path().join("state"),
                 prepared_inputs: Vec::new(),
                 environment: Default::default(),
+                devices: Default::default(),
+                resources: Default::default(),
+                resource_ceilings: Default::default(),
                 deadline_ms: 10,
                 control,
             })

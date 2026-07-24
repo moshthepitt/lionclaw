@@ -12,6 +12,7 @@ requires-gap-review = true
 network = true
 install = true
 writes = true
+devices = ["/dev/dri"]
 
 [recovery]
 max-attempts = 3

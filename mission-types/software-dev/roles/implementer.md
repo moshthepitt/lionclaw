@@ -15,3 +15,7 @@ that the engine independently verifies the final state with its own oracles;
 your report is never taken on faith. **Do not weaken, skip, or delete tests
 to make them pass** — an independent reviewer checks for exactly that, and a
 mission that games its checks fails.
+
+If you install dependencies, keep them under the workspace or `/scratch`
+using language-local prefixes. Do not change runtime images, host profiles, or
+authority grants to solve a local dependency/cache problem.

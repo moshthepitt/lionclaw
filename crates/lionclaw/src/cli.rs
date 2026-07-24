@@ -264,6 +264,8 @@ pub struct TeamAddArgs {
     pub devices: Vec<String>,
     #[arg(long = "input")]
     pub inputs: Vec<String>,
+    #[arg(long = "tmpfs")]
+    pub tmpfs: Vec<String>,
 }
 
 #[derive(Args)]
@@ -1257,7 +1259,7 @@ async fn cmd_team(command: TeamCommand, transports: &MissionTransports) -> Resul
                 println!("team revision {} for mission {mission_id}", team.revision);
                 for role in team.roles.values() {
                     println!(
-                        "  {}  output={} runtime={} skills={}",
+                        "  {}  output={} runtime={} skills={} tmpfs={}",
                         role.id,
                         output_name(role.output),
                         role.runtime,
@@ -1265,6 +1267,11 @@ async fn cmd_team(command: TeamCommand, transports: &MissionTransports) -> Resul
                             "-".to_string()
                         } else {
                             role.skills.join(",")
+                        },
+                        if role.resources.tmpfs.is_empty() {
+                            "-".to_string()
+                        } else {
+                            role.resources.tmpfs.join(",")
                         }
                     );
                 }
@@ -1321,6 +1328,7 @@ async fn cmd_team(command: TeamCommand, transports: &MissionTransports) -> Resul
                     devices: args.devices.into_iter().collect(),
                     inputs,
                 },
+                resources: crate::model::ConfinementResources { tmpfs: args.tmpfs },
                 deadline_secs: args.deadline_secs,
             };
             let profiles = transports.profiles()?;
@@ -3001,6 +3009,9 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
                 "oracles": mt.oracles.keys().map(|o| o.as_str()).collect::<Vec<_>>(),
                 "team": mt.default_team,
                 "ceilings": mt.ceilings,
+                "resource_ceilings": mt.resource_ceilings,
+                "oracle_resources": mt.oracle_resources,
+                "oracle_devices": mt.oracle_devices,
                 "playbook": mt.playbook,
             })
         );
@@ -3053,6 +3064,27 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if !mt.resource_ceilings.tmpfs.is_empty() {
+        println!(
+            "  tmpfs ceilings: {}",
+            mt.resource_ceilings.tmpfs.join(", ")
+        );
+    }
+    if !mt.oracle_resources.is_empty() {
+        println!("  oracle resources:");
+        for (oracle, resources) in &mt.oracle_resources {
+            println!("    {oracle}: tmpfs={}", resources.tmpfs.join(","));
+        }
+    }
+    if !mt.oracle_devices.is_empty() {
+        println!("  oracle devices:");
+        for (oracle, devices) in &mt.oracle_devices {
+            println!(
+                "    {oracle}: {}",
+                devices.iter().cloned().collect::<Vec<_>>().join(",")
+            );
+        }
+    }
     if let Some(playbook) = &mt.playbook {
         println!("\n--- playbook ---\n{playbook}");
     }

@@ -285,6 +285,7 @@ async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) 
             network: true,
             ..Default::default()
         },
+        resources: Default::default(),
         deadline_secs: Some(300),
     };
 
@@ -305,6 +306,7 @@ async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) 
                 environment: BTreeMap::new(),
                 skills: Vec::new(),
                 prepared_inputs: Vec::new(),
+                resource_ceilings: Default::default(),
                 prompt,
                 base_sha: base_sha.clone(),
                 assignment_epoch,

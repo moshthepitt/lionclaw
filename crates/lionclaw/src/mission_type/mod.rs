@@ -39,7 +39,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::model::{
-    validate_environment_entry, AuthorityCeilings, InputName, OracleName, StopBar, TeamRevision,
+    validate_environment_entry, AuthorityCeilings, ConfinementResources, InputName, OracleName,
+    StopBar, TeamRevision,
 };
 
 /// Aggregate program and declared-key content admitted to one prepared-input
@@ -96,6 +97,7 @@ pub struct MissionTypeDefinition {
     pub environment: BTreeMap<String, String>,
     pub default_team: TeamRevision,
     pub ceilings: AuthorityCeilings,
+    pub resource_ceilings: ConfinementResources,
     pub requires_gap_review: bool,
     /// Mission-level role recovery budget.
     pub recovery: crate::model::RecoveryConfig,
@@ -104,6 +106,8 @@ pub struct MissionTypeDefinition {
     pub skills: BTreeMap<String, SkillPackage>,
     pub inputs: BTreeMap<InputName, PreparedInput>,
     pub oracles: BTreeMap<OracleName, PathBuf>,
+    pub oracle_resources: BTreeMap<OracleName, ConfinementResources>,
+    pub oracle_devices: BTreeMap<OracleName, std::collections::BTreeSet<String>>,
 }
 
 /// One validated mission-type closure sealed to its content identity.
@@ -186,6 +190,14 @@ impl MissionType {
                     role.id
                 );
             }
+            role.resources
+                .within(&self.resource_ceilings)
+                .map_err(|detail| {
+                    anyhow::anyhow!(
+                        "role '{}' requests resources outside mission ceilings: {detail}",
+                        role.id
+                    )
+                })?;
             if let Some(timeout_secs) = role.deadline_secs {
                 if timeout_secs == 0 {
                     anyhow::bail!("role '{}' timeout must be at least 1 second", role.id);
@@ -215,6 +227,29 @@ impl MissionType {
         {
             anyhow::bail!("authority ceilings name an undeclared prepared input");
         }
+        self.resource_ceilings
+            .validate()
+            .map_err(|detail| anyhow::anyhow!("resource ceilings are invalid: {detail}"))?;
+        for (oracle, resources) in &self.oracle_resources {
+            if !self.oracles.contains_key(oracle) {
+                anyhow::bail!("oracle resources name undeclared oracle '{oracle}'");
+            }
+            resources
+                .within(&self.resource_ceilings)
+                .map_err(|detail| {
+                    anyhow::anyhow!(
+                        "oracle '{oracle}' requests resources outside mission ceilings: {detail}"
+                    )
+                })?;
+        }
+        for (oracle, devices) in &self.oracle_devices {
+            if !self.oracles.contains_key(oracle) {
+                anyhow::bail!("oracle devices name undeclared oracle '{oracle}'");
+            }
+            if !devices.is_subset(&self.ceilings.devices) {
+                anyhow::bail!("oracle '{oracle}' requests devices outside mission ceilings");
+            }
+        }
         if self.requires_gap_review && self.default_team.gap_review_assignment.is_none() {
             anyhow::bail!("[team] requires-gap-review needs a gap-review assignment");
         }
@@ -229,6 +264,9 @@ impl MissionType {
             stop: self.stop,
             oracles: self.oracles.keys().cloned().collect(),
             ceilings: self.ceilings.clone(),
+            resource_ceilings: self.resource_ceilings.clone(),
+            oracle_resources: self.oracle_resources.clone(),
+            oracle_devices: self.oracle_devices.clone(),
             requires_gap_review: self.requires_gap_review,
             recovery: self.recovery.clone(),
             execution: self.execution.clone(),

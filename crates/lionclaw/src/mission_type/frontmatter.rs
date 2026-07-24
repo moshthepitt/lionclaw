@@ -14,7 +14,7 @@
 //! <prompt body>
 //! ```
 
-use crate::model::{OutputSemantics, MAX_EXECUTION_DURATION_SECS};
+use crate::model::{ConfinementResources, OutputSemantics, MAX_EXECUTION_DURATION_SECS};
 
 #[derive(Debug)]
 pub struct RoleFrontmatter {
@@ -25,6 +25,7 @@ pub struct RoleFrontmatter {
     pub writes: Option<bool>,
     pub devices: Vec<String>,
     pub inputs: Vec<String>,
+    pub resources: ConfinementResources,
     pub runtime: Option<String>,
     pub timeout_secs: Option<u64>,
     pub skills: Vec<String>,
@@ -42,6 +43,7 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
     let mut writes = None;
     let mut devices = Vec::new();
     let mut inputs = Vec::new();
+    let mut tmpfs = Vec::new();
     let mut runtime: Option<String> = None;
     let mut timeout_secs: Option<u64> = None;
     let mut skills: Vec<String> = Vec::new();
@@ -68,6 +70,7 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
             "writes" => writes = Some(parse_bool(key, value)?),
             "devices" => devices = parse_string_list(value)?,
             "inputs" => inputs = parse_string_list(value)?,
+            "tmpfs" => tmpfs = parse_string_list(value)?,
             "runtime" => runtime = Some(parse_scalar(key, value)?),
             "timeout-secs" => {
                 let parsed = value
@@ -98,6 +101,7 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
         writes,
         devices,
         inputs,
+        resources: ConfinementResources { tmpfs },
         runtime,
         timeout_secs,
         skills,
@@ -170,21 +174,37 @@ fn parse_string_list(value: &str) -> Result<Vec<String>, String> {
     let inner = value
         .strip_prefix('[')
         .and_then(|v| v.strip_suffix(']'))
-        .ok_or("skills must be an inline list like [a, b]")?;
+        .ok_or("value must be an inline list like [a, b]")?;
     if inner.trim().is_empty() {
         return Ok(Vec::new());
     }
-    inner
-        .split(',')
-        .map(|item| {
-            let item = item.trim().trim_matches('"').trim();
-            if item.is_empty() {
-                Err("skills list has an empty entry".to_string())
-            } else {
-                Ok(item.to_string())
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    for (index, character) in inner.char_indices() {
+        match character {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                items.push(parse_list_item(&inner[start..index])?);
+                start = index + 1;
             }
-        })
-        .collect()
+            _ => {}
+        }
+    }
+    if in_quotes {
+        return Err("list has an unterminated quoted entry".to_string());
+    }
+    items.push(parse_list_item(&inner[start..])?);
+    Ok(items)
+}
+
+fn parse_list_item(raw: &str) -> Result<String, String> {
+    let item = raw.trim().trim_matches('"').trim();
+    if item.is_empty() {
+        Err("list has an empty entry".to_string())
+    } else {
+        Ok(item.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +282,17 @@ mod tests {
         assert_eq!(
             parse_role_file(&accepted).unwrap().timeout_secs,
             Some(maximum)
+        );
+    }
+
+    #[test]
+    fn parses_quoted_tmpfs_entries_with_commas() {
+        let text =
+            "---\noutput: produces-report\ntmpfs: [\"/tmp:rw,size=1g\", /cache:size=64m]\n---\nx";
+        let fm = parse_role_file(text).expect("parse");
+        assert_eq!(
+            fm.resources.tmpfs,
+            vec!["/tmp:rw,size=1g".to_string(), "/cache:size=64m".to_string()]
         );
     }
 }

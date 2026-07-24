@@ -497,6 +497,7 @@ mod team_prompt_tests {
             skills: Vec::new(),
             environment: BTreeMap::new(),
             grants: AuthorityGrants::default(),
+            resources: Default::default(),
             deadline_secs: None,
         }
     }

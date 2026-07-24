@@ -676,6 +676,8 @@ async fn run_confined_sh(
         },
         judged_roots,
         environment: vec![("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string())],
+        resources: Default::default(),
+        resource_ceilings: &Default::default(),
     })
     .map_err(|e| anyhow::anyhow!("plan refused to compile: {e}"))?;
     let mut executor = MissionProgramExecutor::new(
@@ -1208,6 +1210,8 @@ async fn check_runtime_skill_mount() -> Result<()> {
             "HOME".to_string(),
             lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET.to_string(),
         )],
+        resources: Default::default(),
+        resource_ceilings: &Default::default(),
     })
     .map_err(|err| anyhow::anyhow!("plan refused to compile: {err}"))?;
     let mut executor = MissionProgramExecutor::new(

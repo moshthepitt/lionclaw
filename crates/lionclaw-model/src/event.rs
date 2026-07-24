@@ -21,9 +21,9 @@ use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
 
-/// Version 25 is the Slice 6 receipt/closure bar: typed proof dispositions,
-/// attested finish vocabulary, and explicit finish/apply facts.
-pub const SCHEMA_VERSION: u32 = 25;
+/// Version 26 is the Slice 7 environment/config surface: mission resource
+/// ceilings plus per-role/per-oracle confinement resource declarations.
+pub const SCHEMA_VERSION: u32 = 26;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -189,6 +189,12 @@ pub struct MissionConfig {
     pub oracles: BTreeSet<OracleName>,
     #[serde(default)]
     pub ceilings: super::AuthorityCeilings,
+    #[serde(default, skip_serializing_if = "super::ConfinementResources::is_empty")]
+    pub resource_ceilings: super::ConfinementResources,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub oracle_resources: BTreeMap<OracleName, super::ConfinementResources>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub oracle_devices: BTreeMap<OracleName, BTreeSet<String>>,
     #[serde(default)]
     pub requires_gap_review: bool,
     #[serde(default)]
@@ -203,6 +209,9 @@ impl Default for MissionConfig {
             stop: StopBar::Verified,
             oracles: BTreeSet::new(),
             ceilings: super::AuthorityCeilings::default(),
+            resource_ceilings: super::ConfinementResources::default(),
+            oracle_resources: BTreeMap::new(),
+            oracle_devices: BTreeMap::new(),
             requires_gap_review: false,
             recovery: RecoveryConfig::default(),
             execution: ExecutionPolicy::default(),

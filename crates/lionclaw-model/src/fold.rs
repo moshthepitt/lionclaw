@@ -15,7 +15,7 @@ use crate::{TypedFailure, TypedFailureEvidence};
 
 /// Reducer 50 makes Slice 6 closure event-driven and applies typed proof
 /// disposition honesty.
-pub const REDUCER_VERSION: u32 = 50;
+pub const REDUCER_VERSION: u32 = 51;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -278,6 +278,11 @@ fn apply_team(state: &mut MissionState, team: &super::TeamRevision) {
             .roles
             .values()
             .any(|role| !role.grants.within(&state.config.ceilings))
+        || team.roles.values().any(|role| {
+            role.resources
+                .within(&state.config.resource_ceilings)
+                .is_err()
+        })
         || plan.is_some_and(|plan| !super::validate_plan(plan, team, &state.config).is_empty())
     {
         return;

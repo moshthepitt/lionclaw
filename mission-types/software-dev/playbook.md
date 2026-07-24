@@ -35,7 +35,10 @@ proves it.
    need to change, assign every task to one artifact-producing role instance,
    assign every assertion to its judgment panel, and retain the configured gap
    reviewer. Role instances carry their runtime, output semantics, skills,
-   timeout, instructions, environment, and grants.
+   timeout, instructions, environment, grants, and resource overrides. Use
+   resource overrides only for bounded execution resources such as `/tmp`
+   space, within the mission resource ceilings; they are never authority
+   grants.
 
 5. **Review the proposal before handing it off.** The default planning pass is
    deliberately one strategist turn. Build an explicit objective-to-contract
@@ -91,3 +94,17 @@ revision is a complete next plan, not a patch language: retain the still-valid
 requirements and assertions, add any missing falsifiable assertions and their
 oracle bindings, retire completed work, and add the repair work. Remediation
 automatically re-runs the review at the new commit.
+
+Do not write objectives, assertions, or gap-review instructions that demand
+evidence of a finish attempt from the gap reviewer. The gap review runs before
+finish is legal; finish-attempt evidence cannot exist at that point by
+construction.
+
+## Dependency installs and resources
+
+If an effect needs language-level dependency installs, put them in
+workspace-local or scratch-local prefixes (`venv`, `npm --prefix`,
+`CARGO_HOME`/`CARGO_TARGET_DIR` under `/scratch`) so retries and preserved
+workspaces remain reproducible. Do not treat install policy or tmpfs resource
+overrides as a way to change the runtime image or widen network, secrets,
+device, input, or write authority.

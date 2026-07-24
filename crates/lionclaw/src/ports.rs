@@ -7,6 +7,7 @@
 //! authoritative verdicts exist only on the oracle path, structurally.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -15,8 +16,8 @@ use tokio::sync::watch;
 
 use crate::mission_type::{PreparedInput, SkillPackage};
 use crate::model::{
-    EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef, RoleInstance,
-    RuntimeConfigurationEvidence, TaskId,
+    ConfinementResources, EffectId, EffectResource, Handoff, MissionId, OracleName,
+    PreparedInputRef, RoleInstance, RuntimeConfigurationEvidence, TaskId,
 };
 pub use crate::workspace::{ArtifactCapture, CapturedArtifact};
 
@@ -46,6 +47,8 @@ pub struct RoleTurnRequest {
     pub skills: Vec<SkillPackage>,
     /// Prepared inputs explicitly granted by the pinned role contract.
     pub prepared_inputs: Vec<PreparedInput>,
+    /// Mission resource ceilings applied to the role's resource overrides.
+    pub resource_ceilings: ConfinementResources,
     /// Fully assembled prompt (already persisted in the request event).
     pub prompt: String,
     /// Commit the role's workspace is created at.
@@ -109,6 +112,10 @@ pub struct OracleRunRequest {
     pub prepared_inputs: Vec<PreparedInput>,
     /// Domain policy from the pinned mission type.
     pub environment: BTreeMap<String, String>,
+    pub devices: BTreeSet<String>,
+    /// Per-oracle resource overrides declared by the pinned mission type.
+    pub resources: ConfinementResources,
+    pub resource_ceilings: ConfinementResources,
     pub deadline_ms: i64,
     pub control: watch::Receiver<ExecutionControl>,
 }

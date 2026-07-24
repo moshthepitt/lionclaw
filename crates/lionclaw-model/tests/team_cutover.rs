@@ -2,15 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lionclaw_model::{
     apply, fold, ready_to_finish, step, AdvisoryStatus, Assertion, AssertionId, AttentionKind,
-    AuthorityCeilings, AuthorityGrants, ConversationLifecycle, ConversationState, DecisionAction,
-    DeliveryMarker, EffectId, EventEnvelope, ExecutionPolicy, Handoff, MissionConfig, MissionEvent,
-    MissionGuidance, MissionId, MissionPhase, MissionProposal, MissionState, MissionTypeRef,
-    OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, QueuedMessage, RecoveryConfig,
-    Requirement, RequirementDisposition, RequirementId, RequirementKind, RoleAttemptDisposition,
-    RoleInstance, RoleInstanceId, RolePromptTemplate, RoleTurnSuccess,
-    RuntimeConfigurationEvidence, StepDecision, StopBar, Task, TaskId, TaskRoleAssignment,
-    TaskRuntimeState, TaskStatus, TeamRevision, TypedFailure, ValidationItem, VersionStamps,
-    WorkspacePreparation, SCHEMA_VERSION,
+    AuthorityCeilings, AuthorityGrants, ConfinementResources, ConversationLifecycle,
+    ConversationState, DecisionAction, DeliveryMarker, EffectId, EventEnvelope, ExecutionPolicy,
+    Handoff, MissionConfig, MissionEvent, MissionGuidance, MissionId, MissionPhase,
+    MissionProposal, MissionState, MissionTypeRef, OracleName, OutputSemantics, PayloadRef, Plan,
+    PlanProposal, QueuedMessage, RecoveryConfig, Requirement, RequirementDisposition,
+    RequirementId, RequirementKind, RoleAttemptDisposition, RoleInstance, RoleInstanceId,
+    RolePromptTemplate, RoleTurnSuccess, RuntimeConfigurationEvidence, StepDecision, StopBar, Task,
+    TaskId, TaskRoleAssignment, TaskRuntimeState, TaskStatus, TeamRevision, TypedFailure,
+    ValidationItem, VersionStamps, WorkspacePreparation, SCHEMA_VERSION,
 };
 
 fn instance(raw: &str) -> RoleInstanceId {
@@ -27,6 +27,7 @@ fn role(id: &str, output: OutputSemantics) -> RoleInstance {
         skills: Vec::new(),
         environment: BTreeMap::new(),
         grants: AuthorityGrants::default(),
+        resources: Default::default(),
         deadline_secs: None,
     }
 }
@@ -108,11 +109,67 @@ fn team_role_environment_cannot_override_kernel_coordinates() {
 }
 
 #[test]
+fn role_resource_overrides_are_bounded_by_mission_resource_ceilings() {
+    let mut proposed = team(1, true);
+    proposed
+        .roles
+        .get_mut(&instance("engineer"))
+        .unwrap()
+        .resources = ConfinementResources {
+        tmpfs: vec!["/tmp:rw,size=3g".into()],
+    };
+    let config = MissionConfig {
+        resource_ceilings: ConfinementResources {
+            tmpfs: vec!["/tmp:rw,size=2g".into()],
+        },
+        ceilings: AuthorityCeilings {
+            writes: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let state = fold([
+        event(
+            1,
+            MissionEvent::MissionCreated {
+                objective: "test resource ceilings".into(),
+                mission_type: MissionTypeRef {
+                    name: "test".into(),
+                    digest: "digest".into(),
+                },
+                image_id: "image".into(),
+                workspace_dir: "/workspace".into(),
+                base_sha: "base".into(),
+                config,
+                delegation: lionclaw_model::DelegationSet::none(),
+            },
+        ),
+        event(
+            2,
+            MissionEvent::TeamConfigured {
+                team: team(0, true),
+            },
+        ),
+    ])
+    .unwrap();
+    let proposal = MissionProposal {
+        plan: None,
+        team: Some(proposed),
+    };
+    let error = lionclaw_model::validate_mission_proposal(&state, &proposal)
+        .expect_err("over-ceiling role resources must reject the team proposal");
+    assert!(format!("{error:?}").contains("invalid_team_revision"));
+}
+
+#[test]
 fn sunset_wire_shapes_have_no_planning_or_role_bridges() {
     let config = MissionConfig {
         stop: StopBar::Verified,
         oracles: BTreeSet::from([OracleName::new("cargo-test").expect("oracle")]),
         ceilings: AuthorityCeilings::default(),
+        resource_ceilings: Default::default(),
+        oracle_resources: Default::default(),
+        oracle_devices: Default::default(),
         requires_gap_review: true,
         recovery: RecoveryConfig::default(),
         execution: ExecutionPolicy::default(),
@@ -243,6 +300,9 @@ fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
             writes: true,
             ..Default::default()
         },
+        resource_ceilings: Default::default(),
+        oracle_resources: Default::default(),
+        oracle_devices: Default::default(),
         requires_gap_review: false,
         recovery: RecoveryConfig::default(),
         execution: ExecutionPolicy::default(),

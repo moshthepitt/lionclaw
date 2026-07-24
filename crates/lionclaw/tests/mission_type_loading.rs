@@ -58,6 +58,18 @@ fn software_dev_mission_type_loads() {
     assert!(mission_type
         .oracles
         .contains_key(&lionclaw::model::OracleName::new("cargo-test").expect("name")));
+    assert_eq!(
+        mission_type.resource_ceilings.tmpfs,
+        ["/tmp:rw,size=2g".to_string()]
+    );
+    assert_eq!(
+        mission_type
+            .oracle_resources
+            .get(&lionclaw::model::OracleName::new("cargo-test").expect("name"))
+            .expect("cargo-test resource override")
+            .tmpfs,
+        ["/tmp:rw,size=1536m".to_string()]
+    );
     let planner = &mission_type.default_team.planning_assignment;
     assert_eq!(planner.as_str(), "strategist");
     assert_eq!(
@@ -78,6 +90,7 @@ fn metric_driven_mission_type_loads() {
     assert!(mission_type
         .oracles
         .contains_key(&lionclaw::model::OracleName::new("metric-scalar").expect("name")));
+    assert!(mission_type.ceilings.devices.contains("/dev/dri"));
     let planner = &mission_type.default_team.planning_assignment;
     assert_eq!(planner.as_str(), "metric-planner");
     assert_eq!(
@@ -85,6 +98,166 @@ fn metric_driven_mission_type_loads() {
         lionclaw::model::OutputSemantics::ProposesPlan
     );
     assert!(mission_type.default_team.gap_review_assignment.is_some());
+}
+
+#[test]
+fn mission_type_loads_role_and_oracle_resource_declarations_within_ceiling() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    std::fs::create_dir(dir.path().join("oracles")).unwrap();
+    let oracle = dir.path().join("oracles/check");
+    std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&oracle);
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        r#"[mission-type]
+name = "bounded"
+stop = "verified"
+image = "img"
+
+[team]
+planning-assignment = "worker"
+
+[resource-ceilings]
+tmpfs = ["/tmp:rw,size=2g"]
+
+[oracle-resources.check]
+tmpfs = ["/tmp:rw,size=1g"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\ntmpfs: [\"/tmp:rw,size=1g\"]\n---\nDo it.\n",
+    )
+    .unwrap();
+    let mission_type =
+        load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("mission type loads");
+    let worker = mission_type
+        .default_team
+        .roles
+        .get(&RoleInstanceId::new("worker").unwrap())
+        .expect("worker role");
+    assert_eq!(worker.resources.tmpfs, ["/tmp:rw,size=1g".to_string()]);
+    assert_eq!(
+        mission_type
+            .oracle_resources
+            .get(&lionclaw::model::OracleName::new("check").unwrap())
+            .unwrap()
+            .tmpfs,
+        ["/tmp:rw,size=1g".to_string()]
+    );
+}
+
+#[test]
+fn mission_type_rejects_resource_declaration_above_ceiling() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        r#"[mission-type]
+name = "bounded"
+stop = "verified"
+image = "img"
+
+[team]
+planning-assignment = "worker"
+
+[resource-ceilings]
+tmpfs = ["/tmp:rw,size=1g"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\ntmpfs: [\"/tmp:rw,size=2g\"]\n---\nDo it.\n",
+    )
+    .unwrap();
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("over-ceiling resources must fail closed");
+    assert!(
+        error.to_string().contains("outside mission ceilings"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn mission_type_rejects_oracle_device_declaration_above_ceiling() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    std::fs::create_dir(dir.path().join("oracles")).unwrap();
+    let oracle = dir.path().join("oracles/gpu-check");
+    std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&oracle);
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        r#"[mission-type]
+name = "bounded"
+stop = "verified"
+image = "img"
+
+[team]
+planning-assignment = "worker"
+
+[oracle-devices]
+gpu-check = ["/dev/dri"]
+"#,
+    )
+    .unwrap();
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("over-ceiling oracle devices must fail closed");
+    assert!(
+        error.to_string().contains("outside mission ceilings"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn mission_type_loads_oracle_device_declaration_within_ceiling() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    std::fs::create_dir(dir.path().join("oracles")).unwrap();
+    let oracle = dir.path().join("oracles/gpu-check");
+    std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&oracle);
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        r#"[mission-type]
+name = "bounded"
+stop = "verified"
+image = "img"
+
+[team]
+planning-assignment = "worker"
+
+[ceilings]
+devices = ["/dev/dri"]
+
+[oracle-devices]
+gpu-check = ["/dev/dri"]
+"#,
+    )
+    .unwrap();
+
+    let mission_type =
+        load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("mission type loads");
+    assert_eq!(
+        mission_type
+            .oracle_devices
+            .get(&lionclaw::model::OracleName::new("gpu-check").unwrap())
+            .unwrap(),
+        &std::collections::BTreeSet::from(["/dev/dri".to_string()])
+    );
+}
+
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
 }
 
 #[test]

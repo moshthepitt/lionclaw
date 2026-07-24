@@ -13,3 +13,7 @@ of `gte`, `lte`, or `eq`.
 
 Do not game the metric by deleting checks, weakening fixtures, or changing the
 measurement target unless the approved plan explicitly asks for that.
+
+Keep dependency installs and caches in workspace-local or `/scratch` prefixes.
+Request resource or device grants only when the approved plan needs them and
+the mission ceilings allow them.

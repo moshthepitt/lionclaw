@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AuthorityCeilings, RoleInstanceId};
+use crate::model::{AuthorityCeilings, ConfinementResources, RoleInstanceId};
 
 pub const MISSION_LOCK_FILE: &str = "mission.lock.toml";
 
@@ -25,6 +25,12 @@ pub(crate) struct ManifestFile {
     pub team: ManifestTeam,
     #[serde(default)]
     pub ceilings: AuthorityCeilings,
+    #[serde(default, rename = "resource-ceilings")]
+    pub resource_ceilings: ConfinementResources,
+    #[serde(default, rename = "oracle-resources")]
+    pub oracle_resources: BTreeMap<String, ConfinementResources>,
+    #[serde(default, rename = "oracle-devices")]
+    pub oracle_devices: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub recovery: crate::model::RecoveryConfig,
     #[serde(default)]

@@ -659,6 +659,8 @@ impl RoleRunner for OciRoleRunner {
                 },
                 judged_roots: &judged_roots,
                 environment,
+                resources: request.role.resources.clone(),
+                resource_ceilings: &request.resource_ceilings,
             })
             .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
             Ok((is_writer, compiled.plan().clone()))

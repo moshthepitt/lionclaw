@@ -286,6 +286,11 @@ pub fn validate_mission_proposal(
                 .roles
                 .values()
                 .any(|role| !role.grants.within(&state.config.ceilings))
+            || team.roles.values().any(|role| {
+                role.resources
+                    .within(&state.config.resource_ceilings)
+                    .is_err()
+            })
         {
             return Err(ProposalError::Invalid(vec![err(
                 "invalid_team_revision",
@@ -670,6 +675,14 @@ fn check_shape(
                 format!("role instance '{id}' requests grants outside mission ceilings"),
             ));
         }
+        if let Err(detail) = role.resources.within(&config.resource_ceilings) {
+            errors.push(err(
+                "resources_exceed_ceiling",
+                format!(
+                    "role instance '{id}' requests resources outside mission ceilings: {detail}"
+                ),
+            ));
+        }
         if matches!(
             role.output,
             OutputSemantics::EmitsVerdict | OutputSemantics::EmitsGapVerdict
@@ -951,6 +964,7 @@ mod topology_tests {
             skills: Vec::new(),
             environment: BTreeMap::new(),
             grants: AuthorityGrants::default(),
+            resources: Default::default(),
             deadline_secs: None,
         }
     }

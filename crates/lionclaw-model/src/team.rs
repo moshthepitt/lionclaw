@@ -7,6 +7,7 @@ use super::{ids::lowercase_hex, AssertionId, InputName, OutputSemantics, RoleIns
 use crate::prelude::*;
 
 pub const MAX_GUIDANCE_BYTES: usize = 64 * 1024;
+pub const MAX_TMPFS_RESOURCE_OVERRIDES: usize = 16;
 pub const KERNEL_ENVIRONMENT_KEYS: &[&str] = &[
     "HOME",
     "XDG_CONFIG_HOME",
@@ -83,6 +84,166 @@ impl AuthorityGrants {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ConfinementResources {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmpfs: Vec<String>,
+}
+
+impl ConfinementResources {
+    pub const fn is_empty(&self) -> bool {
+        self.tmpfs.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tmpfs.len() > MAX_TMPFS_RESOURCE_OVERRIDES {
+            return Err(format!(
+                "declares {} tmpfs resources; limit is {MAX_TMPFS_RESOURCE_OVERRIDES}",
+                self.tmpfs.len()
+            ));
+        }
+        let mut targets = BTreeSet::new();
+        for entry in &self.tmpfs {
+            let parsed = ParsedTmpfsResource::parse(entry)?;
+            if !targets.insert(parsed.target) {
+                return Err(format!(
+                    "declares tmpfs target '{}' more than once",
+                    ParsedTmpfsResource::parse(entry)?.target
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn within(&self, ceilings: &Self) -> Result<(), String> {
+        self.validate()?;
+        ceilings.validate()?;
+        let ceiling_by_target = ceilings
+            .tmpfs
+            .iter()
+            .map(|entry| {
+                ParsedTmpfsResource::parse(entry).map(|parsed| (parsed.target.clone(), parsed))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        for entry in &self.tmpfs {
+            let parsed = ParsedTmpfsResource::parse(entry)?;
+            let Some(ceiling) = ceiling_by_target.get(&parsed.target) else {
+                return Err(format!(
+                    "tmpfs target '{}' has no mission resource ceiling",
+                    parsed.target
+                ));
+            };
+            if parsed.size_bytes > ceiling.size_bytes {
+                return Err(format!(
+                    "tmpfs target '{}' requests {}, above ceiling {}",
+                    parsed.target, parsed.size_text, ceiling.size_text
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ParsedTmpfsResource {
+    target: String,
+    size_bytes: u64,
+    size_text: String,
+}
+
+impl ParsedTmpfsResource {
+    fn parse(entry: &str) -> Result<Self, String> {
+        if entry.contains('\0') {
+            return Err("tmpfs resource contains NUL".to_string());
+        }
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return Err("tmpfs resource is required".to_string());
+        }
+        let (raw_target, raw_options) = trimmed
+            .split_once(':')
+            .ok_or_else(|| format!("tmpfs resource '{trimmed}' must declare size=<bytes>"))?;
+        let target = normalize_resource_target(raw_target)?;
+        let mut size = None;
+        for raw_option in raw_options.split(',') {
+            let option = raw_option.trim();
+            if let Some(value) = option.strip_prefix("size=") {
+                if size.is_some() {
+                    return Err(format!(
+                        "tmpfs resource '{target}' declares size more than once"
+                    ));
+                }
+                let value = value.trim();
+                let bytes = parse_confinement_size_bytes(value).map_err(|detail| {
+                    format!("tmpfs resource '{target}' size is invalid: {detail}")
+                })?;
+                size = Some((bytes, value.to_string()));
+            }
+        }
+        let (size_bytes, size_text) =
+            size.ok_or_else(|| format!("tmpfs resource '{target}' must declare size=<bytes>"))?;
+        Ok(Self {
+            target,
+            size_bytes,
+            size_text,
+        })
+    }
+}
+
+fn normalize_resource_target(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("tmpfs target is required".to_string());
+    }
+    if !trimmed.starts_with('/') {
+        return Err(format!("tmpfs target '{trimmed}' must be absolute"));
+    }
+    let parts = trimmed
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Err("tmpfs target must not be '/'".to_string());
+    }
+    if parts.iter().any(|part| *part == "." || *part == "..") {
+        return Err(format!(
+            "tmpfs target '{trimmed}' must not contain '.' or '..' components"
+        ));
+    }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+pub fn parse_confinement_size_bytes(raw: &str) -> Result<u64, String> {
+    if raw.is_empty() {
+        return Err("size is required".to_string());
+    }
+    let split_at = raw
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(raw.len());
+    let (digits, suffix) = raw.split_at(split_at);
+    if digits.is_empty() {
+        return Err(format!("'{raw}' has no numeric prefix"));
+    }
+    let value = digits
+        .parse::<u64>()
+        .map_err(|_| format!("'{raw}' is not a valid integer size"))?;
+    if value == 0 {
+        return Err("size must be greater than zero".to_string());
+    }
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "ki" | "kib" => 1024,
+        "m" | "mb" | "mi" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gi" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "ti" | "tib" => 1024_u64.pow(4),
+        _ => return Err(format!("unsupported size suffix '{suffix}'")),
+    };
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("'{raw}' overflows bytes"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MissionGuidance {
@@ -126,6 +287,8 @@ pub struct RoleInstance {
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub grants: AuthorityGrants,
+    #[serde(default, skip_serializing_if = "ConfinementResources::is_empty")]
+    pub resources: ConfinementResources,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_secs: Option<u64>,
 }
@@ -178,6 +341,9 @@ impl TeamRevision {
                 validate_environment_entry(name, value)
                     .map_err(|detail| format!("role instance '{id}' environment {detail}"))?;
             }
+            role.resources
+                .validate()
+                .map_err(|detail| format!("role instance '{id}' resources {detail}"))?;
             let mut skills = BTreeSet::new();
             for skill in &role.skills {
                 if !skills.insert(skill) {

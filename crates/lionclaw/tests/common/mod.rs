@@ -136,6 +136,7 @@ pub fn role(id: &str, output: OutputSemantics) -> RoleInstance {
             writes: output == OutputSemantics::ProducesArtifact,
             ..Default::default()
         },
+        resources: Default::default(),
         deadline_secs: None,
     }
 }
@@ -195,6 +196,8 @@ fn mission_type(requires_gap_review: bool) -> MissionType {
             writes: true,
             ..Default::default()
         },
+        resource_ceilings: Default::default(),
+        oracle_resources: Default::default(),
         requires_gap_review,
         recovery: Default::default(),
         execution: lionclaw::model::ExecutionPolicy {
@@ -209,6 +212,7 @@ fn mission_type(requires_gap_review: bool) -> MissionType {
             cargo_test,
             "/nonexistent-mission-type/oracles/cargo-test".into(),
         )]),
+        oracle_devices: Default::default(),
     })
 }
 

@@ -1386,6 +1386,7 @@ impl Engine {
             environment,
             skills,
             prepared_inputs,
+            resource_ceilings: self.mission_type.resource_ceilings.clone(),
             prompt: prompt_text.clone(),
             base_sha: base_sha.to_string(),
             assignment_epoch: *assignment_epoch,
@@ -1556,6 +1557,19 @@ impl Engine {
             state_dir: self.store.lionclaw_dir().to_path_buf(),
             prepared_inputs: self.mission_type.inputs.values().cloned().collect(),
             environment: self.mission_type.environment.clone(),
+            devices: self
+                .mission_type
+                .oracle_devices
+                .get(oracle)
+                .cloned()
+                .unwrap_or_default(),
+            resources: self
+                .mission_type
+                .oracle_resources
+                .get(oracle)
+                .cloned()
+                .unwrap_or_default(),
+            resource_ceilings: self.mission_type.resource_ceilings.clone(),
             deadline_ms: effect.deadline_ms(),
             control,
         };
@@ -2187,6 +2201,7 @@ mod prepared_input_grant_tests {
                 inputs: BTreeSet::from([granted.name.clone()]),
                 ..Default::default()
             },
+            resources: Default::default(),
             deadline_secs: None,
         };
         let available = BTreeMap::from([
