@@ -15,7 +15,7 @@ use crate::{TypedFailure, TypedFailureEvidence};
 
 /// Reducer 40 carries exact task failure receipts into attention and durable
 /// planning refinement evidence.
-pub const REDUCER_VERSION: u32 = 44;
+pub const REDUCER_VERSION: u32 = 45;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -755,6 +755,13 @@ fn apply_oracle_outcome(
         }
         Ok(success) => {
             state.oracle_failures.remove(oracle);
+            state.parked_effects.retain(|_, parked| {
+                !matches!(
+                    parked,
+                    ParkedEffect::OracleRun { oracle: parked_oracle }
+                        if parked_oracle == oracle
+                )
+            });
             let verdict = AuthoritativeVerdict::from_oracle_outcome(
                 oracle.clone(),
                 judged_sha.to_string(),
