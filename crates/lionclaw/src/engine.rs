@@ -912,9 +912,22 @@ impl Engine {
             }));
         }
         let mut continue_driving = true;
+        let mut first_error = None;
         for handle in handles {
-            let outcome = handle.await.context("joining effect driver task")??;
-            continue_driving &= outcome;
+            match handle.await {
+                Ok(Ok(outcome)) => continue_driving &= outcome,
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| {
+                        anyhow::anyhow!("joining effect driver task: {error}")
+                    });
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(continue_driving)
     }
@@ -1488,6 +1501,11 @@ impl Engine {
                     Ok(outcome) => outcome,
                     Err(failure) => return Ok(completed(Err(failure))),
                 };
+                if let Err(failure) =
+                    validate_dependency_lineage(state, dependency_refs, base_sha, &outcome).await
+                {
+                    return Ok(completed(Err(failure)));
+                }
                 // A planning author's proposal is validated fail-closed before
                 // it is recorded, exactly like a manually proposed plan — an
                 // invalid proposal is a failed attempt, never a bad contract.
@@ -3112,6 +3130,51 @@ fn validated_role_success(
         ));
     }
     Ok(outcome)
+}
+
+async fn validate_dependency_lineage(
+    state: &MissionState,
+    dependency_refs: &[crate::model::TaskCandidateRef],
+    base_sha: &str,
+    outcome: &crate::ports::RoleTurnOutcome,
+) -> std::result::Result<(), TypedFailure> {
+    let candidate_sha = outcome
+        .artifact
+        .as_ref()
+        .map(|artifact| artifact.as_outcome().head_sha.as_str())
+        .unwrap_or(base_sha);
+    for dependency in dependency_refs {
+        match crate::workspace::is_ancestor(
+            std::path::Path::new(&state.workspace_dir),
+            &dependency.sha,
+            candidate_sha,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(invalid_role_outcome(
+                    "workspace.dependency_lineage",
+                    format!(
+                        "candidate {candidate_sha} does not contain dependency {} at {}",
+                        dependency.task_id, dependency.sha
+                    ),
+                    outcome,
+                ));
+            }
+            Err(error) => {
+                return Err(invalid_role_outcome(
+                    "workspace.dependency_lineage",
+                    format!(
+                        "could not verify dependency {} at {}: {error:#}",
+                        dependency.task_id, dependency.sha
+                    ),
+                    outcome,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn render_conversation_message(

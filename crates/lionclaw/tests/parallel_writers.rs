@@ -55,15 +55,23 @@ struct RunnerCall {
 struct ParallelRoleRunner {
     first_wave: Arc<tokio::sync::Barrier>,
     log: Arc<ParallelLog>,
-    conflict: bool,
+    integration: IntegrationBehavior,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntegrationBehavior {
+    Complete,
+    Conflict,
+    OmitRight,
+    Artifactless,
 }
 
 impl ParallelRoleRunner {
-    fn new(conflict: bool) -> Self {
+    fn new(integration: IntegrationBehavior) -> Self {
         Self {
             first_wave: Arc::new(tokio::sync::Barrier::new(2)),
             log: Arc::new(ParallelLog::default()),
-            conflict,
+            integration,
         }
     }
 
@@ -126,7 +134,7 @@ impl ParallelRoleRunner {
         task: &str,
     ) -> Result<RoleTurnOutcome, TypedFailure> {
         let checkout = checkout(request)?;
-        let file = if self.conflict {
+        let file = if self.integration == IntegrationBehavior::Conflict {
             "shared.txt".to_string()
         } else {
             format!("{task}.txt")
@@ -168,7 +176,15 @@ impl ParallelRoleRunner {
         }
         let checkout = checkout(request)?;
         git_configure(checkout)?;
+        if self.integration == IntegrationBehavior::Artifactless {
+            return Ok(work_outcome(None));
+        }
         for candidate in &request.dependency_refs {
+            if self.integration == IntegrationBehavior::OmitRight
+                && candidate.task_id.to_string() == RIGHT
+            {
+                continue;
+            }
             if candidate.sha == request.base_sha {
                 continue;
             }
@@ -264,9 +280,13 @@ struct Harness {
     oracle: Arc<ScriptedOracleRunner>,
 }
 
-async fn harness(dir: &Path, conflict: bool, oracle: ScriptedOracleRunner) -> Harness {
+async fn harness(
+    dir: &Path,
+    integration: IntegrationBehavior,
+    oracle: ScriptedOracleRunner,
+) -> Harness {
     initialize_repository(dir);
-    let runner = Arc::new(ParallelRoleRunner::new(conflict));
+    let runner = Arc::new(ParallelRoleRunner::new(integration));
     let runner_log = runner.log();
     let oracle = Arc::new(oracle);
     let engine = Engine::new(
@@ -290,7 +310,12 @@ async fn harness(dir: &Path, conflict: bool, oracle: ScriptedOracleRunner) -> Ha
 #[tokio::test]
 async fn parallel_writers_run_concurrently_and_integrate_at_the_deliverable_head() {
     let dir = TempDir::new().expect("tempdir");
-    let h = harness(dir.path(), false, ScriptedOracleRunner::passing()).await;
+    let h = harness(
+        dir.path(),
+        IntegrationBehavior::Complete,
+        ScriptedOracleRunner::passing(),
+    )
+    .await;
     let mission_id = start_parallel_mission(&h.engine, dir.path()).await;
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
@@ -327,7 +352,7 @@ async fn repairing_a_non_sink_task_reowes_integration_and_proof_at_the_new_head(
     let dir = TempDir::new().expect("tempdir");
     let h = harness(
         dir.path(),
-        false,
+        IntegrationBehavior::Complete,
         ScriptedOracleRunner::fail_once("cargo-left"),
     )
     .await;
@@ -377,7 +402,12 @@ async fn repairing_a_non_sink_task_reowes_integration_and_proof_at_the_new_head(
 #[tokio::test]
 async fn integration_merge_conflicts_park_the_sink_task() {
     let dir = TempDir::new().expect("tempdir");
-    let h = harness(dir.path(), true, ScriptedOracleRunner::passing()).await;
+    let h = harness(
+        dir.path(),
+        IntegrationBehavior::Conflict,
+        ScriptedOracleRunner::passing(),
+    )
+    .await;
     let mission_id = start_parallel_mission(&h.engine, dir.path()).await;
 
     let parked = h.engine.advance(&mission_id).await.expect("advance");
@@ -405,6 +435,75 @@ async fn integration_merge_conflicts_park_the_sink_task() {
     assert_eq!(
         failure.evidence().code.as_deref(),
         Some("workspace.merge_conflict")
+    );
+}
+
+#[tokio::test]
+async fn integration_candidate_missing_a_dependency_is_rejected_before_proof() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        IntegrationBehavior::OmitRight,
+        ScriptedOracleRunner::passing(),
+    )
+    .await;
+    let mission_id = start_parallel_mission(&h.engine, dir.path()).await;
+
+    let parked = h.engine.advance(&mission_id).await.expect("advance");
+    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    let merge = parked
+        .state
+        .tasks
+        .get(&MERGE.parse_task())
+        .expect("merge task");
+    assert_eq!(merge.status, lionclaw::model::TaskStatus::Failed);
+    assert!(merge.candidate_sha.is_none());
+    assert_eq!(
+        parked
+            .state
+            .role_attempt_receipts
+            .values()
+            .find_map(|receipt| receipt.failure())
+            .and_then(|failure| failure.evidence().code.as_deref()),
+        Some("workspace.dependency_lineage")
+    );
+    assert!(h.oracle.judged_shas().is_empty());
+}
+
+#[tokio::test]
+async fn accepting_a_failed_fan_in_without_a_candidate_does_not_fabricate_a_head() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        IntegrationBehavior::Artifactless,
+        ScriptedOracleRunner::passing(),
+    )
+    .await;
+    let mission_id = start_parallel_mission(&h.engine, dir.path()).await;
+
+    let parked = h.engine.advance(&mission_id).await.expect("advance");
+    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert!(parked
+        .state
+        .open_attention
+        .contains_key("node_failed:merge"));
+    h.engine
+        .decide(
+            &mission_id,
+            "node_failed:merge",
+            DecisionAction::Accept,
+            "accepting a failed fan-in must not invent a merge",
+        )
+        .await
+        .expect("record decision");
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    assert!(state.open_attention.contains_key("node_failed:merge"));
+    let merge = state.tasks.get(&MERGE.parse_task()).expect("merge task");
+    assert_eq!(merge.status, lionclaw::model::TaskStatus::Failed);
+    assert!(merge.candidate_sha.is_none());
+    assert_ne!(
+        state.deliverable_head(),
+        merge.role_assignment.as_ref().unwrap().base_sha
     );
 }
 
@@ -649,6 +748,51 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
     let mut stale_state = left_state.clone();
     lionclaw::model::apply(&mut stale_state, &stale);
     assert!(stale_state.inflight.is_empty());
+
+    let fan_in = role_request(
+        &mission_id,
+        11,
+        MERGE,
+        "integrator",
+        1,
+        "left-head",
+        vec![
+            TaskCandidateRef {
+                task_id: LEFT.parse_task(),
+                sha: "left-head".to_string(),
+            },
+            TaskCandidateRef {
+                task_id: RIGHT.parse_task(),
+                sha: "right-head".to_string(),
+            },
+        ],
+    );
+    let mut forged = left_state.clone();
+    lionclaw::model::apply(&mut forged, &fan_in);
+    lionclaw::model::apply(
+        &mut forged,
+        &envelope(
+            &mission_id,
+            12,
+            MissionEvent::RoleTurnCompleted {
+                effect_id: fan_in.effect_id(),
+                outcome: Ok(lionclaw::model::RoleTurnSuccess {
+                    handoff: Some(Handoff::Work {
+                        done: true,
+                        report: PayloadRef::inline("done"),
+                        request_attention: false,
+                    }),
+                    artifact: None,
+                    runtime_configuration: Default::default(),
+                    runtime_usage: Default::default(),
+                    final_response: PayloadRef::inline("done"),
+                }),
+            },
+        ),
+    );
+    let merge = &forged.tasks[&MERGE.parse_task()];
+    assert_eq!(merge.status, lionclaw::model::TaskStatus::Failed);
+    assert!(merge.candidate_sha.is_none());
 }
 
 #[derive(Default)]
@@ -907,17 +1051,21 @@ async fn captured_work(request: &RoleTurnRequest) -> Result<RoleTurnOutcome, Typ
         .capture()
         .await
         .map_err(|error| TypedFailure::permanent("testing.capture", error.to_string()))?;
-    Ok(RoleTurnOutcome {
+    Ok(work_outcome(Some(artifact)))
+}
+
+fn work_outcome(artifact: Option<lionclaw::ports::CapturedArtifact>) -> RoleTurnOutcome {
+    RoleTurnOutcome {
         handoff: Some(Handoff::Work {
             done: true,
             report: PayloadRef::inline("done"),
             request_attention: false,
         }),
-        artifact: Some(artifact),
+        artifact,
         runtime_configuration: Default::default(),
         runtime_usage: Default::default(),
         final_response: "done".to_string(),
-    })
+    }
 }
 
 fn checkout(request: &RoleTurnRequest) -> Result<&Path, TypedFailure> {

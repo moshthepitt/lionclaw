@@ -13,9 +13,10 @@ use super::verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 54 derives per-task candidate lineages and the deterministic
-/// deliverable frontier for Slice 9 parallel writers.
-pub const REDUCER_VERSION: u32 = 54;
+/// Reducer 55 derives per-task candidate lineages, the deterministic
+/// deliverable frontier, and fail-closed fan-in acceptance for Slice 9
+/// parallel writers.
+pub const REDUCER_VERSION: u32 = 55;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -609,6 +610,13 @@ fn role_handoff_matches_request(
     if super::role_success_contract_error(output, handoff, artifact, &request.base_sha).is_some() {
         return false;
     }
+    if output == super::OutputSemantics::ProducesArtifact
+        && matches!(handoff, Handoff::Work { .. })
+        && artifact.is_none()
+        && request.dependency_refs.len() > 1
+    {
+        return false;
+    }
     let Handoff::Validate { items, passed, .. } = handoff else {
         return true;
     };
@@ -1138,6 +1146,9 @@ fn apply_decision(
         }
         (super::DecisionAction::Accept, _) => {
             if let Some(task_id) = &item.task_id {
+                if !task_accept_candidate_is_lineage_complete(state, task_id) {
+                    return;
+                }
                 if let Some(task) = state.tasks.get_mut(task_id) {
                     task.status = TaskStatus::Cleared;
                     if task.candidate_sha.is_none() {
@@ -1156,6 +1167,23 @@ fn apply_decision(
         _ => {}
     }
     state.open_attention.remove(attention_id);
+}
+
+fn task_accept_candidate_is_lineage_complete(
+    state: &MissionState,
+    task_id: &super::TaskId,
+) -> bool {
+    if state
+        .tasks
+        .get(task_id)
+        .and_then(|task| task.candidate_sha.as_ref())
+        .is_some()
+    {
+        return true;
+    }
+    state
+        .task_dependency_refs(task_id)
+        .is_some_and(|dependencies| dependencies.len() <= 1)
 }
 
 fn ready_planning_conversation(state: &mut MissionState) {
