@@ -15,7 +15,7 @@ use crate::{TypedFailure, TypedFailureEvidence};
 
 /// Reducer 40 carries exact task failure receipts into attention and durable
 /// planning refinement evidence.
-pub const REDUCER_VERSION: u32 = 40;
+pub const REDUCER_VERSION: u32 = 41;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -194,6 +194,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 state.phase = MissionPhase::Aborted {
                     reason: reason.clone(),
                 };
+                for conversation in state.conversations.values_mut() {
+                    retire_conversation(conversation);
+                }
             }
         }
         MissionEvent::DecisionRecorded {
