@@ -1768,6 +1768,7 @@ impl Engine {
                     .team
                     .as_ref()
                     .context("planning dispatch without a team")?,
+                resource_ceilings: &self.mission_type.resource_ceilings,
                 oracle_inventory: &oracle_inventory,
                 task_body: &intent.body,
                 upstream_reports: &upstream_reports,

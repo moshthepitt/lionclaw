@@ -288,11 +288,14 @@ mod tests {
     #[test]
     fn parses_quoted_tmpfs_entries_with_commas() {
         let text =
-            "---\noutput: produces-report\ntmpfs: [\"/tmp:rw,size=1g\", /cache:size=64m]\n---\nx";
+            "---\noutput: produces-report\ntmpfs: [\"/tmp:rw,size=1g\", \"/cache:rw,size=64m\"]\n---\nx";
         let fm = parse_role_file(text).expect("parse");
         assert_eq!(
             fm.resources.tmpfs,
-            vec!["/tmp:rw,size=1g".to_string(), "/cache:size=64m".to_string()]
+            vec![
+                "/tmp:rw,size=1g".to_string(),
+                "/cache:rw,size=64m".to_string()
+            ]
         );
     }
 }

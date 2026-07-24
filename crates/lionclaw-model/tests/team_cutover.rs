@@ -162,6 +162,57 @@ fn role_resource_overrides_are_bounded_by_mission_resource_ceilings() {
 }
 
 #[test]
+fn over_ceiling_team_configured_event_is_ignored_during_replay() {
+    let mut forged = team(1, true);
+    forged
+        .roles
+        .get_mut(&instance("engineer"))
+        .unwrap()
+        .resources = ConfinementResources {
+        tmpfs: vec!["/tmp:rw,size=3g".into()],
+    };
+    let config = MissionConfig {
+        resource_ceilings: ConfinementResources {
+            tmpfs: vec!["/tmp:rw,size=2g".into()],
+        },
+        ceilings: AuthorityCeilings {
+            writes: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let state = fold([
+        event(
+            1,
+            MissionEvent::MissionCreated {
+                objective: "test direct replay guard".into(),
+                mission_type: MissionTypeRef {
+                    name: "test".into(),
+                    digest: "digest".into(),
+                },
+                image_id: "image".into(),
+                workspace_dir: "/workspace".into(),
+                base_sha: "base".into(),
+                config,
+                delegation: lionclaw_model::DelegationSet::none(),
+            },
+        ),
+        event(
+            2,
+            MissionEvent::TeamConfigured {
+                team: team(0, true),
+            },
+        ),
+        event(3, MissionEvent::TeamConfigured { team: forged }),
+    ])
+    .unwrap();
+
+    assert_eq!(state.team.as_ref().unwrap().revision, 0);
+    assert!(!state.team_history.contains_key(&1));
+}
+
+#[test]
 fn sunset_wire_shapes_have_no_planning_or_role_bridges() {
     let config = MissionConfig {
         stop: StopBar::Verified,

@@ -17,13 +17,11 @@ use std::path::{Path, PathBuf};
 
 use lionclaw_confinement::{
     parse_runtime_tmpfs_entry, ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset,
-    InstallPolicy, MountAccess, MountSpec, NetworkMode, RuntimeTmpfsEntry, WorkspaceAccess,
-    RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET, WORKSPACE_MOUNT_TARGET,
+    InstallPolicy, MountAccess, MountSpec, NetworkMode, WorkspaceAccess, RUNTIME_HOME_MOUNT_TARGET,
+    RUNTIME_MOUNT_TARGET, WORKSPACE_MOUNT_TARGET,
 };
 
-use crate::model::{
-    parse_confinement_size_bytes, ConfinementResources, OutputSemantics, RoleInstance,
-};
+use crate::model::{ConfinementResources, ConfinementTmpfsResource, OutputSemantics, RoleInstance};
 
 /// Mission targets no mount may shadow.
 const RESERVED_TARGETS: &[&str] = &[
@@ -415,40 +413,29 @@ fn apply_resource_overrides(
         })?;
     let mut effective = defaults
         .iter()
-        .map(|(target, entry)| (target.clone(), entry.argument().to_string()))
+        .map(|(target, entry)| (target.clone(), entry.runtime_argument()))
         .collect::<std::collections::BTreeMap<_, _>>();
     for override_entry in &overrides.tmpfs {
-        let parsed = parse_runtime_tmpfs_entry(override_entry).map_err(|detail| {
+        let parsed = ConfinementTmpfsResource::parse(override_entry).map_err(|detail| {
             MoatViolation::InvalidResourceOverride {
                 role: role.to_string(),
                 detail: format!("tmpfs entry '{override_entry}': {detail}"),
             }
         })?;
-        let override_size =
-            tmpfs_size_bytes(&parsed).map_err(|detail| MoatViolation::InvalidResourceOverride {
-                role: role.to_string(),
-                detail: format!("tmpfs entry '{}': {detail}", parsed.argument()),
-            })?;
         if let Some(default) = defaults.get(parsed.target()) {
-            let default_size = tmpfs_size_bytes(default).map_err(|detail| {
-                MoatViolation::InvalidResourceOverride {
-                    role: role.to_string(),
-                    detail: format!("profile tmpfs entry '{}': {detail}", default.argument()),
-                }
-            })?;
-            if override_size < default_size {
+            if parsed.size_bytes() < default.size_bytes() {
                 return Err(MoatViolation::ResourceShrinksDefault {
                     role: role.to_string(),
                     detail: format!(
                         "tmpfs target '{}' requests {}, below profile default {}",
                         parsed.target(),
-                        parsed.argument(),
-                        default.argument()
+                        parsed.runtime_argument(),
+                        default.runtime_argument()
                     ),
                 });
             }
         }
-        effective.insert(parsed.target().to_string(), parsed.argument().to_string());
+        effective.insert(parsed.target().to_string(), parsed.runtime_argument());
     }
     oci.tmpfs = effective.into_values().collect();
     Ok(())
@@ -456,31 +443,19 @@ fn apply_resource_overrides(
 
 fn tmpfs_by_target(
     entries: &[String],
-) -> Result<std::collections::BTreeMap<String, RuntimeTmpfsEntry>, String> {
+) -> Result<std::collections::BTreeMap<String, ConfinementTmpfsResource>, String> {
     let mut parsed = std::collections::BTreeMap::new();
     for entry in entries {
         let tmpfs = parse_runtime_tmpfs_entry(entry)?;
-        if parsed.insert(tmpfs.target().to_string(), tmpfs).is_some() {
+        let resource = ConfinementTmpfsResource::parse(tmpfs.argument())?;
+        if parsed
+            .insert(resource.target().to_string(), resource)
+            .is_some()
+        {
             return Err(format!("tmpfs target declared more than once in '{entry}'"));
         }
     }
     Ok(parsed)
-}
-
-fn tmpfs_size_bytes(entry: &RuntimeTmpfsEntry) -> Result<u64, String> {
-    let Some((_, raw_options)) = entry.argument().split_once(':') else {
-        return Err("missing size=<bytes>".to_string());
-    };
-    let mut size = None;
-    for option in raw_options.split(',') {
-        if let Some(raw_size) = option.trim().strip_prefix("size=") {
-            if size.is_some() {
-                return Err("size declared more than once".to_string());
-            }
-            size = Some(parse_confinement_size_bytes(raw_size.trim())?);
-        }
-    }
-    size.ok_or_else(|| "missing size=<bytes>".to_string())
 }
 
 /// Resolve symlinks where possible; fall back to the lexical path for a
@@ -695,5 +670,59 @@ mod team_authority_tests {
         .expect_err("over-ceiling resource override must refuse before runtime");
 
         assert!(matches!(err, MoatViolation::ResourceExceedsCeiling { .. }));
+    }
+
+    #[test]
+    fn l19_resource_override_below_profile_default_is_refused_at_compile_role_plan() {
+        let mut confinement = ConfinementConfig::Oci(Default::default());
+        confinement.oci_mut().tmpfs = vec!["/tmp:rw,size=512m".to_string()];
+        let authority = oracle_authority("cargo-test");
+        let err = compile_role_plan(RolePlanRequest {
+            authority: &authority,
+            runtime_id: "codex".into(),
+            confinement,
+            mounts: MissionMounts {
+                workspace: "/tmp/work".into(),
+                extras: Vec::new(),
+            },
+            judged_roots: &["/tmp/work".into()],
+            environment: Vec::new(),
+            resources: ConfinementResources {
+                tmpfs: vec!["/tmp:rw,size=256m".to_string()],
+            },
+            resource_ceilings: &ConfinementResources {
+                tmpfs: vec!["/tmp:rw,size=2g".to_string()],
+            },
+        })
+        .expect_err("resource override must not shrink the profile tmpfs default");
+
+        assert!(matches!(err, MoatViolation::ResourceShrinksDefault { .. }));
+    }
+
+    #[test]
+    fn resource_override_cannot_smuggle_tmpfs_authority_flags() {
+        let mut confinement = ConfinementConfig::Oci(Default::default());
+        confinement.oci_mut().tmpfs = vec!["/tmp:rw,size=512m".to_string()];
+        let authority = oracle_authority("cargo-test");
+        let err = compile_role_plan(RolePlanRequest {
+            authority: &authority,
+            runtime_id: "codex".into(),
+            confinement,
+            mounts: MissionMounts {
+                workspace: "/tmp/work".into(),
+                extras: Vec::new(),
+            },
+            judged_roots: &["/tmp/work".into()],
+            environment: Vec::new(),
+            resources: ConfinementResources {
+                tmpfs: vec!["/tmp:rw,exec,size=1536m".to_string()],
+            },
+            resource_ceilings: &ConfinementResources {
+                tmpfs: vec!["/tmp:rw,size=2g".to_string()],
+            },
+        })
+        .expect_err("resource override must not pass through tmpfs authority flags");
+
+        assert!(matches!(err, MoatViolation::InvalidResourceOverride { .. }));
     }
 }

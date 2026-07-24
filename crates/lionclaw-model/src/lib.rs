@@ -77,7 +77,7 @@ pub use state::{
 pub use step::{step, OracleDispatchIntent, RoleDispatchIntent, StepDecision};
 pub use team::{
     parse_confinement_size_bytes, validate_environment_entry, AuthorityCeilings, AuthorityGrants,
-    ConfinementResources, MissionGuidance, RoleInstance, TeamRevision, KERNEL_ENVIRONMENT_KEYS,
-    MAX_GUIDANCE_BYTES, MAX_TMPFS_RESOURCE_OVERRIDES,
+    ConfinementResources, ConfinementTmpfsResource, MissionGuidance, RoleInstance, TeamRevision,
+    KERNEL_ENVIRONMENT_KEYS, MAX_GUIDANCE_BYTES, MAX_TMPFS_RESOURCE_OVERRIDES,
 };
 pub use verdict::{classify_finish, AuthoritativeVerdict, FinishClass};

@@ -14,8 +14,10 @@ use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
 /// Reducer 50 makes Slice 6 closure event-driven and applies typed proof
-/// disposition honesty.
-pub const REDUCER_VERSION: u32 = 51;
+/// disposition honesty; 51 validates Slice 7 team resource overrides against
+/// mission resource ceilings during replay; 52 canonicalizes resource-only
+/// tmpfs declarations during replay validation.
+pub const REDUCER_VERSION: u32 = 52;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;

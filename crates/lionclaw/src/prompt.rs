@@ -4,7 +4,10 @@
 //! judge's prompt never includes a producer's narrative prose — verdict
 //! roles see the contract and the artifact, not the worker's story.
 
-use crate::model::{Assertion, MissionProposal, OutputSemantics, Plan, RoleInstance, TeamRevision};
+use crate::model::{
+    Assertion, ConfinementResources, MissionProposal, OutputSemantics, Plan, RoleInstance,
+    TeamRevision,
+};
 
 pub struct ExecutionContext<'a> {
     pub objective: &'a str,
@@ -116,6 +119,8 @@ pub struct PlanningPromptContext<'a> {
     /// The complete accepted team snapshot. Planning proposals replace it as
     /// one revision so role contracts and assignments cannot drift apart.
     pub team: &'a TeamRevision,
+    /// Resource ceilings the next team revision must stay within.
+    pub resource_ceilings: &'a ConfinementResources,
     /// The oracles the author may bind assertions to.
     pub oracle_inventory: &'a [String],
     pub task_body: &'a str,
@@ -181,6 +186,16 @@ fn render_planning(role: &RoleInstance, ctx: &PlanningPromptContext<'_>) -> Stri
     prompt.push_str("\n\n## Current team revision\n\n");
     prompt.push_str("Return a complete next team revision, preserving every role contract you do not deliberately change. Assign every work task and assertion using role-instance ids from that returned revision.\n\n```json\n");
     prompt.push_str(&serde_json::to_string_pretty(ctx.team).expect("team serializes"));
+    prompt.push_str("\n```\n");
+    prompt.push_str("\n\n## Role resource overrides\n\n");
+    prompt.push_str("A role may include `resources.tmpfs` only when it needs a tmpfs resource larger than the runtime profile default. Entries must use `/absolute/target:rw,size=<bytes>` and stay within the mission ceilings below. Resource overrides change size only; they cannot grant network, secrets, installs, devices, writes, inputs, or mount flags.\n\n");
+    prompt.push_str("Example role fragment:\n\n```json\n");
+    prompt.push_str("{\n  \"resources\": {\n    \"tmpfs\": [\"/tmp:rw,size=1g\"]\n  }\n}");
+    prompt.push_str("\n```\n");
+    prompt.push_str("\nMission resource ceilings:\n\n```json\n");
+    prompt.push_str(
+        &serde_json::to_string_pretty(ctx.resource_ceilings).expect("resource ceilings serialize"),
+    );
     prompt.push_str("\n```\n");
     if !ctx.oracle_inventory.is_empty() {
         prompt.push_str("\n\n## Available oracles\n\n");
@@ -523,6 +538,9 @@ mod team_prompt_tests {
             guidance: None,
         };
         let guidance = "Preserve the public contract exactly.";
+        let resource_ceilings = ConfinementResources {
+            tmpfs: vec!["/tmp:rw,size=2g".to_string()],
+        };
 
         let execution = render(TurnContext::Execution(
             &worker,
@@ -548,6 +566,7 @@ mod team_prompt_tests {
                 },
                 playbook: None,
                 team: &team,
+                resource_ceilings: &resource_ceilings,
                 oracle_inventory: &[],
                 task_body: "plan it",
                 upstream_reports: &[],
@@ -577,6 +596,9 @@ mod team_prompt_tests {
         assert!(planning.contains(guidance));
         assert!(planning.contains("\"revision\": 4"));
         assert!(planning.contains("\"task_assignments\""));
+        assert!(planning.contains("\"tmpfs\": ["));
+        assert!(planning.contains("/tmp:rw,size=2g"));
+        assert!(planning.contains("\"resources\": {"));
         assert!(!planning.contains("\"kind\": \"work\""));
         assert!(!judgment.contains(guidance));
         assert!(!gap_review.contains(guidance));

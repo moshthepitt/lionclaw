@@ -1424,7 +1424,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (26, 51));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (26, 52));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;

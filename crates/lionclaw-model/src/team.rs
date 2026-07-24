@@ -105,11 +105,11 @@ impl ConfinementResources {
         }
         let mut targets = BTreeSet::new();
         for entry in &self.tmpfs {
-            let parsed = ParsedTmpfsResource::parse(entry)?;
-            if !targets.insert(parsed.target) {
+            let parsed = ConfinementTmpfsResource::parse(entry)?;
+            if !targets.insert(parsed.target().to_string()) {
                 return Err(format!(
                     "declares tmpfs target '{}' more than once",
-                    ParsedTmpfsResource::parse(entry)?.target
+                    parsed.target()
                 ));
             }
         }
@@ -123,11 +123,11 @@ impl ConfinementResources {
             .tmpfs
             .iter()
             .map(|entry| {
-                ParsedTmpfsResource::parse(entry).map(|parsed| (parsed.target.clone(), parsed))
+                ConfinementTmpfsResource::parse(entry).map(|parsed| (parsed.target.clone(), parsed))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         for entry in &self.tmpfs {
-            let parsed = ParsedTmpfsResource::parse(entry)?;
+            let parsed = ConfinementTmpfsResource::parse(entry)?;
             let Some(ceiling) = ceiling_by_target.get(&parsed.target) else {
                 return Err(format!(
                     "tmpfs target '{}' has no mission resource ceiling",
@@ -145,15 +145,15 @@ impl ConfinementResources {
     }
 }
 
-#[derive(Debug)]
-struct ParsedTmpfsResource {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfinementTmpfsResource {
     target: String,
     size_bytes: u64,
     size_text: String,
 }
 
-impl ParsedTmpfsResource {
-    fn parse(entry: &str) -> Result<Self, String> {
+impl ConfinementTmpfsResource {
+    pub fn parse(entry: &str) -> Result<Self, String> {
         if entry.contains('\0') {
             return Err("tmpfs resource contains NUL".to_string());
         }
@@ -165,9 +165,24 @@ impl ParsedTmpfsResource {
             .split_once(':')
             .ok_or_else(|| format!("tmpfs resource '{trimmed}' must declare size=<bytes>"))?;
         let target = normalize_resource_target(raw_target)?;
+        let mut writable = false;
         let mut size = None;
         for raw_option in raw_options.split(',') {
             let option = raw_option.trim();
+            if option.is_empty() {
+                return Err(format!(
+                    "tmpfs resource '{target}' declares an empty option"
+                ));
+            }
+            if option == "rw" {
+                if writable {
+                    return Err(format!(
+                        "tmpfs resource '{target}' declares rw more than once"
+                    ));
+                }
+                writable = true;
+                continue;
+            }
             if let Some(value) = option.strip_prefix("size=") {
                 if size.is_some() {
                     return Err(format!(
@@ -179,7 +194,14 @@ impl ParsedTmpfsResource {
                     format!("tmpfs resource '{target}' size is invalid: {detail}")
                 })?;
                 size = Some((bytes, value.to_string()));
+                continue;
             }
+            return Err(format!(
+                "tmpfs resource '{target}' option '{option}' is not allowed; declare only rw and size=<bytes>"
+            ));
+        }
+        if !writable {
+            return Err(format!("tmpfs resource '{target}' must declare rw"));
         }
         let (size_bytes, size_text) =
             size.ok_or_else(|| format!("tmpfs resource '{target}' must declare size=<bytes>"))?;
@@ -188,6 +210,22 @@ impl ParsedTmpfsResource {
             size_bytes,
             size_text,
         })
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    pub fn size_text(&self) -> &str {
+        &self.size_text
+    }
+
+    pub fn runtime_argument(&self) -> String {
+        format!("{}:rw,size={}", self.target, self.size_text)
     }
 }
 
