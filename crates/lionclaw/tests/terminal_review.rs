@@ -850,13 +850,13 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_review() {
 }
 
 #[tokio::test]
-async fn a_reviewed_bar_mission_type_without_a_review_is_refused_at_creation() {
+async fn a_attested_bar_mission_type_without_a_review_is_refused_at_creation() {
     // Directly constructed mission types obey the same creation invariant as
     // loaded bundles; there is no caller-owned config that can weaken it.
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mission_type = review_mission_type();
     mission_type.edit_for_testing(|definition| {
-        definition.stop = lionclaw::model::StopBar::Reviewed;
+        definition.stop = lionclaw::model::StopBar::Attested;
         definition.requires_gap_review = true;
         definition.default_team.gap_review_assignment = None;
     });
@@ -871,7 +871,7 @@ async fn a_reviewed_bar_mission_type_without_a_review_is_refused_at_creation() {
         .engine
         .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA)
         .await
-        .expect_err("a reviewed-bar mission without a review must be refused");
+        .expect_err("a attested-bar mission without a review must be refused");
     assert!(err.to_string().contains("gap-review"), "got {err}");
 }
 

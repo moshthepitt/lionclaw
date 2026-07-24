@@ -66,11 +66,15 @@ mod tests {
         let root = bundle.root().join("software-dev");
         assert!(root.join("mission.toml").is_file());
         assert!(root.join("skills/scrutiny-validator/SKILL.md").is_file());
+        let metric_root = bundle.root().join("metric-driven");
+        assert!(metric_root.join("mission.toml").is_file());
 
         let oracle = std::fs::metadata(root.join("oracles/cargo-test")).unwrap();
+        let metric_oracle = std::fs::metadata(metric_root.join("oracles/metric-scalar")).unwrap();
         let input = std::fs::metadata(root.join("inputs/cargo-home")).unwrap();
         let playbook = std::fs::metadata(root.join("playbook.md")).unwrap();
         assert_ne!(oracle.permissions().mode() & 0o111, 0);
+        assert_ne!(metric_oracle.permissions().mode() & 0o111, 0);
         assert_ne!(input.permissions().mode() & 0o111, 0);
         assert_eq!(playbook.permissions().mode() & 0o111, 0);
     }

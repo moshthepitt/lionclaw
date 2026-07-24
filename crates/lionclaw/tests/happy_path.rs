@@ -437,6 +437,7 @@ async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
             OracleName::new("lint").unwrap(),
             "/nonexistent-mission-type/oracles/lint".into(),
         );
+        definition.execution.auto_continue_candidate = false;
         definition.execution.auto_continue_proof = false;
     });
     let h = common::harness_with_type(
@@ -483,11 +484,16 @@ async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
 
     let checkpoint = h.engine.advance(&mission_id).await.unwrap();
     assert_eq!(checkpoint.disposition, MissionDisposition::Ready);
-    assert!(checkpoint
-        .state
-        .contract
-        .values()
-        .all(|assertion| !assertion.last_advisory.is_empty()));
+    assert_eq!(
+        checkpoint
+            .state
+            .contract
+            .values()
+            .filter(|assertion| assertion.last_authoritative.is_some())
+            .count(),
+        2
+    );
+    assert!(checkpoint.state.inflight.is_empty());
 
     let checkpoint = h.engine.advance(&mission_id).await.unwrap();
     assert_eq!(
@@ -499,15 +505,6 @@ async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
         checkpoint.state.contract
     );
     assert!(checkpoint.state.inflight.is_empty());
-    assert_eq!(
-        checkpoint
-            .state
-            .contract
-            .values()
-            .filter(|assertion| assertion.last_authoritative.is_some())
-            .count(),
-        2
-    );
     let events = h.engine.store().load(&mission_id).await.unwrap();
     assert!(!events.iter().any(|event| {
         matches!(

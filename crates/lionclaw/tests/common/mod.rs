@@ -223,7 +223,7 @@ pub fn review_mission_type() -> MissionType {
 /// One advisory-only assertion with team-owned judgment assignment.
 pub fn advisory_plan() -> Plan {
     Plan {
-        requirements: vec![covered_requirement("READABLE-CODE", "STYLE-OK")],
+        requirements: vec![reviewer_checkable_requirement("READABLE-CODE", "STYLE-OK")],
         assertions: vec![Assertion {
             id: AssertionId::new("STYLE-OK").expect("assertion id"),
             prose: "the code reads cleanly".to_string(),
@@ -260,7 +260,18 @@ pub fn covered_requirement(id: &str, assertion: &str) -> Requirement {
         id: RequirementId::new(id).expect("requirement id"),
         kind: RequirementKind::Capability,
         prose: id.to_ascii_lowercase().replace('-', " "),
-        disposition: RequirementDisposition::Covered {
+        disposition: RequirementDisposition::ConfinedProvable {
+            assertion_ids: vec![AssertionId::new(assertion).expect("assertion id")],
+        },
+    }
+}
+
+pub fn reviewer_checkable_requirement(id: &str, assertion: &str) -> Requirement {
+    Requirement {
+        id: RequirementId::new(id).expect("requirement id"),
+        kind: RequirementKind::Capability,
+        prose: id.to_ascii_lowercase().replace('-', " "),
+        disposition: RequirementDisposition::ReviewerCheckable {
             assertion_ids: vec![AssertionId::new(assertion).expect("assertion id")],
         },
     }

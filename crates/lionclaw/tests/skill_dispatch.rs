@@ -1,8 +1,8 @@
 mod common;
 
 use common::{
-    approve_plan, harness_with_type, proposal_with_team, simple_plan, test_mission_type, BASE_SHA,
-    HEAD_SHA,
+    advisory_plan, approve_plan, harness_with_type, proposal_with_team, simple_plan,
+    test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::mission_type::SkillPackage;
 use lionclaw::model::{Handoff, OutputSemantics, PayloadRef, RoleInstanceId, ValidationItem};
@@ -18,6 +18,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
 
     let mut mission_type = test_mission_type();
     mission_type.edit_for_testing(|definition| {
+        definition.stop = lionclaw::model::StopBar::Attested;
         definition.skills.insert(
             "engineering".to_string(),
             SkillPackage {
@@ -99,7 +100,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
         )
         .await
         .unwrap();
-    let proposed = proposal_with_team(0, simple_plan(), proposed_team);
+    let proposed = proposal_with_team(0, advisory_plan(), proposed_team);
     harness
         .engine
         .propose_plan(&mission_id, proposed)

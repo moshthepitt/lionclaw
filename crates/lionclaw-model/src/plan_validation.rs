@@ -94,11 +94,9 @@ pub fn validate_plan(
         return errors;
     }
     // Group 8: the declared stop bar is reachable. A `Verified` mission must
-    // launch fully provable — every assertion bound to an oracle as proposed.
-    // An oracle-less assertion is rejected at author time. (A later complete
-    // proposal *could* bind one, so this is a
-    // launch-time policy, not a permanence claim; a domain with genuinely
-    // unprovable claims declares `stop = reviewed`.)
+    // launch fully oracle-provable. A domain with genuinely non-oracle proof
+    // declares `stop = attested`; host-only obligations are recorded outside
+    // the confined proof bar.
     check_stop_bar_reachable(plan, config.stop)
 }
 
@@ -167,23 +165,46 @@ fn depends_transitively(plan: &Plan, task: &TaskId, possible_ancestor: &TaskId) 
 }
 
 fn check_stop_bar_reachable(plan: &Plan, stop: StopBar) -> Vec<PlanValidationError> {
-    if stop != StopBar::Verified {
-        return Vec::new();
+    let by_id: BTreeMap<_, _> = plan.assertions.iter().map(|a| (&a.id, a)).collect();
+    let mut errors = Vec::new();
+    for requirement in &plan.requirements {
+        match &requirement.disposition {
+            RequirementDisposition::ConfinedProvable { assertion_ids } => {
+                for assertion_id in assertion_ids {
+                    if by_id
+                        .get(assertion_id)
+                        .is_some_and(|assertion| assertion.oracle.is_none())
+                    {
+                        errors.push(err(
+                            "assertion_unprovable",
+                            format!(
+                                "requirement '{}' classifies assertion '{}' as confined-provable, \
+                                 but it binds no oracle",
+                                requirement.id, assertion_id
+                            ),
+                        ));
+                    }
+                }
+            }
+            RequirementDisposition::ReviewerCheckable { assertion_ids } => {
+                if stop == StopBar::Verified {
+                    for assertion_id in assertion_ids {
+                        errors.push(err(
+                            "reviewer_checkable_under_verified",
+                            format!(
+                                "requirement '{}' classifies assertion '{}' as reviewer-checkable, \
+                                 so the mission type must use stop = attested or reclassify it",
+                                requirement.id, assertion_id
+                            ),
+                        ));
+                    }
+                }
+            }
+            RequirementDisposition::HostAcceptance { .. }
+            | RequirementDisposition::Limitation { .. } => {}
+        }
     }
-    plan.assertions
-        .iter()
-        .filter(|a| a.oracle.is_none())
-        .map(|a| {
-            err(
-                "assertion_unprovable",
-                format!(
-                    "assertion '{}' binds no oracle, so it can never be authoritatively \
-                     Verified; bind an oracle, or declare `stop = reviewed`",
-                    a.id
-                ),
-            )
-        })
-        .collect()
+    errors
 }
 
 /// Why a complete plan proposal is refused.
@@ -347,37 +368,15 @@ fn validate_plan_transition(
     let mut required_requirement_changes = BTreeSet::new();
     for old in &current.requirements {
         let Some(new) = next_requirements.get(&old.id) else {
-            if matches!(old.disposition, RequirementDisposition::Covered { .. }) {
+            if old.disposition.is_proof_bearing() || old.disposition.is_recorded_obligation() {
                 required_requirement_changes.insert(old.id.clone());
             }
             continue;
         };
-        let disposition_strengthens = match (&old.disposition, &new.disposition) {
-            (
-                RequirementDisposition::Covered {
-                    assertion_ids: old_ids,
-                },
-                RequirementDisposition::Covered {
-                    assertion_ids: new_ids,
-                },
-            ) => old_ids.iter().all(|id| new_ids.contains(id)),
-            (
-                RequirementDisposition::Limitation {
-                    rationale: old_reason,
-                },
-                RequirementDisposition::Limitation {
-                    rationale: new_reason,
-                },
-            ) => old_reason == new_reason,
-            (RequirementDisposition::Limitation { .. }, RequirementDisposition::Covered { .. }) => {
-                true
-            }
-            (RequirementDisposition::Covered { .. }, RequirementDisposition::Limitation { .. }) => {
-                false
-            }
-        };
-        if matches!(old.disposition, RequirementDisposition::Covered { .. })
-            && (old.kind != new.kind || old.prose != new.prose || !disposition_strengthens)
+        let disposition_preserves_intent =
+            disposition_preserves_intent(&old.disposition, &new.disposition);
+        if (old.disposition.is_proof_bearing() || old.disposition.is_recorded_obligation())
+            && (old.kind != new.kind || old.prose != new.prose || !disposition_preserves_intent)
         {
             required_requirement_changes.insert(old.id.clone());
         }
@@ -478,7 +477,7 @@ fn validate_plan_transition(
 
 fn check_requirements(plan: &Plan) -> Vec<PlanValidationError> {
     let assertion_ids: BTreeSet<_> = plan.assertions.iter().map(|a| &a.id).collect();
-    let mut referenced = BTreeSet::new();
+    let mut referenced = BTreeMap::new();
     let mut errors = Vec::new();
     for requirement in &plan.requirements {
         if requirement.prose.trim().is_empty() {
@@ -488,7 +487,7 @@ fn check_requirements(plan: &Plan) -> Vec<PlanValidationError> {
             ));
         }
         match &requirement.disposition {
-            RequirementDisposition::Covered { assertion_ids: ids } => {
+            RequirementDisposition::ConfinedProvable { assertion_ids: ids } => {
                 if ids.is_empty() {
                     errors.push(err(
                         "requirement_uncovered",
@@ -505,9 +504,57 @@ fn check_requirements(plan: &Plan) -> Vec<PlanValidationError> {
                             ),
                         ));
                     }
-                    referenced.insert(id);
+                    if let Some(previous) = referenced.insert(id.clone(), "confined-provable") {
+                        if previous != "confined-provable" {
+                            errors.push(err(
+                                "assertion_multiple_proof_dispositions",
+                                format!(
+                                    "assertion '{id}' is covered by both {previous} and confined-provable requirements"
+                                ),
+                            ));
+                        }
+                    }
                 }
             }
+            RequirementDisposition::ReviewerCheckable { assertion_ids: ids } => {
+                if ids.is_empty() {
+                    errors.push(err(
+                        "requirement_uncovered",
+                        format!("requirement '{}' covers no assertions", requirement.id),
+                    ));
+                }
+                for id in ids {
+                    if !assertion_ids.contains(id) {
+                        errors.push(err(
+                            "requirement_unknown_assertion",
+                            format!(
+                                "requirement '{}' references unknown assertion '{id}'",
+                                requirement.id
+                            ),
+                        ));
+                    }
+                    if let Some(previous) = referenced.insert(id.clone(), "reviewer-checkable") {
+                        if previous != "reviewer-checkable" {
+                            errors.push(err(
+                                "assertion_multiple_proof_dispositions",
+                                format!(
+                                    "assertion '{id}' is covered by both {previous} and reviewer-checkable requirements"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            RequirementDisposition::HostAcceptance { rationale } if rationale.trim().is_empty() => {
+                errors.push(err(
+                    "empty_host_acceptance",
+                    format!(
+                        "requirement '{}' has an empty host-acceptance rationale",
+                        requirement.id
+                    ),
+                ));
+            }
+            RequirementDisposition::HostAcceptance { .. } => {}
             RequirementDisposition::Limitation { rationale } if rationale.trim().is_empty() => {
                 errors.push(err(
                     "empty_limitation",
@@ -518,7 +565,7 @@ fn check_requirements(plan: &Plan) -> Vec<PlanValidationError> {
         }
     }
     for assertion in &plan.assertions {
-        if !referenced.contains(&assertion.id) {
+        if !referenced.contains_key(&assertion.id) {
             errors.push(err(
                 "assertion_without_requirement",
                 format!(
@@ -529,6 +576,50 @@ fn check_requirements(plan: &Plan) -> Vec<PlanValidationError> {
         }
     }
     errors
+}
+
+fn disposition_preserves_intent(
+    old: &RequirementDisposition,
+    new: &RequirementDisposition,
+) -> bool {
+    use RequirementDisposition::{ConfinedProvable, HostAcceptance, Limitation, ReviewerCheckable};
+    match (old, new) {
+        (
+            ConfinedProvable {
+                assertion_ids: old_ids,
+            },
+            ConfinedProvable {
+                assertion_ids: new_ids,
+            },
+        )
+        | (
+            ReviewerCheckable {
+                assertion_ids: old_ids,
+            },
+            ReviewerCheckable {
+                assertion_ids: new_ids,
+            },
+        )
+        | (
+            ReviewerCheckable {
+                assertion_ids: old_ids,
+            },
+            ConfinedProvable {
+                assertion_ids: new_ids,
+            },
+        ) => old_ids.iter().all(|id| new_ids.contains(id)),
+        (HostAcceptance { rationale: old }, HostAcceptance { rationale: new })
+        | (Limitation { rationale: old }, Limitation { rationale: new }) => old == new,
+        (Limitation { .. }, ConfinedProvable { .. } | ReviewerCheckable { .. })
+        | (Limitation { .. }, HostAcceptance { .. })
+        | (HostAcceptance { .. }, ConfinedProvable { .. } | ReviewerCheckable { .. }) => true,
+        (
+            ConfinedProvable { .. },
+            ReviewerCheckable { .. } | HostAcceptance { .. } | Limitation { .. },
+        )
+        | (ReviewerCheckable { .. }, HostAcceptance { .. } | Limitation { .. })
+        | (HostAcceptance { .. }, Limitation { .. }) => false,
+    }
 }
 fn check_unique_ids(plan: &Plan) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
@@ -871,7 +962,7 @@ mod topology_tests {
                 id: RequirementId::new("REQ-1").unwrap(),
                 kind: RequirementKind::Capability,
                 prose: "behavior".into(),
-                disposition: RequirementDisposition::Covered {
+                disposition: RequirementDisposition::ConfinedProvable {
                     assertion_ids: vec![assertion.clone()],
                 },
             }],

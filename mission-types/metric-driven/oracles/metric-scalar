@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+value_file="${LIONCLAW_WORKSPACE_DIR:-/workspace}/metric.txt"
+if [ ! -f "$value_file" ]; then
+  echo "metric.value missing: $value_file" >&2
+  exit 1
+fi
+
+value="$(tr -d '[:space:]' < "$value_file")"
+case "$value" in
+  ''|*[!0-9.]*|*.*.*)
+    echo "metric.value invalid: $value" >&2
+    exit 1
+    ;;
+esac
+
+printf 'metric.value=%s\n' "$value"

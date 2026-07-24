@@ -41,7 +41,7 @@ fn moat_refuses_over_privileged_judge_mission_type() {
 /// Scenario 4 — the fold-level honesty cap: a mission type with a reviewer and
 /// no oracles finishes internally-consistent even when the reviewer passes
 /// everything. Never verified — an agent-only verdict can't mint authority.
-/// (Its bar is `reviewed`, so the advisory plan is valid; a `verified`
+/// (Its bar is `attested`, so the advisory plan is valid; a `verified`
 /// type would reject the oracle-less plan when proposed — see
 /// `plan_validation::tests::verified_bar_rejects_an_oracle_less_assertion`.)
 #[tokio::test]
@@ -51,7 +51,7 @@ async fn advisory_only_mission_type_never_verifies() {
         &AuthorityCeiling::default(),
     )
     .expect("advisory-only mission type loads");
-    assert_eq!(mission_type.stop, StopBar::Reviewed);
+    assert_eq!(mission_type.stop, StopBar::Attested);
     assert!(mission_type.oracles.is_empty(), "fixture has no oracles");
     let proposed_team = mission_type.default_team.clone();
 
@@ -121,19 +121,30 @@ async fn advisory_only_mission_type_never_verifies() {
             depends_on: vec![],
         }],
     };
+    let mut plan = plan;
+    plan.requirements[0].disposition = lionclaw::model::RequirementDisposition::ReviewerCheckable {
+        assertion_ids: vec![AssertionId::new("READABLE").unwrap()],
+    };
     engine
         .propose_plan(&mission_id, proposal_with_team(0, plan, proposed_team))
         .await
         .expect("propose");
     approve_plan(&engine, &mission_id).await;
-    engine.advance(&mission_id).await.expect("advance");
-    let state = engine.load_state(&mission_id).await.expect("state");
+    let mut state = None;
+    for _ in 0..6 {
+        let outcome = engine.advance(&mission_id).await.expect("advance");
+        if matches!(outcome.state.phase, MissionPhase::Done { .. }) {
+            state = Some(outcome.state);
+            break;
+        }
+    }
+    let state = state.unwrap_or_else(|| panic!("mission did not finish after bounded advances"));
 
     match state.phase {
         MissionPhase::Done { finish } => {
             assert_eq!(
                 finish,
-                FinishClass::InternallyConsistent,
+                FinishClass::Attested,
                 "advisory-only all-pass is internally consistent, never verified"
             );
         }

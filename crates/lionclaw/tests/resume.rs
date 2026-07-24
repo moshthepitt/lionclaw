@@ -134,6 +134,7 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
     let dir = tempfile::tempdir().unwrap();
     let mut mission_type = common::test_mission_type();
     mission_type.edit_for_testing(|definition| {
+        definition.execution.auto_continue_candidate = false;
         definition.execution.auto_continue_proof = false;
     });
     let harness = common::harness_with_type(
@@ -182,6 +183,7 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
     let before = harness.oracle_runner.calls.lock().unwrap().len();
     let view = harness.engine.advance(&id).await.unwrap();
     assert_eq!(view.disposition, MissionDisposition::Parked);
+    assert!(matches!(view.state.phase, MissionPhase::AttentionNeeded));
     assert_eq!(harness.oracle_runner.calls.lock().unwrap().len(), before);
     assert!(view.state.inflight.is_empty());
     assert!(harness

@@ -9,13 +9,13 @@ use super::state::{
     RoleAttemptDisposition, RoleAttemptReceipt, SettledHandoff, TaskAttemptOutcome,
     TaskRoleAssignment, TaskRuntimeState, TaskStatus,
 };
-use super::verdict::{classify_finish, AuthoritativeVerdict};
+use super::verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 49 preserves exact message-delivery evidence across atomic role
-/// failures.
-pub const REDUCER_VERSION: u32 = 49;
+/// Reducer 50 makes Slice 6 closure event-driven and applies typed proof
+/// disposition honesty.
+pub const REDUCER_VERSION: u32 = 50;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -36,6 +36,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         workspace_dir,
         base_sha,
         config,
+        delegation,
     } = &envelope.event
     else {
         return None;
@@ -48,6 +49,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         workspace_dir: workspace_dir.clone(),
         base_sha: base_sha.clone(),
         config: config.clone(),
+        delegation: delegation.clone(),
         team: None,
         team_history: BTreeMap::new(),
         skills: BTreeMap::new(),
@@ -199,12 +201,39 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 }
             }
         }
+        MissionEvent::MissionFinished { finish, reason } => {
+            if !state.phase.is_terminal()
+                && !reason.trim().is_empty()
+                && ready_to_finish(state) == Some(*finish)
+            {
+                state.phase = MissionPhase::Done { finish: *finish };
+                for conversation in state.conversations.values_mut() {
+                    retire_conversation(conversation);
+                }
+            }
+        }
+        MissionEvent::ResultApplied {
+            branch,
+            sha,
+            reason,
+        } => {
+            let _valid = matches!(state.phase, MissionPhase::Done { .. })
+                && !branch.trim().is_empty()
+                && sha == state.deliverable_head()
+                && !reason.trim().is_empty();
+        }
         MissionEvent::DecisionRecorded {
             attention_id,
             action,
             justification,
-            ..
-        } => apply_decision(state, attention_id, action, justification),
+            requirement_changes,
+        } => apply_decision(
+            state,
+            attention_id,
+            action,
+            justification,
+            requirement_changes,
+        ),
     }
     if state
         .cleanup_failure
@@ -940,6 +969,7 @@ fn apply_decision(
     attention_id: &str,
     action: &super::DecisionAction,
     justification: &str,
+    requirement_changes: &[super::RequirementId],
 ) {
     let Some(item) = state.open_attention.get(attention_id).cloned() else {
         return;
@@ -949,6 +979,15 @@ fn apply_decision(
     }
     match (action, item.kind) {
         (super::DecisionAction::Approve, AttentionKind::PlanProposal) => {
+            let expected = state
+                .proposal
+                .as_ref()
+                .and_then(|proposal| proposal.plan.as_ref())
+                .map(|proposal| proposal.requirement_changes.as_slice())
+                .unwrap_or(&[]);
+            if expected != requirement_changes {
+                return;
+            }
             state.proposal_approved = true;
             state.planning_input.latest_rejected_proposal = None;
             state.planning_input.refinement = None;
@@ -1416,39 +1455,50 @@ fn derive(state: &mut MissionState) {
         return;
     }
     state.phase = MissionPhase::Running;
+}
+
+pub fn ready_to_finish(state: &MissionState) -> Option<FinishClass> {
+    if state.phase.is_terminal()
+        || state.plan.is_none()
+        || !state.inflight.is_empty()
+        || !state.open_attention.is_empty()
+        || oracle_obligation_outstanding(state)
+        || advisory_obligation_outstanding(state)
+        || gap_review_outstanding(state)
+    {
+        return None;
+    }
     let tasks_settled = state
         .tasks
         .values()
         .filter(|task| task.status != TaskStatus::Superseded)
         .all(|task| task.status == TaskStatus::Cleared);
-    if tasks_settled
-        && state.inflight.is_empty()
-        && !oracle_obligation_outstanding(state)
-        && !advisory_obligation_outstanding(state)
-        && !gap_review_outstanding(state)
-    {
-        state.phase = MissionPhase::Done {
-            finish: classify_finish(state),
-        };
-    }
+    tasks_settled.then(|| classify_finish(state))
 }
 
 pub(crate) fn advisory_obligation_outstanding(state: &MissionState) -> bool {
-    state
-        .contract
-        .keys()
-        .any(|assertion_id| state.advisory_status(assertion_id) == super::AdvisoryStatus::Pending)
+    let Some(plan) = &state.plan else {
+        return false;
+    };
+    state.contract.keys().any(|assertion_id| {
+        plan.assertion_requires_judged_proof(assertion_id)
+            && state.advisory_status(assertion_id) == super::AdvisoryStatus::Pending
+    })
 }
 
 pub(crate) fn oracle_obligation_outstanding(state: &MissionState) -> bool {
-    state.contract.iter().any(|(_, assertion)| {
-        assertion.oracle.as_ref().is_some_and(|oracle| {
-            !state.waived_oracles.contains(oracle)
-                && assertion
-                    .last_authoritative
-                    .as_ref()
-                    .is_none_or(|verdict| !verdict.is_fresh_at(state.deliverable_head()))
-        })
+    let Some(plan) = &state.plan else {
+        return false;
+    };
+    state.contract.iter().any(|(assertion_id, assertion)| {
+        plan.assertion_requires_confined_proof(assertion_id)
+            && assertion.oracle.as_ref().is_some_and(|oracle| {
+                !state.waived_oracles.contains(oracle)
+                    && assertion
+                        .last_authoritative
+                        .as_ref()
+                        .is_none_or(|verdict| !verdict.is_fresh_at(state.deliverable_head()))
+            })
     })
 }
 

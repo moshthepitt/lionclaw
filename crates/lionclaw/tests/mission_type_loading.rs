@@ -67,6 +67,27 @@ fn software_dev_mission_type_loads() {
 }
 
 #[test]
+fn metric_driven_mission_type_loads() {
+    let mission_type = load_mission_type(
+        &repo_root().join("mission-types/metric-driven"),
+        &AuthorityCeiling::default(),
+    )
+    .expect("metric-driven mission type loads");
+    assert_eq!(mission_type.name, "metric-driven");
+    assert_eq!(mission_type.stop, StopBar::Attested);
+    assert!(mission_type
+        .oracles
+        .contains_key(&lionclaw::model::OracleName::new("metric-scalar").expect("name")));
+    let planner = &mission_type.default_team.planning_assignment;
+    assert_eq!(planner.as_str(), "metric-planner");
+    assert_eq!(
+        mission_type.default_team.roles[planner].output,
+        lionclaw::model::OutputSemantics::ProposesPlan
+    );
+    assert!(mission_type.default_team.gap_review_assignment.is_some());
+}
+
+#[test]
 fn mission_environment_cannot_replace_kernel_coordinates() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_minimal_bundle(dir.path());
@@ -409,7 +430,7 @@ fn a_skill_package_through_an_escaping_parent_symlink_is_rejected() {
     .unwrap();
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"worker\"\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"attested\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"worker\"\n",
     )
     .unwrap();
     std::fs::create_dir(dir.path().join("roles")).unwrap();
@@ -432,7 +453,7 @@ fn skill_frontmatter_name_must_match_the_declared_package() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"worker\"\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"attested\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"worker\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
@@ -460,7 +481,7 @@ fn duplicate_role_skill_references_are_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"worker\"\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"attested\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"worker\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
@@ -784,12 +805,12 @@ fn a_terminal_review_declaration_loads_and_pins_the_role() {
 }
 
 #[test]
-fn a_reviewed_bar_without_terminal_review_refuses_to_load() {
+fn a_attested_bar_without_terminal_review_refuses_to_load() {
     let dir = tempfile::tempdir().unwrap();
     write_valid_type(dir.path());
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"guarded\"\nstop = \"reviewed\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"implementer\"\nrequires-gap-review = true\n",
+        "[mission-type]\nname = \"guarded\"\nstop = \"attested\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"implementer\"\nrequires-gap-review = true\n",
     )
     .unwrap();
     assert!(matches!(

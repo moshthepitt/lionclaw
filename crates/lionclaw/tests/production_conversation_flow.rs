@@ -1012,7 +1012,7 @@ fn plan() -> Plan {
             id: RequirementId::new("PRODUCTION-CONVERSATION").unwrap(),
             kind: RequirementKind::Validation,
             prose: "production conversation flow works".into(),
-            disposition: RequirementDisposition::Covered {
+            disposition: RequirementDisposition::ConfinedProvable {
                 assertion_ids: assertions
                     .iter()
                     .map(|assertion| assertion.id.clone())
@@ -1039,14 +1039,14 @@ fn awaiting_lead_validation_plan() -> Plan {
             id: RequirementId::new("COMPOSITIONAL-TURN-SETTLEMENT").unwrap(),
             kind: RequirementKind::Validation,
             prose: "awaiting lead and parked role effects compose".into(),
-            disposition: RequirementDisposition::Covered {
+            disposition: RequirementDisposition::ReviewerCheckable {
                 assertion_ids: vec![assertion.clone()],
             },
         }],
         assertions: vec![Assertion {
             id: assertion.clone(),
             prose: "an independent validator runs while the exact writer awaits the lead".into(),
-            oracle: Some(OracleName::new("cargo-test").unwrap()),
+            oracle: None,
         }],
         tasks: vec![Task {
             id: TaskId::new("writer-question").unwrap(),
@@ -1064,7 +1064,7 @@ fn reference_plan() -> Plan {
             id: RequirementId::new("REFERENCES-TRANSIENT").unwrap(),
             kind: RequirementKind::Validation,
             prose: "references remain transient".into(),
-            disposition: RequirementDisposition::Covered {
+            disposition: RequirementDisposition::ConfinedProvable {
                 assertion_ids: vec![first.clone()],
             },
         }],
@@ -1170,14 +1170,14 @@ fn planning_proposal() -> MissionProposal {
             id: RequirementId::new("PRODUCTION-CONVERSATION").unwrap(),
             kind: RequirementKind::Validation,
             prose: "production conversation flow works".into(),
-            disposition: RequirementDisposition::Covered {
+            disposition: RequirementDisposition::ReviewerCheckable {
                 assertion_ids: vec![assertion.clone()],
             },
         }],
         assertions: vec![Assertion {
             id: assertion.clone(),
             prose: "the production flow passes tests".into(),
-            oracle: Some(OracleName::new("cargo-test").unwrap()),
+            oracle: None,
         }],
         tasks: vec![Task {
             id: TaskId::new("integrate").unwrap(),
@@ -1423,7 +1423,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (24, 49));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (25, 50));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -1445,6 +1445,12 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     .unwrap();
     let mission_type = temp.path().join("mission-type");
     materialize_mission_type(&mission_type);
+    let manifest = std::fs::read_to_string(mission_type.join("mission.toml")).unwrap();
+    std::fs::write(
+        mission_type.join("mission.toml"),
+        manifest.replace("stop = \"verified\"", "stop = \"attested\""),
+    )
+    .unwrap();
     std::fs::write(
         mission_type.join("roles/renamed-judgment-role.md"),
         "---\noutput: emits-verdict\nruntime: codex\n---\nValidate existing evidence.\n",
@@ -1971,10 +1977,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     }
     let turns = Arc::new(Mutex::new(VecDeque::from([
         DeliveryTurn::Complete,
-        DeliveryTurn::Validate,
         DeliveryTurn::Fail,
         DeliveryTurn::Complete,
-        DeliveryTurn::Validate,
         DeliveryTurn::Review,
     ])));
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
@@ -2255,551 +2259,595 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     );
 }
 
-#[tokio::test]
-async fn production_planner_resumes_and_missing_validator_verdict_reworks_exact_conversation() {
-    let temp = tempfile::tempdir().unwrap();
-    let repo = temp.path().join("repo");
-    initialize_repo(&repo).await;
-    let fake_oci = temp.path().join("external-oci-transport");
-    std::fs::write(
-        &fake_oci,
-        "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let profiles = RuntimeProfiles::from_toml(
-        &format!(
-            r#"[runtimes.codex]
-driver = "codex"
-command = "external-codex"
-native-resume = true
-confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
-"#,
-            fake_oci.display()
-        ),
-        temp.path(),
-    )
-    .unwrap();
-    let mission_type_dir = temp.path().join("mission-type");
-    materialize_planning_validation_mission_type(&mission_type_dir);
-    let turns = Arc::new(Mutex::new(VecDeque::from([
-        DeliveryTurn::AwaitLead,
-        DeliveryTurn::Plan,
-        DeliveryTurn::Complete,
-        DeliveryTurn::AwaitLead,
-        DeliveryTurn::Validate,
-        DeliveryTurn::Review,
-    ])));
-    let entered = Arc::new(tokio::sync::Semaphore::new(0));
-    let release = Arc::new(tokio::sync::Semaphore::new(32));
-    let sessions = Arc::new(Mutex::new(Vec::new()));
-    let prompts = Arc::new(Mutex::new(Vec::new()));
-    let transports = cli::MissionTransports::external(
-        profiles,
-        RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
-            turns: turns.clone(),
-            entered,
-            release,
-            sessions: sessions.clone(),
-            prompts: prompts.clone(),
-            launch_failures: Arc::new(Mutex::new(0)),
-        }) as Arc<dyn RuntimeDriverProvider>]),
-        RuntimeAuthRegistry::empty(),
-        Arc::new(ExternalOracleTransport {
-            calls: Arc::new(Mutex::new(Vec::new())),
-        }),
-    );
-    cli::run_with_transports(
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "start",
-            "--type",
-            mission_type_dir.to_str().unwrap(),
-            "--repo",
-            repo.to_str().unwrap(),
-            "--objective",
-            "prove planner and validator conversation identity",
-            "--runtime",
-            "codex",
-        ])
-        .unwrap(),
-        transports.clone(),
-    )
-    .await
-    .unwrap();
-    let store = MissionStore::open(&repo).await.unwrap();
-    let mission_id = store.list_missions().await.unwrap().pop().unwrap();
-    let run_driver = |label: &str| {
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "driver",
-            mission_id.as_str(),
-            "--repo",
-            repo.to_str().unwrap(),
-            "--handshake",
-            temp.path().join(label).to_str().unwrap(),
-        ])
-        .unwrap()
-    };
-    cli::run_with_transports(run_driver("planner-await.ready"), transports.clone())
-        .await
-        .unwrap();
-
-    let planner_state = MissionStore::open(&repo)
-        .await
-        .unwrap()
-        .require_state(&mission_id)
-        .await
-        .unwrap();
-    let planner_id = RoleInstanceId::new("planner").unwrap();
-    let planner = &planner_state.conversations[&planner_id];
-    assert_eq!(
-        planner.lifecycle,
-        lionclaw::model::ConversationLifecycle::AwaitingLead
-    );
-    cli::run_with_transports(
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "send",
-            "--mission-id",
-            mission_id.as_str(),
-            "--to",
-            planner_id.as_str(),
-            "--repo",
-            repo.to_str().unwrap(),
-            "Use the exact proposed production contract.",
-        ])
-        .unwrap(),
-        transports.clone(),
-    )
-    .await
-    .unwrap();
-    cli::run_with_transports(run_driver("planner-resume.ready"), transports.clone())
-        .await
-        .unwrap();
-    let after_planner = MissionStore::open(&repo)
-        .await
-        .unwrap()
-        .require_state(&mission_id)
-        .await
-        .unwrap();
-    let planner = &after_planner.conversations[&planner_id];
-    assert!(planner.queued.is_empty());
-    assert!(planner.consumed_through > 0);
-    assert!(after_planner.proposal.is_some());
-
-    cli::run_with_transports(
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "decide",
-            mission_id.as_str(),
-            "plan_proposal:mission",
-            "approve",
-            "--justification",
-            "exercise validator production routing",
-            "--repo",
-            repo.to_str().unwrap(),
-        ])
-        .unwrap(),
-        transports.clone(),
-    )
-    .await
-    .unwrap();
-    cli::run_with_transports(run_driver("validator-await.ready"), transports.clone())
-        .await
-        .unwrap();
-    // Promotion of the implementer's commit closes that driver pass. A fresh
-    // production driver reload dispatches the dependent validator.
-    cli::run_with_transports(run_driver("validator-dispatch.ready"), transports.clone())
-        .await
-        .unwrap();
-    let validator_state = MissionStore::open(&repo)
-        .await
-        .unwrap()
-        .require_state(&mission_id)
-        .await
-        .unwrap();
-    let validator_id = RoleInstanceId::new("validator").unwrap();
-    let validator = &validator_state.conversations[&validator_id];
-    assert_ne!(
-        validator.lifecycle,
-        lionclaw::model::ConversationLifecycle::AwaitingLead,
-        "required verdict absence must never become a dialogue checkpoint"
-    );
-    assert_ne!(planner_id, validator_id);
-    cli::run_with_transports(run_driver("terminal-review.ready"), transports.clone())
-        .await
-        .unwrap();
-    let final_events = MissionStore::open(&repo)
-        .await
-        .unwrap()
-        .load(&mission_id)
-        .await
-        .unwrap();
-    let final_state = fold(final_events.clone()).unwrap();
-    let validator = &final_state.conversations[&validator_id];
-    assert!(validator.queued.is_empty());
-    assert_eq!(validator.invalid_handoff_reworks, 1);
-    let mut validator_receipts = final_state
-        .role_attempt_receipts
-        .values()
-        .filter_map(|receipt| match &receipt.source {
-            lionclaw::model::RoleEffectSource::Turn { request, .. }
-                if request.role_instance == validator_id =>
-            {
-                Some((request.attempt_no, receipt))
-            }
-            _ => None,
+#[test]
+fn production_planner_resumes_and_missing_validator_verdict_reworks_exact_conversation() {
+    std::thread::Builder::new()
+        .name("production-validator-rework-proof".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(production_planner_resumes_and_missing_validator_verdict_reworks_exact_conversation_scenario());
         })
-        .collect::<Vec<_>>();
-    validator_receipts.sort_by_key(|(attempt, _)| *attempt);
-    assert_eq!(validator_receipts.len(), 2);
-    assert!(validator_receipts[0]
-        .1
-        .failure()
-        .is_some_and(|failure| failure.is_invalid_output()
-            && failure.evidence().code.as_deref() == Some("handoff.missing")));
-    assert!(matches!(
-        validator_receipts[1].1.disposition,
-        lionclaw::model::RoleAttemptDisposition::Succeeded { .. }
-    ));
-    let validator_effects = validator_receipts
-        .iter()
-        .map(|(_, receipt)| receipt.effect_id.clone())
-        .collect::<Vec<_>>();
-    assert_eq!(fold(final_events).unwrap(), final_state);
-    assert!(turns.lock().unwrap().is_empty());
-    let sessions = sessions.lock().unwrap();
-    assert!(sessions.iter().any(|(_, resumed, _)| *resumed));
-    let prompts = prompts.lock().unwrap();
-    assert!(prompts
-        .iter()
-        .any(|(prompt, _)| { prompt.contains("Use the exact proposed production contract.") }));
-    assert_eq!(validator_effects.len(), 2);
-    assert_ne!(validator_effects[0], validator_effects[1]);
-    assert!(validator_effects.iter().all(|effect_id| prompts
-        .iter()
-        .any(|(_, runtime)| runtime.to_string_lossy().contains(effect_id.as_str()))));
-    assert!(prompts
-        .iter()
-        .all(|(_, runtime)| !runtime.to_string_lossy().contains(validator_id.as_str())));
-    assert!(prompts
-        .iter()
-        .any(|(_, runtime)| runtime.to_string_lossy().contains(planner_id.as_str())));
-    for effect_id in &validator_effects {
-        let runtime = prompts
-            .iter()
-            .find(|(_, runtime)| runtime.to_string_lossy().contains(effect_id.as_str()))
-            .map(|(_, runtime)| runtime)
-            .expect("validator effect runtime was observed");
-        assert!(
-            !runtime
-                .parent()
-                .expect("effect runtime has a root")
-                .exists(),
-            "settled validator effect resources must be removed"
-        );
-    }
-    let planner_runtime = prompts
-        .iter()
-        .find(|(_, runtime)| runtime.to_string_lossy().contains(planner_id.as_str()))
-        .map(|(_, runtime)| runtime)
-        .expect("planner conversation runtime was observed");
-    assert!(planner_runtime.is_dir());
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
-#[tokio::test]
-async fn production_same_base_revision_reuses_team_owned_planner_before_broadcast() {
-    let temp = tempfile::tempdir().unwrap();
-    let repo = temp.path().join("repo");
-    let base = initialize_repo(&repo).await;
-    let fake_oci = temp.path().join("external-oci-transport");
-    std::fs::write(
+fn production_planner_resumes_and_missing_validator_verdict_reworks_exact_conversation_scenario(
+) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+    Box::pin(async move {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        initialize_repo(&repo).await;
+        let fake_oci = temp.path().join("external-oci-transport");
+        std::fs::write(
         &fake_oci,
         "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n",
     )
     .unwrap();
-    std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let profiles = RuntimeProfiles::from_toml(
-        &format!(
-            r#"[runtimes.codex]
+        std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let profiles = RuntimeProfiles::from_toml(
+            &format!(
+                r#"[runtimes.codex]
 driver = "codex"
 command = "external-codex"
 native-resume = true
 confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 "#,
-            fake_oci.display()
-        ),
-        temp.path(),
-    )
-    .unwrap();
-    let mission_type_dir = temp.path().join("mission-type");
-    materialize_planning_validation_mission_type(&mission_type_dir);
-    let turns = Arc::new(Mutex::new(VecDeque::from([
-        DeliveryTurn::AwaitLead,
-        DeliveryTurn::AwaitLead,
-    ])));
-    let transports = cli::MissionTransports::external(
-        profiles,
-        RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
-            turns: turns.clone(),
-            entered: Arc::new(tokio::sync::Semaphore::new(0)),
-            release: Arc::new(tokio::sync::Semaphore::new(8)),
-            sessions: Arc::new(Mutex::new(Vec::new())),
-            prompts: Arc::new(Mutex::new(Vec::new())),
-            launch_failures: Arc::new(Mutex::new(0)),
-        }) as Arc<dyn RuntimeDriverProvider>]),
-        RuntimeAuthRegistry::empty(),
-        Arc::new(ExternalOracleTransport {
-            calls: Arc::new(Mutex::new(Vec::new())),
-        }),
-    );
-    cli::run_with_transports(
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "start",
-            "--type",
-            mission_type_dir.to_str().unwrap(),
-            "--repo",
-            repo.to_str().unwrap(),
-            "--objective",
-            "prove same-base planner replacement routing",
-            "--runtime",
-            "codex",
-        ])
-        .unwrap(),
-        transports.clone(),
-    )
-    .await
-    .unwrap();
-    let store = MissionStore::open(&repo).await.unwrap();
-    let mission_id = store.list_missions().await.unwrap().pop().unwrap();
-    let driver = |label: &str| {
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "driver",
-            mission_id.as_str(),
-            "--repo",
-            repo.to_str().unwrap(),
-            "--handshake",
-            temp.path().join(label).to_str().unwrap(),
-        ])
-        .unwrap()
-    };
-    cli::run_with_transports(driver("original-planner.ready"), transports.clone())
+                fake_oci.display()
+            ),
+            temp.path(),
+        )
+        .unwrap();
+        let mission_type_dir = temp.path().join("mission-type");
+        materialize_planning_validation_mission_type(&mission_type_dir);
+        let manifest = std::fs::read_to_string(mission_type_dir.join("mission.toml")).unwrap();
+        std::fs::write(
+            mission_type_dir.join("mission.toml"),
+            manifest.replace("stop = \"verified\"", "stop = \"attested\""),
+        )
+        .unwrap();
+        let turns = Arc::new(Mutex::new(VecDeque::from([
+            DeliveryTurn::AwaitLead,
+            DeliveryTurn::Plan,
+            DeliveryTurn::Complete,
+            DeliveryTurn::AwaitLead,
+            DeliveryTurn::Validate,
+            DeliveryTurn::Review,
+        ])));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(32));
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let transports = cli::MissionTransports::external(
+            profiles,
+            RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
+                turns: turns.clone(),
+                entered,
+                release,
+                sessions: sessions.clone(),
+                prompts: prompts.clone(),
+                launch_failures: Arc::new(Mutex::new(0)),
+            }) as Arc<dyn RuntimeDriverProvider>]),
+            RuntimeAuthRegistry::empty(),
+            Arc::new(ExternalOracleTransport {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        cli::run_with_transports(
+            cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "start",
+                "--type",
+                mission_type_dir.to_str().unwrap(),
+                "--repo",
+                repo.to_str().unwrap(),
+                "--objective",
+                "prove planner and validator conversation identity",
+                "--runtime",
+                "codex",
+            ])
+            .unwrap(),
+            transports.clone(),
+        )
         .await
         .unwrap();
+        let store = MissionStore::open(&repo).await.unwrap();
+        let mission_id = store.list_missions().await.unwrap().pop().unwrap();
+        let run_driver = |label: &str| {
+            cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "driver",
+                mission_id.as_str(),
+                "--repo",
+                repo.to_str().unwrap(),
+                "--handshake",
+                temp.path().join(label).to_str().unwrap(),
+            ])
+            .unwrap()
+        };
+        cli::run_with_transports(run_driver("planner-await.ready"), transports.clone())
+            .await
+            .unwrap();
 
-    let awaiting = MissionStore::open(&repo)
-        .await
-        .unwrap()
-        .require_state(&mission_id)
+        let planner_state = MissionStore::open(&repo)
+            .await
+            .unwrap()
+            .require_state(&mission_id)
+            .await
+            .unwrap();
+        let planner_id = RoleInstanceId::new("planner").unwrap();
+        let planner = &planner_state.conversations[&planner_id];
+        assert_eq!(
+            planner.lifecycle,
+            lionclaw::model::ConversationLifecycle::AwaitingLead
+        );
+        cli::run_with_transports(
+            cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "send",
+                "--mission-id",
+                mission_id.as_str(),
+                "--to",
+                planner_id.as_str(),
+                "--repo",
+                repo.to_str().unwrap(),
+                "Use the exact proposed production contract.",
+            ])
+            .unwrap(),
+            transports.clone(),
+        )
         .await
         .unwrap();
-    assert_eq!(awaiting.current_sha, base);
-    let planner_id = RoleInstanceId::new("planner").unwrap();
-    let original = &awaiting.conversations[&planner_id];
-    assert_eq!(
-        original.lifecycle,
-        lionclaw::model::ConversationLifecycle::AwaitingLead
-    );
-    assert!(original.final_response.is_some());
-    let (original_effect, original_team_revision, original_generation) = awaiting
-        .role_attempt_receipts
-        .iter()
-        .find_map(|(effect_id, receipt)| match &receipt.source {
-            lionclaw::model::RoleEffectSource::Turn { request, .. }
-                if request.role_instance == planner_id =>
-            {
-                Some((
-                    effect_id.clone(),
-                    request.team_revision,
-                    request.assignment_epoch,
-                ))
-            }
-            _ => None,
+        cli::run_with_transports(run_driver("planner-resume.ready"), transports.clone())
+            .await
+            .unwrap();
+        let after_planner = MissionStore::open(&repo)
+            .await
+            .unwrap()
+            .require_state(&mission_id)
+            .await
+            .unwrap();
+        let planner = &after_planner.conversations[&planner_id];
+        assert!(planner.queued.is_empty());
+        assert!(planner.consumed_through > 0);
+        assert!(after_planner.proposal.is_some());
+
+        cli::run_with_transports(
+            cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "decide",
+                mission_id.as_str(),
+                "plan_proposal:mission",
+                "approve",
+                "--justification",
+                "exercise validator production routing",
+                "--repo",
+                repo.to_str().unwrap(),
+            ])
+            .unwrap(),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+        cli::run_with_transports(run_driver("validator-await.ready"), transports.clone())
+            .await
+            .unwrap();
+        // Promotion of the implementer's commit closes that driver pass. A fresh
+        // production driver reload dispatches the dependent validator.
+        cli::run_with_transports(run_driver("validator-dispatch.ready"), transports.clone())
+            .await
+            .unwrap();
+        let validator_state = MissionStore::open(&repo)
+            .await
+            .unwrap()
+            .require_state(&mission_id)
+            .await
+            .unwrap();
+        let validator_id = RoleInstanceId::new("validator").unwrap();
+        let validator = &validator_state.conversations[&validator_id];
+        assert_ne!(
+            validator.lifecycle,
+            lionclaw::model::ConversationLifecycle::AwaitingLead,
+            "required verdict absence must never become a dialogue checkpoint"
+        );
+        assert_ne!(planner_id, validator_id);
+        cli::run_with_transports(run_driver("terminal-review.ready"), transports.clone())
+            .await
+            .unwrap();
+        let final_events = MissionStore::open(&repo)
+            .await
+            .unwrap()
+            .load(&mission_id)
+            .await
+            .unwrap();
+        let final_state = fold(final_events.clone()).unwrap();
+        let validator = &final_state.conversations[&validator_id];
+        assert!(validator.queued.is_empty());
+        assert_eq!(validator.invalid_handoff_reworks, 1);
+        let mut validator_receipts = final_state
+            .role_attempt_receipts
+            .values()
+            .filter_map(|receipt| match &receipt.source {
+                lionclaw::model::RoleEffectSource::Turn { request, .. }
+                    if request.role_instance == validator_id =>
+                {
+                    Some((request.attempt_no, receipt))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        validator_receipts.sort_by_key(|(attempt, _)| *attempt);
+        assert_eq!(validator_receipts.len(), 2);
+        assert!(validator_receipts[0]
+            .1
+            .failure()
+            .is_some_and(|failure| failure.is_invalid_output()
+                && failure.evidence().code.as_deref() == Some("handoff.missing")));
+        assert!(matches!(
+            validator_receipts[1].1.disposition,
+            lionclaw::model::RoleAttemptDisposition::Succeeded { .. }
+        ));
+        let validator_effects = validator_receipts
+            .iter()
+            .map(|(_, receipt)| receipt.effect_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(fold(final_events).unwrap(), final_state);
+        assert!(turns.lock().unwrap().is_empty());
+        let sessions = sessions.lock().unwrap();
+        assert!(sessions.iter().any(|(_, resumed, _)| *resumed));
+        let prompts = prompts.lock().unwrap();
+        assert!(prompts
+            .iter()
+            .any(|(prompt, _)| { prompt.contains("Use the exact proposed production contract.") }));
+        assert_eq!(validator_effects.len(), 2);
+        assert_ne!(validator_effects[0], validator_effects[1]);
+        assert!(validator_effects.iter().all(|effect_id| prompts
+            .iter()
+            .any(|(_, runtime)| runtime.to_string_lossy().contains(effect_id.as_str()))));
+        assert!(prompts
+            .iter()
+            .all(|(_, runtime)| !runtime.to_string_lossy().contains(validator_id.as_str())));
+        assert!(prompts
+            .iter()
+            .any(|(_, runtime)| runtime.to_string_lossy().contains(planner_id.as_str())));
+        for effect_id in &validator_effects {
+            let runtime = prompts
+                .iter()
+                .find(|(_, runtime)| runtime.to_string_lossy().contains(effect_id.as_str()))
+                .map(|(_, runtime)| runtime)
+                .expect("validator effect runtime was observed");
+            assert!(
+                !runtime
+                    .parent()
+                    .expect("effect runtime has a root")
+                    .exists(),
+                "settled validator effect resources must be removed"
+            );
+        }
+        let planner_runtime = prompts
+            .iter()
+            .find(|(_, runtime)| runtime.to_string_lossy().contains(planner_id.as_str()))
+            .map(|(_, runtime)| runtime)
+            .expect("planner conversation runtime was observed");
+        assert!(planner_runtime.is_dir());
+    })
+}
+
+#[test]
+fn production_same_base_revision_reuses_team_owned_planner_before_broadcast() {
+    std::thread::Builder::new()
+        .name("production-same-base-planner-proof".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(production_same_base_revision_reuses_team_owned_planner_before_broadcast_scenario());
         })
-        .unwrap();
-
-    cli::run_with_transports(
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "send",
-            "--mission-id",
-            mission_id.as_str(),
-            "--to",
-            planner_id.as_str(),
-            "--repo",
-            repo.to_str().unwrap(),
-            "Retain this queued message for the stable team-owned planner.",
-        ])
-        .unwrap(),
-        transports.clone(),
-    )
-    .await
-    .unwrap();
-
-    let proposal_path = temp.path().join("same-base-plan.json");
-    std::fs::write(
-        &proposal_path,
-        serde_json::to_vec(&mission_proposal(0, plan())).unwrap(),
-    )
-    .unwrap();
-    cli::run_with_transports(
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "plan",
-            "propose",
-            mission_id.as_str(),
-            "--file",
-            proposal_path.to_str().unwrap(),
-            "--repo",
-            repo.to_str().unwrap(),
-        ])
-        .unwrap(),
-        transports.clone(),
-    )
-    .await
-    .unwrap();
-    let feedback = temp.path().join("revision-feedback.txt");
-    std::fs::write(&feedback, "replace the awaiting planner generation\n").unwrap();
-    cli::run_with_transports(
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "decide",
-            mission_id.as_str(),
-            "plan_proposal:mission",
-            "revise",
-            "--feedback-file",
-            feedback.to_str().unwrap(),
-            "--repo",
-            repo.to_str().unwrap(),
-        ])
-        .unwrap(),
-        transports.clone(),
-    )
-    .await
-    .unwrap();
-
-    let revised_events = store.load(&mission_id).await.unwrap();
-    let revised = fold(revised_events.clone()).unwrap();
-    assert_eq!(revised.current_sha, base, "revision must not move Git base");
-    let original = &revised.conversations[&planner_id];
-    assert_eq!(
-        original.lifecycle,
-        lionclaw::model::ConversationLifecycle::Ready
-    );
-    assert!(original.final_response.is_some());
-    assert!(original.active_delivery.is_none());
-    assert_eq!(original.queued.len(), 1);
-    assert!(original
-        .queued
-        .iter()
-        .all(|message| { message.marker == lionclaw::model::DeliveryMarker::Queued }));
-    assert!(revised.conversation_is_messageable(&planner_id));
-    assert!(!revised.conversation_legal_actions(&planner_id).is_empty());
-    assert!(revised
-        .parked_effects
-        .keys()
-        .all(|effect_id| !revised.parked_effect_is_continuable(effect_id)));
-    cli::run_with_transports(
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "send",
-            "--mission-id",
-            mission_id.as_str(),
-            "--to",
-            planner_id.as_str(),
-            "--repo",
-            repo.to_str().unwrap(),
-            "second message for the same team-owned planner",
-        ])
-        .unwrap(),
-        transports.clone(),
-    )
-    .await
-    .unwrap();
-
-    cli::run_with_transports(driver("replacement-planner.ready"), transports.clone())
-        .await
-        .unwrap();
-    let replacement_state = MissionStore::open(&repo)
-        .await
         .unwrap()
-        .require_state(&mission_id)
-        .await
+        .join()
         .unwrap();
-    let replacement_id = &planner_id;
-    let replacement = &replacement_state.conversations[replacement_id];
-    assert!(replacement_state.conversation_is_messageable(replacement_id));
-    let planner_attempts = replacement_state
-        .role_attempt_receipts
-        .iter()
-        .filter_map(|(effect_id, receipt)| match &receipt.source {
-            lionclaw::model::RoleEffectSource::Turn { request, .. }
-                if request.role_instance == *replacement_id =>
-            {
-                Some((effect_id, request.team_revision, request.assignment_epoch))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(planner_attempts.len(), 2);
-    let (_, resumed_team_revision, resumed_generation) = planner_attempts
-        .iter()
-        .find(|(effect_id, ..)| **effect_id != original_effect)
-        .unwrap();
-    assert_eq!(*resumed_team_revision, original_team_revision);
-    assert_eq!(*resumed_generation, original_generation);
-    assert!(replacement.queued.is_empty());
+}
 
-    let before_all = store.load(&mission_id).await.unwrap();
-    cli::run_with_transports(
-        cli::Cli::try_parse_from([
-            "lionclaw",
-            "mission",
-            "send",
-            "--mission-id",
-            mission_id.as_str(),
-            "--all",
-            "--repo",
-            repo.to_str().unwrap(),
-            "broadcast only to live replacement conversations",
-        ])
-        .unwrap(),
-        transports,
+fn production_same_base_revision_reuses_team_owned_planner_before_broadcast_scenario(
+) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+    Box::pin(async move {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let base = initialize_repo(&repo).await;
+        let fake_oci = temp.path().join("external-oci-transport");
+        std::fs::write(
+        &fake_oci,
+        "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo production-image-id; fi\nexit 0\n",
     )
-    .await
     .unwrap();
-    let after_all = store.load(&mission_id).await.unwrap();
-    assert_eq!(after_all.len(), before_all.len() + 1);
-    let MissionEvent::MessageSent { recipients, .. } = &after_all.last().unwrap().event else {
-        panic!("--all must append one atomic MessageSent event")
-    };
-    assert_eq!(recipients.len(), 1);
-    assert_eq!(recipients[0], *replacement_id);
+        std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let profiles = RuntimeProfiles::from_toml(
+            &format!(
+                r#"[runtimes.codex]
+driver = "codex"
+command = "external-codex"
+native-resume = true
+confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
+"#,
+                fake_oci.display()
+            ),
+            temp.path(),
+        )
+        .unwrap();
+        let mission_type_dir = temp.path().join("mission-type");
+        materialize_planning_validation_mission_type(&mission_type_dir);
+        let turns = Arc::new(Mutex::new(VecDeque::from([
+            DeliveryTurn::AwaitLead,
+            DeliveryTurn::AwaitLead,
+        ])));
+        let transports = cli::MissionTransports::external(
+            profiles,
+            RuntimeDriverRegistry::new([Arc::new(DeliveryProvider {
+                turns: turns.clone(),
+                entered: Arc::new(tokio::sync::Semaphore::new(0)),
+                release: Arc::new(tokio::sync::Semaphore::new(8)),
+                sessions: Arc::new(Mutex::new(Vec::new())),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                launch_failures: Arc::new(Mutex::new(0)),
+            }) as Arc<dyn RuntimeDriverProvider>]),
+            RuntimeAuthRegistry::empty(),
+            Arc::new(ExternalOracleTransport {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        cli::run_with_transports(
+            cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "start",
+                "--type",
+                mission_type_dir.to_str().unwrap(),
+                "--repo",
+                repo.to_str().unwrap(),
+                "--objective",
+                "prove same-base planner replacement routing",
+                "--runtime",
+                "codex",
+            ])
+            .unwrap(),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+        let store = MissionStore::open(&repo).await.unwrap();
+        let mission_id = store.list_missions().await.unwrap().pop().unwrap();
+        let driver = |label: &str| {
+            cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "driver",
+                mission_id.as_str(),
+                "--repo",
+                repo.to_str().unwrap(),
+                "--handshake",
+                temp.path().join(label).to_str().unwrap(),
+            ])
+            .unwrap()
+        };
+        cli::run_with_transports(driver("original-planner.ready"), transports.clone())
+            .await
+            .unwrap();
 
-    let full = fold(after_all).expect("full replay after replacement broadcast");
-    let fresh = MissionStore::open(&repo)
+        let awaiting = MissionStore::open(&repo)
+            .await
+            .unwrap()
+            .require_state(&mission_id)
+            .await
+            .unwrap();
+        assert_eq!(awaiting.current_sha, base);
+        let planner_id = RoleInstanceId::new("planner").unwrap();
+        let original = &awaiting.conversations[&planner_id];
+        assert_eq!(
+            original.lifecycle,
+            lionclaw::model::ConversationLifecycle::AwaitingLead
+        );
+        assert!(original.final_response.is_some());
+        let (original_effect, original_team_revision, original_generation) = awaiting
+            .role_attempt_receipts
+            .iter()
+            .find_map(|(effect_id, receipt)| match &receipt.source {
+                lionclaw::model::RoleEffectSource::Turn { request, .. }
+                    if request.role_instance == planner_id =>
+                {
+                    Some((
+                        effect_id.clone(),
+                        request.team_revision,
+                        request.assignment_epoch,
+                    ))
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        cli::run_with_transports(
+            cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "send",
+                "--mission-id",
+                mission_id.as_str(),
+                "--to",
+                planner_id.as_str(),
+                "--repo",
+                repo.to_str().unwrap(),
+                "Retain this queued message for the stable team-owned planner.",
+            ])
+            .unwrap(),
+            transports.clone(),
+        )
         .await
-        .unwrap()
-        .load_state_snapshotted(&mission_id)
+        .unwrap();
+
+        let proposal_path = temp.path().join("same-base-plan.json");
+        std::fs::write(
+            &proposal_path,
+            serde_json::to_vec(&mission_proposal(0, plan())).unwrap(),
+        )
+        .unwrap();
+        cli::run_with_transports(
+            cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "plan",
+                "propose",
+                mission_id.as_str(),
+                "--file",
+                proposal_path.to_str().unwrap(),
+                "--repo",
+                repo.to_str().unwrap(),
+            ])
+            .unwrap(),
+            transports.clone(),
+        )
         .await
-        .unwrap()
-        .expect("fresh snapshotted replay");
-    assert_eq!(fresh, full);
-    assert!(full.conversations[&planner_id].final_response.is_some());
-    assert!(turns.lock().unwrap().is_empty());
+        .unwrap();
+        let feedback = temp.path().join("revision-feedback.txt");
+        std::fs::write(&feedback, "replace the awaiting planner generation\n").unwrap();
+        cli::run_with_transports(
+            cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "decide",
+                mission_id.as_str(),
+                "plan_proposal:mission",
+                "revise",
+                "--feedback-file",
+                feedback.to_str().unwrap(),
+                "--repo",
+                repo.to_str().unwrap(),
+            ])
+            .unwrap(),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+
+        let revised_events = store.load(&mission_id).await.unwrap();
+        let revised = fold(revised_events.clone()).unwrap();
+        assert_eq!(revised.current_sha, base, "revision must not move Git base");
+        let original = &revised.conversations[&planner_id];
+        assert_eq!(
+            original.lifecycle,
+            lionclaw::model::ConversationLifecycle::Ready
+        );
+        assert!(original.final_response.is_some());
+        assert!(original.active_delivery.is_none());
+        assert_eq!(original.queued.len(), 1);
+        assert!(original
+            .queued
+            .iter()
+            .all(|message| { message.marker == lionclaw::model::DeliveryMarker::Queued }));
+        assert!(revised.conversation_is_messageable(&planner_id));
+        assert!(!revised.conversation_legal_actions(&planner_id).is_empty());
+        assert!(revised
+            .parked_effects
+            .keys()
+            .all(|effect_id| !revised.parked_effect_is_continuable(effect_id)));
+        cli::run_with_transports(
+            cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "send",
+                "--mission-id",
+                mission_id.as_str(),
+                "--to",
+                planner_id.as_str(),
+                "--repo",
+                repo.to_str().unwrap(),
+                "second message for the same team-owned planner",
+            ])
+            .unwrap(),
+            transports.clone(),
+        )
+        .await
+        .unwrap();
+
+        cli::run_with_transports(driver("replacement-planner.ready"), transports.clone())
+            .await
+            .unwrap();
+        let replacement_state = MissionStore::open(&repo)
+            .await
+            .unwrap()
+            .require_state(&mission_id)
+            .await
+            .unwrap();
+        let replacement_id = &planner_id;
+        let replacement = &replacement_state.conversations[replacement_id];
+        assert!(replacement_state.conversation_is_messageable(replacement_id));
+        let planner_attempts = replacement_state
+            .role_attempt_receipts
+            .iter()
+            .filter_map(|(effect_id, receipt)| match &receipt.source {
+                lionclaw::model::RoleEffectSource::Turn { request, .. }
+                    if request.role_instance == *replacement_id =>
+                {
+                    Some((effect_id, request.team_revision, request.assignment_epoch))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(planner_attempts.len(), 2);
+        let (_, resumed_team_revision, resumed_generation) = planner_attempts
+            .iter()
+            .find(|(effect_id, ..)| **effect_id != original_effect)
+            .unwrap();
+        assert_eq!(*resumed_team_revision, original_team_revision);
+        assert_eq!(*resumed_generation, original_generation);
+        assert!(replacement.queued.is_empty());
+
+        let before_all = store.load(&mission_id).await.unwrap();
+        cli::run_with_transports(
+            cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "send",
+                "--mission-id",
+                mission_id.as_str(),
+                "--all",
+                "--repo",
+                repo.to_str().unwrap(),
+                "broadcast only to live replacement conversations",
+            ])
+            .unwrap(),
+            transports,
+        )
+        .await
+        .unwrap();
+        let after_all = store.load(&mission_id).await.unwrap();
+        assert_eq!(after_all.len(), before_all.len() + 1);
+        let MissionEvent::MessageSent { recipients, .. } = &after_all.last().unwrap().event else {
+            panic!("--all must append one atomic MessageSent event")
+        };
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0], *replacement_id);
+
+        let full = fold(after_all).expect("full replay after replacement broadcast");
+        let fresh = MissionStore::open(&repo)
+            .await
+            .unwrap()
+            .load_state_snapshotted(&mission_id)
+            .await
+            .unwrap()
+            .expect("fresh snapshotted replay");
+        assert_eq!(fresh, full);
+        assert!(full.conversations[&planner_id].final_response.is_some());
+        assert!(turns.lock().unwrap().is_empty());
+    })
 }
 
 #[test]
@@ -3443,8 +3491,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .all(|(_, judged_sha)| judged_sha == &outcome.state.current_sha));
     assert_eq!(
         turns.lock().unwrap().len(),
-        6,
-        "writer, four team-owned judgments, and gap review run"
+        2,
+        "writer and gap review run; oracle-backed assertions do not dispatch team-owned judgments"
     );
     let restarted = MissionStore::open(&repo).await.unwrap();
     let events = restarted.load(&mission_id).await.unwrap();
@@ -3603,10 +3651,6 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             DeliveryTurn::Fail,
             DeliveryTurn::AwaitLead,
             DeliveryTurn::Complete,
-            DeliveryTurn::Validate,
-            DeliveryTurn::Validate,
-            DeliveryTurn::Validate,
-            DeliveryTurn::Validate,
             DeliveryTurn::Review,
         ])));
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
@@ -4577,21 +4621,24 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         release.add_permits(6);
         completion_driver.await.unwrap().unwrap();
         let mut completed_store = MissionStore::open(&repo).await.unwrap();
-        if completed_store
-            .require_state(&mission_id)
-            .await
-            .unwrap()
-            .phase
-            != (MissionPhase::Done {
-                finish: FinishClass::Verified,
-            })
-        {
-            cli::run_with_transports(
-                driver_cli(&temp.path().join("delivery-closing.ready")),
-                transports.clone(),
-            )
-            .await
-            .unwrap();
+        for attempt in 0..6 {
+            if completed_store
+                .require_state(&mission_id)
+                .await
+                .unwrap()
+                .phase
+                == (MissionPhase::Done {
+                    finish: FinishClass::Verified,
+                })
+            {
+                break;
+            }
+            let handshake = temp
+                .path()
+                .join(format!("delivery-closing-{attempt}.ready"));
+            cli::run_with_transports(driver_cli(&handshake), transports.clone())
+                .await
+                .unwrap();
             completed_store = MissionStore::open(&repo).await.unwrap();
         }
         let completed = completed_store.require_state(&mission_id).await.unwrap();
@@ -4634,7 +4681,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         assert!(turns.lock().unwrap().is_empty());
         {
             let sessions = sessions.lock().unwrap();
-            assert_eq!(sessions.len(), 10);
+            assert_eq!(sessions.len(), 6);
             assert_eq!(sessions[0].0, sessions[1].0, "workspace changed on restart");
             assert_eq!(sessions[1].0, sessions[2].0, "workspace changed on repair");
             assert_eq!(
@@ -4751,13 +4798,10 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(completions.len(), 11);
+        assert_eq!(completions.len(), 7);
         assert!(completions.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(oracle_completions.len(), 4);
-        assert_eq!(judgment_turns.len(), 4);
-        assert!(judgment_turns.iter().all(|(requested, completed)| {
-            completions[5] < *requested && requested < completed && *completed < review_requested
-        }));
+        assert!(judgment_turns.is_empty());
         let calls = oracle_calls.lock().unwrap();
         assert_eq!(
             oracle_completions
@@ -4777,7 +4821,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             assert!(completions[5] < index && index < review_requested);
         }
         assert!(review_requested < review_completed);
-        assert_eq!(review_completed, completions[10]);
+        assert_eq!(review_completed, completions[6]);
     })
 }
 

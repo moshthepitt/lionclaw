@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use lionclaw_model::{
-    apply, fold, step, AdvisoryStatus, Assertion, AssertionId, AttentionKind, AuthorityCeilings,
-    AuthorityGrants, ConversationLifecycle, ConversationState, DecisionAction, DeliveryMarker,
-    EffectId, EventEnvelope, ExecutionPolicy, Handoff, MissionConfig, MissionEvent,
+    apply, fold, ready_to_finish, step, AdvisoryStatus, Assertion, AssertionId, AttentionKind,
+    AuthorityCeilings, AuthorityGrants, ConversationLifecycle, ConversationState, DecisionAction,
+    DeliveryMarker, EffectId, EventEnvelope, ExecutionPolicy, Handoff, MissionConfig, MissionEvent,
     MissionGuidance, MissionId, MissionPhase, MissionProposal, MissionState, MissionTypeRef,
     OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, QueuedMessage, RecoveryConfig,
     Requirement, RequirementDisposition, RequirementId, RequirementKind, RoleAttemptDisposition,
@@ -174,7 +174,7 @@ fn plan() -> Plan {
             id: RequirementId::new("REQ-1").unwrap(),
             kind: RequirementKind::Capability,
             prose: "the requested behavior works".into(),
-            disposition: RequirementDisposition::Covered {
+            disposition: RequirementDisposition::ConfinedProvable {
                 assertion_ids: vec![assertion.clone()],
             },
         }],
@@ -269,6 +269,7 @@ fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
+                delegation: lionclaw_model::DelegationSet::agent_lead_default(),
             },
         ),
         event(
@@ -329,6 +330,7 @@ fn a_skipped_team_revision_is_ignored_during_replay() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
+                delegation: lionclaw_model::DelegationSet::agent_lead_default(),
             },
         ),
         event(
@@ -382,6 +384,7 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
+                delegation: lionclaw_model::DelegationSet::agent_lead_default(),
             },
         ),
         event(
@@ -475,6 +478,9 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
 fn accepted_advisory_state() -> MissionState {
     let mut advisory_plan = plan();
     advisory_plan.assertions[0].oracle = None;
+    advisory_plan.requirements[0].disposition = RequirementDisposition::ReviewerCheckable {
+        assertion_ids: vec![AssertionId::new("A-1").unwrap()],
+    };
     let accepted_team = team(1, true);
     fold([
         event(
@@ -489,13 +495,14 @@ fn accepted_advisory_state() -> MissionState {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config: MissionConfig {
-                    stop: StopBar::Reviewed,
+                    stop: StopBar::Attested,
                     ceilings: AuthorityCeilings {
                         writes: true,
                         ..Default::default()
                     },
                     ..Default::default()
                 },
+                delegation: lionclaw_model::DelegationSet::agent_lead_default(),
             },
         ),
         event(
@@ -596,7 +603,7 @@ fn validate_success(items: Vec<ValidationItem>, passed: bool) -> RoleTurnSuccess
 }
 
 #[test]
-fn reviewed_closure_waits_for_every_assigned_judge() {
+fn attested_closure_waits_for_every_assigned_judge() {
     let mut state = accepted_advisory_state();
     state
         .tasks
@@ -639,9 +646,23 @@ fn reviewed_closure_waits_for_every_assigned_judge() {
         ),
     );
     assert_eq!(
+        ready_to_finish(&state),
+        Some(lionclaw_model::FinishClass::Attested)
+    );
+    apply(
+        &mut state,
+        &event(
+            9,
+            MissionEvent::MissionFinished {
+                finish: lionclaw_model::FinishClass::Attested,
+                reason: "attested proof bar satisfied".into(),
+            },
+        ),
+    );
+    assert_eq!(
         state.phase,
         MissionPhase::Done {
-            finish: lionclaw_model::FinishClass::InternallyConsistent
+            finish: lionclaw_model::FinishClass::Attested
         }
     );
 }

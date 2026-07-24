@@ -59,7 +59,7 @@ async fn run(reviewer_passes: bool) -> lionclaw::model::MissionState {
     let dir = tempfile::tempdir().unwrap();
     let mut mission_type = common::test_mission_type();
     mission_type
-        .edit_for_testing(|definition| definition.stop = lionclaw::model::StopBar::Reviewed);
+        .edit_for_testing(|definition| definition.stop = lionclaw::model::StopBar::Attested);
     let harness = common::harness_with_type(
         dir.path(),
         mission_type,
@@ -82,14 +82,14 @@ async fn run(reviewer_passes: bool) -> lionclaw::model::MissionState {
 }
 
 #[tokio::test]
-async fn advisory_pass_is_internally_consistent_never_verified() {
+async fn advisory_pass_is_attested_never_verified() {
     let state = run(true).await;
     let assertion = lionclaw::model::AssertionId::new("STYLE-OK").unwrap();
     assert_eq!(state.advisory_status(&assertion), AdvisoryStatus::Passed);
     assert_eq!(
         state.phase,
         MissionPhase::Done {
-            finish: FinishClass::InternallyConsistent
+            finish: FinishClass::Attested
         }
     );
 }
@@ -152,7 +152,7 @@ async fn read_only_validator_artifacts_are_rejected_before_the_fold() {
     }));
     let mut mission_type = common::test_mission_type();
     mission_type
-        .edit_for_testing(|definition| definition.stop = lionclaw::model::StopBar::Reviewed);
+        .edit_for_testing(|definition| definition.stop = lionclaw::model::StopBar::Attested);
     let harness = common::harness_with_type(
         dir.path(),
         mission_type,
@@ -237,14 +237,33 @@ async fn replacement_validator_requires_new_receipt_and_retains_prior_evidence()
             other => panic!("unexpected output {other:?}"),
         }
     }));
-    let harness = common::harness(dir.path(), runner, MockOracleRunner::exiting(1)).await;
+    let mut mission_type = common::test_mission_type();
+    mission_type
+        .edit_for_testing(|definition| definition.stop = lionclaw::model::StopBar::Attested);
+    let harness = common::harness_with_type(
+        dir.path(),
+        mission_type,
+        runner,
+        MockOracleRunner::exiting(1),
+    )
+    .await;
     let id = harness
         .engine
         .create_mission(dir.path().to_str().unwrap(), "replace judge", BASE_SHA)
         .await
         .unwrap();
     let mut plan = advisory_plan();
-    plan.assertions[0].oracle = Some(lionclaw::model::OracleName::new("cargo-test").unwrap());
+    let tests_pass = lionclaw::model::AssertionId::new("TESTS-PASS").unwrap();
+    plan.requirements.push(common::covered_requirement(
+        "GREEN-TESTS",
+        tests_pass.as_str(),
+    ));
+    plan.assertions.push(lionclaw::model::Assertion {
+        id: tests_pass.clone(),
+        prose: "cargo test exits 0".to_string(),
+        oracle: Some(lionclaw::model::OracleName::new("cargo-test").unwrap()),
+    });
+    plan.tasks[0].targets.push(tests_pass);
     harness
         .engine
         .propose_plan(&id, proposal(0, plan))
@@ -270,6 +289,13 @@ async fn replacement_validator_requires_new_receipt_and_retains_prior_evidence()
     next_team
         .judgment_assignments
         .insert(assertion.clone(), vec![replacement.clone()]);
+    for panel in next_team.judgment_assignments.values_mut() {
+        for role in panel {
+            if *role == old {
+                *role = replacement.clone();
+            }
+        }
+    }
     harness
         .engine
         .propose_plan(

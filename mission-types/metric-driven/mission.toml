@@ -1,10 +1,10 @@
 [mission-type]
-name = "advisory-only"
+name = "metric-driven"
 stop = "attested"
 image = "localhost/lionclaw-runtime-dev:v1"
 
 [team]
-planning-assignment = "strategist"
+planning-assignment = "metric-planner"
 gap-review-assignment = "gap-reviewer"
 requires-gap-review = true
 
@@ -13,9 +13,12 @@ network = true
 install = true
 writes = true
 
+[recovery]
+max-attempts = 3
+
 [execution]
 default-timeout-secs = 1800
-max-task-time-secs = 1800
-extension-step-secs = 300
-auto-continue-candidate = true
-auto-continue-proof = true
+max-task-time-secs = 3600
+extension-step-secs = 600
+auto-continue-candidate = false
+auto-continue-proof = false

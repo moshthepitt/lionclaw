@@ -7,6 +7,9 @@ mod native_home_auth;
 mod prepared_input;
 mod role_runner;
 
+#[cfg(test)]
+mod real_runtime_continuity_tests;
+
 pub use executor::MissionProgramExecutor;
 pub(crate) use handoff::validate_handoff;
 pub(crate) use prepared_input::{prepare_inputs, PreparedInputs};

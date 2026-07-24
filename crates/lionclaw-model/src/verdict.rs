@@ -87,13 +87,13 @@ impl AuthoritativeVerdict {
 }
 
 /// How honest a finish is. The engine says "verified" only with fresh
-/// authoritative coverage of every assertion; advisory-only green is
-/// "internally consistent", never verified.
+/// authoritative coverage of every assertion; judged-only green is
+/// "attested", never verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishClass {
     Verified,
-    InternallyConsistent,
+    Attested,
     Unverified,
 }
 
@@ -104,7 +104,7 @@ impl FinishClass {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Verified => "verified",
-            Self::InternallyConsistent => "internally_consistent",
+            Self::Attested => "attested",
             Self::Unverified => "unverified",
         }
     }
@@ -112,15 +112,15 @@ impl FinishClass {
 
 impl StopBar {
     /// Does a finish class clear this honesty bar? `Verified` demands an
-    /// authoritative oracle pass; `Reviewed` also accepts agent-only
-    /// `InternallyConsistent`. `Unverified` clears neither.
+    /// authoritative oracle pass; `Attested` also accepts fresh judged proof.
+    /// `Unverified` clears neither.
     pub const fn satisfied_by(self, finish: FinishClass) -> bool {
         matches!(
             (self, finish),
             (StopBar::Verified, FinishClass::Verified)
                 | (
-                    StopBar::Reviewed,
-                    FinishClass::Verified | FinishClass::InternallyConsistent
+                    StopBar::Attested,
+                    FinishClass::Verified | FinishClass::Attested
                 )
         )
     }
@@ -135,6 +135,9 @@ impl StopBar {
 /// contradiction — never a green advisory papering over a real oracle
 /// failure.
 pub fn classify_finish(state: &MissionState) -> FinishClass {
+    let Some(plan) = &state.plan else {
+        return FinishClass::Unverified;
+    };
     if state.contract.is_empty() {
         return FinishClass::Unverified;
     }
@@ -154,16 +157,26 @@ pub fn classify_finish(state: &MissionState) -> FinishClass {
             }
             None => {
                 all_authoritative_pass = false;
-                if state.advisory_status(assertion_id) != AdvisoryStatus::Passed {
-                    all_green = false;
-                }
             }
+        }
+        if plan.assertion_requires_confined_proof(assertion_id) {
+            if !matches!(fresh, Some(v) if v.passed()) {
+                all_green = false;
+            }
+        } else if plan.assertion_requires_judged_proof(assertion_id) {
+            all_authoritative_pass = false;
+            if state.advisory_status(assertion_id) != AdvisoryStatus::Passed {
+                all_green = false;
+            }
+        } else {
+            all_authoritative_pass = false;
+            all_green = false;
         }
     }
     if all_authoritative_pass {
         FinishClass::Verified
     } else if all_green {
-        FinishClass::InternallyConsistent
+        FinishClass::Attested
     } else {
         FinishClass::Unverified
     }
@@ -174,16 +187,16 @@ mod tests {
     use super::*;
 
     // P7's "honest exit code at finish": Verified is cleared only by a Verified
-    // finish; Reviewed also accepts an agent-only InternallyConsistent finish;
+    // finish; Attested also accepts judged-only proof;
     // Unverified clears neither. `cmd_advance` exits nonzero when this is false.
     #[test]
     fn stop_bar_satisfied_by_truth_table() {
-        use FinishClass::{InternallyConsistent, Unverified, Verified};
+        use FinishClass::{Attested, Unverified, Verified};
         assert!(StopBar::Verified.satisfied_by(Verified));
-        assert!(!StopBar::Verified.satisfied_by(InternallyConsistent));
+        assert!(!StopBar::Verified.satisfied_by(Attested));
         assert!(!StopBar::Verified.satisfied_by(Unverified));
-        assert!(StopBar::Reviewed.satisfied_by(Verified));
-        assert!(StopBar::Reviewed.satisfied_by(InternallyConsistent));
-        assert!(!StopBar::Reviewed.satisfied_by(Unverified));
+        assert!(StopBar::Attested.satisfied_by(Verified));
+        assert!(StopBar::Attested.satisfied_by(Attested));
+        assert!(!StopBar::Attested.satisfied_by(Unverified));
     }
 }

@@ -37,20 +37,20 @@ pub mod verdict;
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
     resolve_execution_deadline_ms, role_prompt_template, role_success_contract_error,
-    ArtifactOutcome, BlobRef, ContinueMode, ControlAction, DecisionAction, EffectEventClass,
-    EffectResource, EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff, MessageReference,
-    MissionConfig, MissionEvent, MissionProposal, MissionSkill, MissionTypeRef, OracleRunSuccess,
-    PayloadRef, PreparedInputRef, RecoveryConfig, RolePromptTemplate, RoleTurnSuccess,
-    RuntimeConfigurationEvidence, StopBar, UnavailableReferenceCause, ValidationItem,
-    VersionStamps, WorkspacePreparation, MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES,
-    MAX_MESSAGE_BYTES, MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES,
+    ArtifactOutcome, BlobRef, ContinueMode, ControlAction, DecisionAction, DelegationSet,
+    EffectEventClass, EffectResource, EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff,
+    MessageReference, MissionConfig, MissionEvent, MissionProposal, MissionSkill, MissionTypeRef,
+    OracleRunSuccess, PayloadRef, PreparedInputRef, RecoveryConfig, RolePromptTemplate,
+    RoleTurnSuccess, RuntimeConfigurationEvidence, StopBar, UnavailableReferenceCause,
+    ValidationItem, VersionStamps, WorkspacePreparation, MAX_EXECUTION_DURATION_SECS,
+    MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES, MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES,
     MAX_QUEUED_MESSAGES_PER_CONVERSATION, MAX_ROLE_REPORT_BYTES, SCHEMA_VERSION,
 };
 pub use failure::{
     bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,
     RuntimeConfigurationConfirmation, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT,
 };
-pub use fold::{apply, fold, REDUCER_VERSION};
+pub use fold::{apply, fold, ready_to_finish, REDUCER_VERSION};
 pub use ids::{
     short_hex, AssertionId, EffectId, IdError, InputName, MissionId, OracleName, RequirementId,
     RoleInstanceId, TaskId,

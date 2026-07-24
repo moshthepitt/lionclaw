@@ -467,6 +467,7 @@ mod tests {
                     workspace_dir: "/workspace".into(),
                     base_sha: "base".into(),
                     config: crate::model::MissionConfig::default(),
+                    delegation: crate::model::DelegationSet::agent_lead_default(),
                 },
             ),
             envelope(

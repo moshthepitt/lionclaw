@@ -25,11 +25,12 @@ use crate::mission_type::{
 use crate::model::{
     fold, short_hex, AuthorityGrants, ControlAction, DecisionAction, EffectId, FinishClass,
     InputName, MissionGuidance, MissionId, MissionPhase, MissionSkill, OutputSemantics,
-    RoleInstance, RoleInstanceId, TaskId,
+    RequirementDisposition, RoleInstance, RoleInstanceId, TaskId,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, OracleRunner, SystemClock};
 use crate::runner::OciRoleRunner;
+use crate::store::NewEvent;
 use crate::store::{BlobStore, MissionStore};
 use crate::workspace;
 use lionclaw_runtime_api::{RuntimeAuthRegistry, RuntimeDriverRegistry};
@@ -179,6 +180,8 @@ pub enum MissionCommand {
     Skill(MissionSkillCommand),
     /// Resolve an open attention item.
     Decide(DecideArgs),
+    /// Finish a mission whose proof bar is satisfied.
+    Finish(FinishArgs),
     /// Abort any nonterminal mission while preserving its evidence.
     Abort(AbortArgs),
     /// Request cancellation of one exact active effect.
@@ -462,6 +465,18 @@ pub struct AbortArgs {
 }
 
 #[derive(Args)]
+pub struct FinishArgs {
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    /// Why the mission is complete. Recorded verbatim in the event log.
+    #[arg(long)]
+    pub reason: String,
+}
+
+#[derive(Args)]
 pub struct PlanProposeArgs {
     /// Mission id (default: the sole live mission in this repo).
     pub mission_id: Option<String>,
@@ -661,6 +676,7 @@ impl MissionCommand {
             | Self::Team(_)
             | Self::Skill(_)
             | Self::Decide(_)
+            | Self::Finish(_)
             | Self::Abort(_)
             | Self::Stop(_)
             | Self::Extend(_)
@@ -712,6 +728,9 @@ async fn dispatch_mission(
             .await
             .map(|()| ExitCode::SUCCESS),
         MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Finish(args) => cmd_finish(args, transports)
+            .await
+            .map(|()| ExitCode::SUCCESS),
         MissionCommand::Abort(args) => cmd_abort(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Stop(args) => cmd_stop(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Extend(args) => cmd_extend(args).await.map(|()| ExitCode::SUCCESS),
@@ -1139,12 +1158,12 @@ async fn cmd_plan_show(args: PlanShowArgs) -> Result<()> {
     } else {
         bail!("mission {mission_id} has no current or pending plan");
     };
-    // The verified/reviewed ceiling: a plan is verified-possible iff every
+    // The verified/attested ceiling: a plan is verified-possible iff every
     // assertion binds an oracle.
     let ceiling = if plan.all_assertions_bound() {
         "verified-possible"
     } else {
-        "reviewed-only"
+        "attested-only"
     };
     if args.json {
         let bindings: Vec<_> = plan
@@ -1496,6 +1515,23 @@ async fn cmd_apply(args: ApplyArgs) -> Result<()> {
         .with_context(|| {
             format!("could not create branch '{branch}' (already exists? use --force)")
         })?;
+    store
+        .append(
+            &mission_id,
+            state.head,
+            &[NewEvent::new(crate::model::MissionEvent::ResultApplied {
+                branch: branch.clone(),
+                sha: state.deliverable_head().to_string(),
+                reason: "mission apply created the result branch".into(),
+            })],
+            SystemClock.now_ms(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "branch '{branch}' was created, but ResultApplied could not be recorded; inspect mission log before applying again"
+            )
+        })?;
     println!(
         "applied mission {mission_id} → branch {branch} ({})",
         short_hex(state.deliverable_head())
@@ -1564,6 +1600,21 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         .filter(|(_, a)| a.oracle.is_none())
         .map(|(id, _)| id.as_str())
         .collect();
+    let host_acceptance_obligations = state
+        .plan
+        .as_ref()
+        .map(|plan| {
+            plan.requirements
+                .iter()
+                .filter_map(|requirement| match &requirement.disposition {
+                    RequirementDisposition::HostAcceptance { rationale } => {
+                        Some((requirement, rationale))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     if args.json {
         let review = review_summary(state, store.blobs());
@@ -1575,6 +1626,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "mission_type": { "name": state.mission_type.name, "digest": state.mission_type.digest },
                 "image_id": state.image_id,
                 "team": state.team,
+                "delegation": state.delegation,
                 "stop_bar": state.config.stop.slug(),
                 "base_sha": state.base_sha,
                 "current_sha": state.current_sha,
@@ -1599,6 +1651,12 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                     "waived": row.waived,
                     "verdict": row.verdict,
                     "advisory_results": row.advisory_results,
+                })).collect::<Vec<_>>(),
+                "host_acceptance_obligations": host_acceptance_obligations.iter().map(|(requirement, rationale)| serde_json::json!({
+                    "id": requirement.id.as_str(),
+                    "kind": requirement.kind,
+                    "requirement": requirement.prose,
+                    "rationale": rationale,
                 })).collect::<Vec<_>>(),
                 "not_covered_by_an_oracle": uncovered,
                 "superseded_assertions": superseded_assertions_json(state, store.blobs()),
@@ -1633,8 +1691,8 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "  finish:  VERIFIED — a fresh oracle pass at the final commit for every assertion"
             )
         }
-        Some(FinishClass::InternallyConsistent) => {
-            println!("  finish:  INTERNALLY-CONSISTENT — no machine checked this; an agent said so")
+        Some(FinishClass::Attested) => {
+            println!("  finish:  ATTESTED — fresh assigned judges passed without a fresh oracle contradiction")
         }
         Some(FinishClass::Unverified) => {
             println!("  finish:  UNVERIFIED — not proven at the final commit")
@@ -1787,9 +1845,16 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     }
     if !uncovered.is_empty() {
         println!(
-            "\n  NOT covered by an oracle (agent judgement only): {}",
+            "\n  NOT covered by an oracle (judged proof only): {}",
             uncovered.join(", ")
         );
+    }
+    if !host_acceptance_obligations.is_empty() {
+        println!("\n  host acceptance obligations:");
+        for (requirement, rationale) in host_acceptance_obligations {
+            println!("    {}: {}", requirement.id, requirement.prose);
+            println!("      rationale: {rationale}");
+        }
     }
     print_superseded_assertions(state, store.blobs(), "  ");
     if !state.acknowledged_gates.is_empty() {
@@ -1849,6 +1914,13 @@ async fn cmd_abort(args: AbortArgs) -> Result<()> {
     crate::engine::record_abort(&store, SystemClock.now_ms(), &mission_id, &args.reason).await?;
     println!("aborted mission {mission_id}");
     Ok(())
+}
+
+async fn cmd_finish(args: FinishArgs, transports: &MissionTransports) -> Result<()> {
+    let (repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    let engine = build_engine_for_mission(store, &repo, &mission_id, transports).await?;
+    engine.finish(&mission_id, &args.reason).await
 }
 
 async fn cmd_send(args: SendArgs) -> Result<()> {
@@ -3092,6 +3164,7 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         "next_actions": view.next_actions(),
         "revision": state.revision,
         "team_revision": state.team.as_ref().map(|team| team.revision),
+        "delegation": state.delegation,
         "current_sha": state.current_sha,
         "objective": state.objective,
         "conversations": conversation_views(state, store)?,

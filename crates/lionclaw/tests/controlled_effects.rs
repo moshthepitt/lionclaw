@@ -1339,7 +1339,7 @@ async fn settlement_retains_bounded_blob_backed_oracle_stderr() {
                 entered: entered.clone(),
                 release: release.clone(),
                 discards: discards.clone(),
-                pause_on: 3,
+                pause_on: 2,
             }),
             Arc::new(MockClock::default()),
         ),
@@ -1389,7 +1389,7 @@ async fn settlement_retains_bounded_blob_backed_oracle_stderr() {
     assert!(!failure.evidence().stderr.is_empty());
     assert!(failure.evidence().stderr.len() <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT);
     assert!(failure.evidence().stderr.starts_with('E'));
-    assert_eq!(discards.lock().unwrap().as_slice(), &[false, false, true]);
+    assert_eq!(discards.lock().unwrap().as_slice(), &[false, true]);
 }
 
 #[tokio::test]
@@ -1542,10 +1542,8 @@ async fn policy_auto_continues_candidate_and_proof_with_recorded_controls() {
 
     let finished = engine.advance(&mission_id).await.unwrap();
     assert_eq!(finished.disposition, MissionDisposition::Terminal);
-    let automatic = store
-        .load(&mission_id)
-        .await
-        .unwrap()
+    let events = store.load(&mission_id).await.unwrap();
+    let automatic = events
         .iter()
         .filter(|event| {
             matches!(
@@ -1560,7 +1558,11 @@ async fn policy_auto_continues_candidate_and_proof_with_recorded_controls() {
             )
         })
         .count();
-    assert_eq!(automatic, 3);
+    assert_eq!(automatic, 2);
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        lionclaw::model::MissionEvent::MissionFinished { .. }
+    )));
 }
 
 #[tokio::test]
@@ -1596,10 +1598,8 @@ async fn policy_auto_continues_an_artifactless_writer_success() {
 
     assert_eq!(finished.disposition, MissionDisposition::Terminal);
     assert_eq!(finished.state.deliverable_head(), BASE_SHA);
-    let automatic = store
-        .load(&mission_id)
-        .await
-        .unwrap()
+    let events = store.load(&mission_id).await.unwrap();
+    let automatic = events
         .iter()
         .filter(|event| {
             matches!(
@@ -1614,7 +1614,11 @@ async fn policy_auto_continues_an_artifactless_writer_success() {
             )
         })
         .count();
-    assert_eq!(automatic, 3);
+    assert_eq!(automatic, 2);
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        lionclaw::model::MissionEvent::MissionFinished { .. }
+    )));
 }
 
 #[tokio::test]

@@ -601,8 +601,8 @@ pub struct EffectCleanupFailure {
     pub failure: TypedFailure,
 }
 
-/// Zenith's sticky per-assertion advisory status: `pending → passed` is
-/// sticky; anything else that reports non-pass lands `failed`.
+/// Fresh per-assertion judged status. Omission counts as pending; a later
+/// non-pass receipt downgrades the assertion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdvisoryStatus {
@@ -1065,6 +1065,8 @@ impl InflightEffect {
             | MissionEvent::RoleTurnCompleted { .. }
             | MissionEvent::OracleRunCompleted { .. }
             | MissionEvent::MissionAborted { .. }
+            | MissionEvent::MissionFinished { .. }
+            | MissionEvent::ResultApplied { .. }
             | MissionEvent::DecisionRecorded { .. }
             | MissionEvent::ControlRequested { .. }
             | MissionEvent::EffectCleanupFailed { .. } => None,
@@ -1084,6 +1086,7 @@ pub struct MissionState {
     /// Target repo HEAD at mission creation.
     pub base_sha: String,
     pub config: MissionConfig,
+    pub delegation: super::DelegationSet,
     pub team: Option<super::TeamRevision>,
     pub team_history: BTreeMap<u32, super::TeamRevision>,
     #[serde(default)]
@@ -1297,6 +1300,7 @@ impl MissionState {
             .get(&request.team_revision)?
             .role(&request.role_instance)?;
         if role.output != super::OutputSemantics::EmitsVerdict
+            || request.team_revision != self.team.as_ref()?.revision
             || *plan_revision != self.revision
             || request.base_sha != self.deliverable_head()
             || !self
@@ -1807,10 +1811,14 @@ impl MissionState {
     }
 
     pub(crate) fn owed_assertions_for_oracle(&self, oracle: &OracleName) -> Vec<AssertionId> {
+        let Some(plan) = &self.plan else {
+            return Vec::new();
+        };
         self.contract
             .iter()
-            .filter(|(_, assertion)| {
+            .filter(|(assertion_id, assertion)| {
                 assertion.oracle.as_ref() == Some(oracle)
+                    && plan.assertion_requires_confined_proof(assertion_id)
                     && assertion
                         .last_authoritative
                         .as_ref()

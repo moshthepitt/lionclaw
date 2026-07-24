@@ -17,12 +17,13 @@ use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleInstanceId, TaskId};
 use super::plan::{OutputSemantics, PlanProposal};
+use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure, TypedFailureEvidence};
 
-/// Version 24 is the Slice 5 team cutover: role-instance/team identity replaces
-/// every planning-DAG, task-namespace, and copied request-identity bridge.
-pub const SCHEMA_VERSION: u32 = 24;
+/// Version 25 is the Slice 6 receipt/closure bar: typed proof dispositions,
+/// attested finish vocabulary, and explicit finish/apply facts.
+pub const SCHEMA_VERSION: u32 = 25;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -158,7 +159,7 @@ impl PayloadRef {
 #[serde(rename_all = "snake_case")]
 pub enum StopBar {
     Verified,
-    Reviewed,
+    Attested,
 }
 
 impl StopBar {
@@ -166,7 +167,7 @@ impl StopBar {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Verified => "verified",
-            Self::Reviewed => "reviewed",
+            Self::Attested => "attested",
         }
     }
 }
@@ -508,6 +509,39 @@ pub enum EffectResource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationSet {
+    #[serde(default)]
+    pub ratification: bool,
+    #[serde(default)]
+    pub proof_bar_weakening: bool,
+    #[serde(default)]
+    pub finish: bool,
+    #[serde(default)]
+    pub abort: bool,
+    #[serde(default)]
+    pub apply: bool,
+}
+
+impl DelegationSet {
+    pub const fn agent_lead_default() -> Self {
+        Self {
+            ratification: true,
+            proof_bar_weakening: true,
+            finish: true,
+            abort: true,
+            apply: true,
+        }
+    }
+}
+
+impl Default for DelegationSet {
+    fn default() -> Self {
+        Self::agent_lead_default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum MissionEvent {
@@ -522,6 +556,7 @@ pub enum MissionEvent {
         /// HEAD of the target repo when the mission was created.
         base_sha: String,
         config: MissionConfig,
+        delegation: DelegationSet,
     },
     ProposalRecorded {
         proposal: Box<MissionProposal>,
@@ -605,6 +640,15 @@ pub enum MissionEvent {
         failure: TypedFailure,
     },
     MissionAborted {
+        reason: String,
+    },
+    MissionFinished {
+        finish: FinishClass,
+        reason: String,
+    },
+    ResultApplied {
+        branch: String,
+        sha: String,
         reason: String,
     },
     /// A human/orchestrator decision resolving an open attention item (a
@@ -722,6 +766,8 @@ impl MissionEvent {
             Self::ControlRequested { .. } => "control_requested",
             Self::EffectCleanupFailed { .. } => "effect_cleanup_failed",
             Self::MissionAborted { .. } => "mission_aborted",
+            Self::MissionFinished { .. } => "mission_finished",
+            Self::ResultApplied { .. } => "result_applied",
             Self::DecisionRecorded { .. } => "decision_recorded",
         }
     }
@@ -747,6 +793,8 @@ impl MissionEvent {
             | Self::MessageSent { .. }
             | Self::ControlRequested { .. }
             | Self::MissionAborted { .. }
+            | Self::MissionFinished { .. }
+            | Self::ResultApplied { .. }
             | Self::DecisionRecorded { .. }
             | Self::EffectCleanupFailed { .. } => None,
         }

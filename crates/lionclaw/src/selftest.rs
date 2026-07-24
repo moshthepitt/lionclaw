@@ -499,7 +499,7 @@ fn oracle_plan() -> Plan {
             id: RequirementId::new("TESTS-GREEN").expect("requirement id"),
             kind: RequirementKind::Validation,
             prose: "the project test suite passes".to_string(),
-            disposition: RequirementDisposition::Covered {
+            disposition: RequirementDisposition::ConfinedProvable {
                 assertion_ids: vec![AssertionId::new("TESTS-PASS").expect("assertion id")],
             },
         }],
@@ -1018,7 +1018,7 @@ async fn check_replanning() -> Result<()> {
 /// (6) Gap review gates closure: a mission type declaring a closing
 /// review does not close on a blocking verdict — it parks for a human, and
 /// only an explicit `accept` (acknowledge) lets it finish, with the
-/// acknowledgment on record. Also: the loader refuses `stop = "reviewed"`
+/// acknowledgment on record. Also: the loader refuses `stop = "attested"`
 /// without the declaration (that bar is *defined* by the review). Pure — no
 /// agent turn, no oracle run — so it always runs.
 async fn check_gap_review() -> Result<()> {

@@ -943,9 +943,12 @@ async fn completed_writer_turn_without_handoff_recovers_as_same_conversation_che
         deletions: AtomicUsize::new(0),
         after_first_deletion: None,
     });
+    let mut mission_type = test_mission_type();
+    mission_type
+        .edit_for_testing(|definition| definition.stop = lionclaw::model::StopBar::Attested);
     let engine = Arc::new(Engine::new(
         store.clone(),
-        test_mission_type(),
+        mission_type,
         "test-image".to_string(),
         EngineServices::new(
             Arc::new(RetainedHandoffRunner {
@@ -1519,9 +1522,12 @@ async fn completed_validator_turn_without_handoff_recovers_as_typed_rework() {
         validator_assignment: Mutex::new(None),
     });
     let store = MissionStore::open(dir.path()).await.unwrap();
+    let mut mission_type = test_mission_type();
+    mission_type
+        .edit_for_testing(|definition| definition.stop = lionclaw::model::StopBar::Attested);
     let engine = Arc::new(Engine::new(
         store.clone(),
-        test_mission_type(),
+        mission_type,
         "test-image".to_string(),
         EngineServices::new(
             runner.clone(),
@@ -1538,10 +1544,8 @@ async fn completed_validator_turn_without_handoff_recovers_as_typed_rework() {
         )
         .await
         .unwrap();
-    let mut plan = advisory_plan();
-    plan.assertions[0].oracle = Some(lionclaw::model::OracleName::new("cargo-test").unwrap());
     engine
-        .propose_plan(&mission_id, proposal(0, plan))
+        .propose_plan(&mission_id, proposal(0, advisory_plan()))
         .await
         .unwrap();
     approve_plan(&engine, &mission_id).await;

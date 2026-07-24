@@ -18,10 +18,10 @@ use sha2::{Digest, Sha256};
 use crate::driver_lock::DriverGuard;
 use crate::mission_type::MissionType;
 use crate::model::{
-    step, validate_mission_proposal, EffectEventClass, EffectId, Handoff, InflightEffect,
-    MissionEvent, MissionId, MissionPhase, MissionProposal, MissionState, OracleDispatchIntent,
-    OracleRunSuccess, PayloadRef, ProposalError, RoleDispatchIntent, RoleInstance, RoleTurnSuccess,
-    StepDecision, TaskId, MAX_ROLE_REPORT_BYTES,
+    ready_to_finish, step, validate_mission_proposal, EffectEventClass, EffectId, Handoff,
+    InflightEffect, MissionEvent, MissionId, MissionPhase, MissionProposal, MissionState,
+    OracleDispatchIntent, OracleRunSuccess, PayloadRef, ProposalError, RoleDispatchIntent,
+    RoleInstance, RoleTurnSuccess, StepDecision, TaskId, MAX_ROLE_REPORT_BYTES,
 };
 use crate::ports::{
     ArtifactCapture, Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl,
@@ -514,6 +514,7 @@ impl Engine {
             workspace_dir: workspace_dir.to_string(),
             base_sha: base_sha.to_string(),
             config,
+            delegation: crate::model::DelegationSet::agent_lead_default(),
         });
         self.store
             .create_mission_with_events(
@@ -655,6 +656,11 @@ impl Engine {
         record_abort(&self.store, self.clock.now_ms(), mission_id, reason).await
     }
 
+    /// Finish a mission that currently satisfies its declared proof bar.
+    pub async fn finish(&self, mission_id: &MissionId, reason: &str) -> Result<()> {
+        record_finish(&self.store, self.clock.now_ms(), mission_id, reason).await
+    }
+
     pub async fn load_state(&self, mission_id: &MissionId) -> Result<MissionState> {
         let state = self.store.require_state(mission_id).await?;
         // The instrument of judgment is pinned: this verifies the mission type's
@@ -748,6 +754,18 @@ impl Engine {
             }
             match step(&state) {
                 StepDecision::Idle => {
+                    if let Some(finish) = ready_to_finish(&state) {
+                        self.append_fact(
+                            &state.mission_id,
+                            state.head,
+                            NewEvent::new(MissionEvent::MissionFinished {
+                                finish,
+                                reason: "proof bar satisfied".into(),
+                            }),
+                        )
+                        .await?;
+                        continue;
+                    }
                     return if state.phase == MissionPhase::Planning
                         || state.conversations.values().any(|conversation| {
                             conversation.lifecycle
@@ -1022,6 +1040,19 @@ impl Engine {
         };
         let checkpoint = checkpoint_after(&outcome.event, &effect, &state.config.execution);
         let Some((automatic, reason)) = checkpoint else {
+            let current = self.load_state(&state.mission_id).await?;
+            if let Some(finish) = ready_to_finish(&current) {
+                self.append_fact(
+                    &current.mission_id,
+                    current.head,
+                    NewEvent::new(MissionEvent::MissionFinished {
+                        finish,
+                        reason: "proof bar satisfied".into(),
+                    }),
+                )
+                .await?;
+                return Ok(true);
+            }
             return Ok(true);
         };
         if !automatic {
@@ -1778,7 +1809,14 @@ impl Engine {
                         crate::model::RequirementDisposition::Limitation { rationale } => {
                             Some(format!("{}: {rationale}", requirement.prose))
                         }
-                        crate::model::RequirementDisposition::Covered { .. } => None,
+                        crate::model::RequirementDisposition::HostAcceptance { rationale } => {
+                            Some(format!(
+                                "{}: host acceptance required after apply ({rationale})",
+                                requirement.prose
+                            ))
+                        }
+                        crate::model::RequirementDisposition::ConfinedProvable { .. }
+                        | crate::model::RequirementDisposition::ReviewerCheckable { .. } => None,
                     })
                     .collect::<Vec<_>>();
                 let nonce = EffectId::for_parts(&[
@@ -2359,6 +2397,52 @@ pub async fn record_abort(
     Ok(())
 }
 
+/// Record mission completion as a closure fact. The fold independently
+/// verifies the finish class against current receipts before accepting it.
+pub async fn record_finish(
+    store: &MissionStore,
+    now_ms: i64,
+    mission_id: &MissionId,
+    reason: &str,
+) -> Result<()> {
+    if reason.trim().is_empty() {
+        bail!("finish requires a non-empty reason");
+    }
+    let state = store.require_state(mission_id).await?;
+    if state.phase.is_terminal() {
+        bail!("mission '{mission_id}' is terminal; finish is not legal");
+    }
+    let Some(finish) = ready_to_finish(&state) else {
+        bail!("mission '{mission_id}' is not ready to finish");
+    };
+    if !state.config.stop.satisfied_by(finish) {
+        bail!(
+            "mission '{mission_id}' only finishes {}, below the declared stop bar {}",
+            finish.slug(),
+            state.config.stop.slug()
+        );
+    }
+    store
+        .append(
+            mission_id,
+            state.head,
+            &[NewEvent::new(MissionEvent::MissionFinished {
+                finish,
+                reason: reason.to_string(),
+            })],
+            now_ms,
+        )
+        .await?;
+    reconcile_disposable_conversation_resources(store, mission_id)
+        .await
+        .with_context(|| {
+            format!(
+                "mission '{mission_id}' was finished durably, but disposable resource cleanup failed; run 'lionclaw mission advance {mission_id}' to retry"
+            )
+        })?;
+    Ok(())
+}
+
 async fn materialize_conversation_messages(
     engine: &Engine,
     state: &MissionState,
@@ -2817,6 +2901,16 @@ fn checkpoint_after(
         ) => Some((
             policy.auto_continue_proof,
             "mission policy auto-continued advisory proof completion",
+        )),
+        (
+            MissionEvent::RoleTurnCompleted { outcome: Ok(_), .. },
+            InflightEffect::RoleTurn {
+                output: crate::model::OutputSemantics::EmitsGapVerdict,
+                ..
+            },
+        ) => Some((
+            policy.auto_continue_proof,
+            "mission policy auto-continued gap review completion",
         )),
         (
             MissionEvent::RoleTurnCompleted { outcome: Ok(_), .. },

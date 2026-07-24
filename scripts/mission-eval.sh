@@ -100,11 +100,11 @@ PY
 
 # NOTE: the former "reviewer catches a planted regression" scenario was removed.
 # It needs a reviewer-only (oracle-less) assertion, which is only valid
-# under a `stop = reviewed` mission type — and no product mission type ships with
+# under a `stop = attested` mission type — and no product mission type ships with
 # that bar today (software-dev is `verified`, which rejects an oracle-less
 # assertion when proposed). The advisory-only-can't-verify behavior it checked stays
 # covered deterministically by `cargo test --test eval_deterministic`. Restore an
-# agentic reviewer scenario once a `reviewed`-stop mission type (e.g. code-review)
+# agentic reviewer scenario once an `attested`-stop mission type (e.g. code-review)
 # ships.
 
 # --- Scenario 2: planning-in-phase -> approve -> verified -----------------

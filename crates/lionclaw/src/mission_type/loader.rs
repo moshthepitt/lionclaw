@@ -92,10 +92,10 @@ pub(crate) fn load_materialized_mission_type(
     }
     let stop = match manifest.mission_type.stop.as_str() {
         "verified" => StopBar::Verified,
-        "reviewed" => StopBar::Reviewed,
+        "attested" => StopBar::Attested,
         other => {
             return Err(MissionTypeError::Manifest(format!(
-                "stop must be 'verified' or 'reviewed', got '{other}'"
+                "stop must be 'verified' or 'attested', got '{other}'"
             )))
         }
     };

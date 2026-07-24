@@ -200,6 +200,9 @@ fn step_running(state: &MissionState) -> StepDecision {
         return StepDecision::Idle;
     };
     for (assertion_id, panel) in &team.judgment_assignments {
+        if !plan.assertion_requires_judged_proof(assertion_id) {
+            continue;
+        }
         for role_id in panel {
             let already_settled = state
                 .contract
@@ -226,7 +229,11 @@ fn step_running(state: &MissionState) -> StepDecision {
 
     if oracle_obligation_outstanding(state) {
         let mut by_oracle: BTreeMap<OracleName, Vec<AssertionId>> = BTreeMap::new();
-        for assertion in state.contract.values() {
+        for (assertion_id, assertion) in state
+            .contract
+            .iter()
+            .filter(|(assertion_id, _)| plan.assertion_requires_confined_proof(assertion_id))
+        {
             let Some(oracle) = &assertion.oracle else {
                 continue;
             };
@@ -235,6 +242,7 @@ fn step_running(state: &MissionState) -> StepDecision {
             }
             let owed = state.owed_assertions_for_oracle(oracle);
             if !owed.is_empty() {
+                debug_assert!(owed.contains(assertion_id));
                 by_oracle.insert(oracle.clone(), owed);
             }
         }

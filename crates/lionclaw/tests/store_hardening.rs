@@ -489,6 +489,9 @@ async fn forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail() {
         .expect("create");
     let mut plan = advisory_plan();
     plan.assertions[0].oracle = Some(lionclaw::model::OracleName::new("cargo-test").unwrap());
+    plan.requirements[0].disposition = lionclaw::model::RequirementDisposition::ConfinedProvable {
+        assertion_ids: vec![lionclaw::model::AssertionId::new("STYLE-OK").unwrap()],
+    };
     h.engine
         .propose_plan(&mission_id, proposal(0, plan))
         .await

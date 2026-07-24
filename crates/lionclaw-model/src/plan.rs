@@ -21,14 +21,50 @@ pub enum RequirementKind {
     Validation,
 }
 
-/// How a plan accounts for one objective requirement. Every requirement is
-/// either covered by falsifiable assertions or called out as an explicit
-/// limitation; silent omission is not representable.
+/// How a plan accounts for one objective requirement. Proof-bearing
+/// dispositions name the assertions that carry the requirement; host-only
+/// obligations and limitations are recorded explicitly instead of being
+/// assigned to confined work that cannot prove them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequirementDisposition {
-    Covered { assertion_ids: Vec<AssertionId> },
-    Limitation { rationale: String },
+    /// Worker-independent oracle proof inside confinement.
+    ConfinedProvable {
+        assertion_ids: Vec<AssertionId>,
+    },
+    /// Fresh judged receipts from the assigned in-confinement panel.
+    ReviewerCheckable {
+        assertion_ids: Vec<AssertionId>,
+    },
+    /// Owed after apply by the operator/host because confinement cannot
+    /// honestly observe the claim.
+    HostAcceptance {
+        rationale: String,
+    },
+    Limitation {
+        rationale: String,
+    },
+}
+
+impl RequirementDisposition {
+    pub fn assertion_ids(&self) -> &[AssertionId] {
+        match self {
+            Self::ConfinedProvable { assertion_ids }
+            | Self::ReviewerCheckable { assertion_ids } => assertion_ids,
+            Self::HostAcceptance { .. } | Self::Limitation { .. } => &[],
+        }
+    }
+
+    pub const fn is_proof_bearing(&self) -> bool {
+        matches!(
+            self,
+            Self::ConfinedProvable { .. } | Self::ReviewerCheckable { .. }
+        )
+    }
+
+    pub const fn is_recorded_obligation(&self) -> bool {
+        matches!(self, Self::HostAcceptance { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,11 +218,31 @@ pub struct Plan {
 impl Plan {
     /// Whether every assertion binds an oracle — i.e. the plan is
     /// verified-possible (each claim can be authoritatively judged). Backs the
-    /// CLI `verified-possible`/`reviewed-only` ceiling display. (The `Verified`
+    /// CLI `verified-possible`/`attested-only` ceiling display. (The `Verified`
     /// stop-bar reachability check computes the same condition independently, to
     /// report the offending assertion ids.)
     pub fn all_assertions_bound(&self) -> bool {
         self.assertions.iter().all(|a| a.oracle.is_some())
+    }
+
+    pub fn assertion_requires_confined_proof(&self, assertion_id: &AssertionId) -> bool {
+        self.requirements.iter().any(|requirement| {
+            matches!(
+                &requirement.disposition,
+                RequirementDisposition::ConfinedProvable { assertion_ids }
+                    if assertion_ids.contains(assertion_id)
+            )
+        })
+    }
+
+    pub fn assertion_requires_judged_proof(&self, assertion_id: &AssertionId) -> bool {
+        self.requirements.iter().any(|requirement| {
+            matches!(
+                &requirement.disposition,
+                RequirementDisposition::ReviewerCheckable { assertion_ids }
+                    if assertion_ids.contains(assertion_id)
+            )
+        })
     }
 }
 
