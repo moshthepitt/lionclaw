@@ -13,9 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 47 derives successful writer workspace provenance from the accepted
-/// team-owned request before retiring its active delivery.
-pub const REDUCER_VERSION: u32 = 47;
+/// Reducer 48 clears settled cleanup failures and preserves terminal
+/// conversation retirement while inherited role effects settle.
+pub const REDUCER_VERSION: u32 = 48;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -205,6 +205,13 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             justification,
             ..
         } => apply_decision(state, attention_id, action, justification),
+    }
+    if state
+        .cleanup_failure
+        .as_ref()
+        .is_some_and(|failure| !state.inflight.contains_key(&failure.effect_id))
+    {
+        state.cleanup_failure = None;
     }
     state.head = seq;
     derive(state);
@@ -686,7 +693,11 @@ fn settle_role_failure(
         },
     );
     if let Some(conversation) = state.conversations.get_mut(&request.role_instance) {
-        conversation.lifecycle = ConversationLifecycle::Ready;
+        if state.phase.is_terminal() {
+            retire_conversation(conversation);
+        } else {
+            conversation.lifecycle = ConversationLifecycle::Ready;
+        }
     }
 }
 
