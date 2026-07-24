@@ -2,7 +2,9 @@
 
 use super::fold::{gap_review_outstanding, oracle_obligation_outstanding};
 use super::ids::{AssertionId, OracleName, RoleInstanceId, TaskId};
-use super::state::{ConversationLifecycle, MissionPhase, MissionState, ReviewOutcome, TaskStatus};
+use super::state::{
+    ConversationLifecycle, DeliveryMarker, MissionPhase, MissionState, ReviewOutcome, TaskStatus,
+};
 use crate::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +121,10 @@ fn step_running(state: &MissionState) -> StepDecision {
     };
 
     for (role_id, conversation) in &state.conversations {
-        if conversation.queued.is_empty()
+        if !conversation
+            .queued
+            .iter()
+            .any(|message| message.marker != DeliveryMarker::Undeliverable)
             || !state.conversation_is_messageable(role_id)
             || conversation.lifecycle == ConversationLifecycle::Completed
         {
@@ -129,9 +134,11 @@ fn step_running(state: &MissionState) -> StepDecision {
             return StepDecision::Idle;
         };
         let task = state.tasks.iter().find_map(|(task_id, task)| {
-            (matches!(task.status, TaskStatus::Running | TaskStatus::Failed)
-                && (task.status != TaskStatus::Failed
-                    || state.task_automatic_retry_remaining(task_id))
+            (matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running | TaskStatus::Failed
+            ) && (task.status != TaskStatus::Failed
+                || state.task_automatic_retry_remaining(task_id))
                 && task.role_assignment.as_ref().is_some_and(|assignment| {
                     assignment.role_instance == *role_id
                         && assignment.team_revision == team.revision
@@ -179,6 +186,14 @@ fn step_running(state: &MissionState) -> StepDecision {
         ) {
             return StepDecision::DispatchRole(intent);
         }
+    }
+
+    if plan
+        .tasks
+        .iter()
+        .any(|task| status_of(&task.id) != Some(TaskStatus::Cleared))
+    {
+        return StepDecision::Idle;
     }
 
     let Some(team) = state.team.as_ref() else {

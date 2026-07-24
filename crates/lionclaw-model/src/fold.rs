@@ -15,7 +15,7 @@ use crate::{TypedFailure, TypedFailureEvidence};
 
 /// Reducer 40 carries exact task failure receipts into attention and durable
 /// planning refinement evidence.
-pub const REDUCER_VERSION: u32 = 42;
+pub const REDUCER_VERSION: u32 = 44;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -440,7 +440,7 @@ fn apply_role_outcome(
         Err(failure)
             if failure.evidence().code.as_deref() == Some("message.reference_unavailable") =>
         {
-            settle_delivery(state, &request.role_instance, true);
+            settle_unavailable_delivery(state, &request.role_instance);
             if let Some(receipt) = state.role_attempt_receipts.get_mut(effect_id) {
                 receipt.disposition = RoleAttemptDisposition::Failed {
                     failure: failure.clone(),
@@ -549,10 +549,14 @@ fn apply_success_handoff(
         | (super::OutputSemantics::ProducesReport, None)
         | (super::OutputSemantics::ProposesPlan, None) => {
             if let Some(conversation) = state.conversations.get_mut(&request.role_instance) {
-                conversation.lifecycle = if conversation.queued.is_empty() {
-                    ConversationLifecycle::AwaitingLead
-                } else {
+                conversation.lifecycle = if conversation
+                    .queued
+                    .iter()
+                    .any(|message| message.marker != DeliveryMarker::Undeliverable)
+                {
                     ConversationLifecycle::Ready
+                } else {
+                    ConversationLifecycle::AwaitingLead
                 };
             }
         }
@@ -580,10 +584,14 @@ fn apply_success_handoff(
                 }
             }
             if let Some(conversation) = state.conversations.get_mut(&request.role_instance) {
-                conversation.lifecycle = if conversation.queued.is_empty() {
-                    ConversationLifecycle::AwaitingLead
-                } else {
+                conversation.lifecycle = if conversation
+                    .queued
+                    .iter()
+                    .any(|message| message.marker != DeliveryMarker::Undeliverable)
+                {
                     ConversationLifecycle::Ready
+                } else {
+                    ConversationLifecycle::AwaitingLead
                 };
             }
         }
@@ -684,9 +692,25 @@ fn settle_delivery(state: &mut MissionState, role_instance: &RoleInstanceId, suc
     }
     if success {
         conversation.consumed_through = delivery.message_boundary;
-        conversation
-            .queued
-            .retain(|message| message.sequence_no > delivery.message_boundary);
+        conversation.queued.retain(|message| {
+            (message.marker == DeliveryMarker::Undeliverable
+                && !delivery.presented_messages.contains(&message.sequence_no))
+                || message.sequence_no > delivery.message_boundary
+        });
+    }
+}
+
+fn settle_unavailable_delivery(state: &mut MissionState, role_instance: &RoleInstanceId) {
+    let Some(conversation) = state.conversations.get_mut(role_instance) else {
+        return;
+    };
+    let Some(delivery) = conversation.active_delivery.take() else {
+        return;
+    };
+    for message in &mut conversation.queued {
+        if delivery.presented_messages.contains(&message.sequence_no) {
+            message.marker = DeliveryMarker::Undeliverable;
+        }
     }
 }
 
@@ -705,17 +729,18 @@ fn apply_oracle_outcome(
         judged_sha: expected_sha,
         attempt_no: expected_attempt,
         ..
-    }) = state.inflight.remove(effect_id)
+    }) = state.inflight.get(effect_id)
     else {
         return;
     };
     if expected_assertions != assertion_ids
-        || expected_oracle != *oracle
+        || *expected_oracle != *oracle
         || expected_sha != judged_sha
-        || expected_attempt != attempt_no
+        || *expected_attempt != attempt_no
     {
         return;
     }
+    state.inflight.remove(effect_id);
     match outcome {
         Err(failure) => {
             state
