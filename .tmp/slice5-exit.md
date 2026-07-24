@@ -11,21 +11,61 @@
 - Joint plan/team promotion, exact judgment panels, taskless recovery,
   prepared role inputs, gap acknowledgment, and authoritative failure repair
   all use one team-owned path.
+- The deleted Slice 4 proof corpus is restored against schema-24 team
+  vocabulary. Ported production proofs also restored post-turn native-state
+  enforcement, exact failure delivery markers, invalid-handoff rework, and
+  active task-workspace observation where the tests proved the cutover wrong.
 - One RoboRev pass (job 1420); all six findings were addressed.
 
-Versions: `SCHEMA_VERSION = 24`, `REDUCER_VERSION = 37`.
+Versions: `SCHEMA_VERSION = 24`, `REDUCER_VERSION = 49`.
 
 Security impact: team role grants are validated against mission ceilings,
 kernel-owned environment coordinates cannot be overridden, and prepared inputs
 are mounted only when explicitly granted. No sender identity was introduced.
 
 Contract impact: schema 24 deliberately replaces the unreleased pre-team event
-and wire vocabulary without aliases or compatibility bridges. Reducer 37
-records the final joint-promotion and recovery semantics.
+and wire vocabulary without aliases or compatibility bridges. Reducer 49
+preserves exact delivery and invalid-handoff evidence across atomic role
+failures.
+
+## Proof-corpus inventory
+
+Cutover baseline `7ffd3f98` had deleted all 24 files below. Every file is
+present again on the final tree; the 23 executable suites contain exactly 193
+tests on both signed Slice 4 head `eabc0094` and this head. `common/mod.rs` is
+shared test support. No test file remains deleted relative to `eabc0094`.
+
+- `D -> restored` `advisory_validator.rs` (4)
+- `D -> restored` `approval.rs` (2)
+- `D -> restored` `common/mod.rs` (support)
+- `D -> restored` `controlled_effects.rs` (14)
+- `D -> restored` `conversation_resource_lifecycle.rs` (5)
+- `D -> restored` `driver_recovery.rs` (17)
+- `D -> restored` `eval_deterministic.rs` (2)
+- `D -> restored` `fold_litmus.rs` (7)
+- `D -> restored` `happy_path.rs` (10)
+- `D -> restored` `identity.rs` (3)
+- `D -> restored` `message_routing.rs` (1)
+- `D -> restored` `mission_type_loading.rs` (42)
+- `D -> restored` `phase0_liveness.rs` (2)
+- `D -> restored` `planning.rs` (11)
+- `D -> restored` `production_conversation_flow.rs` (9)
+- `D -> restored` `queue_bounds.rs` (3)
+- `D -> restored` `recovery.rs` (8)
+- `D -> restored` `reference_expansion.rs` (6)
+- `D -> restored` `replanning.rs` (9)
+- `D -> restored` `resume.rs` (4)
+- `D -> restored` `skill_dispatch.rs` (2)
+- `D -> restored` `skill_prompts.rs` (7)
+- `D -> restored` `store_hardening.rs` (6)
+- `D -> restored` `terminal_review.rs` (19)
+
+Suite dispositions: none died. `planning.rs` remains because planning,
+ratification, and refinement machinery survives the sunset.
 
 ## Gates
 
-All passed on signed implementation head `c5760b4a`:
+All passed on the final proof-corpus tree:
 
 - `cargo fmt -- --check`
 - `cargo check`
