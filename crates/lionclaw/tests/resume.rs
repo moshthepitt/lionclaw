@@ -32,6 +32,7 @@ fn role_request(mission_id: &lionclaw::model::MissionId, head: u64) -> (EffectId
             prompt_template: RolePromptTemplate::Execution,
             prompt_hash: PROMPT_HASH.to_string(),
             base_sha: BASE_SHA.to_string(),
+            dependency_refs: vec![],
             assignment_epoch: 1,
             message_boundary: head,
             presented_messages: vec![],

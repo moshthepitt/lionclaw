@@ -1656,7 +1656,8 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "delegation": state.delegation,
                 "stop_bar": state.config.stop.slug(),
                 "base_sha": state.base_sha,
-                "current_sha": state.current_sha,
+                "current_sha": state.deliverable_head(),
+                "deliverable_head": state.deliverable_head(),
                 "finish": finish.map(|f| f.slug()),
                 "disposition": view.disposition.slug(),
                 "next_actions": view.next_actions(),
@@ -1904,11 +1905,12 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     if !matches!(view.disposition, MissionDisposition::Terminal) {
         println!("\n  next: {}", view.next_actions().join(" | "));
     }
-    if args.patch && state.current_sha != state.base_sha {
+    if args.patch && state.deliverable_head() != state.base_sha {
         let diff = workspace::diff(&repo, &state.base_sha, state.deliverable_head()).await?;
         println!(
             "\n--- diff {}..{} ---\n{diff}",
-            state.base_sha, state.current_sha
+            state.base_sha,
+            state.deliverable_head()
         );
     }
     Ok(())
@@ -3216,7 +3218,8 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         "revision": state.revision,
         "team_revision": state.team.as_ref().map(|team| team.revision),
         "delegation": state.delegation,
-        "current_sha": state.current_sha,
+        "current_sha": state.deliverable_head(),
+        "deliverable_head": state.deliverable_head(),
         "objective": state.objective,
         "conversations": conversation_views(state, store)?,
         "role_attempt_receipts": role_attempt_receipts_json(state, blobs),
@@ -3391,6 +3394,8 @@ fn task_runtime_json(
         "id": id.as_str(),
         "status": format!("{:?}", task.status).to_ascii_lowercase(),
         "assignment_base_sha": assignment.map(|assignment| assignment.base_sha.as_str()),
+        "candidate_sha": task.candidate_sha.as_deref(),
+        "pending_base_sha": task.pending_base_sha.as_deref(),
         "assignment_epoch": assignment.map(|assignment| assignment.assignment_epoch).unwrap_or(0),
         "workspace_provenance": workspace.map(|workspace| serde_json::json!({
             "effect_id": workspace.effect_id.as_str(),

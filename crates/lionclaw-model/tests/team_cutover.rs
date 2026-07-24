@@ -259,6 +259,7 @@ fn sunset_wire_shapes_have_no_planning_or_role_bridges() {
         prompt_template: RolePromptTemplate::Execution,
         prompt_hash: "prompt".into(),
         base_sha: "base".into(),
+        dependency_refs: Vec::new(),
         assignment_epoch: 1,
         message_boundary: 0,
         presented_messages: Vec::new(),
@@ -546,6 +547,7 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
                 prompt_template: RolePromptTemplate::Execution,
                 prompt_hash: "prompt".into(),
                 base_sha: "base".into(),
+                dependency_refs: Vec::new(),
                 assignment_epoch: 1,
                 message_boundary: 5,
                 presented_messages: Vec::new(),
@@ -687,6 +689,7 @@ fn reviewer_request(
                 prompt_template: RolePromptTemplate::Judgment,
                 prompt_hash: prompt_hash.into(),
                 base_sha: "base".into(),
+                dependency_refs: Vec::new(),
                 assignment_epoch: 1,
                 message_boundary: sequence_no - 1,
                 presented_messages: Vec::new(),
@@ -882,6 +885,7 @@ fn queued_continuation_uses_the_roles_running_serial_task() {
     let earlier = TaskId::new("implement").unwrap();
     let active = TaskId::new("verify").unwrap();
     state.tasks.get_mut(&earlier).unwrap().status = TaskStatus::Cleared;
+    state.tasks.get_mut(&earlier).unwrap().candidate_sha = Some("earlier-sha".into());
     state.plan.as_mut().unwrap().tasks.push(Task {
         id: active.clone(),
         body: "finish the later serial task".into(),
@@ -901,6 +905,8 @@ fn queued_continuation_uses_the_roles_running_serial_task() {
             attempts: 1,
             consecutive_failures: 0,
             last_outcome: None,
+            candidate_sha: None,
+            pending_base_sha: None,
             feedback: Vec::new(),
             role_assignment: Some(TaskRoleAssignment {
                 role_instance: instance("engineer"),

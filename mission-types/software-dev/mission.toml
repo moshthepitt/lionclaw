@@ -30,6 +30,7 @@ max-attempts = 3
 default-timeout-secs = 1800
 max-task-time-secs = 3600
 extension-step-secs = 600
+effect-capacity = 4
 auto-continue-candidate = false
 auto-continue-proof = false
 

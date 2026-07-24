@@ -6,7 +6,7 @@
 
 use crate::model::{
     Assertion, ConfinementResources, MissionProposal, OutputSemantics, Plan, RoleInstance,
-    TeamRevision,
+    TaskCandidateRef, TeamRevision,
 };
 
 pub struct ExecutionContext<'a> {
@@ -19,6 +19,8 @@ pub struct ExecutionContext<'a> {
     /// artifact and the contract, never the producer's narrative
     /// (fresh-context).
     pub upstream_reports: &'a [String],
+    /// Exact candidate commits for cleared dependency tasks.
+    pub upstream_refs: &'a [TaskCandidateRef],
     /// Accepted team guidance, present only in execution and planning turns.
     pub guidance: &'a str,
     /// Engine-routed failure evidence and repair guidance from prior attempts.
@@ -73,6 +75,15 @@ fn render_execution(role: &RoleInstance, ctx: &ExecutionContext<'_>) -> String {
         for report in ctx.upstream_reports {
             prompt.push_str(&format!("- {report}\n"));
         }
+    }
+    if !ctx.upstream_refs.is_empty() {
+        prompt.push_str("\n\n## Upstream task candidate refs\n\n");
+        for candidate in ctx.upstream_refs {
+            prompt.push_str(&format!("- {}: {}\n", candidate.task_id, candidate.sha));
+        }
+        prompt.push_str(
+            "Fetch these exact dependency commits by SHA before merging. Merge forward; do not rewrite or squash dependency history.\n",
+        );
     }
     if !ctx.guidance.is_empty() {
         prompt.push_str("\n\n## Team guidance\n\n");
@@ -549,6 +560,7 @@ mod team_prompt_tests {
                 task_body: "change it",
                 targets: &[],
                 upstream_reports: &[],
+                upstream_refs: &[],
                 guidance,
                 feedback: &[],
             },

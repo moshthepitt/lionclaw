@@ -34,6 +34,7 @@ use crate::prompt::{
 use crate::resources::MissionDirs;
 use crate::store::{AppendError, MissionStore, NewEvent};
 
+#[derive(Clone)]
 pub struct Engine {
     store: MissionStore,
     mission_type: MissionType,
@@ -389,7 +390,28 @@ impl Engine {
         let state =
             crate::model::fold(prefix).context("role request prefix has no creation event")?;
         let StepDecision::DispatchRole(intent) = step(&state) else {
-            bail!("role request prefix no longer reconstructs its dispatch")
+            let StepDecision::DispatchRoles(intents) = step(&state) else {
+                bail!("role request prefix no longer reconstructs its dispatch")
+            };
+            let Some(intent) = intents.into_iter().find(|intent| {
+                intent.role_instance == role_instance && intent.team_revision == team_revision
+            }) else {
+                bail!("role request prefix no longer reconstructs its dispatch")
+            };
+            let role = state
+                .team_history
+                .get(&team_revision)
+                .and_then(|team| team.role(&role_instance))
+                .context("role instance missing from recorded team revision")?;
+            let dialogue =
+                materialize_conversation_messages(self, &state, &role_instance, state.head).await?;
+            let prompt = self.assemble_role_request(&state, role, &intent, &dialogue)?;
+            let actual_template = crate::model::role_prompt_template(role.output);
+            let actual_hash = hex::encode(Sha256::digest(prompt.as_bytes()));
+            if template != actual_template || expected_hash != actual_hash {
+                bail!("canonical role prompt drift")
+            }
+            return Ok(prompt);
         };
         ensure!(
             intent.role_instance == role_instance && intent.team_revision == team_revision,
@@ -747,7 +769,7 @@ impl Engine {
         for _ in 0..MAX_LOOP_ITERATIONS {
             let state = self.load_state(mission_id).await?;
             if !state.inflight.is_empty() {
-                if self.drive_one(&state, activity.clone()).await? {
+                if Box::pin(self.drive_active(&state, activity.clone())).await? {
                     continue;
                 }
                 return Ok(());
@@ -779,6 +801,9 @@ impl Engine {
                 StepDecision::Park | StepDecision::Terminal => return Ok(()),
                 StepDecision::DispatchRole(intent) => {
                     self.materialize_role_turn_request(&state, intent).await?;
+                }
+                StepDecision::DispatchRoles(intents) => {
+                    self.materialize_role_turn_requests(&state, intents).await?;
                 }
                 StepDecision::RunOracles(intents) => {
                     self.materialize_oracle_requests(&state, intents).await?;
@@ -850,19 +875,61 @@ impl Engine {
         }
     }
 
+    async fn drive_active(
+        &self,
+        state: &MissionState,
+        activity: tokio::sync::watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
+    ) -> Result<bool> {
+        let effect_ids: Vec<_> = state.inflight.keys().cloned().collect();
+        if effect_ids.is_empty() {
+            return Ok(false);
+        }
+        let parallel_writers = effect_ids.len() > 1
+            && effect_ids.iter().all(|effect_id| {
+                matches!(
+                    state.inflight.get(effect_id),
+                    Some(InflightEffect::RoleTurn {
+                        output: crate::model::OutputSemantics::ProducesArtifact,
+                        ..
+                    })
+                )
+            });
+        if !parallel_writers {
+            return Box::pin(self.drive_one(
+                state,
+                effect_ids.into_iter().next().expect("non-empty"),
+                activity,
+            ))
+            .await;
+        }
+        let mut handles = Vec::new();
+        for effect_id in effect_ids {
+            let engine = self.clone();
+            let state = state.clone();
+            let activity = activity.clone();
+            handles.push(tokio::spawn(async move {
+                engine.drive_one(&state, effect_id, activity).await
+            }));
+        }
+        let mut continue_driving = true;
+        for handle in handles {
+            let outcome = handle.await.context("joining effect driver task")??;
+            continue_driving &= outcome;
+        }
+        Ok(continue_driving)
+    }
+
     /// Execute one request materialized by this driver, clean its transient
     /// resources, then durably record the outcome.
     async fn drive_one(
         &self,
         state: &MissionState,
+        effect_id: EffectId,
         activity: tokio::sync::watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
     ) -> Result<bool> {
-        let Some(effect_id) = state.inflight.keys().next() else {
-            return Ok(false);
-        };
         let wait_ms = state
             .inflight
-            .get(effect_id)
+            .get(&effect_id)
             .expect("effect id came from the same map")
             .not_before_ms()
             .saturating_sub(self.clock.now_ms())
@@ -870,12 +937,12 @@ impl Engine {
         let start_at = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
         let effect = loop {
             let current = self.load_state(&state.mission_id).await?;
-            let Some(active) = current.inflight.get(effect_id) else {
+            let Some(active) = current.inflight.get(&effect_id) else {
                 return Ok(true);
             };
             if let MissionPhase::Aborted { reason } = &current.phase {
                 if matches!(
-                    self.cleanup_effect(&current, effect_id, true).await?,
+                    self.cleanup_effect(&current, &effect_id, true).await?,
                     EffectCleanupDisposition::Blocked
                 ) {
                     return Ok(false);
@@ -883,8 +950,8 @@ impl Engine {
                 if self
                     .append_outcome(
                         &current.mission_id,
-                        effect_id,
-                        aborted_before_start_outcome(effect_id, active, reason),
+                        &effect_id,
+                        aborted_before_start_outcome(&effect_id, active, reason),
                         true,
                     )
                     .await?
@@ -894,9 +961,9 @@ impl Engine {
                 }
                 return Ok(true);
             }
-            if let Some(reason) = current.stop_requests.get(effect_id) {
+            if let Some(reason) = current.stop_requests.get(&effect_id) {
                 if matches!(
-                    self.cleanup_effect(&current, effect_id, true).await?,
+                    self.cleanup_effect(&current, &effect_id, true).await?,
                     EffectCleanupDisposition::Blocked
                 ) {
                     return Ok(false);
@@ -904,8 +971,8 @@ impl Engine {
                 if self
                     .append_outcome(
                         &current.mission_id,
-                        effect_id,
-                        stopped_before_start_outcome(effect_id, active, reason),
+                        &effect_id,
+                        stopped_before_start_outcome(&effect_id, active, reason),
                         true,
                     )
                     .await?
@@ -913,7 +980,7 @@ impl Engine {
                 {
                     return Ok(false);
                 }
-                return Ok(has_owned_oracle_sibling(&current, effect_id, active));
+                return Ok(has_owned_sibling(&current, &effect_id, active));
             }
             let now = tokio::time::Instant::now();
             if now >= start_at {
@@ -926,11 +993,11 @@ impl Engine {
         let execution = async {
             match &effect {
                 InflightEffect::RoleTurn { .. } => {
-                    self.execute_role_turn(state, effect_id, &effect, control_rx, activity.clone())
+                    self.execute_role_turn(state, &effect_id, &effect, control_rx, activity.clone())
                         .await
                 }
                 InflightEffect::OracleRun { .. } => {
-                    self.execute_oracle_run(state, effect_id, &effect, control_rx)
+                    self.execute_oracle_run(state, &effect_id, &effect, control_rx)
                         .await
                 }
             }
@@ -944,18 +1011,18 @@ impl Engine {
                 outcome = &mut execution => break outcome?,
                 () = tokio::time::sleep(Duration::from_millis(100)) => {
                     let current = self.load_state(&state.mission_id).await?;
-                    let Some(active) = current.inflight.get(effect_id) else {
+                    let Some(active) = current.inflight.get(&effect_id) else {
                         bail!("active effect '{effect_id}' disappeared without an outcome");
                     };
                     if let MissionPhase::Aborted { reason } = &current.phase {
                         control_tx.send_replace(ExecutionControl::Abort(reason.clone()));
                         continue;
                     }
-                    if current.reached_deadlines.contains_key(effect_id) {
+                    if current.reached_deadlines.contains_key(&effect_id) {
                         control_tx.send_replace(ExecutionControl::DeadlineExhausted);
                         continue;
                     }
-                    if let Some(reason) = current.stop_requests.get(effect_id) {
+                    if let Some(reason) = current.stop_requests.get(&effect_id) {
                         control_tx.send_replace(ExecutionControl::Stop(reason.clone()));
                         continue;
                     }
@@ -1002,7 +1069,7 @@ impl Engine {
                         )
                         .await?;
                         let latest = self.load_state(&current.mission_id).await?;
-                        if latest.reached_deadlines.get(effect_id) == Some(&deadline_ms) {
+                        if latest.reached_deadlines.get(&effect_id) == Some(&deadline_ms) {
                             control_tx.send_replace(ExecutionControl::DeadlineExhausted);
                         }
                     } else {
@@ -1016,7 +1083,7 @@ impl Engine {
             MissionEvent::RoleTurnCompleted { outcome: Ok(_), .. }
         );
         match self
-            .cleanup_effect(state, effect_id, discard_artifact)
+            .cleanup_effect(state, &effect_id, discard_artifact)
             .await?
         {
             EffectCleanupDisposition::Complete(Some(failure))
@@ -1025,7 +1092,7 @@ impl Engine {
                     MissionEvent::RoleTurnCompleted { outcome: Ok(_), .. }
                 ) =>
             {
-                outcome = failed_outcome(effect_id, &effect, failure);
+                outcome = failed_outcome(&effect_id, &effect, failure);
                 discard_artifact = true;
             }
             EffectCleanupDisposition::Complete(Some(_)) => {}
@@ -1033,7 +1100,7 @@ impl Engine {
             EffectCleanupDisposition::Blocked => return Ok(false),
         }
         let Some(outcome) = self
-            .append_outcome(&state.mission_id, effect_id, outcome, discard_artifact)
+            .append_outcome(&state.mission_id, &effect_id, outcome, discard_artifact)
             .await?
         else {
             return Ok(false);
@@ -1059,7 +1126,7 @@ impl Engine {
             // Oracle requests are materialized as one owned batch. Yield only
             // after every sibling has run; otherwise recovery would falsely
             // classify an unstarted sibling as a crashed effect.
-            if has_owned_oracle_sibling(state, effect_id, &effect) {
+            if has_owned_sibling(state, &effect_id, &effect) {
                 return Ok(true);
             }
             return Ok(false);
@@ -1294,6 +1361,7 @@ impl Engine {
             attempt_no,
             output,
             base_sha,
+            dependency_refs,
             assignment_epoch,
             workspace_preparation,
             ..
@@ -1389,6 +1457,7 @@ impl Engine {
             resource_ceilings: self.mission_type.resource_ceilings.clone(),
             prompt: prompt_text.clone(),
             base_sha: base_sha.to_string(),
+            dependency_refs: dependency_refs.clone(),
             assignment_epoch: *assignment_epoch,
             workspace_preparation: workspace_preparation.clone(),
             deadline_ms: effect.deadline_ms(),
@@ -1728,6 +1797,7 @@ impl Engine {
                 task_body: &intent.body,
                 targets: &targets,
                 upstream_reports: &upstream_reports,
+                upstream_refs: &intent.dependency_refs,
                 guidance: state
                     .team
                     .as_ref()
@@ -1885,6 +1955,29 @@ impl Engine {
         state: &MissionState,
         intent: RoleDispatchIntent,
     ) -> Result<()> {
+        let events = self.build_role_turn_events(state, intent).await?;
+        self.append_idempotent(&state.mission_id, state.head, &events)
+            .await
+    }
+
+    async fn materialize_role_turn_requests(
+        &self,
+        state: &MissionState,
+        intents: Vec<RoleDispatchIntent>,
+    ) -> Result<()> {
+        let mut events = Vec::new();
+        for intent in intents {
+            events.extend(self.build_role_turn_events(state, intent).await?);
+        }
+        self.append_idempotent(&state.mission_id, state.head, &events)
+            .await
+    }
+
+    async fn build_role_turn_events(
+        &self,
+        state: &MissionState,
+        intent: RoleDispatchIntent,
+    ) -> Result<Vec<NewEvent>> {
         let role = state
             .team
             .as_ref()
@@ -1910,6 +2003,7 @@ impl Engine {
                     .as_ref()
                     .and_then(|task_id| state.tasks.get(task_id)),
                 required_base: &intent.base_sha,
+                dependency_refs: &intent.dependency_refs,
                 lifecycle_generation: state.revision.max(1),
                 retrying_failure: intent
                     .task_id
@@ -1966,6 +2060,7 @@ impl Engine {
         };
         let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));
         let base_sha = assignment.base_sha;
+        let dependency_refs = assignment.dependency_refs;
         let assignment_epoch = assignment.generation;
         let workspace_preparation = assignment.workspace_preparation;
         let effect_id = EffectId::for_role_turn(
@@ -1998,6 +2093,7 @@ impl Engine {
             prompt_template: crate::model::role_prompt_template(intent.output),
             prompt_hash: prompt_hash.clone(),
             base_sha,
+            dependency_refs,
             assignment_epoch,
             message_boundary,
             presented_messages,
@@ -2022,11 +2118,9 @@ impl Engine {
                 effect_id,
                 outcome: Err(failure),
             });
-            self.append_idempotent(&state.mission_id, state.head, &[event, completed])
-                .await
+            Ok(vec![event, completed])
         } else {
-            self.append_idempotent(&state.mission_id, state.head, &[event])
-                .await
+            Ok(vec![event])
         }
     }
 
@@ -2945,11 +3039,7 @@ fn checkpoint_after(
     }
 }
 
-fn has_owned_oracle_sibling(
-    state: &MissionState,
-    effect_id: &EffectId,
-    effect: &InflightEffect,
-) -> bool {
+fn has_owned_sibling(state: &MissionState, effect_id: &EffectId, effect: &InflightEffect) -> bool {
     matches!(effect, InflightEffect::OracleRun { .. })
         && state.inflight.iter().any(|(sibling_id, sibling)| {
             sibling_id != effect_id && matches!(sibling, InflightEffect::OracleRun { .. })

@@ -21,9 +21,10 @@ use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailureEvidence};
 
-/// Version 27 is the Slice 8 runtime-truth surface: role outcomes carry
-/// provider-reported usage evidence, including explicit non-reporting.
-pub const SCHEMA_VERSION: u32 = 27;
+/// Version 28 is the Slice 9 parallel-writer surface: role requests carry
+/// dependency candidate refs, and mission execution policy carries effect
+/// capacity.
+pub const SCHEMA_VERSION: u32 = 28;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -225,6 +226,8 @@ pub struct ExecutionPolicy {
     pub default_timeout_secs: u64,
     pub max_task_time_secs: u64,
     pub extension_step_secs: u64,
+    #[serde(default = "default_effect_capacity")]
+    pub effect_capacity: u32,
     #[serde(default)]
     pub auto_continue_candidate: bool,
     #[serde(default)]
@@ -237,16 +240,24 @@ impl Default for ExecutionPolicy {
             default_timeout_secs: 30 * 60,
             max_task_time_secs: 30 * 60,
             extension_step_secs: 5 * 60,
+            effect_capacity: default_effect_capacity(),
             auto_continue_candidate: false,
             auto_continue_proof: false,
         }
     }
 }
 
+const fn default_effect_capacity() -> u32 {
+    4
+}
+
 impl ExecutionPolicy {
     pub fn validate(&self) -> Result<(), String> {
         if self.default_timeout_secs == 0 || self.extension_step_secs == 0 {
             return Err("execution durations must be greater than zero".into());
+        }
+        if self.effect_capacity == 0 || self.effect_capacity > 64 {
+            return Err("effect-capacity must be between 1 and 64".into());
         }
         if self.max_task_time_secs < self.default_timeout_secs {
             return Err("max-task-time-secs must be at least default-timeout-secs".into());
@@ -428,6 +439,15 @@ pub struct ArtifactOutcome {
     pub head_sha: String,
 }
 
+/// Exact candidate commits from a task's dependency lineages, copied onto a
+/// writer request so replay can reject stale integration work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCandidateRef {
+    pub task_id: TaskId,
+    pub sha: String,
+}
+
 /// Validate the parts of a role success that are authoritative at the effect
 /// boundary. Writers may legitimately report no artifact when the requested
 /// work was already satisfied, but only writers may return one and its base
@@ -605,6 +625,10 @@ pub enum MissionEvent {
         prompt_hash: String,
         /// Commit the role's workspace is created at.
         base_sha: String,
+        /// Candidate commits this task depends on, in plan-authored dependency
+        /// order. Empty for root tasks and taskless turns.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dependency_refs: Vec<TaskCandidateRef>,
         /// Monotonic identity for a fresh task assignment. Retries and
         /// continues retain the epoch and workspace.
         assignment_epoch: u32,

@@ -328,6 +328,7 @@ async fn controlled_effect_log_satisfies_every_prefix_and_snapshot_law() {
                 prompt_template: lionclaw::model::RolePromptTemplate::Execution,
                 prompt_hash,
                 base_sha: BASE_SHA.into(),
+                dependency_refs: vec![],
                 assignment_epoch: 1,
                 message_boundary: state.head,
                 presented_messages: vec![],

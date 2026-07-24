@@ -1425,7 +1425,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (27, 53));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (28, 54));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -3120,6 +3120,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             .unwrap();
         }
         let moved = reloaded_store.require_state(&mission).await.unwrap();
+        let repair_base = moved.deliverable_head().to_string();
         let old_response = moved.conversations[&old_id].final_response.clone();
         assert!(old_response.is_some());
         let attention = moved
@@ -3160,7 +3161,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         let replacement_id = &old_id;
         let replacement = &moved.conversations[replacement_id];
         let replacement_workspace = moved.tasks[&task_id].workspace_provenance.as_ref().unwrap();
-        assert_eq!(replacement_workspace.base_sha, moved.current_sha);
+        assert_eq!(replacement_workspace.base_sha, repair_base);
         assert!(replacement_workspace.assignment_epoch > old_generation);
         assert!(replacement.active_delivery.is_none());
         assert_ne!(replacement.final_response, old_response);

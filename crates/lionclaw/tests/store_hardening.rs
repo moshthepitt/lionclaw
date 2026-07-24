@@ -35,6 +35,7 @@ fn role_request(
         lionclaw::model::RoleAssignmentContext {
             previous,
             required_base: &state.current_sha,
+            dependency_refs: &[],
             lifecycle_generation: state.revision.max(1),
             retrying_failure: task_id
                 .as_ref()
@@ -77,6 +78,7 @@ fn role_request(
         prompt_template: lionclaw::model::role_prompt_template(role.output),
         prompt_hash: PROMPT_HASH.into(),
         base_sha: assignment.base_sha,
+        dependency_refs: assignment.dependency_refs,
         assignment_epoch: assignment.generation,
         message_boundary: state.head,
         presented_messages,

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::event::{
     EffectResource, MissionConfig, MissionTypeRef, PayloadRef, RuntimeConfigurationEvidence,
+    TaskCandidateRef,
 };
 use super::ids::{AssertionId, MissionId, OracleName, RoleInstanceId, TaskId};
 use super::plan::{Assertion, Plan};
@@ -259,6 +260,7 @@ pub struct RoleTurnProvenance {
     pub prompt_template: super::RolePromptTemplate,
     pub prompt_hash: String,
     pub base_sha: String,
+    pub dependency_refs: Vec<TaskCandidateRef>,
     pub workspace_preparation: super::WorkspacePreparation,
     pub message_boundary: u64,
     pub presented_messages: Vec<u64>,
@@ -399,6 +401,16 @@ pub struct TaskRuntimeState {
     /// evidence are mutually exclusive by construction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_outcome: Option<TaskAttemptOutcome>,
+    /// Current candidate commit for this task lineage. A task that completed
+    /// with no captured commit inherits its assignment base. A downstream
+    /// repair clears this field until the task is re-owed and reruns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_sha: Option<String>,
+    /// Exact base required for a repaired task's next non-retry attempt. This
+    /// is set from the deliverable head that made the failed proof current and
+    /// cleared once the replacement candidate settles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_base_sha: Option<String>,
     /// Engine-routed repair feedback for this task's next attempt.
     #[serde(default)]
     pub feedback: Vec<FailureFeedback>,
@@ -485,6 +497,7 @@ pub struct RoleAssignment {
     pub role_instance: RoleInstanceId,
     pub team_revision: u32,
     pub base_sha: String,
+    pub dependency_refs: Vec<TaskCandidateRef>,
     pub generation: u32,
     pub workspace_preparation: super::WorkspacePreparation,
 }
@@ -493,6 +506,7 @@ pub struct RoleAssignment {
 pub struct RoleAssignmentContext<'a> {
     pub previous: Option<&'a TaskRuntimeState>,
     pub required_base: &'a str,
+    pub dependency_refs: &'a [TaskCandidateRef],
     pub lifecycle_generation: u32,
     pub retrying_failure: bool,
     pub output: super::OutputSemantics,
@@ -518,6 +532,7 @@ pub fn resolve_role_assignment(
         role_instance: role_instance.clone(),
         team_revision,
         base_sha,
+        dependency_refs: context.dependency_refs.to_vec(),
         generation,
         workspace_preparation,
     }
@@ -867,6 +882,8 @@ pub enum InflightEffect {
         prompt_template: super::RolePromptTemplate,
         prompt_hash: String,
         base_sha: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dependency_refs: Vec<TaskCandidateRef>,
         assignment_epoch: u32,
         message_boundary: u64,
         presented_messages: Vec<u64>,
@@ -926,6 +943,7 @@ impl InflightEffect {
             prompt_template,
             prompt_hash,
             base_sha,
+            dependency_refs,
             assignment_epoch,
             message_boundary,
             presented_messages,
@@ -945,6 +963,7 @@ impl InflightEffect {
             prompt_template: *prompt_template,
             prompt_hash: prompt_hash.clone(),
             base_sha: base_sha.clone(),
+            dependency_refs: dependency_refs.clone(),
             workspace_preparation: workspace_preparation.clone(),
             message_boundary: *message_boundary,
             presented_messages: presented_messages.clone(),
@@ -1003,6 +1022,7 @@ impl InflightEffect {
                 prompt_template,
                 prompt_hash,
                 base_sha,
+                dependency_refs,
                 assignment_epoch,
                 message_boundary,
                 presented_messages,
@@ -1025,6 +1045,7 @@ impl InflightEffect {
                         prompt_template: *prompt_template,
                         prompt_hash: prompt_hash.clone(),
                         base_sha: base_sha.clone(),
+                        dependency_refs: dependency_refs.clone(),
                         assignment_epoch: *assignment_epoch,
                         message_boundary: *message_boundary,
                         presented_messages: presented_messages.clone(),
@@ -1700,6 +1721,67 @@ impl MissionState {
 
     pub fn deliverable_head(&self) -> &str {
         &self.current_sha
+    }
+
+    pub fn deliverable_task_id(&self) -> Option<&TaskId> {
+        let plan = self.plan.as_ref()?;
+        let depended_on: BTreeSet<_> = plan
+            .tasks
+            .iter()
+            .flat_map(|task| task.depends_on.iter())
+            .collect();
+        plan.tasks
+            .iter()
+            .find(|task| !depended_on.contains(&task.id))
+            .map(|task| &task.id)
+    }
+
+    pub fn task_dependency_refs(&self, task_id: &TaskId) -> Option<Vec<TaskCandidateRef>> {
+        let task = self
+            .plan
+            .as_ref()?
+            .tasks
+            .iter()
+            .find(|task| &task.id == task_id)?;
+        task.depends_on
+            .iter()
+            .map(|dependency| {
+                let runtime = self.tasks.get(dependency)?;
+                (runtime.status == TaskStatus::Cleared)
+                    .then_some(runtime.candidate_sha.as_ref())
+                    .flatten()
+                    .map(|sha| TaskCandidateRef {
+                        task_id: dependency.clone(),
+                        sha: sha.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    pub fn task_required_base(&self, task_id: &TaskId) -> Option<String> {
+        if let Some(base_sha) = self
+            .tasks
+            .get(task_id)
+            .and_then(|runtime| runtime.pending_base_sha.as_ref())
+        {
+            return Some(base_sha.clone());
+        }
+        let refs = self.task_dependency_refs(task_id)?;
+        Some(
+            refs.first()
+                .map(|candidate| candidate.sha.clone())
+                .unwrap_or_else(|| self.base_sha.clone()),
+        )
+    }
+
+    pub fn task_lineage_request_matches(
+        &self,
+        task_id: &TaskId,
+        base_sha: &str,
+        dependency_refs: &[TaskCandidateRef],
+    ) -> bool {
+        self.task_required_base(task_id).as_deref() == Some(base_sha)
+            && self.task_dependency_refs(task_id).as_deref() == Some(dependency_refs)
     }
 
     pub fn durable_cancellation(&self, effect_id: &super::EffectId) -> Option<DurableCancellation> {

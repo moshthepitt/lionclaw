@@ -356,7 +356,7 @@ fn manifest_toml(name: &str) -> String {
          \n[team]\nplanning-assignment = \"strategist\"\nrequires-gap-review = false\n\
          \n[ceilings]\nwrites = true\nnetwork = true\ninstall = true\n\
          \n[execution]\ndefault-timeout-secs = 1800\nmax-task-time-secs = 1800\n\
-         extension-step-secs = 300\nauto-continue-candidate = true\nauto-continue-proof = true\n"
+         extension-step-secs = 300\neffect-capacity = 4\nauto-continue-candidate = true\nauto-continue-proof = true\n"
     )
 }
 const IMPLEMENTER_ROLE: &str = "\
@@ -739,9 +739,9 @@ async fn build_engine(
 // ---- The six checks ----
 
 /// (1) A real writable worker fixes a broken tree in a container; its commit
-/// lands and the engine records it (`current_sha` advances); the real oracle
-/// then judges the fix and the mission reaches VERIFIED. A fresh engine on the
-/// same DB resumes and does NOT re-run the oracle (counter stays 1).
+/// lands and the engine records it (`deliverable_head` advances); the real
+/// oracle then judges the fix and the mission reaches VERIFIED. A fresh engine
+/// on the same DB resumes and does NOT re-run the oracle (counter stays 1).
 async fn check_happy_writer_and_resume() -> Result<()> {
     let repo = tempfile::tempdir().context("tempdir")?;
     let type_dir = tempfile::tempdir().context("tempdir")?;
@@ -770,8 +770,8 @@ async fn check_happy_writer_and_resume() -> Result<()> {
         assert_verified(&engine, &id).await?;
         // The worker's writes landed and the engine recorded the commit.
         let state = engine.load_state(&id).await?;
-        if state.current_sha == base {
-            anyhow::bail!("worker ran but no commit was recorded (current_sha unchanged)");
+        if state.deliverable_head() == base {
+            anyhow::bail!("worker ran but no commit was recorded (deliverable head unchanged)");
         }
         id
     };

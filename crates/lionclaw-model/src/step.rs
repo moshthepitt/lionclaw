@@ -3,7 +3,8 @@
 use super::fold::{gap_review_outstanding, oracle_obligation_outstanding};
 use super::ids::{AssertionId, OracleName, RoleInstanceId, TaskId};
 use super::state::{
-    ConversationLifecycle, DeliveryMarker, MissionPhase, MissionState, ReviewOutcome, TaskStatus,
+    ConversationLifecycle, DeliveryMarker, InflightEffect, MissionPhase, MissionState,
+    ReviewOutcome, TaskStatus,
 };
 use crate::prelude::*;
 
@@ -13,6 +14,7 @@ pub enum StepDecision {
     Park,
     Terminal,
     DispatchRole(RoleDispatchIntent),
+    DispatchRoles(Vec<RoleDispatchIntent>),
     RunOracles(Vec<OracleDispatchIntent>),
 }
 
@@ -26,6 +28,7 @@ pub struct RoleDispatchIntent {
     pub body: String,
     pub targets: Vec<AssertionId>,
     pub base_sha: String,
+    pub dependency_refs: Vec<super::TaskCandidateRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +69,8 @@ fn role_intent(
     task_id: Option<TaskId>,
     body: String,
     targets: Vec<AssertionId>,
+    base_sha: String,
+    dependency_refs: Vec<super::TaskCandidateRef>,
 ) -> Option<RoleDispatchIntent> {
     let team = state.team.as_ref()?;
     let role = team.role(role_instance)?;
@@ -77,7 +82,8 @@ fn role_intent(
         attempt_no: next_attempt(state, role_instance),
         body,
         targets,
-        base_sha: state.deliverable_head().to_string(),
+        base_sha,
+        dependency_refs,
     })
 }
 
@@ -108,58 +114,110 @@ fn step_planning(state: &MissionState) -> StepDecision {
         None,
         "Propose the complete mission plan.".to_string(),
         Vec::new(),
+        state.deliverable_head().to_string(),
+        Vec::new(),
     )
     .map_or(StepDecision::Idle, StepDecision::DispatchRole)
 }
 
 fn step_running(state: &MissionState) -> StepDecision {
-    if !state.inflight.is_empty() {
-        return StepDecision::Idle;
-    }
     let Some(plan) = &state.plan else {
         return StepDecision::Idle;
     };
+    let capacity = state.config.execution.effect_capacity as usize;
+    let remaining_capacity = capacity.saturating_sub(state.inflight.len());
+    if remaining_capacity == 0 {
+        return StepDecision::Idle;
+    }
 
-    for (role_id, conversation) in &state.conversations {
-        if !conversation
-            .queued
-            .iter()
-            .any(|message| message.marker != DeliveryMarker::Undeliverable)
-            || !state.conversation_is_messageable(role_id)
-            || conversation.lifecycle == ConversationLifecycle::Completed
-        {
-            continue;
-        }
-        let Some(team) = state.team.as_ref() else {
-            return StepDecision::Idle;
-        };
-        let task = state.tasks.iter().find_map(|(task_id, task)| {
-            (matches!(
-                task.status,
-                TaskStatus::Pending | TaskStatus::Running | TaskStatus::Failed
-            ) && (task.status != TaskStatus::Failed
-                || state.task_automatic_retry_remaining(task_id))
-                && task.role_assignment.as_ref().is_some_and(|assignment| {
-                    assignment.role_instance == *role_id
-                        && assignment.team_revision == team.revision
-                }))
-            .then_some(task_id)
-        });
-        let (task_id, body, targets) = match task.and_then(|id| {
-            plan.tasks
+    if state.inflight.is_empty() {
+        for (role_id, conversation) in &state.conversations {
+            if !conversation
+                .queued
                 .iter()
-                .find(|task| &task.id == id)
-                .map(|task| (id.clone(), task.body.clone(), task.targets.clone()))
-        }) {
-            Some((id, body, targets)) => (Some(id), body, targets),
-            None => (None, "Continue the conversation.".to_string(), Vec::new()),
-        };
-        if let Some(intent) = role_intent(state, role_id, task_id, body, targets) {
-            return StepDecision::DispatchRole(intent);
+                .any(|message| message.marker != DeliveryMarker::Undeliverable)
+                || !state.conversation_is_messageable(role_id)
+                || conversation.lifecycle == ConversationLifecycle::Completed
+            {
+                continue;
+            }
+            let Some(team) = state.team.as_ref() else {
+                return StepDecision::Idle;
+            };
+            let task = state.tasks.iter().find_map(|(task_id, task)| {
+                (matches!(
+                    task.status,
+                    TaskStatus::Pending | TaskStatus::Running | TaskStatus::Failed
+                ) && (task.status != TaskStatus::Failed
+                    || state.task_automatic_retry_remaining(task_id))
+                    && task.role_assignment.as_ref().is_some_and(|assignment| {
+                        assignment.role_instance == *role_id
+                            && assignment.team_revision == team.revision
+                    }))
+                .then_some(task_id)
+            });
+            let (task_id, body, targets, base_sha, dependency_refs) = match task.and_then(|id| {
+                let task = plan.tasks.iter().find(|task| &task.id == id)?;
+                let base_sha = state.task_required_base(id)?;
+                let dependency_refs = state.task_dependency_refs(id)?;
+                Some((
+                    id.clone(),
+                    task.body.clone(),
+                    task.targets.clone(),
+                    base_sha,
+                    dependency_refs,
+                ))
+            }) {
+                Some((id, body, targets, base_sha, dependency_refs)) => {
+                    (Some(id), body, targets, base_sha, dependency_refs)
+                }
+                None => (
+                    None,
+                    "Continue the conversation.".to_string(),
+                    Vec::new(),
+                    state.deliverable_head().to_string(),
+                    Vec::new(),
+                ),
+            };
+            if let Some(intent) = role_intent(
+                state,
+                role_id,
+                task_id,
+                body,
+                targets,
+                base_sha,
+                dependency_refs,
+            ) {
+                return StepDecision::DispatchRole(intent);
+            }
         }
     }
 
     let status_of = |id: &TaskId| state.tasks.get(id).map(|task| task.status);
+    let active_roles: BTreeSet<_> = state
+        .inflight
+        .values()
+        .filter_map(|effect| match effect {
+            InflightEffect::RoleTurn { role_instance, .. } => Some(role_instance.clone()),
+            InflightEffect::OracleRun { .. } => None,
+        })
+        .collect();
+    let active_tasks: BTreeSet<_> = state
+        .inflight
+        .values()
+        .filter_map(|effect| match effect {
+            InflightEffect::RoleTurn {
+                task_id: Some(task_id),
+                ..
+            } => Some(task_id.clone()),
+            InflightEffect::RoleTurn { task_id: None, .. } | InflightEffect::OracleRun { .. } => {
+                None
+            }
+        })
+        .collect();
+    let mut reserved_roles = active_roles;
+    let mut reserved_tasks = active_tasks;
+    let mut intents = Vec::new();
     for task in &plan.tasks {
         let runnable = matches!(
             status_of(&task.id),
@@ -177,15 +235,39 @@ fn step_running(state: &MissionState) -> StepDecision {
         let Some(role_id) = team.task_assignments.get(&task.id) else {
             return StepDecision::Idle;
         };
+        if reserved_tasks.contains(&task.id) || reserved_roles.contains(role_id) {
+            continue;
+        }
+        let Some(base_sha) = state.task_required_base(&task.id) else {
+            continue;
+        };
+        let Some(dependency_refs) = state.task_dependency_refs(&task.id) else {
+            continue;
+        };
         if let Some(intent) = role_intent(
             state,
             role_id,
             Some(task.id.clone()),
             task.body.clone(),
             task.targets.clone(),
+            base_sha,
+            dependency_refs,
         ) {
-            return StepDecision::DispatchRole(intent);
+            reserved_tasks.insert(task.id.clone());
+            reserved_roles.insert(role_id.clone());
+            intents.push(intent);
+            if intents.len() == remaining_capacity {
+                break;
+            }
         }
+    }
+    match intents.len() {
+        0 => {}
+        1 => return StepDecision::DispatchRole(intents.remove(0)),
+        _ => return StepDecision::DispatchRoles(intents),
+    }
+    if !state.inflight.is_empty() {
+        return StepDecision::Idle;
     }
 
     if plan
@@ -220,6 +302,8 @@ fn step_running(state: &MissionState) -> StepDecision {
                     None,
                     "Judge the assigned assertions.".to_string(),
                     vec![assertion_id.clone()],
+                    state.deliverable_head().to_string(),
+                    Vec::new(),
                 ) {
                     return StepDecision::DispatchRole(intent);
                 }
@@ -279,6 +363,8 @@ fn step_running(state: &MissionState) -> StepDecision {
                     role_id,
                     None,
                     "Review the delivered product against the objective.".to_string(),
+                    Vec::new(),
+                    state.deliverable_head().to_string(),
                     Vec::new(),
                 ) {
                     return StepDecision::DispatchRole(intent);

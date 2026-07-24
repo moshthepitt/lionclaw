@@ -1,7 +1,7 @@
 //! Pure event fold for the team-owned runtime model.
 
 use super::event::{ControlAction, EventEnvelope, Handoff, MissionEvent};
-use super::ids::{AssertionId, RoleInstanceId};
+use super::ids::{AssertionId, RoleInstanceId, TaskId};
 use super::state::{
     ActiveDelivery, AssertionState, AttentionItem, AttentionKind, ConversationLifecycle,
     ConversationState, DeliveryMarker, InflightEffect, MissionPhase, MissionState, ParkedEffect,
@@ -13,9 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 53 preserves Slice 8 runtime usage evidence on role receipts during
-/// replay, including explicit non-reporting.
-pub const REDUCER_VERSION: u32 = 53;
+/// Reducer 54 derives per-task candidate lineages and the deterministic
+/// deliverable frontier for Slice 9 parallel writers.
+pub const REDUCER_VERSION: u32 = 54;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -320,6 +320,7 @@ fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
         prompt_template,
         prompt_hash,
         base_sha,
+        dependency_refs,
         assignment_epoch,
         message_boundary,
         presented_messages,
@@ -352,6 +353,29 @@ fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
             task_id.as_ref(),
             assertion_ids,
         )
+        && task_id.as_ref().is_none_or(|task_id| {
+            state.task_lineage_request_matches(task_id, base_sha, dependency_refs)
+        })
+        && task_id.as_ref().is_none_or(|task_id| {
+            !state.inflight.values().any(|effect| {
+                matches!(
+                    effect,
+                    InflightEffect::RoleTurn {
+                        task_id: Some(active),
+                        ..
+                    } if active == task_id
+                )
+            })
+        })
+        && !state.inflight.values().any(|effect| {
+            matches!(
+                effect,
+                InflightEffect::RoleTurn {
+                    role_instance: active,
+                    ..
+                } if active == role_instance
+            )
+        })
         && *message_boundary <= envelope.sequence_no.saturating_sub(1)
         && !state.inflight.contains_key(effect_id);
     if !canonical {
@@ -623,14 +647,22 @@ fn apply_success_handoff(
                 if let Some(task) = state.tasks.get_mut(task_id) {
                     task.status = TaskStatus::Cleared;
                     task.consecutive_failures = 0;
+                    task.candidate_sha = Some(
+                        success
+                            .artifact
+                            .as_ref()
+                            .map(|artifact| artifact.head_sha.clone())
+                            .unwrap_or_else(|| request.base_sha.clone()),
+                    );
+                    task.pending_base_sha = None;
                     task.last_outcome = Some(TaskAttemptOutcome::Accepted {
                         effect_id: effect_id.clone(),
                     });
                 }
                 if let Some(artifact) = &success.artifact {
-                    state.current_sha = artifact.head_sha.clone();
                     state.reachable_commits.insert(artifact.head_sha.clone());
                 }
+                mark_downstream_stale(state, task_id);
             }
             retire_role_conversation(state, &request.role_instance);
         }
@@ -1027,19 +1059,27 @@ fn apply_decision(
                 evidence: item.evidence.clone(),
                 justification: justification.to_string(),
             };
+            let repair_base = state.deliverable_head().to_string();
             clear_authoritative_verdicts(state, &item.assertion_ids);
+            let mut repaired_tasks = Vec::new();
             if let Some(plan) = &state.plan {
                 for task in plan.tasks.iter().filter(|task| {
                     task.targets
                         .iter()
                         .any(|target| item.assertion_ids.contains(target))
                 }) {
+                    repaired_tasks.push(task.id.clone());
                     if let Some(runtime) = state.tasks.get_mut(&task.id) {
                         runtime.status = TaskStatus::Pending;
                         runtime.consecutive_failures = 0;
+                        runtime.candidate_sha = None;
+                        runtime.pending_base_sha = Some(repair_base.clone());
                         runtime.feedback.push(feedback.clone());
                     }
                 }
+            }
+            for task_id in repaired_tasks {
+                mark_downstream_stale(state, &task_id);
             }
             state.gap_review = Default::default();
         }
@@ -1100,6 +1140,13 @@ fn apply_decision(
             if let Some(task_id) = &item.task_id {
                 if let Some(task) = state.tasks.get_mut(task_id) {
                     task.status = TaskStatus::Cleared;
+                    if task.candidate_sha.is_none() {
+                        task.candidate_sha = task
+                            .role_assignment
+                            .as_ref()
+                            .map(|assignment| assignment.base_sha.clone());
+                    }
+                    task.pending_base_sha = None;
                 }
             }
             if let Some(oracle) = &item.oracle {
@@ -1166,6 +1213,7 @@ fn promote_proposal_plan(state: &mut MissionState) {
     if !super::validate_plan(&plan_proposal.plan, team, &state.config).is_empty() {
         return;
     }
+    let prior_deliverable = state.deliverable_head().to_string();
     let supersessions: BTreeMap<_, _> = plan_proposal
         .assertion_supersessions
         .iter()
@@ -1205,28 +1253,30 @@ fn promote_proposal_plan(state: &mut MissionState) {
             )
         })
         .collect();
-    let current_ids: BTreeSet<_> = plan_proposal
-        .plan
-        .tasks
-        .iter()
-        .map(|task| task.id.clone())
-        .collect();
     for task in state.tasks.values_mut() {
         task.status = TaskStatus::Superseded;
     }
-    for task_id in current_ids {
-        state
+    for task in &plan_proposal.plan.tasks {
+        let runtime = state
             .tasks
-            .entry(task_id)
-            .or_insert_with(pending_task)
-            .status = TaskStatus::Pending;
+            .entry(task.id.clone())
+            .or_insert_with(pending_task);
+        runtime.status = TaskStatus::Pending;
+        if task.depends_on.is_empty()
+            && runtime.candidate_sha.is_none()
+            && prior_deliverable != state.base_sha
+        {
+            runtime.pending_base_sha = Some(prior_deliverable.clone());
+        }
     }
     state.proposal = None;
     state.proposal_approved = false;
     state.phase = MissionPhase::Running;
+    recompute_current_sha(state);
 }
 
 fn derive(state: &mut MissionState) {
+    recompute_current_sha(state);
     if state.phase.is_terminal() {
         return;
     }
@@ -1557,11 +1607,82 @@ fn pending_task() -> TaskRuntimeState {
         attempts: 0,
         consecutive_failures: 0,
         last_outcome: None,
+        candidate_sha: None,
+        pending_base_sha: None,
         feedback: Vec::new(),
         role_assignment: None,
         workspace_provenance: None,
         pending_workspace_recreation: None,
     }
+}
+
+fn mark_downstream_stale(state: &mut MissionState, changed_task: &TaskId) {
+    let Some(plan) = &state.plan else {
+        return;
+    };
+    let mut descendants = BTreeSet::new();
+    let mut frontier = vec![changed_task.clone()];
+    while let Some(parent) = frontier.pop() {
+        for task in plan
+            .tasks
+            .iter()
+            .filter(|task| task.depends_on.contains(&parent))
+        {
+            if descendants.insert(task.id.clone()) {
+                frontier.push(task.id.clone());
+            }
+        }
+    }
+    for task_id in descendants {
+        if let Some(runtime) = state.tasks.get_mut(&task_id) {
+            if runtime.status != TaskStatus::Superseded {
+                runtime.status = TaskStatus::Pending;
+                runtime.consecutive_failures = 0;
+                runtime.last_outcome = None;
+                runtime.candidate_sha = None;
+                runtime.pending_base_sha = None;
+            }
+        }
+    }
+    state.gap_review = Default::default();
+    recompute_current_sha(state);
+}
+
+fn recompute_current_sha(state: &mut MissionState) {
+    let Some(plan) = &state.plan else {
+        state.current_sha = state.base_sha.clone();
+        return;
+    };
+    let cleared_candidates: BTreeMap<_, _> = plan
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            let runtime = state.tasks.get(&task.id)?;
+            (runtime.status == TaskStatus::Cleared)
+                .then_some(runtime.candidate_sha.as_ref())
+                .flatten()
+                .map(|sha| (task.id.clone(), sha.clone()))
+        })
+        .collect();
+    if cleared_candidates.is_empty() {
+        return;
+    }
+    let depended_on_by_cleared: BTreeSet<_> = plan
+        .tasks
+        .iter()
+        .filter(|task| cleared_candidates.contains_key(&task.id))
+        .flat_map(|task| task.depends_on.iter().cloned())
+        .filter(|dependency| cleared_candidates.contains_key(dependency))
+        .collect();
+    let leaves: Vec<_> = cleared_candidates
+        .iter()
+        .filter(|(task_id, _)| !depended_on_by_cleared.contains(*task_id))
+        .map(|(_, sha)| sha.clone())
+        .collect();
+    state.current_sha = match leaves.as_slice() {
+        [sha] => sha.clone(),
+        _ => state.base_sha.clone(),
+    };
 }
 
 fn retire_role_conversation(state: &mut MissionState, role_instance: &RoleInstanceId) {

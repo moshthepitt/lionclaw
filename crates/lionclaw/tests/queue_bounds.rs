@@ -357,9 +357,11 @@ async fn production_broadcast_is_atomic_when_one_live_conversation_is_full() {
     let validator_id = reporter_id;
     assert!(active.conversations.contains_key(&writer_id));
     assert!(active.conversations.contains_key(&validator_id));
-    assert_eq!(
-        active.conversations[&validator_id].lifecycle,
-        ConversationLifecycle::Running
+    assert!(
+        [&writer_id, &validator_id].iter().any(|role_id| {
+            active.conversations[*role_id].lifecycle == ConversationLifecycle::Running
+        }),
+        "one independent task should remain running while the other is live"
     );
     for index in 0..MAX_QUEUED_MESSAGES_PER_CONVERSATION {
         cli::run(send_cli(

@@ -1475,6 +1475,7 @@ async fn finite_policy_budget_extends_before_the_initial_deadline() {
             default_timeout_secs: 1,
             max_task_time_secs: 2,
             extension_step_secs: 1,
+            effect_capacity: 4,
             auto_continue_candidate: false,
             auto_continue_proof: false,
         };
