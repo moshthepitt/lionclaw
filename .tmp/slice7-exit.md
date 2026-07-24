@@ -334,3 +334,118 @@ Docs/product impact:
 - Objective-authoring anti-patterns now state that terminal gap reviewers cannot
   provide finish-attempt evidence because finish is not legal before a clean gap
   review.
+
+## Acceptance Close-Out Addendum
+
+Close-out request: complete existing mission `m31162d3948dc` through its own
+legal actions. No new mission was started. No waiver or accept action was used.
+
+Fresh close-out binary:
+
+```text
+CARGO_TARGET_DIR=/tmp/lionclaw-slice7-closeout-target-20260724-1915 cargo build -p lionclaw
+```
+
+Binary used for all close-out mission actions:
+`/tmp/lionclaw-slice7-closeout-target-20260724-1915/debug/lionclaw`.
+
+Acceptance repo correction:
+
+- path: `/tmp/lionclaw-slice7-accept-repo-20260724`
+- forward fixture commit: `c846fce` `Fix Slice 7 acceptance tmpfs probe`
+- signed by `Kelvin Jayanoris <kelvin@jayanoris.com>`
+- correction: `src/lib.rs` now writes the 640 MiB probe to literal `/tmp`
+  rather than `std::env::temp_dir()`, and uses a drop guard to remove the probe
+  on success or panic/failure.
+- local fixture check:
+  ```text
+  TMPDIR=/home/mosh/.cache/lionclaw-slice7-fixture-tmpdir CARGO_TARGET_DIR=/tmp/lionclaw-slice7-fixture-target cargo test --locked -- --nocapture
+  ```
+  result: one test passed; no matching `/tmp/lionclaw-slice7-tmpfs-*` probe file
+  remained afterward.
+
+Mission legal close-out:
+
+- `mission decide ... gap_review_gaps:mission revise --feedback-file /tmp/lionclaw-slice7-revise-feedback.txt`
+- revision proposal base revision: `1`
+- revision proposal preserved requirement/assertion `TMPFS-640` and added one
+  repair task: `repair-tmpfs-probe`
+- `mission decide ... plan_proposal:mission approve`
+- worker produced mission-owned artifact commit:
+  `ce4b198690e02f3bc43255790830279bf4868770`
+- worker report: tree exactly matches forward fixture commit `c846fce`
+- authoritative `cargo-test` oracle reran at `ce4b198` and passed
+- fresh gap review reran at `ce4b198` and was clean
+- `mission finish --reason ...` recorded verified finish
+- `mission apply` created result branch
+  `lionclaw/m31162d3948dc` at `ce4b198690e0`
+
+Final status projection:
+
+```json
+{
+  "mission_id": "m31162d3948dc",
+  "phase": "done:verified",
+  "disposition": "terminal",
+  "current_sha": "ce4b198690e02f3bc43255790830279bf4868770",
+  "revision": 2,
+  "team_revision": 2,
+  "finish": "verified",
+  "contract": [{"id":"TMPFS-640","authoritative_pass":true}],
+  "gap_review": {
+    "attempts": 2,
+    "fresh": true,
+    "gaps": {"blocking":0,"major":0,"minor":0},
+    "judged_sha": "ce4b198690e02f3bc43255790830279bf4868770",
+    "role": "gap-reviewer",
+    "verdict": "clean",
+    "waived": false
+  },
+  "attention_ids": [],
+  "driver_error": null,
+  "cleanup_failure": null
+}
+```
+
+Final event log:
+
+```text
+   1 mission_created
+   2 team_configured
+   3 proposal_recorded
+   4 decision_recorded
+   5 team_configured
+   6 role_turn_requested
+   7 role_turn_completed
+   8 oracle_run_requested
+   9 oracle_run_completed
+  10 role_turn_requested
+  11 role_turn_completed
+  12 decision_recorded
+  13 proposal_recorded
+  14 decision_recorded
+  15 team_configured
+  16 role_turn_requested
+  17 role_turn_completed
+  18 oracle_run_requested
+  19 oracle_run_completed
+  20 role_turn_requested
+  21 role_turn_completed
+  22 mission_finished
+  23 result_applied
+```
+
+Final report facts:
+
+```text
+commit:  a3f7b55eec86 -> ce4b198690e0
+finish:  VERIFIED - a fresh oracle pass at the final commit for every assertion
+bar:     Verified
+state:   done:verified (terminal)
+assertions:
+  TMPFS-640: PASS by cargo-test (exit 0)
+```
+
+The carried Slice 6 finish obligation is now closed for this acceptance mission:
+`mission_finished` and `result_applied` are both present, the finish class is
+truthfully `Verified`, and the report reflects the verified bar.
