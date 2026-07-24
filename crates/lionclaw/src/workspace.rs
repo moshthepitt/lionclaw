@@ -463,6 +463,30 @@ pub async fn replace_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()>
     Ok(())
 }
 
+/// Fetch already-captured sibling candidates into a task checkout without
+/// moving HEAD. Fan-in tasks need the objects locally so ordinary Git merges
+/// can stack the dependency lineages forward inside the role workspace.
+pub async fn fetch_checkout_commits(repo: &Path, checkout: &Path, shas: Vec<String>) -> Result<()> {
+    for sha in shas {
+        if checkout_commit_exists(checkout, &sha).await {
+            continue;
+        }
+        let mut fetch = managed_git_command();
+        fetch
+            .current_dir(checkout)
+            .args(["fetch", "--quiet", "--no-write-fetch-head", "--"])
+            .arg(repo)
+            .arg(&sha);
+        run(&mut fetch, "git fetch dependency commit")
+            .await
+            .with_context(|| format!("fetching dependency commit '{sha}'"))?;
+        if !checkout_commit_exists(checkout, &sha).await {
+            bail!("dependency commit '{sha}' was not materialized in task checkout");
+        }
+    }
+    Ok(())
+}
+
 /// Archive a retained checkout whole, including its Git metadata and uncommitted
 /// work, then publish a fresh checkout at the required base. The archive path is
 /// bound to the exact parked effect by the resource model.
@@ -2050,6 +2074,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(head_sha(&replay).await.unwrap(), recorded.head_sha());
+    }
+
+    #[tokio::test]
+    async fn fan_in_checkout_fetches_sibling_candidates_without_moving_head() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let work = tempfile::tempdir().unwrap();
+        let left_checkout = work.path().join("left");
+        let right_checkout = work.path().join("right");
+        let integration_checkout = work.path().join("integration");
+
+        create_checkout(repo.path(), &left_checkout, &base)
+            .await
+            .unwrap();
+        std::fs::write(left_checkout.join("left.txt"), "left\n").unwrap();
+        git(&left_checkout, &["add", "-A"]).await.unwrap();
+        git(&left_checkout, &["commit", "-q", "-m", "left"])
+            .await
+            .unwrap();
+        let left = capture_worker_result(
+            repo.path(),
+            &left_checkout,
+            &base,
+            &test_mission_id(),
+            &EffectId::for_parts(&["test", "left"]),
+        )
+        .await
+        .unwrap();
+
+        create_checkout(repo.path(), &right_checkout, &base)
+            .await
+            .unwrap();
+        std::fs::write(right_checkout.join("right.txt"), "right\n").unwrap();
+        git(&right_checkout, &["add", "-A"]).await.unwrap();
+        git(&right_checkout, &["commit", "-q", "-m", "right"])
+            .await
+            .unwrap();
+        let right = capture_worker_result(
+            repo.path(),
+            &right_checkout,
+            &base,
+            &test_mission_id(),
+            &EffectId::for_parts(&["test", "right"]),
+        )
+        .await
+        .unwrap();
+
+        create_checkout(repo.path(), &integration_checkout, left.head_sha())
+            .await
+            .unwrap();
+        assert_eq!(
+            head_sha(&integration_checkout).await.unwrap(),
+            left.head_sha()
+        );
+        assert!(
+            !checkout_commit_exists(&integration_checkout, right.head_sha()).await,
+            "the sibling candidate should not be present before explicit materialization"
+        );
+
+        fetch_checkout_commits(
+            repo.path(),
+            &integration_checkout,
+            vec![right.head_sha().to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            head_sha(&integration_checkout).await.unwrap(),
+            left.head_sha(),
+            "fetching dependencies must not move the integration checkout head"
+        );
+        assert!(checkout_commit_exists(&integration_checkout, right.head_sha()).await);
+        git(
+            &integration_checkout,
+            &["merge", "--no-ff", "--no-edit", right.head_sha()],
+        )
+        .await
+        .unwrap();
+        let merged = head_sha(&integration_checkout).await.unwrap();
+        assert!(
+            checkout_is_ancestor(&integration_checkout, left.head_sha(), &merged)
+                .await
+                .unwrap()
+        );
+        assert!(
+            checkout_is_ancestor(&integration_checkout, right.head_sha(), &merged)
+                .await
+                .unwrap()
+        );
+        assert_eq!(head_sha(repo.path()).await.unwrap(), base);
     }
 
     #[tokio::test]

@@ -378,6 +378,7 @@ async fn prepare_writer_checkout(
     workspace: &std::path::Path,
     observer_index: &lionclaw_durable_fs::RootedDirectory,
     base_sha: &str,
+    dependency_refs: &[crate::model::TaskCandidateRef],
     workspace_preparation: &crate::model::WorkspacePreparation,
     archive_checkout: Option<&std::path::Path>,
 ) -> Result<(), TypedFailure> {
@@ -390,6 +391,16 @@ async fn prepare_writer_checkout(
         workspace::archive_and_replace_checkout(repo, workspace, archive_checkout, base_sha)
             .await
             .map_err(|e| launch(format!("failed to archive and recreate checkout: {e}")))?;
+        workspace::fetch_checkout_commits(
+            repo,
+            workspace,
+            dependency_refs
+                .iter()
+                .map(|dependency| dependency.sha.clone())
+                .collect(),
+        )
+        .await
+        .map_err(|e| launch(format!("failed to materialize dependency commits: {e}")))?;
         return workspace::prepare_checkout_observer_index(repo, observer_index, base_sha, true)
             .await
             .map_err(|e| launch(format!("failed to prepare workspace observer: {e}")));
@@ -408,6 +419,16 @@ async fn prepare_writer_checkout(
                         launch(format!("failed to compare retained checkout ancestry: {e}"))
                     })?
             {
+                workspace::fetch_checkout_commits(
+                    repo,
+                    workspace,
+                    dependency_refs
+                        .iter()
+                        .map(|dependency| dependency.sha.clone())
+                        .collect(),
+                )
+                .await
+                .map_err(|e| launch(format!("failed to materialize dependency commits: {e}")))?;
                 workspace::prepare_checkout_observer_index(repo, observer_index, base_sha, false)
                     .await
                     .map_err(|e| launch(format!("failed to prepare workspace observer: {e}")))?;
@@ -448,6 +469,16 @@ async fn prepare_writer_checkout(
             .await
             .map_err(|e| launch(format!("failed to create checkout: {e}")))?;
     }
+    workspace::fetch_checkout_commits(
+        repo,
+        workspace,
+        dependency_refs
+            .iter()
+            .map(|dependency| dependency.sha.clone())
+            .collect(),
+    )
+    .await
+    .map_err(|e| launch(format!("failed to materialize dependency commits: {e}")))?;
     workspace::prepare_checkout_observer_index(
         repo,
         observer_index,
@@ -612,6 +643,7 @@ impl RoleRunner for OciRoleRunner {
                         &workspace_source,
                         observer_index.as_ref().expect("writer observer index"),
                         &request.base_sha,
+                        &request.dependency_refs,
                         &request.workspace_preparation,
                         archive_checkout.as_deref(),
                     )
