@@ -3,13 +3,19 @@ name = "advisory-only"
 stop = "reviewed"
 image = "localhost/lionclaw-runtime-dev:v1"
 
+[team]
+planning-assignment = "strategist"
+gap-review-assignment = "gap-reviewer"
+requires-gap-review = true
+
+[ceilings]
+network = true
+install = true
+writes = true
+
 [execution]
 default-timeout-secs = 1800
 max-task-time-secs = 1800
 extension-step-secs = 300
 auto-continue-candidate = true
 auto-continue-proof = true
-
-# The reviewed bar is defined by an independent closing review.
-[gap-review]
-role = "gap-reviewer"

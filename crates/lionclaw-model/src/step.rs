@@ -129,7 +129,9 @@ fn step_running(state: &MissionState) -> StepDecision {
             return StepDecision::Idle;
         };
         let task = state.tasks.iter().find_map(|(task_id, task)| {
-            (task.status == TaskStatus::Running
+            (matches!(task.status, TaskStatus::Running | TaskStatus::Failed)
+                && (task.status != TaskStatus::Failed
+                    || state.task_automatic_retry_remaining(task_id))
                 && task.role_assignment.as_ref().is_some_and(|assignment| {
                     assignment.role_instance == *role_id
                         && assignment.team_revision == team.revision

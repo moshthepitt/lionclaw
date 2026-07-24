@@ -13,9 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 37 promotes joint plan/team revisions atomically and preserves
-/// explicit recovery paths for authoritative failures and gap acknowledgments.
-pub const REDUCER_VERSION: u32 = 37;
+/// Reducer 38 preserves superseded assertion receipts across joint plan/team
+/// revision promotion.
+pub const REDUCER_VERSION: u32 = 38;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -959,6 +959,28 @@ fn promote_proposal_plan(state: &mut MissionState) {
     };
     if !super::validate_plan(&plan_proposal.plan, team, &state.config).is_empty() {
         return;
+    }
+    let supersessions: BTreeMap<_, _> = plan_proposal
+        .assertion_supersessions
+        .iter()
+        .map(|entry| (entry.assertion_id.clone(), entry.replacement_ids.clone()))
+        .collect();
+    if let Some(current) = &state.plan {
+        for assertion in &current.assertions {
+            let Some(replacement_ids) = supersessions.get(&assertion.id) else {
+                continue;
+            };
+            if let Some(assertion_state) = state.contract.remove(&assertion.id) {
+                state
+                    .superseded_assertions
+                    .push(super::SupersededAssertion {
+                        assertion: assertion.clone(),
+                        state: assertion_state,
+                        replacement_ids: replacement_ids.clone(),
+                        superseded_at_revision: state.revision.saturating_add(1),
+                    });
+            }
+        }
     }
     state.revision = state.revision.saturating_add(1);
     state.plan = Some(plan_proposal.plan.clone());

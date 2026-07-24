@@ -2,3 +2,9 @@
 name = "writable-judge"
 stop = "verified"
 image = "localhost/lionclaw-runtime-dev:v1"
+
+[team]
+planning-assignment = "strategist"
+
+[ceilings]
+secrets = true
