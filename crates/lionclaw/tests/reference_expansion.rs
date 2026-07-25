@@ -49,6 +49,7 @@ fn checkpoint(_request: &RoleTurnRequest) -> RoleTurnOutcome {
     RoleTurnOutcome {
         handoff: None,
         artifact: None,
+        prepared_inputs: Vec::new(),
         runtime_configuration: Default::default(),
         runtime_usage: Default::default(),
         final_response: "awaiting lead".into(),
@@ -74,6 +75,7 @@ fn judgment_outcome(request: &RoleTurnRequest) -> Option<RoleTurnOutcome> {
                 request_attention: false,
             }),
             artifact: None,
+            prepared_inputs: Vec::new(),
             runtime_configuration: Default::default(),
             runtime_usage: Default::default(),
             final_response: "reference behavior reviewed".into(),
@@ -247,7 +249,7 @@ async fn accepted_commit_object_fault_settles_once_and_does_not_block_later_mess
 }
 
 async fn prove_commit_object_fault_settles_once(fault: CommitObjectFault) {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (28, 55));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (29, 56));
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let h = checkpoint_harness(dir.path(), prompts.clone()).await;
@@ -488,6 +490,7 @@ async fn oversized_authoritative_receipt_is_rejected_with_exact_typed_truth() {
                     request.base_sha.clone(),
                     common::HEAD_SHA.to_string(),
                 )),
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "minted oversized receipt authority".into(),
@@ -611,6 +614,7 @@ async fn prove_receipt_blob_fault_settles_once(fault: ReceiptBlobFault) {
                     request.base_sha.clone(),
                     common::HEAD_SHA.to_string(),
                 )),
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "minted receipt authority".into(),

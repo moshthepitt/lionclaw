@@ -1279,6 +1279,13 @@ mod tests {
             .any(|pair| { pair == ["--device".to_string(), "/dev/dri".to_string()] }));
     }
 
+    #[test]
+    fn absent_device_grants_emit_no_oci_device_arguments() {
+        let request = sample_execution_request();
+        let launch = prepare_oci_process_launch(&request, None).expect("prepare");
+        assert!(!launch.args.iter().any(|arg| arg == "--device"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn install_policy_system_root_posture_uses_root_identity_args() {

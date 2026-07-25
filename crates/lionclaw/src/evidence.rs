@@ -212,6 +212,7 @@ pub fn role_attempt_receipt_json(
         "source": receipt.source,
         "effective_runtime_configuration": receipt.effective_runtime_configuration(),
         "runtime_usage": receipt.runtime_usage,
+        "prepared_inputs": &receipt.prepared_inputs,
         "turn": turn,
         "handoff": handoff,
         "disposition": disposition,
@@ -305,6 +306,17 @@ pub fn render_role_attempt_receipt(
         rendered.push('\n');
         rendered.push_str("effective ");
         rendered.push_str(&render_runtime_configuration(configuration));
+    }
+    if !receipt.prepared_inputs.is_empty() {
+        rendered.push_str("\nprepared inputs: ");
+        rendered.push_str(
+            &receipt
+                .prepared_inputs
+                .iter()
+                .map(|input| format!("{}@{}", input.name, crate::model::short_hex(&input.digest)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     }
     rendered.push('\n');
     rendered.push_str(&render_runtime_usage(&receipt.runtime_usage));

@@ -5,6 +5,22 @@ host harness driving the engine) uses it to author a plan: a **contract of
 falsifiable assertions** plus a **task DAG** that produces the change and
 proves it.
 
+## Lead restart loop
+
+Use `lionclaw mission guide` as the lead's restart-safe orientation surface.
+It is a folded projection, like `mission status --json`: it can be read in
+planning, running, parked, cleanup-blocked, done, or aborted phases without
+granting authority. After a lead process restarts, read `mission guide` and
+`mission status --json`, then take only the actions listed by the current
+state (`advance`, `send`, `decide`, `continue`, `finish`, `apply`, or `abort`
+as applicable).
+
+Use `lionclaw mission environment show` to inspect the active runtime image.
+Use `lionclaw mission environment use <digest>` only for a host-built image
+pinned as `sha256:<hex>` or `<name>@sha256:<hex>`. A tag is not a benchmark
+identity. The command preflights the image through the mission's OCI engine and
+records the resolved image id before any later effect can run under it.
+
 ## The shape of a good plan
 
 1. **State the contract first.** Each assertion is a falsifiable claim about

@@ -13,10 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 55 derives per-task candidate lineages, the deterministic
-/// deliverable frontier, and fail-closed fan-in acceptance for Slice 9
-/// parallel writers.
-pub const REDUCER_VERSION: u32 = 55;
+/// Reducer 56 derives digest-pinned mission environment assignments and
+/// preserves role prepared-input receipt evidence for Slice 9.5.
+pub const REDUCER_VERSION: u32 = 56;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -47,6 +46,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         objective: objective.clone(),
         mission_type: mission_type.clone(),
         image_id: image_id.clone(),
+        environment_history: Vec::new(),
         workspace_dir: workspace_dir.clone(),
         base_sha: base_sha.clone(),
         config: config.clone(),
@@ -101,6 +101,20 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 state.skills.insert(skill.name.clone(), skill.clone());
             }
         }
+        MissionEvent::EnvironmentAssigned {
+            image_ref,
+            image_id,
+            preflight,
+            team_revision,
+            reason,
+        } => apply_environment_assignment(
+            state,
+            image_ref,
+            image_id,
+            preflight,
+            *team_revision,
+            reason,
+        ),
         MissionEvent::ProposalRecorded { proposal, .. } => {
             if valid_proposal(state, proposal) {
                 state.proposal = Some((**proposal).clone());
@@ -253,6 +267,66 @@ fn valid_skill(skill: &super::MissionSkill) -> bool {
         && skill.digest.len() == 64
         && skill
             .digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn apply_environment_assignment(
+    state: &mut MissionState,
+    image_ref: &str,
+    image_id: &str,
+    preflight: &super::EnvironmentPreflight,
+    team_revision: Option<u32>,
+    reason: &str,
+) {
+    if state.phase.is_terminal()
+        || !state.inflight.is_empty()
+        || reason.trim().is_empty()
+        || !valid_environment_image_ref(image_ref)
+        || !valid_environment_image_id(image_id)
+        || preflight.image_ref != image_ref
+        || preflight.image_id != image_id
+        || preflight.engine.trim().is_empty()
+        || team_revision != state.team.as_ref().map(|team| team.revision)
+    {
+        return;
+    }
+    let revision = state.environment_history.len().saturating_add(1) as u32;
+    state.image_id = image_id.to_string();
+    state
+        .environment_history
+        .push(super::EnvironmentAssignment {
+            revision,
+            image_ref: image_ref.to_string(),
+            image_id: image_id.to_string(),
+            preflight: preflight.clone(),
+            team_revision,
+            reason: reason.to_string(),
+        });
+}
+
+fn valid_environment_image_ref(image_ref: &str) -> bool {
+    let image_ref = image_ref.trim();
+    if let Some(hex) = image_ref.strip_prefix("sha256:") {
+        return valid_sha256_hex(hex);
+    }
+    image_ref
+        .rsplit_once("@sha256:")
+        .is_some_and(|(name, hex)| !name.trim().is_empty() && valid_sha256_hex(hex))
+}
+
+fn valid_environment_image_id(image_id: &str) -> bool {
+    let image_id = image_id.trim();
+    if let Some(hex) = image_id.strip_prefix("sha256:") {
+        valid_sha256_hex(hex)
+    } else {
+        valid_sha256_hex(image_id)
+    }
+}
+
+fn valid_sha256_hex(hex: &str) -> bool {
+    hex.len() == 64
+        && hex
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
@@ -570,6 +644,7 @@ fn apply_role_outcome(
             if let Some(receipt) = state.role_attempt_receipts.get_mut(effect_id) {
                 receipt.runtime_configuration = Some(success.runtime_configuration.clone());
                 receipt.runtime_usage = success.runtime_usage.clone();
+                receipt.prepared_inputs = success.prepared_inputs.clone();
                 receipt.final_response = Some(success.final_response.clone());
                 receipt.handoff = success.handoff.clone();
                 receipt.disposition = RoleAttemptDisposition::Succeeded {

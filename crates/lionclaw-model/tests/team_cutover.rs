@@ -573,6 +573,7 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
                 artifact: None,
                 final_response: PayloadRef::inline("done"),
                 runtime_configuration: RuntimeConfigurationEvidence::default(),
+                prepared_inputs: Vec::new(),
                 runtime_usage: Default::default(),
             }),
         },
@@ -714,6 +715,7 @@ fn validate_success(items: Vec<ValidationItem>, passed: bool) -> RoleTurnSuccess
         artifact: None,
         final_response: PayloadRef::inline("done"),
         runtime_configuration: RuntimeConfigurationEvidence::default(),
+        prepared_inputs: Vec::new(),
         runtime_usage: Default::default(),
     }
 }

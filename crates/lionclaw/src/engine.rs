@@ -884,17 +884,7 @@ impl Engine {
         if effect_ids.is_empty() {
             return Ok(false);
         }
-        let parallel_writers = effect_ids.len() > 1
-            && effect_ids.iter().all(|effect_id| {
-                matches!(
-                    state.inflight.get(effect_id),
-                    Some(InflightEffect::RoleTurn {
-                        output: crate::model::OutputSemantics::ProducesArtifact,
-                        ..
-                    })
-                )
-            });
-        if !parallel_writers {
+        if effect_ids.len() == 1 {
             return Box::pin(self.drive_one(
                 state,
                 effect_ids.into_iter().next().expect("non-empty"),
@@ -1139,7 +1129,8 @@ impl Engine {
             // Oracle requests are materialized as one owned batch. Yield only
             // after every sibling has run; otherwise recovery would falsely
             // classify an unstarted sibling as a crashed effect.
-            if has_owned_sibling(state, &effect_id, &effect) {
+            let current = self.load_state(&state.mission_id).await?;
+            if has_owned_sibling(&current, &effect_id, &effect) {
                 return Ok(true);
             }
             return Ok(false);
@@ -1584,6 +1575,7 @@ impl Engine {
                     final_response,
                     runtime_configuration: outcome.runtime_configuration,
                     runtime_usage: outcome.runtime_usage,
+                    prepared_inputs: outcome.prepared_inputs,
                 }))
                 .with_settlement_evidence(settlement_evidence))
             }
@@ -2503,28 +2495,33 @@ pub async fn record_abort(
     if reason.trim().is_empty() {
         bail!("abort requires a non-empty reason");
     }
-    let state = store.require_state(mission_id).await?;
-    if state.phase.is_terminal() {
-        bail!("mission '{mission_id}' is terminal; abort is not legal");
+    let event = NewEvent::new(MissionEvent::MissionAborted {
+        reason: reason.to_string(),
+    });
+    for _ in 0..MAX_LOOP_ITERATIONS {
+        let state = store.require_state(mission_id).await?;
+        if state.phase.is_terminal() {
+            bail!("mission '{mission_id}' is terminal; abort is not legal");
+        }
+        match store
+            .append(mission_id, state.head, std::slice::from_ref(&event), now_ms)
+            .await
+        {
+            Ok(_) => {
+                reconcile_disposable_conversation_resources(store, mission_id)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "mission '{mission_id}' was aborted durably, but disposable resource cleanup failed; run 'lionclaw mission advance {mission_id}' to retry"
+                        )
+                    })?;
+                return Ok(());
+            }
+            Err(AppendError::Conflict { .. }) => continue,
+            Err(err) => return Err(err.into()),
+        }
     }
-    store
-        .append(
-            mission_id,
-            state.head,
-            &[NewEvent::new(MissionEvent::MissionAborted {
-                reason: reason.to_string(),
-            })],
-            now_ms,
-        )
-        .await?;
-    reconcile_disposable_conversation_resources(store, mission_id)
-        .await
-        .with_context(|| {
-            format!(
-                "mission '{mission_id}' was aborted durably, but disposable resource cleanup failed; run 'lionclaw mission advance {mission_id}' to retry"
-            )
-        })?;
-    Ok(())
+    bail!("abort append kept conflicting after {MAX_LOOP_ITERATIONS} retries");
 }
 
 /// Record mission completion as a closure fact. The fold independently

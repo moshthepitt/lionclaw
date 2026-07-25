@@ -266,10 +266,6 @@ fn step_running(state: &MissionState) -> StepDecision {
         1 => return StepDecision::DispatchRole(intents.remove(0)),
         _ => return StepDecision::DispatchRoles(intents),
     }
-    if !state.inflight.is_empty() {
-        return StepDecision::Idle;
-    }
-
     if plan
         .tasks
         .iter()
@@ -281,11 +277,16 @@ fn step_running(state: &MissionState) -> StepDecision {
     let Some(team) = state.team.as_ref() else {
         return StepDecision::Idle;
     };
+    let mut judgment_intents = Vec::new();
+    let mut reserved_judges = reserved_roles;
     for (assertion_id, panel) in &team.judgment_assignments {
         if !plan.assertion_requires_judged_proof(assertion_id) {
             continue;
         }
         for role_id in panel {
+            if reserved_judges.contains(role_id) {
+                continue;
+            }
             let already_settled = state
                 .contract
                 .get(assertion_id)
@@ -305,10 +306,26 @@ fn step_running(state: &MissionState) -> StepDecision {
                     state.deliverable_head().to_string(),
                     Vec::new(),
                 ) {
-                    return StepDecision::DispatchRole(intent);
+                    reserved_judges.insert(role_id.clone());
+                    judgment_intents.push(intent);
+                    if judgment_intents.len() == remaining_capacity {
+                        break;
+                    }
                 }
             }
         }
+        if judgment_intents.len() == remaining_capacity {
+            break;
+        }
+    }
+    match judgment_intents.len() {
+        0 => {}
+        1 => return StepDecision::DispatchRole(judgment_intents.remove(0)),
+        _ => return StepDecision::DispatchRoles(judgment_intents),
+    }
+
+    if !state.inflight.is_empty() {
+        return StepDecision::Idle;
     }
 
     if oracle_obligation_outstanding(state) {

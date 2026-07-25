@@ -56,6 +56,7 @@ async fn production_cli_routes_atomically_only_to_explicit_live_conversations() 
                     request_attention: false,
                 }),
                 artifact: None,
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "reviewed".into(),
@@ -64,6 +65,7 @@ async fn production_cli_routes_atomically_only_to_explicit_live_conversations() 
             Ok(lionclaw::ports::RoleTurnOutcome {
                 handoff: None,
                 artifact: None,
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "question".into(),

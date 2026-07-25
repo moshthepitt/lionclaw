@@ -101,6 +101,7 @@ fn planning_runner(proposal: lionclaw::model::MissionProposal) -> MockRoleRunner
                 request_attention: false,
             }),
             artifact: None,
+            prepared_inputs: Vec::new(),
             runtime_configuration: Default::default(),
             runtime_usage: Default::default(),
             final_response: "proposed".to_string(),

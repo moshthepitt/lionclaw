@@ -44,6 +44,7 @@ pub fn review_verdict(request: &RoleTurnRequest, passed: bool, gaps: Vec<Gap>) -
                 .to_string(),
         }),
         artifact: None,
+        prepared_inputs: Vec::new(),
         runtime_configuration: crate::model::RuntimeConfigurationEvidence {
             requested_model: Some("mock-model".to_string()),
             applied_model: Some("mock-model".to_string()),
@@ -143,6 +144,7 @@ impl MockRoleRunner {
                     request.base_sha.clone(),
                     head_sha.clone(),
                 )),
+                prepared_inputs: Vec::new(),
                 runtime_configuration: crate::model::RuntimeConfigurationEvidence {
                     requested_model: Some("mock-model".to_string()),
                     applied_model: Some("mock-model".to_string()),

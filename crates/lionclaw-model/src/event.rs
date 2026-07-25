@@ -21,10 +21,10 @@ use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailureEvidence};
 
-/// Version 28 is the Slice 9 parallel-writer surface: role requests carry
-/// dependency candidate refs, and mission execution policy carries effect
-/// capacity.
-pub const SCHEMA_VERSION: u32 = 28;
+/// Version 29 is the Slice 9.5 plan-contract closeout surface: role successes
+/// carry prepared-input digests, and missions can durably assign a digest-pinned
+/// runtime environment after OCI preflight.
+pub const SCHEMA_VERSION: u32 = 29;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -484,6 +484,26 @@ pub struct PreparedInputRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct EnvironmentPreflight {
+    pub engine: String,
+    pub image_ref: String,
+    pub image_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentAssignment {
+    pub revision: u32,
+    pub image_ref: String,
+    pub image_id: String,
+    pub preflight: EnvironmentPreflight,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_revision: Option<u32>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoleTurnSuccess {
     /// `None` is a dialogue checkpoint only when the pinned output semantics
     /// makes its handoff optional; required-output absence is invalid output.
@@ -495,6 +515,8 @@ pub struct RoleTurnSuccess {
     pub runtime_configuration: RuntimeConfigurationEvidence,
     #[serde(default)]
     pub runtime_usage: RuntimeUsage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepared_inputs: Vec<PreparedInputRef>,
 }
 
 /// Immutable authority carried from a role request into its completion.
@@ -609,6 +631,17 @@ pub enum MissionEvent {
     },
     SkillAdded {
         skill: MissionSkill,
+    },
+    EnvironmentAssigned {
+        /// Digest-pinned user input, either `sha256:<hex>` or
+        /// `<name>@sha256:<hex>`. Tags are deliberately not accepted.
+        image_ref: String,
+        /// OCI engine's immutable image identity from preflight.
+        image_id: String,
+        preflight: EnvironmentPreflight,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        team_revision: Option<u32>,
+        reason: String,
     },
     RoleTurnRequested {
         role_instance: RoleInstanceId,
@@ -803,6 +836,7 @@ impl MissionEvent {
             Self::ProposalRecorded { .. } => "proposal_recorded",
             Self::TeamConfigured { .. } => "team_configured",
             Self::SkillAdded { .. } => "skill_added",
+            Self::EnvironmentAssigned { .. } => "environment_assigned",
             Self::RoleTurnRequested { .. } => "role_turn_requested",
             Self::MessageSent { .. } => "message_sent",
             Self::RoleTurnCompleted { .. } => "role_turn_completed",
@@ -835,6 +869,7 @@ impl MissionEvent {
             | Self::ProposalRecorded { .. }
             | Self::TeamConfigured { .. }
             | Self::SkillAdded { .. }
+            | Self::EnvironmentAssigned { .. }
             | Self::MessageSent { .. }
             | Self::ControlRequested { .. }
             | Self::MissionAborted { .. }

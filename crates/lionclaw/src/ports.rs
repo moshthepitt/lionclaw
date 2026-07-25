@@ -83,6 +83,8 @@ pub struct RoleTurnOutcome {
     /// satisfied may legitimately return `None`. Read-only roles never return
     /// an artifact.
     pub artifact: Option<CapturedArtifact>,
+    /// Prepared inputs actually published and mounted for this role turn.
+    pub prepared_inputs: Vec<PreparedInputRef>,
     pub runtime_configuration: RuntimeConfigurationEvidence,
     pub runtime_usage: RuntimeUsage,
     pub final_response: String,

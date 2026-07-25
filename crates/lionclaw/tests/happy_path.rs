@@ -49,6 +49,7 @@ async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_complet
                     request_attention: false,
                 }),
                 artifact: None,
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "judged".into(),
@@ -58,6 +59,7 @@ async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_complet
             0 => Ok(lionclaw::ports::RoleTurnOutcome {
                 handoff: None,
                 artifact: None,
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "Which behavior should I preserve?".into(),
@@ -80,6 +82,7 @@ async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_complet
                     request.base_sha.clone(),
                     HEAD_SHA,
                 )),
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "Implemented and verified.".into(),
@@ -395,6 +398,7 @@ async fn durable_role_outcomes_bound_adapter_configuration_evidence() {
                     request.base_sha.clone(),
                     HEAD_SHA,
                 )),
+                prepared_inputs: Vec::new(),
                 runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
                     applied_model: Some(oversized.clone()),
                     ..Default::default()
@@ -434,6 +438,68 @@ async fn durable_role_outcomes_bound_adapter_configuration_evidence() {
 }
 
 #[tokio::test]
+async fn role_prepared_input_refs_are_durable_receipt_evidence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input_ref = lionclaw::model::PreparedInputRef {
+        name: InputName::new("cargo-home").unwrap(),
+        digest: "a".repeat(64),
+    };
+    let expected = input_ref.clone();
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::new(Box::new(move |request| {
+            Ok(lionclaw::ports::RoleTurnOutcome {
+                handoff: Some(lionclaw::model::Handoff::Work {
+                    done: true,
+                    report: lionclaw::model::PayloadRef::inline("done"),
+                    request_attention: false,
+                }),
+                artifact: Some(lionclaw::ports::CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    HEAD_SHA,
+                )),
+                prepared_inputs: vec![input_ref.clone()],
+                runtime_configuration: Default::default(),
+                runtime_usage: Default::default(),
+                final_response: "done".into(),
+            })
+        })),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "retain input receipt",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+    let done = h.engine.advance(&mission_id).await.expect("advance");
+    let receipt = done
+        .state
+        .role_attempt_receipts
+        .values()
+        .find(|receipt| !receipt.prepared_inputs.is_empty())
+        .expect("role prepared-input receipt");
+    assert_eq!(receipt.prepared_inputs, vec![expected.clone()]);
+    let events = h.engine.store().load(&mission_id).await.expect("events");
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        lionclaw::model::MissionEvent::RoleTurnCompleted {
+            outcome: Ok(success),
+            ..
+        } if success.prepared_inputs == vec![expected.clone()]
+    )));
+}
+
+#[tokio::test]
 async fn durable_role_outcomes_preserve_and_report_runtime_usage() {
     let dir = tempfile::tempdir().expect("tempdir");
     let h = harness(
@@ -449,6 +515,7 @@ async fn durable_role_outcomes_preserve_and_report_runtime_usage() {
                     request.base_sha.clone(),
                     HEAD_SHA,
                 )),
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: RuntimeUsage::from_details(RuntimeUsageDetails {
                     input_tokens: Some(10),
@@ -619,6 +686,7 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
                         request_attention: false,
                     }),
                     artifact: None,
+                    prepared_inputs: Vec::new(),
                     runtime_configuration: Default::default(),
                     runtime_usage: Default::default(),
                     final_response: "judged".into(),
@@ -634,6 +702,7 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
                         request.base_sha.clone(),
                         BASE_SHA,
                     )),
+                    prepared_inputs: Vec::new(),
                     runtime_configuration: Default::default(),
                     runtime_usage: Default::default(),
                     final_response: "already satisfied".into(),
@@ -734,6 +803,7 @@ async fn worker_reporting_not_done_parks_with_attention() {
                     request_attention: false,
                 }),
                 artifact: None,
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: String::new(),
@@ -784,6 +854,7 @@ async fn role_runner_cannot_inject_a_durable_blob_reference() {
                     request.base_sha.clone(),
                     HEAD_SHA,
                 )),
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "attempted injection".into(),
@@ -837,6 +908,7 @@ async fn role_runner_oversized_report_is_a_durable_invalid_output() {
                     request.base_sha.clone(),
                     HEAD_SHA,
                 )),
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "oversized report".into(),

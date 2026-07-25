@@ -5,8 +5,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::event::{
-    EffectResource, MissionConfig, MissionTypeRef, PayloadRef, RuntimeConfigurationEvidence,
-    TaskCandidateRef,
+    EffectResource, EnvironmentAssignment, MissionConfig, MissionTypeRef, PayloadRef,
+    PreparedInputRef, RuntimeConfigurationEvidence, TaskCandidateRef,
 };
 use super::ids::{AssertionId, MissionId, OracleName, RoleInstanceId, TaskId};
 use super::plan::{Assertion, Plan};
@@ -184,6 +184,8 @@ pub struct RoleAttemptReceipt {
     pub runtime_configuration: Option<RuntimeConfigurationEvidence>,
     #[serde(default)]
     pub runtime_usage: RuntimeUsage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepared_inputs: Vec<PreparedInputRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_response: Option<PayloadRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -927,6 +929,7 @@ impl InflightEffect {
             source,
             runtime_configuration: None,
             runtime_usage: RuntimeUsage::NotReported,
+            prepared_inputs: Vec::new(),
             final_response: None,
             handoff: None,
             disposition: RoleAttemptDisposition::Active,
@@ -1085,6 +1088,7 @@ impl InflightEffect {
             | MissionEvent::ProposalRecorded { .. }
             | MissionEvent::TeamConfigured { .. }
             | MissionEvent::SkillAdded { .. }
+            | MissionEvent::EnvironmentAssigned { .. }
             | MissionEvent::MessageSent { .. }
             | MissionEvent::RoleTurnCompleted { .. }
             | MissionEvent::OracleRunCompleted { .. }
@@ -1106,6 +1110,8 @@ pub struct MissionState {
     pub mission_type: MissionTypeRef,
     /// The confinement image, resolved to a content id at start.
     pub image_id: String,
+    #[serde(default)]
+    pub environment_history: Vec<EnvironmentAssignment>,
     pub workspace_dir: String,
     /// Target repo HEAD at mission creation.
     pub base_sha: String,

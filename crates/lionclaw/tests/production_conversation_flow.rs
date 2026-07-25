@@ -1425,7 +1425,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (28, 55));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (29, 56));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -3558,16 +3558,19 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         })
         .collect::<Vec<_>>();
     assert_eq!(oracle_completions.len(), 4);
+    let mut completed_oracles = oracle_completions
+        .iter()
+        .map(|(_, oracle, ..)| *oracle)
+        .collect::<Vec<_>>();
+    let mut called_oracles = oracle_calls
+        .iter()
+        .map(|(oracle, _)| oracle.as_str())
+        .collect::<Vec<_>>();
+    completed_oracles.sort_unstable();
+    called_oracles.sort_unstable();
     assert_eq!(
-        oracle_completions
-            .iter()
-            .map(|(_, oracle, ..)| *oracle)
-            .collect::<Vec<_>>(),
-        oracle_calls
-            .iter()
-            .map(|(oracle, _)| oracle.as_str())
-            .collect::<Vec<_>>(),
-        "completion receipts must retain the serial external transport order"
+        completed_oracles, called_oracles,
+        "parallel completion receipts must retain the exact oracle set"
     );
     for (_, oracle, judged_sha, actual) in &oracle_completions {
         let (exit_code, _, duration_ms) = scripted_oracle_outcome(oracle);
@@ -4822,16 +4825,17 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         assert_eq!(oracle_completions.len(), 4);
         assert!(judgment_turns.is_empty());
         let calls = oracle_calls.lock().unwrap();
-        assert_eq!(
-            oracle_completions
-                .iter()
-                .map(|(_, oracle, ..)| *oracle)
-                .collect::<Vec<_>>(),
-            calls
-                .iter()
-                .map(|(oracle, _)| oracle.as_str())
-                .collect::<Vec<_>>()
-        );
+        let mut completed_oracles = oracle_completions
+            .iter()
+            .map(|(_, oracle, ..)| *oracle)
+            .collect::<Vec<_>>();
+        let mut called_oracles = calls
+            .iter()
+            .map(|(oracle, _)| oracle.as_str())
+            .collect::<Vec<_>>();
+        completed_oracles.sort_unstable();
+        called_oracles.sort_unstable();
+        assert_eq!(completed_oracles, called_oracles);
         for (index, oracle, judged_sha, actual) in oracle_completions {
             let (exit_code, _, duration_ms) = scripted_oracle_outcome(oracle);
             assert_eq!(judged_sha, completed.current_sha);

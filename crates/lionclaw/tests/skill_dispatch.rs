@@ -58,6 +58,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
                     request_attention: false,
                 }),
                 artifact: None,
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "judged".into(),
@@ -77,6 +78,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
                 request.base_sha.clone(),
                 HEAD_SHA,
             )),
+            prepared_inputs: Vec::new(),
             runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
                 requested_model: Some("mock".to_string()),
                 applied_model: Some("mock".to_string()),
@@ -145,6 +147,7 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
                     request_attention: false,
                 }),
                 artifact: None,
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "judged".into(),
@@ -162,6 +165,7 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
                 request.base_sha.clone(),
                 HEAD_SHA,
             )),
+            prepared_inputs: Vec::new(),
             runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
                 requested_model: Some("mock".to_string()),
                 applied_model: Some("mock".to_string()),

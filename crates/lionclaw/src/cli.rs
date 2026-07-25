@@ -23,9 +23,9 @@ use crate::mission_type::{
     MissionType, MissionTypeLocator, SkillSource,
 };
 use crate::model::{
-    fold, short_hex, AuthorityGrants, ControlAction, DecisionAction, EffectId, FinishClass,
-    InputName, MissionGuidance, MissionId, MissionPhase, MissionSkill, OutputSemantics,
-    RequirementDisposition, RoleInstance, RoleInstanceId, TaskId,
+    fold, short_hex, AuthorityGrants, ControlAction, DecisionAction, EffectId,
+    EnvironmentPreflight, FinishClass, InputName, MissionGuidance, MissionId, MissionPhase,
+    MissionSkill, OutputSemantics, RequirementDisposition, RoleInstance, RoleInstanceId, TaskId,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, OracleRunner, SystemClock};
@@ -159,6 +159,11 @@ pub enum MissionCommand {
     DriverStderr(DriverStderrArgs),
     /// Show a mission's state (contract, phase, finish grade).
     Status(StatusArgs),
+    /// Print restart-safe lead guidance derived from folded state.
+    Guide(GuideArgs),
+    /// Inspect or assign the mission runtime environment.
+    #[command(subcommand)]
+    Environment(EnvironmentCommand),
     /// The verifiable receipt: what was proven, by what, and what was NOT.
     Report(ReportArgs),
     /// Create a branch (`lionclaw/<id>`) at the mission's produced commit.
@@ -205,6 +210,14 @@ pub enum PlanCommand {
     Show(PlanShowArgs),
     /// Propose a complete plan revision from JSON.
     Propose(PlanProposeArgs),
+}
+
+#[derive(Subcommand)]
+pub enum EnvironmentCommand {
+    /// Show the mission's active digest-pinned runtime environment.
+    Show(EnvironmentShowArgs),
+    /// Assign a preflighted digest-pinned image to subsequent effects.
+    Use(EnvironmentUseArgs),
 }
 
 #[derive(Subcommand)]
@@ -568,6 +581,45 @@ pub struct StatusArgs {
 }
 
 #[derive(Args)]
+pub struct GuideArgs {
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct EnvironmentShowArgs {
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct EnvironmentUseArgs {
+    /// Digest-pinned image ref: `sha256:<hex>` or `<name>@sha256:<hex>`.
+    pub image: String,
+    /// Mission id (default: the sole live mission in this repo).
+    #[arg(long)]
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    /// Why this mission should switch to this image.
+    #[arg(long)]
+    pub reason: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
 pub struct ReportArgs {
     /// Mission id (default: the sole live mission in this repo).
     pub mission_id: Option<String>,
@@ -664,8 +716,10 @@ impl MissionCommand {
         match self {
             Self::Start(a) => a.json,
             Self::Status(a) => a.json,
+            Self::Guide(a) => a.json,
             Self::Report(a) => a.json,
             Self::Plan(a) => a.is_json(),
+            Self::Environment(a) => a.is_json(),
             Self::Team(TeamCommand::Show(a)) => a.json,
             Self::Inbox(a) => a.json,
             Self::Advance(a) => a.json,
@@ -696,6 +750,15 @@ impl PlanCommand {
     }
 }
 
+impl EnvironmentCommand {
+    fn is_json(&self) -> bool {
+        match self {
+            Self::Show(args) => args.json,
+            Self::Use(args) => args.json,
+        }
+    }
+}
+
 impl TypeCommand {
     fn is_json(&self) -> bool {
         match self {
@@ -719,6 +782,10 @@ async fn dispatch_mission(
         MissionCommand::Driver(args) => cmd_driver(args, transports).await,
         MissionCommand::DriverStderr(args) => cmd_driver_stderr(args).await,
         MissionCommand::Status(args) => cmd_status(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Guide(args) => cmd_guide(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Environment(cmd) => cmd_environment(cmd, transports)
+            .await
+            .map(|()| ExitCode::SUCCESS),
         MissionCommand::Report(args) => cmd_report(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Apply(args) => cmd_apply(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Log(args) => cmd_log(args).await.map(|()| ExitCode::SUCCESS),
@@ -1502,6 +1569,37 @@ fn output_name(output: OutputSemantics) -> &'static str {
     }
 }
 
+fn parse_digest_pinned_image_ref(raw: &str) -> Result<String> {
+    let image = raw.trim();
+    if let Some(hex) = image.strip_prefix("sha256:") {
+        return Ok(format!("sha256:{}", normalized_sha256_hex(hex)?));
+    }
+    if let Some((name, hex)) = image.rsplit_once("@sha256:") {
+        if name.trim().is_empty() {
+            bail!("environment image digest ref requires an image name before '@sha256:'");
+        }
+        return Ok(format!("{name}@sha256:{}", normalized_sha256_hex(hex)?));
+    }
+    bail!(
+        "environment use requires a digest-pinned image ref (sha256:<hex> or <name>@sha256:<hex>)"
+    )
+}
+
+fn normalize_oci_image_id(raw: &str) -> Result<String> {
+    let image_id = raw.trim();
+    if let Some(hex) = image_id.strip_prefix("sha256:") {
+        return Ok(format!("sha256:{}", normalized_sha256_hex(hex)?));
+    }
+    Ok(format!("sha256:{}", normalized_sha256_hex(image_id)?))
+}
+
+fn normalized_sha256_hex(hex: &str) -> Result<String> {
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("expected a sha256 digest with exactly 64 hex characters");
+    }
+    Ok(hex.to_ascii_lowercase())
+}
+
 /// The branch name and target commit for `apply`, or an error when the mission
 /// produced no commit (`current == base`) — never create an empty branch.
 fn apply_target(mission_id: &MissionId, base_sha: &str, current_sha: &str) -> Result<String> {
@@ -1652,6 +1750,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "objective": state.objective,
                 "mission_type": { "name": state.mission_type.name, "digest": state.mission_type.digest },
                 "image_id": state.image_id,
+                "environment": environment_json(state),
                 "team": state.team,
                 "delegation": state.delegation,
                 "stop_bar": state.config.stop.slug(),
@@ -1916,6 +2015,119 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_guide(args: GuideArgs) -> Result<()> {
+    let (_repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    let view = load_mission_view(&store, &mission_id).await?;
+    if args.json {
+        println!("{}", guide_json(&view, &store).await?);
+    } else {
+        print_guide(&view, &store).await?;
+    }
+    Ok(())
+}
+
+async fn cmd_environment(
+    command: EnvironmentCommand,
+    transports: &MissionTransports,
+) -> Result<()> {
+    match command {
+        EnvironmentCommand::Show(args) => cmd_environment_show(args).await,
+        EnvironmentCommand::Use(args) => cmd_environment_use(args, transports).await,
+    }
+}
+
+async fn cmd_environment_show(args: EnvironmentShowArgs) -> Result<()> {
+    let (_repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    let state = store.require_state(&mission_id).await?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "mission_id": mission_id.as_str(),
+                "environment": environment_json(&state),
+            })
+        );
+        return Ok(());
+    }
+    println!("mission {mission_id} environment");
+    print_environment(&state, "  ");
+    Ok(())
+}
+
+async fn cmd_environment_use(
+    args: EnvironmentUseArgs,
+    transports: &MissionTransports,
+) -> Result<()> {
+    let image_ref = parse_digest_pinned_image_ref(&args.image)?;
+    if args.reason.trim().is_empty() {
+        bail!("environment use requires a non-empty --reason");
+    }
+    let (_repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    let state = store.require_state(&mission_id).await?;
+    if state.phase.is_terminal() {
+        bail!("mission {mission_id} is terminal; environment assignment is closed");
+    }
+    if !state.inflight.is_empty() {
+        bail!(
+            "mission {mission_id} has {} active effect(s); retry after they settle",
+            state.inflight.len()
+        );
+    }
+    let team = state.team.as_ref().context("mission has no active team")?;
+    let runtime = team
+        .role(&team.planning_assignment)
+        .map(|role| role.runtime.clone())
+        .context("mission has no active planning role runtime")?;
+    let profiles = transports.profiles()?;
+    let profile = validate_team_runtimes(team, &runtime, &profiles, transports)?;
+    let engine = profile.confinement.oci().engine.clone();
+    let image_id =
+        lionclaw_confinement::resolve_oci_image_compatibility_identity(&engine, &image_ref)
+            .await
+            .with_context(|| format!("preflighting digest-pinned image '{image_ref}'"))?;
+    let image_id = normalize_oci_image_id(&image_id)?;
+    let preflight = EnvironmentPreflight {
+        engine,
+        image_ref: image_ref.clone(),
+        image_id: image_id.clone(),
+    };
+    let event = NewEvent::new(crate::model::MissionEvent::EnvironmentAssigned {
+        image_ref: image_ref.clone(),
+        image_id: image_id.clone(),
+        preflight,
+        team_revision: Some(team.revision),
+        reason: args.reason,
+    });
+    store
+        .append(&mission_id, state.head, &[event], SystemClock.now_ms())
+        .await
+        .with_context(|| {
+            format!(
+                "mission {mission_id} changed while assigning environment; retry from current status"
+            )
+        })?;
+    if args.json {
+        let updated = store.require_state(&mission_id).await?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "mission_id": mission_id.as_str(),
+                "environment": environment_json(&updated),
+            })
+        );
+    } else {
+        println!(
+            "assigned environment for mission {mission_id}: {}",
+            short_hex(&image_id)
+        );
+    }
+    Ok(())
+}
+
 async fn cmd_decide(args: DecideArgs) -> Result<()> {
     let action = parse_decision_action(&args.action)?;
     let mission_id = MissionId::parse(&args.mission_id)?;
@@ -2126,6 +2338,49 @@ mod team_cli_tests {
             guidance.command,
             Command::Mission(MissionCommand::Team(TeamCommand::GuideSet(_)))
         ));
+    }
+
+    #[test]
+    fn parses_mission_guide_and_environment_commands() {
+        let guide = Cli::try_parse_from(["lionclaw", "mission", "guide", "--json"]).unwrap();
+        assert!(matches!(
+            guide.command,
+            Command::Mission(MissionCommand::Guide(_))
+        ));
+
+        let show =
+            Cli::try_parse_from(["lionclaw", "mission", "environment", "show", "--json"]).unwrap();
+        assert!(matches!(
+            show.command,
+            Command::Mission(MissionCommand::Environment(EnvironmentCommand::Show(_)))
+        ));
+
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let assign = Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "environment",
+            "use",
+            digest.as_str(),
+            "--reason",
+            "benchmark image",
+        ])
+        .unwrap();
+        assert!(matches!(
+            assign.command,
+            Command::Mission(MissionCommand::Environment(EnvironmentCommand::Use(_)))
+        ));
+    }
+
+    #[test]
+    fn environment_image_refs_must_be_digest_pinned() {
+        let digest = "A".repeat(64);
+        assert_eq!(
+            parse_digest_pinned_image_ref(&format!("localhost/test@sha256:{digest}")).unwrap(),
+            format!("localhost/test@sha256:{}", "a".repeat(64))
+        );
+        assert!(parse_digest_pinned_image_ref("localhost/test:latest").is_err());
+        assert!(parse_digest_pinned_image_ref("sha256:1234").is_err());
     }
 
     #[test]
@@ -2568,6 +2823,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
             view.disposition.slug(),
         );
         println!("objective: {}", state.objective);
+        print_environment(state, "");
         if let Some(failure) = &state.cleanup_failure {
             println!(
                 "cleanup blocked for effect {} ({:?}): {}",
@@ -3204,6 +3460,126 @@ fn workspace_observation_summary(observation: &crate::activity::WorkspaceObserva
     }
 }
 
+async fn guide_json(view: &MissionView, store: &MissionStore) -> Result<serde_json::Value> {
+    let state = &view.state;
+    Ok(serde_json::json!({
+        "mission_id": state.mission_id.as_str(),
+        "objective": state.objective,
+        "phase": phase_slug(&state.phase),
+        "finish": state.phase.finish().map(|finish| finish.slug()),
+        "disposition": view.disposition.slug(),
+        "stop_bar": state.config.stop.slug(),
+        "revision": state.revision,
+        "team_revision": state.team.as_ref().map(|team| team.revision),
+        "current_sha": state.deliverable_head(),
+        "deliverable_head": state.deliverable_head(),
+        "environment": environment_json(state),
+        "next_actions": view.next_actions(),
+        "operator_loop": [
+            "mission guide",
+            "mission status --json",
+        ],
+        "active_effects": active_effects_json(state),
+        "parked_effects": parked_effect_views(state),
+        "attention": state.open_attention.values().map(|item| {
+            attention_json(store.blobs(), state, item)
+        }).collect::<Result<Vec<_>>>()?,
+        "conversations": conversation_views(state, store)?,
+    }))
+}
+
+async fn print_guide(view: &MissionView, store: &MissionStore) -> Result<()> {
+    let state = &view.state;
+    println!("mission {} guide", state.mission_id);
+    println!("objective: {}", state.objective);
+    println!(
+        "state: {} ({})",
+        phase_slug(&state.phase),
+        view.disposition.slug()
+    );
+    println!("commit: {}", short_hex(state.deliverable_head()));
+    print_environment(state, "");
+    if !state.inflight.is_empty() {
+        println!("active effects:");
+        for effect in active_effects_json(state) {
+            println!(
+                "  {} {} deadline={}",
+                effect["effect_id"].as_str().unwrap_or("?"),
+                effect["kind"].as_str().unwrap_or("?"),
+                effect["deadline_ms"]
+            );
+        }
+    }
+    if !state.parked_effects.is_empty() {
+        println!("parked effects:");
+        for (effect_id, parked) in &state.parked_effects {
+            println!("  {effect_id}: {:?}", parked);
+        }
+    }
+    if !state.open_attention.is_empty() {
+        println!("attention:");
+        for item in state.open_attention.values() {
+            println!("  {} [{}] {}", item.id, item.kind.slug(), item.report);
+        }
+    }
+    print_conversations(state, store, "  ")?;
+    println!("next: {}", view.next_actions().join(" | "));
+    Ok(())
+}
+
+fn environment_json(state: &crate::model::MissionState) -> serde_json::Value {
+    serde_json::json!({
+        "image_id": &state.image_id,
+        "active_assignment": state.environment_history.last(),
+        "history": &state.environment_history,
+    })
+}
+
+fn print_environment(state: &crate::model::MissionState, indent: &str) {
+    println!("{indent}environment: {}", state.image_id);
+    if let Some(active) = state.environment_history.last() {
+        println!(
+            "{indent}  assignment {}: {} via {}",
+            active.revision, active.image_ref, active.preflight.engine
+        );
+    }
+}
+
+fn active_effects_json(state: &crate::model::MissionState) -> Vec<serde_json::Value> {
+    state
+        .inflight
+        .iter()
+        .map(|(effect_id, effect)| match effect {
+            crate::model::InflightEffect::RoleTurn {
+                role_instance,
+                task_id,
+                assertion_ids,
+                deadline_ms,
+                ..
+            } => serde_json::json!({
+                "effect_id": effect_id.as_str(),
+                "kind": "role_turn",
+                "role_instance": role_instance.as_str(),
+                "task_id": task_id.as_ref().map(|task| task.as_str()),
+                "assertion_ids": assertion_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                "deadline_ms": deadline_ms,
+            }),
+            crate::model::InflightEffect::OracleRun {
+                oracle,
+                assertion_ids,
+                deadline_ms,
+                ..
+            } => serde_json::json!({
+                "effect_id": effect_id.as_str(),
+                "kind": "oracle_run",
+                "oracle": oracle.as_str(),
+                "assertion_ids": assertion_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                "deadline_ms": deadline_ms,
+            }),
+        })
+        .collect()
+}
+
 async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<serde_json::Value> {
     let state = &view.state;
     let blobs = store.blobs();
@@ -3218,6 +3594,7 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         "revision": state.revision,
         "team_revision": state.team.as_ref().map(|team| team.revision),
         "delegation": state.delegation,
+        "environment": environment_json(state),
         "current_sha": state.deliverable_head(),
         "deliverable_head": state.deliverable_head(),
         "objective": state.objective,

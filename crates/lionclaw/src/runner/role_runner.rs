@@ -686,9 +686,14 @@ impl RoleRunner for OciRoleRunner {
                     ))
                 })?
             };
-            extras.extend(prepared.mounts);
+            let PreparedInputs {
+                mounts,
+                environment: prepared_environment,
+                refs: prepared_refs,
+            } = prepared;
+            extras.extend(mounts);
             let environment =
-                mission_environment(&dirs, &request.environment, prepared.environment);
+                mission_environment(&dirs, &request.environment, prepared_environment);
             let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
             let compiled = compile_role_plan(RolePlanRequest {
                 authority: &authority,
@@ -704,9 +709,9 @@ impl RoleRunner for OciRoleRunner {
                 resource_ceilings: &request.resource_ceilings,
             })
             .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
-            Ok((is_writer, compiled.plan().clone()))
+            Ok((is_writer, compiled.plan().clone(), prepared_refs))
         };
-        let (is_writer, plan) =
+        let (is_writer, plan, prepared_inputs) =
             await_controlled(Box::pin(setup), request.control.clone(), |control| {
                 setup_control_failure(&profile, control)
             })
@@ -779,6 +784,7 @@ impl RoleRunner for OciRoleRunner {
             Ok(RoleTurnOutcome {
                 handoff,
                 artifact,
+                prepared_inputs,
                 runtime_configuration: role_runtime_configuration(&applied),
                 runtime_usage,
                 final_response,

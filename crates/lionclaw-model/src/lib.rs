@@ -38,12 +38,12 @@ pub use decision::{validate_decision, DecisionError};
 pub use event::{
     resolve_execution_deadline_ms, role_prompt_template, role_success_contract_error,
     ArtifactOutcome, BlobRef, ContinueMode, ControlAction, DecisionAction, DelegationSet,
-    EffectEventClass, EffectResource, EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff,
-    MessageReference, MissionConfig, MissionEvent, MissionProposal, MissionSkill, MissionTypeRef,
-    OracleRunSuccess, PayloadRef, PreparedInputRef, RecoveryConfig, RolePromptTemplate,
-    RoleTurnSuccess, RuntimeConfigurationEvidence, StopBar, TaskCandidateRef,
-    UnavailableReferenceCause, ValidationItem, VersionStamps, WorkspacePreparation,
-    MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES,
+    EffectEventClass, EffectResource, EnvironmentAssignment, EnvironmentPreflight, EventEnvelope,
+    ExecutionPolicy, Gap, GapSeverity, Handoff, MessageReference, MissionConfig, MissionEvent,
+    MissionProposal, MissionSkill, MissionTypeRef, OracleRunSuccess, PayloadRef, PreparedInputRef,
+    RecoveryConfig, RolePromptTemplate, RoleTurnSuccess, RuntimeConfigurationEvidence, StopBar,
+    TaskCandidateRef, UnavailableReferenceCause, ValidationItem, VersionStamps,
+    WorkspacePreparation, MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES,
     MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES, MAX_QUEUED_MESSAGES_PER_CONVERSATION,
     MAX_ROLE_REPORT_BYTES, SCHEMA_VERSION,
 };

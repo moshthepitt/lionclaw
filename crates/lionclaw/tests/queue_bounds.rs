@@ -77,6 +77,7 @@ impl RoleRunner for GatedRoleRunner {
                         request_attention: false,
                     }),
                     artifact: None,
+                    prepared_inputs: Vec::new(),
                     runtime_configuration,
                     runtime_usage: Default::default(),
                     final_response: final_response.into(),
@@ -88,6 +89,7 @@ impl RoleRunner for GatedRoleRunner {
                 Ok(RoleTurnOutcome {
                     handoff: None,
                     artifact: None,
+                    prepared_inputs: Vec::new(),
                     runtime_configuration,
                     runtime_usage: Default::default(),
                     final_response: final_response.into(),
@@ -426,6 +428,7 @@ async fn exact_queue_capacity_is_typed_atomic_replay_safe_and_recoverable() {
                     request_attention: false,
                 }),
                 artifact: None,
+                prepared_inputs: Vec::new(),
                 runtime_configuration: Default::default(),
                 runtime_usage: Default::default(),
                 final_response: "reviewed".into(),
@@ -434,6 +437,7 @@ async fn exact_queue_capacity_is_typed_atomic_replay_safe_and_recoverable() {
         Ok(lionclaw::ports::RoleTurnOutcome {
             handoff: None,
             artifact: None,
+            prepared_inputs: Vec::new(),
             runtime_configuration: Default::default(),
             runtime_usage: Default::default(),
             final_response: "question".into(),

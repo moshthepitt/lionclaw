@@ -274,6 +274,73 @@ impl OracleRunner for ScriptedOracleRunner {
     }
 }
 
+struct ConcurrentOracleRunner {
+    barrier: Arc<tokio::sync::Barrier>,
+    calls: Mutex<Vec<String>>,
+}
+
+impl ConcurrentOracleRunner {
+    fn new(width: usize) -> Self {
+        Self {
+            barrier: Arc::new(tokio::sync::Barrier::new(width)),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl OracleRunner for ConcurrentOracleRunner {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+        self.calls
+            .lock()
+            .expect("lock")
+            .push(request.oracle.to_string());
+        self.barrier.wait().await;
+        Ok(OracleOutcome {
+            exit_code: 0,
+            exit_signal: None,
+            stdout: format!("oracle pass at {}", request.judged_sha).into_bytes(),
+            stderr: Vec::new(),
+            prepared_inputs: Vec::new(),
+            duration_ms: 1,
+        })
+    }
+}
+
+struct ConcurrentJudgeRunner {
+    barrier: Arc<tokio::sync::Barrier>,
+    calls: Mutex<Vec<String>>,
+}
+
+impl ConcurrentJudgeRunner {
+    fn new(width: usize) -> Self {
+        Self {
+            barrier: Arc::new(tokio::sync::Barrier::new(width)),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl RoleRunner for ConcurrentJudgeRunner {
+    async fn run(&self, request: RoleTurnRequest) -> Result<RoleTurnOutcome, TypedFailure> {
+        if request.role.output == OutputSemantics::EmitsVerdict {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push(request.role.id.to_string());
+            self.barrier.wait().await;
+            return Ok(validate_outcome(&request));
+        }
+        lionclaw::testing::prepare_test_workspace(&request).await?;
+        let checkout = checkout(&request)?;
+        std::fs::write(checkout.join("judge-target.txt"), "judge target\n").map_err(infra)?;
+        git(checkout, &["add", "-A"])?;
+        git_commit(checkout, "judge target", request.attempt_no)?;
+        captured_work(&request).await
+    }
+}
+
 struct Harness {
     engine: Engine,
     runner_log: Arc<ParallelLog>,
@@ -345,6 +412,89 @@ async fn parallel_writers_run_concurrently_and_integrate_at_the_deliverable_head
     let judged = h.oracle.judged_shas();
     assert_eq!(judged.len(), 2);
     assert!(judged.iter().all(|judged| judged == &deliverable));
+}
+
+#[tokio::test]
+async fn oracle_batches_run_concurrently_after_writer_fan_in() {
+    let dir = TempDir::new().expect("tempdir");
+    initialize_repository(dir.path());
+    let runner = Arc::new(ParallelRoleRunner::new(IntegrationBehavior::Complete));
+    let oracle = Arc::new(ConcurrentOracleRunner::new(2));
+    let engine = Engine::new(
+        MissionStore::open(dir.path()).await.expect("open store"),
+        mission_type(),
+        "localhost/lionclaw-runtime-dev:v1".to_string(),
+        EngineServices::new(
+            runner,
+            oracle.clone(),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    );
+    let mission_id = start_parallel_mission(&engine, dir.path()).await;
+
+    let done = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        engine.advance(&mission_id),
+    )
+    .await
+    .expect("oracle batch did not run concurrently")
+    .expect("advance");
+    assert_eq!(done.disposition, MissionDisposition::Terminal);
+    assert_eq!(oracle.calls.lock().expect("lock").len(), 2);
+}
+
+#[tokio::test]
+async fn judge_turn_batches_run_concurrently_after_work_settles() {
+    let dir = TempDir::new().expect("tempdir");
+    initialize_repository(dir.path());
+    let runner = Arc::new(ConcurrentJudgeRunner::new(2));
+    let engine = Engine::new(
+        MissionStore::open(dir.path()).await.expect("open store"),
+        judged_mission_type(),
+        "localhost/lionclaw-runtime-dev:v1".to_string(),
+        EngineServices::new(
+            runner.clone(),
+            Arc::new(ScriptedOracleRunner::passing()),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    );
+    let plan = judged_plan();
+    let mission_id = engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "parallel judges",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    engine
+        .propose_plan(
+            &mission_id,
+            MissionProposal {
+                team: Some(judged_team(1, &plan)),
+                plan: Some(PlanProposal {
+                    base_revision: 0,
+                    requirement_changes: vec![],
+                    assertion_supersessions: vec![],
+                    plan,
+                }),
+            },
+        )
+        .await
+        .expect("propose");
+    approve_plan(&engine, &mission_id).await;
+
+    let done = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        engine.advance(&mission_id),
+    )
+    .await
+    .expect("judge batch did not run concurrently")
+    .expect("advance");
+    assert_eq!(done.disposition, MissionDisposition::Terminal);
+    assert_eq!(runner.calls.lock().expect("lock").len(), 2);
 }
 
 #[tokio::test]
@@ -784,6 +934,7 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
                     }),
                     artifact: None,
                     runtime_configuration: Default::default(),
+                    prepared_inputs: Vec::new(),
                     runtime_usage: Default::default(),
                     final_response: PayloadRef::inline("done"),
                 }),
@@ -863,6 +1014,35 @@ fn mission_type() -> MissionType {
     })
 }
 
+fn judged_mission_type() -> MissionType {
+    MissionType::for_testing(MissionTypeDefinition {
+        name: "parallel-judge-test".to_string(),
+        stop: StopBar::Attested,
+        image: "localhost/lionclaw-runtime-dev:v1".to_string(),
+        environment: BTreeMap::new(),
+        default_team: judged_team(0, &judged_plan()),
+        ceilings: AuthorityCeilings {
+            writes: true,
+            ..Default::default()
+        },
+        resource_ceilings: Default::default(),
+        oracle_resources: Default::default(),
+        requires_gap_review: false,
+        recovery: Default::default(),
+        execution: ExecutionPolicy {
+            effect_capacity: 2,
+            auto_continue_candidate: true,
+            auto_continue_proof: true,
+            ..Default::default()
+        },
+        playbook: None,
+        skills: BTreeMap::new(),
+        inputs: BTreeMap::new(),
+        oracles: BTreeMap::new(),
+        oracle_devices: Default::default(),
+    })
+}
+
 fn default_team() -> TeamRevision {
     TeamRevision {
         revision: 0,
@@ -870,6 +1050,38 @@ fn default_team() -> TeamRevision {
         planning_assignment: RoleInstanceId::new("strategist").unwrap(),
         task_assignments: BTreeMap::new(),
         judgment_assignments: BTreeMap::new(),
+        gap_review_assignment: None,
+        guidance: None,
+    }
+}
+
+fn judged_team(revision: u32, plan: &Plan) -> TeamRevision {
+    TeamRevision {
+        revision,
+        roles: [
+            role("strategist", OutputSemantics::ProposesPlan, false),
+            role("implementer", OutputSemantics::ProducesArtifact, true),
+            role("judge-a", OutputSemantics::EmitsVerdict, false),
+            role("judge-b", OutputSemantics::EmitsVerdict, false),
+        ]
+        .into_iter()
+        .map(|role| (role.id.clone(), role))
+        .collect(),
+        planning_assignment: RoleInstanceId::new("strategist").unwrap(),
+        task_assignments: BTreeMap::from([(
+            "build".parse_task(),
+            RoleInstanceId::new("implementer").unwrap(),
+        )]),
+        judgment_assignments: BTreeMap::from([
+            (
+                plan.assertions[0].id.clone(),
+                vec![RoleInstanceId::new("judge-a").unwrap()],
+            ),
+            (
+                plan.assertions[1].id.clone(),
+                vec![RoleInstanceId::new("judge-b").unwrap()],
+            ),
+        ]),
         gap_review_assignment: None,
         guidance: None,
     }
@@ -994,6 +1206,39 @@ fn assertion(id: AssertionId, prose: &str, oracle: &str) -> Assertion {
     }
 }
 
+fn judged_plan() -> Plan {
+    let first = AssertionId::new("FIRST-OK").unwrap();
+    let second = AssertionId::new("SECOND-OK").unwrap();
+    Plan {
+        requirements: vec![lionclaw::model::Requirement {
+            id: lionclaw::model::RequirementId::new("JUDGED").unwrap(),
+            kind: lionclaw::model::RequirementKind::Capability,
+            prose: "the work is judged".to_string(),
+            disposition: lionclaw::model::RequirementDisposition::ReviewerCheckable {
+                assertion_ids: vec![first.clone(), second.clone()],
+            },
+        }],
+        assertions: vec![
+            Assertion {
+                id: first.clone(),
+                prose: "first judge passes".to_string(),
+                oracle: None,
+            },
+            Assertion {
+                id: second.clone(),
+                prose: "second judge passes".to_string(),
+                oracle: None,
+            },
+        ],
+        tasks: vec![Task {
+            id: "build".parse_task(),
+            body: "build judged artifact".to_string(),
+            targets: vec![first, second],
+            depends_on: Vec::new(),
+        }],
+    }
+}
+
 async fn start_parallel_mission(engine: &Engine, repo: &Path) -> lionclaw::model::MissionId {
     let plan = parallel_plan(false);
     let mission_id = engine
@@ -1037,6 +1282,7 @@ fn validate_outcome(request: &RoleTurnRequest) -> RoleTurnOutcome {
             request_attention: false,
         }),
         artifact: None,
+        prepared_inputs: Vec::new(),
         runtime_configuration: Default::default(),
         runtime_usage: Default::default(),
         final_response: "judged".to_string(),
@@ -1062,6 +1308,7 @@ fn work_outcome(artifact: Option<lionclaw::ports::CapturedArtifact>) -> RoleTurn
             request_attention: false,
         }),
         artifact,
+        prepared_inputs: Vec::new(),
         runtime_configuration: Default::default(),
         runtime_usage: Default::default(),
         final_response: "done".to_string(),
@@ -1247,6 +1494,7 @@ fn role_success(effect_id: EffectId, head_sha: &str) -> MissionEvent {
                 head_sha: head_sha.to_string(),
             }),
             runtime_configuration: Default::default(),
+            prepared_inputs: Vec::new(),
             runtime_usage: Default::default(),
             final_response: PayloadRef::inline("done"),
         }),
