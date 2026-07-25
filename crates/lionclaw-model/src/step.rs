@@ -345,6 +345,9 @@ fn step_running(state: &MissionState) -> StepDecision {
             if !owed.is_empty() {
                 debug_assert!(owed.contains(assertion_id));
                 by_oracle.insert(oracle.clone(), owed);
+                if by_oracle.len() == remaining_capacity {
+                    break;
+                }
             }
         }
         return StepDecision::RunOracles(

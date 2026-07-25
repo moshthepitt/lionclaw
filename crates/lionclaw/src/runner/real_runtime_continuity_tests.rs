@@ -257,11 +257,7 @@ async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) 
         )
     });
     let profiles = RuntimeProfiles::built_in().expect("load built-in runtime profiles");
-    let first_runner = OciRoleRunner::new(
-        profiles.clone(),
-        image_id.clone(),
-        AuthorityCeiling::default(),
-    );
+    let first_runner = OciRoleRunner::new(profiles.clone(), AuthorityCeiling::default());
 
     let mission_id = MissionId::for_creation(
         repo.to_str()
@@ -497,7 +493,7 @@ async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) 
         second_request.role.id, role_instance,
         "both effects must address the same conversation generation"
     );
-    let second_runner = OciRoleRunner::new(profiles, image_id.clone(), AuthorityCeiling::default());
+    let second_runner = OciRoleRunner::new(profiles, AuthorityCeiling::default());
     let second_run = tokio::spawn(async move { second_runner.run(second_request).await });
     let second_outcome = await_bounded_real_turn(
         runtime,

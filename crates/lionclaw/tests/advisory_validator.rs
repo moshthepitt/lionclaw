@@ -99,6 +99,21 @@ async fn advisory_pass_is_attested_never_verified() {
 }
 
 #[tokio::test]
+async fn advisory_receipt_is_stale_after_environment_digest_change() {
+    let state = run(true).await;
+    let assertion = lionclaw::model::AssertionId::new("STYLE-OK").unwrap();
+    assert_eq!(state.advisory_status(&assertion), AdvisoryStatus::Passed);
+
+    let mut changed_environment = state.clone();
+    changed_environment.image_id = format!("sha256:{}", "b".repeat(64));
+
+    assert_eq!(
+        changed_environment.advisory_status(&assertion),
+        AdvisoryStatus::Pending
+    );
+}
+
+#[tokio::test]
 async fn advisory_fail_is_unverified() {
     let state = run(false).await;
     let assertion = lionclaw::model::AssertionId::new("STYLE-OK").unwrap();

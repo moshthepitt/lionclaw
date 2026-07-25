@@ -269,6 +269,13 @@ pub struct RoleTurnProvenance {
     pub presented_messages: Vec<u64>,
 }
 
+impl RoleTurnProvenance {
+    pub fn is_fresh_at(&self, state: &MissionState) -> bool {
+        self.base_sha == state.deliverable_head()
+            && self.environment_digest == state.environment_digest()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RoleAttemptDisposition {
@@ -1341,7 +1348,7 @@ impl MissionState {
         if role.output != super::OutputSemantics::EmitsVerdict
             || request.team_revision != self.team.as_ref()?.revision
             || *plan_revision != self.revision
-            || request.base_sha != self.deliverable_head()
+            || !request.is_fresh_at(self)
             || !self
                 .team
                 .as_ref()

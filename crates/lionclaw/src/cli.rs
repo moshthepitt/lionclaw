@@ -900,14 +900,10 @@ async fn assemble_engine(
     workspace::ensure_excluded(repo).await?;
     default_profile.confinement.oci_mut().image = Some(image_id.clone());
     let role_runner = Arc::new(match &transports.runtime {
-        Some((drivers, auth)) => OciRoleRunner::with_registries(
-            profiles,
-            image_id.clone(),
-            ceiling,
-            drivers.clone(),
-            auth.clone(),
-        ),
-        None => OciRoleRunner::new(profiles, image_id.clone(), ceiling),
+        Some((drivers, auth)) => {
+            OciRoleRunner::with_registries(profiles, ceiling, drivers.clone(), auth.clone())
+        }
+        None => OciRoleRunner::new(profiles, ceiling),
     });
     let effect_cleaner = Arc::new(crate::effect_cleanup::LocalEffectCleaner::new(
         default_profile.confinement.oci().engine.clone(),
@@ -1861,8 +1857,8 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     }
     if let Some(line) = review_line(state, store.blobs()) {
         println!("  {line}");
-        if let Some((receipt, judged_sha, _, gaps)) = gap_review_verdict(state) {
-            if judged_sha == state.deliverable_head() {
+        if let Some((receipt, judged_sha, is_fresh, _, gaps)) = gap_review_verdict(state) {
+            if is_fresh {
                 for gap in gaps {
                     println!(
                         "    [{}] {}{}",
@@ -1914,7 +1910,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                     if fresh {
                         ""
                     } else {
-                        " [STALE — not at the final commit]"
+                            " [STALE - not at the current commit/environment]"
                     },
                 );
                 let prepared = v["prepared_inputs"]
@@ -2067,6 +2063,11 @@ async fn cmd_environment_use(
     }
     let (_repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    let Some(_driver_guard) =
+        crate::driver_lock::DriverGuard::try_acquire(&store.driver_lock_path(&mission_id))?
+    else {
+        bail!("mission {mission_id} has a running driver; retry after it parks or finishes");
+    };
     let state = store.require_state(&mission_id).await?;
     if state.phase.is_terminal() {
         bail!("mission {mission_id} is terminal; environment assignment is closed");
@@ -4255,6 +4256,7 @@ fn gap_review_verdict(
     &crate::model::RoleAttemptReceipt,
     &str,
     bool,
+    bool,
     &[crate::model::Gap],
 )> {
     let crate::model::ReviewOutcome::Verdict { effect_id } = state.gap_review.outcome.as_ref()?
@@ -4273,7 +4275,13 @@ fn gap_review_verdict(
     let crate::model::SettledHandoff::Review { passed, gaps } = receipt.settled_handoff()? else {
         return None;
     };
-    Some((receipt, request.base_sha.as_str(), *passed, gaps))
+    Some((
+        receipt,
+        request.base_sha.as_str(),
+        request.is_fresh_at(state),
+        *passed,
+        gaps,
+    ))
 }
 
 fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serde_json::Value {
@@ -4295,10 +4303,9 @@ fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serd
     });
     let waived = tr.waived_at(state.deliverable_head());
     let (verdict, judged_sha, fresh, counts, acknowledged) =
-        if let Some((_, judged_sha, passed, gaps)) = gap_review_verdict(state) {
+        if let Some((_, judged_sha, is_fresh, passed, gaps)) = gap_review_verdict(state) {
             let count =
                 |severity: GapSeverity| gaps.iter().filter(|gap| gap.severity == severity).count();
-            let is_fresh = judged_sha == state.deliverable_head();
             let blocking = !passed || gaps.iter().any(|gap| gap.severity == GapSeverity::Blocking);
             let kind = if !is_fresh && done {
                 "skipped"
@@ -4360,7 +4367,7 @@ fn review_line(state: &crate::model::MissionState, blobs: &BlobStore) -> Option<
         .map(short_hex)
         .unwrap_or_default();
     let stale = if summary["fresh"] == serde_json::json!(false) {
-        " [STALE — not at the final commit]"
+        " [STALE - not at the current commit/environment]"
     } else {
         ""
     };

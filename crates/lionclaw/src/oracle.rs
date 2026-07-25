@@ -38,6 +38,12 @@ impl OciOracleRunner {
             input_lock: Arc::new(Mutex::new(())),
         }
     }
+
+    fn profile_for(&self, environment_digest: &str) -> MissionRuntimeProfile {
+        let mut profile = self.profile.clone();
+        profile.confinement.oci_mut().image = Some(environment_digest.to_string());
+        profile
+    }
 }
 
 fn fail(detail: impl Into<String>) -> TypedFailure {
@@ -96,6 +102,7 @@ impl OracleRunner for OciOracleRunner {
         let dirs = MissionDirs::new(&request.state_dir, &request.mission_id)
             .effect(&request.effect_id)
             .oracle();
+        let profile = self.profile_for(&request.environment_digest);
         dirs.prepare()
             .map_err(|e| fail(format!("failed to prepare oracle dirs: {e}")))?;
 
@@ -134,7 +141,7 @@ impl OracleRunner for OciOracleRunner {
             } else {
                 let _guard = self.input_lock.lock().await;
                 prepare_inputs(
-                    &self.profile,
+                    &profile,
                     &request.state_dir,
                     dirs.root(),
                     &checkout,
@@ -164,8 +171,8 @@ impl OracleRunner for OciOracleRunner {
             let judged_roots = [crate::authority::canonical_or_lexical(&checkout)];
             let compiled = compile_role_plan(RolePlanRequest {
                 authority: &authority,
-                runtime_id: self.profile.name.clone(),
-                confinement: self.profile.confinement.clone(),
+                runtime_id: profile.name.clone(),
+                confinement: profile.confinement.clone(),
                 mounts: MissionMounts {
                     workspace: checkout.clone(),
                     extras,

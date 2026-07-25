@@ -13,10 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 57 derives digest-pinned mission environment assignments, preserves
-/// prepared-input receipt evidence, and makes authoritative proof freshness
-/// include the resolved runtime environment digest.
-pub const REDUCER_VERSION: u32 = 57;
+/// Reducer 58 keeps every proof receipt fresh only under the current
+/// deliverable head and environment digest, and capacity-bounds oracle batches.
+pub const REDUCER_VERSION: u32 = 58;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -1566,7 +1565,7 @@ fn derive(state: &mut MissionState) {
                             (
                                 super::RoleEffectSource::Turn { request, .. },
                                 Some(SettledHandoff::Review { passed, gaps }),
-                            ) if request.base_sha == state.deliverable_head() => Some(
+                            ) if request.is_fresh_at(state) => Some(
                                 !passed
                                     || gaps
                                         .iter()
@@ -1693,16 +1692,12 @@ pub(crate) fn gap_review_outstanding(state: &MissionState) -> bool {
                 (
                     super::RoleEffectSource::Turn { request, .. },
                     Some(SettledHandoff::Review { passed, gaps }),
-                ) if &request.role_instance == role_id
-                    && request.base_sha == state.deliverable_head() =>
-                {
-                    Some(
-                        *passed
-                            && gaps
-                                .iter()
-                                .all(|gap| gap.severity != super::GapSeverity::Blocking),
-                    )
-                }
+                ) if &request.role_instance == role_id && request.is_fresh_at(state) => Some(
+                    *passed
+                        && gaps
+                            .iter()
+                            .all(|gap| gap.severity != super::GapSeverity::Blocking),
+                ),
                 _ => None,
             },
         )

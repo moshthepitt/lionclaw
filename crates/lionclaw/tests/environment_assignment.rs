@@ -569,6 +569,9 @@ async fn mission_guide_renders_every_phase() {
 
 #[tokio::test]
 async fn environment_assignment_rejects_tags_and_inflight_races() {
+    use rustix::fs::{flock, FlockOperation};
+    use std::fs::OpenOptions;
+
     let dir = tempfile::tempdir().expect("tempdir");
     let h = common::harness(
         dir.path(),
@@ -599,6 +602,55 @@ async fn environment_assignment_rejects_tags_and_inflight_races() {
     let after_tag = h.engine.store().require_state(&mission_id).await.unwrap();
     assert_eq!(after_tag.image_id, initial.image_id);
     assert!(after_tag.environment_history.is_empty());
+
+    let lock_path = dir
+        .path()
+        .join(".lionclaw/missions")
+        .join(mission_id.as_str())
+        .join("driver.lock");
+    std::fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock dir");
+    let held_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open driver lock");
+    flock(&held_lock, FlockOperation::LockExclusive).expect("hold driver lock");
+
+    let locked_ref = format!("sha256:{}", digest('1'));
+    let locked_id = format!("sha256:{}", digest('2'));
+    let locked_transports = transports_with_oci(
+        dir.path(),
+        &format!(
+            "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo {locked_id}; exit 0; fi\nexit 2\n"
+        ),
+    );
+    let code = cli::run_with_transports(
+        cli::Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "environment",
+            "use",
+            locked_ref.as_str(),
+            "--mission-id",
+            mission_id.as_str(),
+            "--reason",
+            "locked image",
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .unwrap(),
+        locked_transports,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, std::process::ExitCode::FAILURE);
+    flock(&held_lock, FlockOperation::Unlock).expect("release driver lock");
+    let after_locked_cli = h.engine.store().require_state(&mission_id).await.unwrap();
+    assert_eq!(after_locked_cli.image_id, initial.image_id);
+    assert!(after_locked_cli.environment_history.is_empty());
 
     let planner = team.planning_assignment.clone();
     let prompt_hash = digest('d');

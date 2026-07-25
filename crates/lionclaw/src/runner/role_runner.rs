@@ -38,7 +38,6 @@ use crate::workspace;
 
 pub struct OciRoleRunner {
     profiles: RuntimeProfiles,
-    image_id: String,
     ceiling: AuthorityCeiling,
     drivers: RuntimeDriverRegistry,
     auth_providers: RuntimeAuthRegistry,
@@ -63,7 +62,7 @@ impl RuntimeTurnAuth {
 }
 
 impl OciRoleRunner {
-    pub fn new(profiles: RuntimeProfiles, image_id: String, ceiling: AuthorityCeiling) -> Self {
+    pub fn new(profiles: RuntimeProfiles, ceiling: AuthorityCeiling) -> Self {
         let drivers = RuntimeDriverRegistry::new([
             Arc::new(CodexRuntimeDriver) as Arc<dyn RuntimeDriverProvider>,
             Arc::new(AcpRuntimeDriver) as Arc<dyn RuntimeDriverProvider>,
@@ -71,7 +70,7 @@ impl OciRoleRunner {
         let auth_providers = RuntimeAuthRegistry::new([
             Arc::new(CodexRuntimeAuthProvider) as Arc<dyn RuntimeAuthProvider>
         ]);
-        Self::with_registries(profiles, image_id, ceiling, drivers, auth_providers)
+        Self::with_registries(profiles, ceiling, drivers, auth_providers)
     }
 
     /// Construct the production runner with protocol registries supplied by
@@ -81,14 +80,12 @@ impl OciRoleRunner {
     /// substituted.
     pub fn with_registries(
         profiles: RuntimeProfiles,
-        image_id: String,
         ceiling: AuthorityCeiling,
         drivers: RuntimeDriverRegistry,
         auth_providers: RuntimeAuthRegistry,
     ) -> Self {
         Self {
             profiles,
-            image_id,
             ceiling,
             drivers,
             auth_providers,
@@ -97,12 +94,16 @@ impl OciRoleRunner {
         }
     }
 
-    fn profile(&self, runtime: &str) -> Result<MissionRuntimeProfile, TypedFailure> {
+    fn profile(
+        &self,
+        runtime: &str,
+        environment_digest: &str,
+    ) -> Result<MissionRuntimeProfile, TypedFailure> {
         let mut profile = self
             .profiles
             .get(runtime)
             .map_err(|err| launch(err.to_string()))?;
-        profile.confinement.oci_mut().image = Some(self.image_id.clone());
+        profile.confinement.oci_mut().image = Some(environment_digest.to_string());
         Ok(profile)
     }
 
@@ -210,7 +211,6 @@ impl OciRoleRunner {
     pub(crate) fn validate_profile(profile: &MissionRuntimeProfile) -> anyhow::Result<()> {
         let runner = Self::new(
             RuntimeProfiles::single(profile.clone()),
-            String::new(),
             AuthorityCeiling::default(),
         );
         let driver = runner.driver(profile)?;
@@ -226,7 +226,6 @@ impl OciRoleRunner {
     ) -> anyhow::Result<()> {
         let runner = Self::with_registries(
             RuntimeProfiles::single(profile.clone()),
-            String::new(),
             AuthorityCeiling::default(),
             drivers,
             auth,
@@ -492,7 +491,7 @@ async fn prepare_writer_checkout(
 #[async_trait]
 impl RoleRunner for OciRoleRunner {
     async fn run(&self, request: RoleTurnRequest) -> Result<RoleTurnOutcome, TypedFailure> {
-        let profile = self.profile(&request.role.runtime)?;
+        let profile = self.profile(&request.role.runtime, &request.environment_digest)?;
         if let Some(failure) = setup_control_failure(&profile, &request.control.borrow().clone()) {
             return Err(failure);
         }

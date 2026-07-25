@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use lionclaw_model::{
-    apply, fold, ready_to_finish, step, AdvisoryStatus, Assertion, AssertionId, AttentionKind,
-    AuthorityCeilings, AuthorityGrants, ConfinementResources, ConversationLifecycle,
+    apply, fold, ready_to_finish, step, AdvisoryStatus, Assertion, AssertionId, AssertionState,
+    AttentionKind, AuthorityCeilings, AuthorityGrants, ConfinementResources, ConversationLifecycle,
     ConversationState, DecisionAction, DeliveryMarker, EffectId, EventEnvelope, ExecutionPolicy,
     Handoff, MissionConfig, MissionEvent, MissionGuidance, MissionId, MissionPhase,
     MissionProposal, MissionState, MissionTypeRef, OracleName, OutputSemantics, PayloadRef, Plan,
@@ -304,6 +304,44 @@ fn plan() -> Plan {
     }
 }
 
+fn two_oracle_plan() -> Plan {
+    let left = AssertionId::new("A-LEFT").unwrap();
+    let right = AssertionId::new("A-RIGHT").unwrap();
+    Plan {
+        requirements: vec![
+            Requirement {
+                id: RequirementId::new("REQ-LEFT").unwrap(),
+                kind: RequirementKind::Capability,
+                prose: "left behavior works".into(),
+                disposition: RequirementDisposition::ConfinedProvable {
+                    assertion_ids: vec![left.clone()],
+                },
+            },
+            Requirement {
+                id: RequirementId::new("REQ-RIGHT").unwrap(),
+                kind: RequirementKind::Capability,
+                prose: "right behavior works".into(),
+                disposition: RequirementDisposition::ConfinedProvable {
+                    assertion_ids: vec![right.clone()],
+                },
+            },
+        ],
+        assertions: vec![
+            Assertion {
+                id: left,
+                prose: "left behavior is verified".into(),
+                oracle: Some(OracleName::new("left").unwrap()),
+            },
+            Assertion {
+                id: right,
+                prose: "right behavior is verified".into(),
+                oracle: Some(OracleName::new("right").unwrap()),
+            },
+        ],
+        tasks: Vec::new(),
+    }
+}
+
 fn team(revision: u32, assigned: bool) -> TeamRevision {
     let planner = role("planner", OutputSemantics::ProposesPlan);
     let mut engineer = role("engineer", OutputSemantics::ProducesArtifact);
@@ -330,6 +368,140 @@ fn team(revision: u32, assigned: bool) -> TeamRevision {
         gap_review_assignment: None,
         guidance: None,
     }
+}
+
+#[test]
+fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
+    let config = MissionConfig {
+        stop: StopBar::Verified,
+        oracles: BTreeSet::from([OracleName::new("test").unwrap()]),
+        ceilings: AuthorityCeilings {
+            writes: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let accepted_team = team(1, true);
+    let mut state = fold([
+        event(
+            1,
+            MissionEvent::MissionCreated {
+                objective: "test oracle capacity".into(),
+                mission_type: MissionTypeRef {
+                    name: "test".into(),
+                    digest: "digest".into(),
+                },
+                image_id: "image".into(),
+                workspace_dir: "/workspace".into(),
+                base_sha: "base".into(),
+                config,
+                delegation: lionclaw_model::DelegationSet::none(),
+            },
+        ),
+        event(
+            2,
+            MissionEvent::TeamConfigured {
+                team: team(0, false),
+            },
+        ),
+        event(
+            3,
+            MissionEvent::ProposalRecorded {
+                proposal: Box::new(MissionProposal {
+                    plan: Some(PlanProposal {
+                        base_revision: 0,
+                        requirement_changes: Vec::new(),
+                        assertion_supersessions: Vec::new(),
+                        plan: plan(),
+                    }),
+                    team: Some(accepted_team.clone()),
+                }),
+                proposal_hash: "proposal".into(),
+            },
+        ),
+        event(
+            4,
+            MissionEvent::DecisionRecorded {
+                attention_id: "plan_proposal:mission".into(),
+                action: DecisionAction::Approve,
+                justification: "ratified".into(),
+                requirement_changes: Vec::new(),
+            },
+        ),
+        event(
+            5,
+            MissionEvent::TeamConfigured {
+                team: accepted_team,
+            },
+        ),
+    ])
+    .expect("accepted mission plan");
+    let left = AssertionId::new("A-LEFT").unwrap();
+    let right = AssertionId::new("A-RIGHT").unwrap();
+    state.phase = MissionPhase::Running;
+    state.config.oracles = BTreeSet::from([
+        OracleName::new("left").unwrap(),
+        OracleName::new("right").unwrap(),
+    ]);
+    state.config.execution.effect_capacity = 1;
+    state.tasks.clear();
+    state.plan = Some(two_oracle_plan());
+    state.contract = BTreeMap::from([
+        (
+            left.clone(),
+            AssertionState {
+                oracle: Some(OracleName::new("left").unwrap()),
+                last_advisory: BTreeMap::new(),
+                last_authoritative: None,
+            },
+        ),
+        (
+            right.clone(),
+            AssertionState {
+                oracle: Some(OracleName::new("right").unwrap()),
+                last_advisory: BTreeMap::new(),
+                last_authoritative: None,
+            },
+        ),
+    ]);
+    let plan = state.plan.as_ref().expect("plan");
+    assert!(plan.assertion_requires_confined_proof(&left));
+    assert!(plan.assertion_requires_confined_proof(&right));
+    assert!(state.inflight.is_empty());
+    assert_eq!(
+        state
+            .plan
+            .as_ref()
+            .unwrap()
+            .tasks
+            .iter()
+            .filter(|task| state.tasks.get(&task.id).map(|task| task.status)
+                != Some(TaskStatus::Cleared))
+            .count(),
+        0
+    );
+    assert_eq!(
+        state
+            .contract
+            .iter()
+            .filter(|(assertion_id, assertion)| {
+                plan.assertion_requires_confined_proof(assertion_id)
+                    && assertion.oracle.as_ref().is_some_and(|oracle| {
+                        !state.waived_oracles.contains(oracle)
+                            && assertion
+                                .last_authoritative
+                                .as_ref()
+                                .is_none_or(|verdict| !verdict.is_fresh_at(&state))
+                    })
+            })
+            .count(),
+        2
+    );
+
+    let StepDecision::RunOracles(intents) = step(&state) else {
+        panic!("expected oracle dispatch, got {:?}", step(&state))
+    };
+    assert_eq!(intents.len(), 1);
 }
 
 fn event(sequence_no: u64, event: MissionEvent) -> EventEnvelope {

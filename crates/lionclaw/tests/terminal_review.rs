@@ -254,11 +254,17 @@ async fn a_clean_review_closes_verified_with_no_park() {
     // Exactly one reviewer run, judged at the final commit, recorded fresh.
     assert_eq!(review_calls(&h, &mission_id).await.len(), 1);
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    let (_, judged_sha, passed, gaps) = gap_review_verdict(&state);
+    let (receipt, judged_sha, passed, gaps) = gap_review_verdict(&state);
     assert_eq!(judged_sha, HEAD_SHA);
     assert_eq!(judged_sha, state.current_sha);
     assert!(passed);
     assert!(!gaps.iter().any(|gap| gap.severity == GapSeverity::Blocking));
+
+    let RoleEffectSource::Turn { request, .. } = &receipt.source;
+    assert!(request.is_fresh_at(&state));
+    let mut changed_environment = state.clone();
+    changed_environment.image_id = format!("sha256:{}", "b".repeat(64));
+    assert!(!request.is_fresh_at(&changed_environment));
 }
 
 #[tokio::test]
