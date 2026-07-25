@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::event::{PayloadRef, PreparedInputRef, StopBar};
+use super::event::{OracleRunSuccess, PayloadRef, PreparedInputRef, StopBar};
 use super::ids::OracleName;
 use super::state::{AdvisoryStatus, MissionState};
 use crate::prelude::*;
@@ -20,6 +20,7 @@ pub struct AuthoritativeVerdict {
     passed: bool,
     oracle: OracleName,
     judged_sha: String,
+    environment_digest: String,
     exit_code: i32,
     exit_signal: Option<i32>,
     stdout: PayloadRef,
@@ -29,24 +30,22 @@ pub struct AuthoritativeVerdict {
 }
 
 impl AuthoritativeVerdict {
-    pub(crate) fn from_oracle_outcome(
+    pub(crate) fn from_oracle_success(
         oracle: OracleName,
         judged_sha: String,
-        exit_code: i32,
-        exit_signal: Option<i32>,
-        stdout: PayloadRef,
-        stderr: PayloadRef,
-        prepared_inputs: Vec<PreparedInputRef>,
+        environment_digest: String,
+        success: &OracleRunSuccess,
     ) -> Self {
         Self {
-            passed: exit_code == 0 && exit_signal.is_none(),
+            passed: success.exit_code == 0 && success.exit_signal.is_none(),
             oracle,
             judged_sha,
-            exit_code,
-            exit_signal,
-            stdout,
-            stderr,
-            prepared_inputs,
+            environment_digest,
+            exit_code: success.exit_code,
+            exit_signal: success.exit_signal,
+            stdout: success.stdout.clone(),
+            stderr: success.stderr.clone(),
+            prepared_inputs: success.prepared_inputs.clone(),
         }
     }
 
@@ -62,11 +61,16 @@ impl AuthoritativeVerdict {
         &self.judged_sha
     }
 
-    /// Whether this verdict judged the mission's current artifact commit — the
-    /// freshness the honesty moat turns on. One definition, so the fold, the
-    /// scheduler, and the report can never disagree about what "fresh" means.
-    pub fn is_fresh_at(&self, current_sha: &str) -> bool {
-        self.judged_sha == current_sha
+    pub fn environment_digest(&self) -> &str {
+        &self.environment_digest
+    }
+
+    /// Whether this verdict judged the mission's current artifact commit under
+    /// its current immutable runtime environment. One definition, so the fold,
+    /// scheduler, and reports cannot drift on what "fresh" means.
+    pub fn is_fresh_at(&self, state: &MissionState) -> bool {
+        self.judged_sha == state.deliverable_head()
+            && self.environment_digest == state.environment_digest()
     }
 
     pub fn exit_code(&self) -> i32 {
@@ -127,7 +131,8 @@ impl StopBar {
 }
 
 /// Classify a finished mission. Freshness: an authoritative verdict counts
-/// only if it judged the mission's current artifact commit.
+/// only if it judged the mission's current artifact commit under the mission's
+/// current immutable runtime environment.
 ///
 /// A fresh authoritative **fail** is ground truth and dominates: it forces
 /// Unverified no matter what an advisory verdict claims. "Internally
@@ -147,7 +152,7 @@ pub fn classify_finish(state: &MissionState) -> FinishClass {
         let fresh = assertion
             .last_authoritative
             .as_ref()
-            .filter(|v| v.is_fresh_at(state.deliverable_head()));
+            .filter(|v| v.is_fresh_at(state));
         match fresh {
             Some(v) if v.passed() => {}
             Some(_) => {

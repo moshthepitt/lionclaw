@@ -21,10 +21,11 @@ use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailureEvidence};
 
-/// Version 29 is the Slice 9.5 plan-contract closeout surface: role successes
-/// carry prepared-input digests, and missions can durably assign a digest-pinned
-/// runtime environment after OCI preflight.
-pub const SCHEMA_VERSION: u32 = 29;
+/// Version 30 is the Slice 9.5 plan-contract closeout surface: role successes
+/// carry prepared-input digests, missions can durably assign a digest-pinned
+/// runtime environment after OCI preflight, and effect requests bind the
+/// resolved environment digest they ran under.
+pub const SCHEMA_VERSION: u32 = 30;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -658,6 +659,8 @@ pub enum MissionEvent {
         prompt_hash: String,
         /// Commit the role's workspace is created at.
         base_sha: String,
+        /// Resolved immutable environment digest at dispatch time.
+        environment_digest: String,
         /// Candidate commits this task depends on, in plan-authored dependency
         /// order. Empty for root tasks and taskless turns.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -691,6 +694,8 @@ pub enum MissionEvent {
         assertion_ids: Vec<AssertionId>,
         oracle: OracleName,
         judged_sha: String,
+        /// Resolved immutable environment digest at dispatch time.
+        environment_digest: String,
         attempt_no: u32,
         effect_id: super::EffectId,
         requested_at_ms: i64,

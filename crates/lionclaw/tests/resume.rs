@@ -16,7 +16,11 @@ use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 const PROMPT_HASH: &str = "cf07194ee232eb531e15f690000d19846dea69cf05504782658afcfacb9228a2";
 
-fn role_request(mission_id: &lionclaw::model::MissionId, head: u64) -> (EffectId, MissionEvent) {
+fn role_request(
+    mission_id: &lionclaw::model::MissionId,
+    head: u64,
+    environment_digest: &str,
+) -> (EffectId, MissionEvent) {
     let role = RoleInstanceId::new("implementer").unwrap();
     let task = TaskId::new("fix").unwrap();
     let effect = EffectId::for_role_turn(mission_id, &role, 1, Some(&task), 1, 1, PROMPT_HASH);
@@ -32,6 +36,7 @@ fn role_request(mission_id: &lionclaw::model::MissionId, head: u64) -> (EffectId
             prompt_template: RolePromptTemplate::Execution,
             prompt_hash: PROMPT_HASH.to_string(),
             base_sha: BASE_SHA.to_string(),
+            environment_digest: environment_digest.to_string(),
             dependency_refs: vec![],
             assignment_epoch: 1,
             message_boundary: head,
@@ -99,7 +104,7 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
         .unwrap();
     approve_plan(&harness.engine, &id).await;
     let state = harness.engine.load_state(&id).await.unwrap();
-    let (effect, request) = role_request(&id, state.head);
+    let (effect, request) = role_request(&id, state.head, state.environment_digest());
     fault_append_events(
         dir.path(),
         &id,
@@ -173,6 +178,7 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
             assertion_ids: vec![lionclaw::model::AssertionId::new("TESTS-PASS").unwrap()],
             oracle: oracle.clone(),
             judged_sha: HEAD_SHA.to_string(),
+            environment_digest: ready.environment_digest().to_string(),
             attempt_no: 1,
             effect_id: effect.clone(),
             requested_at_ms: 0,
@@ -225,7 +231,7 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
         .unwrap();
     approve_plan(&harness.engine, &id).await;
     let state = harness.engine.load_state(&id).await.unwrap();
-    let (effect, request) = role_request(&id, state.head);
+    let (effect, request) = role_request(&id, state.head, state.environment_digest());
     fault_append_events(
         dir.path(),
         &id,

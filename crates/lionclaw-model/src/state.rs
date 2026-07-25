@@ -262,6 +262,7 @@ pub struct RoleTurnProvenance {
     pub prompt_template: super::RolePromptTemplate,
     pub prompt_hash: String,
     pub base_sha: String,
+    pub environment_digest: String,
     pub dependency_refs: Vec<TaskCandidateRef>,
     pub workspace_preparation: super::WorkspacePreparation,
     pub message_boundary: u64,
@@ -884,6 +885,7 @@ pub enum InflightEffect {
         prompt_template: super::RolePromptTemplate,
         prompt_hash: String,
         base_sha: String,
+        environment_digest: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         dependency_refs: Vec<TaskCandidateRef>,
         assignment_epoch: u32,
@@ -900,6 +902,7 @@ pub enum InflightEffect {
         assertion_ids: Vec<AssertionId>,
         oracle: OracleName,
         judged_sha: String,
+        environment_digest: String,
         attempt_no: u32,
         requested_at_ms: i64,
         not_before_ms: i64,
@@ -946,6 +949,7 @@ impl InflightEffect {
             prompt_template,
             prompt_hash,
             base_sha,
+            environment_digest,
             dependency_refs,
             assignment_epoch,
             message_boundary,
@@ -966,6 +970,7 @@ impl InflightEffect {
             prompt_template: *prompt_template,
             prompt_hash: prompt_hash.clone(),
             base_sha: base_sha.clone(),
+            environment_digest: environment_digest.clone(),
             dependency_refs: dependency_refs.clone(),
             workspace_preparation: workspace_preparation.clone(),
             message_boundary: *message_boundary,
@@ -1025,6 +1030,7 @@ impl InflightEffect {
                 prompt_template,
                 prompt_hash,
                 base_sha,
+                environment_digest,
                 dependency_refs,
                 assignment_epoch,
                 message_boundary,
@@ -1048,6 +1054,7 @@ impl InflightEffect {
                         prompt_template: *prompt_template,
                         prompt_hash: prompt_hash.clone(),
                         base_sha: base_sha.clone(),
+                        environment_digest: environment_digest.clone(),
                         dependency_refs: dependency_refs.clone(),
                         assignment_epoch: *assignment_epoch,
                         message_boundary: *message_boundary,
@@ -1065,6 +1072,7 @@ impl InflightEffect {
                 assertion_ids,
                 oracle,
                 judged_sha,
+                environment_digest,
                 attempt_no,
                 effect_id,
                 requested_at_ms,
@@ -1075,6 +1083,7 @@ impl InflightEffect {
                     assertion_ids: assertion_ids.clone(),
                     oracle: oracle.clone(),
                     judged_sha: judged_sha.clone(),
+                    environment_digest: environment_digest.clone(),
                     attempt_no: *attempt_no,
                     requested_at_ms: *requested_at_ms,
                     not_before_ms,
@@ -1729,6 +1738,10 @@ impl MissionState {
         &self.current_sha
     }
 
+    pub fn environment_digest(&self) -> &str {
+        &self.image_id
+    }
+
     pub fn deliverable_task_id(&self) -> Option<&TaskId> {
         let plan = self.plan.as_ref()?;
         let depended_on: BTreeSet<_> = plan
@@ -1913,7 +1926,7 @@ impl MissionState {
                     && assertion
                         .last_authoritative
                         .as_ref()
-                        .is_none_or(|verdict| !verdict.is_fresh_at(self.deliverable_head()))
+                        .is_none_or(|verdict| !verdict.is_fresh_at(self))
             })
             .map(|(id, _)| id.clone())
             .collect()

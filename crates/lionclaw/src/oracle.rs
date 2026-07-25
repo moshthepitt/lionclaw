@@ -273,6 +273,7 @@ mod tests {
                 oracle: OracleName::new("checks").unwrap(),
                 oracle_path: temp.path().join("must-not-be-read"),
                 judged_sha: "must-not-be-resolved".into(),
+                environment_digest: "sha256:oracle-test".into(),
                 workspace_dir: temp.path().join("must-not-be-cloned"),
                 state_dir: temp.path().join("state"),
                 prepared_inputs: Vec::new(),

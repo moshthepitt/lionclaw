@@ -78,6 +78,7 @@ fn role_request(
         prompt_template: lionclaw::model::role_prompt_template(role.output),
         prompt_hash: PROMPT_HASH.into(),
         base_sha: assignment.base_sha,
+        environment_digest: state.environment_digest().to_string(),
         dependency_refs: assignment.dependency_refs,
         assignment_epoch: assignment.generation,
         message_boundary: state.head,

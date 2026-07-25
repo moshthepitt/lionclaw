@@ -225,6 +225,7 @@ fn orphaned_gap_review_request(
         prompt_template: RolePromptTemplate::GapReview,
         prompt_hash,
         base_sha: state.current_sha.clone(),
+        environment_digest: state.environment_digest().to_string(),
         dependency_refs: vec![],
         assignment_epoch,
         message_boundary: state.head,

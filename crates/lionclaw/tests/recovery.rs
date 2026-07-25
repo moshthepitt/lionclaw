@@ -128,6 +128,7 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
         prompt_template: lionclaw::model::RolePromptTemplate::Execution,
         prompt_hash: prompt_hash.into(),
         base_sha: BASE_SHA.into(),
+        environment_digest: state.environment_digest().to_string(),
         dependency_refs: vec![],
         assignment_epoch: 1,
         message_boundary: head,

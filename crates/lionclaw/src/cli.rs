@@ -1683,7 +1683,8 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "exit_code": v.exit_code(),
                 "exit_signal": v.exit_signal(),
                 "judged_sha": v.judged_sha(),
-                "fresh": v.is_fresh_at(state.deliverable_head()),
+                "environment_digest": v.environment_digest(),
+                "fresh": v.is_fresh_at(state),
                 "prepared_inputs": v.prepared_inputs(),
                 "evidence": crate::evidence::evidence_json(store.blobs(), &evidence)?,
             }))

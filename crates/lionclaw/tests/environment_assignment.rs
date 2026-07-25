@@ -1,7 +1,7 @@
 mod common;
 
 use clap::Parser;
-use common::BASE_SHA;
+use common::{BASE_SHA, HEAD_SHA};
 use lionclaw::config::RuntimeProfiles;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 use lionclaw::cli;
 use lionclaw::model::{
-    role_prompt_template, EffectId, EnvironmentPreflight, MissionEvent, OutputSemantics,
-    RoleInstanceId, WorkspacePreparation,
+    ready_to_finish, resolve_role_assignment, role_prompt_template, ArtifactOutcome, AssertionId,
+    EffectId, EnvironmentPreflight, FinishClass, Handoff, MissionEvent, OracleName,
+    OracleRunSuccess, OutputSemantics, PayloadRef, RoleAssignmentContext, RoleInstanceId,
+    RoleTurnSuccess, TaskId, WorkspacePreparation,
 };
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -252,6 +254,212 @@ async fn environment_use_preflights_and_records_only_verified_digests() {
 }
 
 #[tokio::test]
+async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = common::harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "environment proof freshness",
+            BASE_SHA,
+        )
+        .await
+        .unwrap();
+    h.engine
+        .propose_plan(&mission_id, common::proposal(0, common::simple_plan()))
+        .await
+        .unwrap();
+    common::approve_plan(&h.engine, &mission_id).await;
+
+    let running = h.engine.store().require_state(&mission_id).await.unwrap();
+    let team_revision = running.team.as_ref().map(|team| team.revision);
+    let image_a = format!("sha256:{}", digest('a'));
+    common::fault_append_events(
+        dir.path(),
+        &mission_id,
+        running.head,
+        &[NewEvent::new(environment_event(
+            image_a.clone(),
+            image_a.clone(),
+            team_revision,
+        ))],
+        20,
+    )
+    .await;
+    let image_a_state = h.engine.store().require_state(&mission_id).await.unwrap();
+    assert_eq!(image_a_state.environment_digest(), image_a);
+
+    let task_id = TaskId::new("fix").unwrap();
+    let assertion_id = AssertionId::new("TESTS-PASS").unwrap();
+    let role_instance = RoleInstanceId::new("implementer").unwrap();
+    let team = image_a_state.team.as_ref().expect("team");
+    let role = team.role(&role_instance).expect("implementer");
+    let prompt_hash = digest('c');
+    let assignment = resolve_role_assignment(
+        &role_instance,
+        team.revision,
+        RoleAssignmentContext {
+            previous: image_a_state.tasks.get(&task_id),
+            required_base: BASE_SHA,
+            dependency_refs: &[],
+            lifecycle_generation: image_a_state.revision.max(1),
+            retrying_failure: false,
+            output: role.output,
+        },
+    );
+    let role_effect = EffectId::for_role_turn(
+        &mission_id,
+        &role_instance,
+        team.revision,
+        Some(&task_id),
+        1,
+        assignment.generation,
+        &prompt_hash,
+    );
+    let oracle = OracleName::new("cargo-test").unwrap();
+    let oracle_effect = EffectId::for_oracle_request(&mission_id, &oracle, HEAD_SHA, 1);
+    common::fault_append_events(
+        dir.path(),
+        &mission_id,
+        image_a_state.head,
+        &[
+            NewEvent::new(MissionEvent::RoleTurnRequested {
+                role_instance,
+                team_revision: team.revision,
+                task_id: Some(task_id),
+                assertion_ids: vec![assertion_id.clone()],
+                attempt_no: 1,
+                effect_id: role_effect.clone(),
+                prompt_template: role_prompt_template(OutputSemantics::ProducesArtifact),
+                prompt_hash: prompt_hash.clone(),
+                base_sha: assignment.base_sha.clone(),
+                environment_digest: image_a_state.environment_digest().to_string(),
+                dependency_refs: assignment.dependency_refs.clone(),
+                assignment_epoch: assignment.generation,
+                message_boundary: image_a_state.head,
+                presented_messages: Vec::new(),
+                workspace_preparation: assignment.workspace_preparation,
+                requested_at_ms: 21,
+                deadline_ms: 30_000,
+                budget_deadline_ms: 30_000,
+            })
+            .with_prompt_hash(prompt_hash),
+            NewEvent::new(MissionEvent::RoleTurnCompleted {
+                effect_id: role_effect,
+                outcome: Ok(RoleTurnSuccess {
+                    handoff: Some(Handoff::Work {
+                        done: true,
+                        report: PayloadRef::inline("implemented"),
+                        request_attention: false,
+                    }),
+                    artifact: Some(ArtifactOutcome {
+                        base_sha: BASE_SHA.to_string(),
+                        head_sha: HEAD_SHA.to_string(),
+                    }),
+                    final_response: PayloadRef::inline("done"),
+                    runtime_configuration: Default::default(),
+                    runtime_usage: Default::default(),
+                    prepared_inputs: Vec::new(),
+                }),
+            }),
+            NewEvent::new(MissionEvent::OracleRunRequested {
+                assertion_ids: vec![assertion_id.clone()],
+                oracle: oracle.clone(),
+                judged_sha: HEAD_SHA.to_string(),
+                environment_digest: image_a_state.environment_digest().to_string(),
+                attempt_no: 1,
+                effect_id: oracle_effect.clone(),
+                requested_at_ms: 22,
+                deadline_ms: 30_000,
+            }),
+            NewEvent::new(MissionEvent::OracleRunCompleted {
+                assertion_ids: vec![assertion_id.clone()],
+                oracle: oracle.clone(),
+                judged_sha: HEAD_SHA.to_string(),
+                attempt_no: 1,
+                effect_id: oracle_effect,
+                outcome: Ok(OracleRunSuccess {
+                    exit_code: 0,
+                    exit_signal: None,
+                    stdout: PayloadRef::inline("pass"),
+                    stderr: PayloadRef::inline(""),
+                    prepared_inputs: Vec::new(),
+                    duration_ms: 1,
+                }),
+            }),
+        ],
+        21,
+    )
+    .await;
+    let proved = h.engine.store().require_state(&mission_id).await.unwrap();
+    let verdict = proved.contract[&assertion_id]
+        .last_authoritative
+        .as_ref()
+        .expect("proof under image A");
+    assert_eq!(verdict.environment_digest(), image_a);
+    assert!(verdict.is_fresh_at(&proved));
+    assert_eq!(ready_to_finish(&proved), Some(FinishClass::Verified));
+
+    let image_b = format!("sha256:{}", digest('b'));
+    common::fault_append_events(
+        dir.path(),
+        &mission_id,
+        proved.head,
+        &[NewEvent::new(environment_event(
+            image_b.clone(),
+            image_b.clone(),
+            team_revision,
+        ))],
+        30,
+    )
+    .await;
+    let stale = h.engine.store().require_state(&mission_id).await.unwrap();
+    let stale_verdict = stale.contract[&assertion_id]
+        .last_authoritative
+        .as_ref()
+        .expect("historical proof remains inspectable");
+    assert_eq!(stale_verdict.environment_digest(), image_a);
+    assert!(!stale_verdict.is_fresh_at(&stale));
+    assert_eq!(ready_to_finish(&stale), None);
+
+    let rerun = h.engine.advance(&mission_id).await.unwrap();
+    assert_eq!(rerun.state.phase.finish(), Some(FinishClass::Verified));
+    {
+        let rerun_calls = h.oracle_runner.calls.lock().expect("oracle calls");
+        assert_eq!(
+            rerun_calls.as_slice(),
+            [("cargo-test".to_string(), HEAD_SHA.to_string())]
+        );
+    }
+
+    let events = h.engine.store().load(&mission_id).await.unwrap();
+    let requests = events
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            MissionEvent::OracleRunRequested {
+                attempt_no,
+                environment_digest,
+                ..
+            } => Some((*attempt_no, environment_digest.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests, vec![(1, image_a.as_str()), (2, image_b.as_str())]);
+    let final_verdict = rerun.state.contract[&assertion_id]
+        .last_authoritative
+        .as_ref()
+        .expect("proof under image B");
+    assert_eq!(final_verdict.environment_digest(), image_b);
+    assert!(final_verdict.is_fresh_at(&rerun.state));
+}
+
+#[tokio::test]
 async fn mission_guide_renders_every_phase() {
     let planning_dir = tempfile::tempdir().expect("tempdir");
     let planning = common::harness(
@@ -417,6 +625,7 @@ async fn environment_assignment_rejects_tags_and_inflight_races() {
             prompt_template: role_prompt_template(OutputSemantics::ProposesPlan),
             prompt_hash,
             base_sha: after_tag.deliverable_head().to_string(),
+            environment_digest: after_tag.environment_digest().to_string(),
             dependency_refs: Vec::new(),
             assignment_epoch: 1,
             message_boundary: after_tag.head,

@@ -13,9 +13,10 @@ use super::verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 56 derives digest-pinned mission environment assignments and
-/// preserves role prepared-input receipt evidence for Slice 9.5.
-pub const REDUCER_VERSION: u32 = 56;
+/// Reducer 57 derives digest-pinned mission environment assignments, preserves
+/// prepared-input receipt evidence, and makes authoritative proof freshness
+/// include the resolved runtime environment digest.
+pub const REDUCER_VERSION: u32 = 57;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -134,6 +135,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             assertion_ids,
             oracle,
             judged_sha,
+            environment_digest,
             attempt_no,
             effect_id,
             requested_at_ms,
@@ -147,6 +149,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     *attempt_no,
                 )
                 && judged_sha == state.deliverable_head()
+                && environment_digest == state.environment_digest()
                 && !assertion_ids.is_empty()
                 && assertion_ids == &state.owed_assertions_for_oracle(oracle);
             if canonical && !state.inflight.contains_key(effect_id) {
@@ -157,6 +160,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         assertion_ids: assertion_ids.clone(),
                         oracle: oracle.clone(),
                         judged_sha: judged_sha.clone(),
+                        environment_digest: environment_digest.clone(),
                         attempt_no: *attempt_no,
                         requested_at_ms: *requested_at_ms,
                         not_before_ms: state
@@ -395,6 +399,7 @@ fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
         prompt_template,
         prompt_hash,
         base_sha,
+        environment_digest,
         dependency_refs,
         assignment_epoch,
         message_boundary,
@@ -422,6 +427,7 @@ fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
             prompt_hash,
         )
         && *prompt_template == super::role_prompt_template(role.output)
+        && environment_digest == state.environment_digest()
         && state.role_dispatch_contract_matches(
             role_instance,
             *team_revision,
@@ -959,6 +965,7 @@ fn apply_oracle_outcome(
         assertion_ids: expected_assertions,
         oracle: expected_oracle,
         judged_sha: expected_sha,
+        environment_digest,
         attempt_no: expected_attempt,
         ..
     }) = state.inflight.get(effect_id)
@@ -972,6 +979,7 @@ fn apply_oracle_outcome(
     {
         return;
     }
+    let environment_digest = environment_digest.clone();
     state.inflight.remove(effect_id);
     match outcome {
         Err(failure) => {
@@ -994,14 +1002,11 @@ fn apply_oracle_outcome(
                         if parked_oracle == oracle
                 )
             });
-            let verdict = AuthoritativeVerdict::from_oracle_outcome(
+            let verdict = AuthoritativeVerdict::from_oracle_success(
                 oracle.clone(),
                 judged_sha.to_string(),
-                success.exit_code,
-                success.exit_signal,
-                success.stdout.clone(),
-                success.stderr.clone(),
-                success.prepared_inputs.clone(),
+                environment_digest,
+                success,
             );
             for assertion_id in assertion_ids {
                 if let Some(assertion) = state.contract.get_mut(assertion_id) {
@@ -1486,7 +1491,7 @@ fn derive(state: &mut MissionState) {
         let Some(verdict) = assertion
             .last_authoritative
             .as_ref()
-            .filter(|verdict| verdict.is_fresh_at(state.deliverable_head()) && !verdict.passed())
+            .filter(|verdict| verdict.is_fresh_at(state) && !verdict.passed())
         else {
             continue;
         };
@@ -1657,7 +1662,7 @@ pub(crate) fn oracle_obligation_outstanding(state: &MissionState) -> bool {
                     && assertion
                         .last_authoritative
                         .as_ref()
-                        .is_none_or(|verdict| !verdict.is_fresh_at(state.deliverable_head()))
+                        .is_none_or(|verdict| !verdict.is_fresh_at(state))
             })
     })
 }

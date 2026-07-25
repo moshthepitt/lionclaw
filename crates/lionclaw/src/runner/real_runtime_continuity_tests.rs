@@ -309,6 +309,7 @@ async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) 
                 resource_ceilings: Default::default(),
                 prompt,
                 base_sha: base_sha.clone(),
+                environment_digest: "sha256:continuity-test".to_string(),
                 dependency_refs: Vec::new(),
                 assignment_epoch,
                 workspace_preparation: crate::model::WorkspacePreparation::Preserve,

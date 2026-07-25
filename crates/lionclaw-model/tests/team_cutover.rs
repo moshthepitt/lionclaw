@@ -13,6 +13,8 @@ use lionclaw_model::{
     ValidationItem, VersionStamps, WorkspacePreparation, SCHEMA_VERSION,
 };
 
+const BASE_ENVIRONMENT_DIGEST: &str = "image";
+
 fn instance(raw: &str) -> RoleInstanceId {
     RoleInstanceId::new(raw).expect("valid role instance id")
 }
@@ -259,6 +261,7 @@ fn sunset_wire_shapes_have_no_planning_or_role_bridges() {
         prompt_template: RolePromptTemplate::Execution,
         prompt_hash: "prompt".into(),
         base_sha: "base".into(),
+        environment_digest: BASE_ENVIRONMENT_DIGEST.into(),
         dependency_refs: Vec::new(),
         assignment_epoch: 1,
         message_boundary: 0,
@@ -547,6 +550,7 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
                 prompt_template: RolePromptTemplate::Execution,
                 prompt_hash: "prompt".into(),
                 base_sha: "base".into(),
+                environment_digest: BASE_ENVIRONMENT_DIGEST.into(),
                 dependency_refs: Vec::new(),
                 assignment_epoch: 1,
                 message_boundary: 5,
@@ -690,6 +694,7 @@ fn reviewer_request(
                 prompt_template: RolePromptTemplate::Judgment,
                 prompt_hash: prompt_hash.into(),
                 base_sha: "base".into(),
+                environment_digest: BASE_ENVIRONMENT_DIGEST.into(),
                 dependency_refs: Vec::new(),
                 assignment_epoch: 1,
                 message_boundary: sequence_no - 1,

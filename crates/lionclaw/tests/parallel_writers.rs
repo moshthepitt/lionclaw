@@ -1455,6 +1455,7 @@ fn role_request(
             prompt_template: RolePromptTemplate::Execution,
             prompt_hash,
             base_sha: base_sha.to_string(),
+            environment_digest: "image".to_string(),
             dependency_refs,
             assignment_epoch: 1,
             message_boundary: sequence_no - 1,

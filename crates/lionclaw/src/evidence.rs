@@ -267,7 +267,7 @@ pub fn render_role_attempt_receipt(
             plan_revision,
         } => format!(
             "turn role_instance={} team_revision={} task={} attempt={} generation={} \
-             prompt={} base={} plan_revision={plan_revision} targets={}",
+             prompt={} base={} environment={} plan_revision={plan_revision} targets={}",
             request.role_instance,
             request.team_revision,
             request
@@ -278,6 +278,7 @@ pub fn render_role_attempt_receipt(
             request.assignment_epoch,
             request.prompt_hash,
             request.base_sha,
+            request.environment_digest,
             request
                 .assertion_ids
                 .iter()

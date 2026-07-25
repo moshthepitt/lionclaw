@@ -54,6 +54,8 @@ pub struct RoleTurnRequest {
     pub prompt: String,
     /// Commit the role's workspace is created at.
     pub base_sha: String,
+    /// Resolved immutable environment digest this effect is authorized under.
+    pub environment_digest: String,
     /// Exact upstream task candidates this turn must incorporate.
     pub dependency_refs: Vec<TaskCandidateRef>,
     pub assignment_epoch: u32,
@@ -114,6 +116,8 @@ pub struct OracleRunRequest {
     /// runner stays domain-blind — it never sees which assertions it judges).
     pub oracle_path: PathBuf,
     pub judged_sha: String,
+    /// Resolved immutable environment digest this effect is authorized under.
+    pub environment_digest: String,
     pub workspace_dir: PathBuf,
     pub state_dir: PathBuf,
     pub prepared_inputs: Vec<PreparedInput>,
