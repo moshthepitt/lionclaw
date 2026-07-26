@@ -1115,7 +1115,11 @@ async fn check_gap_review() -> Result<()> {
         );
     }
     match &done.gap_review.accepted {
-        Some(a) if a.kind == ReviewAcceptanceKind::AcknowledgedGaps && a.judged_sha == base => {
+        Some(a)
+            if a.kind == ReviewAcceptanceKind::AcknowledgedGaps
+                && a.judged_sha == base
+                && a.environment_digest == done.environment_digest() =>
+        {
             Ok(())
         }
         other => anyhow::bail!("acknowledgment not on record at the judged sha: {other:?}"),

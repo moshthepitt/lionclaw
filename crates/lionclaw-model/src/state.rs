@@ -692,27 +692,27 @@ pub struct GapReviewState {
 }
 
 impl GapReviewState {
-    /// The acceptance, if it still holds at the current head — the ONE
+    /// The acceptance, if it still holds in the current state — the ONE
     /// freshness-law site the fold's derivations and the CLI's summaries all
     /// share, so they can never disagree about whether the mission may close.
-    pub fn fresh_acceptance(&self, current_sha: &str) -> Option<&ReviewAcceptance> {
-        self.accepted
-            .as_ref()
-            .filter(|a| a.is_fresh_at(current_sha))
+    pub fn fresh_acceptance(&self, state: &MissionState) -> Option<&ReviewAcceptance> {
+        self.accepted.as_ref().filter(|a| a.is_fresh_at(state))
     }
 
-    /// Whether a fresh waiver stands at the current head (closure permitted
+    /// Whether a fresh waiver stands in the current state (closure permitted
     /// without a verdict).
-    pub fn waived_at(&self, current_sha: &str) -> bool {
-        self.fresh_acceptance(current_sha)
+    pub fn waived_at(&self, state: &MissionState) -> bool {
+        self.fresh_acceptance(state)
             .is_some_and(|a| a.kind == ReviewAcceptanceKind::Waived)
     }
 
     /// Whether this verdict's blocking gaps were acknowledged (the
-    /// acknowledgment is keyed to the verdict's own sha).
-    pub fn acknowledges_sha(&self, judged_sha: &str) -> bool {
+    /// acknowledgment is keyed to the verdict's own sha and environment).
+    pub fn acknowledges_sha(&self, state: &MissionState, judged_sha: &str) -> bool {
         self.accepted.as_ref().is_some_and(|a| {
-            a.kind == ReviewAcceptanceKind::AcknowledgedGaps && a.judged_sha == judged_sha
+            a.kind == ReviewAcceptanceKind::AcknowledgedGaps
+                && a.judged_sha == judged_sha
+                && a.is_fresh_at(state)
         })
     }
 }
@@ -772,15 +772,18 @@ pub enum ReferenceRecipientPolicy {
 /// the review outright. One value, so waived-and-acknowledged is unrepresentable;
 /// the receipt distinguishes the kinds and cites why it was accepted.
 ///
-/// Both kinds are keyed to the head they were granted at: a later artifact
-/// commit stales the acceptance and re-opens the review, so neither an
-/// acknowledgment nor a waiver is ever inherited by work the human never saw.
+/// Both kinds are keyed to the head and environment they were granted at: a
+/// later artifact commit or environment change stales the acceptance and
+/// re-opens the review, so neither an acknowledgment nor a waiver is ever
+/// inherited by work the human never saw or ran under a different instrument.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewAcceptance {
     pub kind: ReviewAcceptanceKind,
     /// `current_sha` at the moment of acceptance (for an acknowledgment this
     /// is also the verdict's `judged_sha` — the gap item only raises fresh).
     pub judged_sha: String,
+    /// Resolved immutable environment digest at the moment of acceptance.
+    pub environment_digest: String,
     pub justification: String,
 }
 
@@ -795,9 +798,10 @@ pub enum ReviewAcceptanceKind {
 
 impl ReviewAcceptance {
     /// Same freshness law as verdicts: an acceptance holds only at the head
-    /// it was granted at.
-    pub fn is_fresh_at(&self, current_sha: &str) -> bool {
-        self.judged_sha == current_sha
+    /// and environment it was granted at.
+    pub fn is_fresh_at(&self, state: &MissionState) -> bool {
+        self.judged_sha == state.deliverable_head()
+            && self.environment_digest == state.environment_digest()
     }
 }
 

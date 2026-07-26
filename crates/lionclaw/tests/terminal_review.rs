@@ -16,15 +16,33 @@ use common::{
 };
 use lionclaw::engine::{MissionDisposition, MissionView};
 use lionclaw::model::{
-    BlobRef, DecisionAction, EffectId, FinishClass, Gap, GapSeverity, Handoff, MissionEvent,
-    MissionPhase, MissionState, OutputSemantics, PayloadRef, ReviewAcceptanceKind,
-    RoleAttemptReceipt, RoleEffectSource, RolePromptTemplate, RoleResourceLifetime, SettledHandoff,
-    Task, WorkspacePreparation,
+    ready_to_finish, BlobRef, DecisionAction, EffectId, EnvironmentPreflight, FinishClass, Gap,
+    GapSeverity, Handoff, MissionEvent, MissionPhase, MissionState, OutputSemantics, PayloadRef,
+    ReviewAcceptanceKind, RoleAttemptReceipt, RoleEffectSource, RolePromptTemplate,
+    RoleResourceLifetime, SettledHandoff, Task, WorkspacePreparation,
 };
 use lionclaw::ports::{CapturedArtifact, RoleTurnOutcome, RoleTurnRequest};
 use lionclaw::testing::{review_verdict, MockOracleRunner, MockRoleRunner};
 
 const REVIEW_ROLE: &str = "gap-reviewer";
+
+fn digest(ch: char) -> String {
+    ch.to_string().repeat(64)
+}
+
+fn environment_event(image_digest: &str, team_revision: Option<u32>) -> MissionEvent {
+    MissionEvent::EnvironmentAssigned {
+        image_ref: image_digest.to_string(),
+        image_id: image_digest.to_string(),
+        preflight: EnvironmentPreflight {
+            engine: "podman".to_string(),
+            image_ref: image_digest.to_string(),
+            image_id: image_digest.to_string(),
+        },
+        team_revision,
+        reason: "switch test environment".to_string(),
+    }
+}
 
 fn parked(view: &MissionView) -> Vec<&lionclaw::model::AttentionItem> {
     assert_eq!(view.disposition, MissionDisposition::Parked, "got {view:?}");
@@ -567,11 +585,98 @@ async fn blocking_gaps_park_then_accept_closes_with_acknowledged_gaps() {
     let outcome = h.engine.advance(&mission_id).await.expect("re-advance");
     assert_terminal(&outcome);
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    let accepted = state.gap_review.accepted.expect("acceptance recorded");
+    let accepted = state
+        .gap_review
+        .accepted
+        .as_ref()
+        .expect("acceptance recorded");
     assert_eq!(accepted.kind, ReviewAcceptanceKind::AcknowledgedGaps);
     assert_eq!(accepted.judged_sha, HEAD_SHA);
+    assert_eq!(accepted.environment_digest, state.environment_digest());
     // The receipt preserves the exact reason without claiming a caller actor.
     assert_eq!(accepted.justification, "gap is acceptable for this release");
+}
+
+#[tokio::test]
+async fn accepted_blocking_gap_review_reopens_after_environment_change() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let image_b = format!("sha256:{}", digest('b'));
+    let (h, mission_id) = started(
+        &dir,
+        review_runner(vec![
+            (false, vec![blocking_gap()]),
+            (false, vec![blocking_gap()]),
+        ]),
+    )
+    .await;
+
+    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    let attention = parked(&outcome);
+    assert_eq!(attention.len(), 1);
+    assert_eq!(attention[0].id, "gap_review_gaps:mission");
+    let image_a = outcome.state.environment_digest().to_string();
+
+    h.engine
+        .decide(
+            &mission_id,
+            "gap_review_gaps:mission",
+            DecisionAction::Accept,
+            "gap accepted only for image A",
+        )
+        .await
+        .expect("accept gaps under image A");
+    let accepted = h.engine.load_state(&mission_id).await.expect("accepted");
+    let acceptance = accepted
+        .gap_review
+        .accepted
+        .as_ref()
+        .expect("acceptance recorded");
+    assert_eq!(acceptance.kind, ReviewAcceptanceKind::AcknowledgedGaps);
+    assert_eq!(acceptance.judged_sha, HEAD_SHA);
+    assert_eq!(acceptance.environment_digest, image_a);
+    assert!(acceptance.is_fresh_at(&accepted));
+    assert_eq!(ready_to_finish(&accepted), Some(FinishClass::Verified));
+
+    fault_append_events(
+        dir.path(),
+        &mission_id,
+        accepted.head,
+        &[lionclaw::store::NewEvent::new(environment_event(
+            &image_b,
+            accepted.team.as_ref().map(|team| team.revision),
+        ))],
+        10,
+    )
+    .await;
+    let stale = h.engine.load_state(&mission_id).await.expect("stale");
+    let stale_acceptance = stale
+        .gap_review
+        .accepted
+        .as_ref()
+        .expect("historical acceptance remains inspectable");
+    assert_eq!(stale.environment_digest(), image_b);
+    assert_eq!(stale_acceptance.environment_digest, image_a);
+    assert!(!stale_acceptance.is_fresh_at(&stale));
+    assert!(stale.gap_review.fresh_acceptance(&stale).is_none());
+    assert_eq!(ready_to_finish(&stale), None);
+
+    let reopened = h
+        .engine
+        .advance(&mission_id)
+        .await
+        .expect("re-open gap review");
+    let attention = parked(&reopened);
+    assert_eq!(attention.len(), 1);
+    assert_eq!(attention[0].id, "gap_review_gaps:mission");
+    assert_eq!(
+        review_calls(&h, &mission_id).await.len(),
+        2,
+        "environment change must force a fresh gap review"
+    );
+    let (receipt, judged_sha, _, _) = gap_review_verdict(&reopened.state);
+    assert_eq!(judged_sha, HEAD_SHA);
+    let RoleEffectSource::Turn { request, .. } = &receipt.source;
+    assert_eq!(request.environment_digest, image_b);
 }
 
 #[tokio::test]

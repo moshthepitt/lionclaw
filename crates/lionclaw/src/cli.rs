@@ -4301,7 +4301,7 @@ fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serd
             AttentionKind::OracleFailed | AttentionKind::OracleVerdictFailed
         )
     });
-    let waived = tr.waived_at(state.deliverable_head());
+    let waived = tr.waived_at(state);
     let (verdict, judged_sha, fresh, counts, acknowledged) =
         if let Some((_, judged_sha, is_fresh, passed, gaps)) = gap_review_verdict(state) {
             let count =
@@ -4323,7 +4323,7 @@ fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serd
                     "major": count(GapSeverity::Major),
                     "minor": count(GapSeverity::Minor),
                 })),
-                tr.acknowledges_sha(judged_sha),
+                tr.acknowledges_sha(state, judged_sha),
             )
         } else {
             match &tr.outcome {

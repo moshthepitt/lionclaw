@@ -21,11 +21,12 @@ use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailureEvidence};
 
-/// Version 30 is the Slice 9.5 plan-contract closeout surface: role successes
+/// Version 31 is the Slice 9.5 plan-contract closeout surface: role successes
 /// carry prepared-input digests, missions can durably assign a digest-pinned
-/// runtime environment after OCI preflight, and effect requests bind the
-/// resolved environment digest they ran under.
-pub const SCHEMA_VERSION: u32 = 30;
+/// runtime environment after OCI preflight, effect requests bind the resolved
+/// environment digest they ran under, and human gap-review acceptances bind to
+/// the environment digest they were granted under.
+pub const SCHEMA_VERSION: u32 = 31;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.

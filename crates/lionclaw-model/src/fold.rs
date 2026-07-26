@@ -13,9 +13,10 @@ use super::verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 58 keeps every proof receipt fresh only under the current
-/// deliverable head and environment digest, and capacity-bounds oracle batches.
-pub const REDUCER_VERSION: u32 = 58;
+/// Reducer 59 keeps every proof receipt and gap-review acceptance fresh only
+/// under the current deliverable head and environment digest, and
+/// capacity-bounds oracle batches.
+pub const REDUCER_VERSION: u32 = 59;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -1208,6 +1209,7 @@ fn apply_decision(
                 state.gap_review.accepted = Some(ReviewAcceptance {
                     kind: ReviewAcceptanceKind::AcknowledgedGaps,
                     judged_sha,
+                    environment_digest: state.environment_digest().to_string(),
                     justification: justification.to_string(),
                 });
             }
@@ -1220,6 +1222,7 @@ fn apply_decision(
             state.gap_review.accepted = Some(ReviewAcceptance {
                 kind: ReviewAcceptanceKind::Waived,
                 judged_sha: state.deliverable_head().to_string(),
+                environment_digest: state.environment_digest().to_string(),
                 justification: justification.to_string(),
             });
         }
@@ -1584,7 +1587,9 @@ fn derive(state: &mut MissionState) {
                     && !oracle_obligation_outstanding(state);
                 if blocking
                     && work_settled
-                    && !state.gap_review.acknowledges_sha(state.deliverable_head())
+                    && !state
+                        .gap_review
+                        .acknowledges_sha(state, state.deliverable_head())
                 {
                     let id = "gap_review_gaps:mission".to_string();
                     attention.insert(
@@ -1670,8 +1675,10 @@ pub(crate) fn gap_review_outstanding(state: &MissionState) -> bool {
     if !state.config.requires_gap_review {
         return false;
     }
-    if state.gap_review.waived_at(state.deliverable_head())
-        || state.gap_review.acknowledges_sha(state.deliverable_head())
+    if state.gap_review.waived_at(state)
+        || state
+            .gap_review
+            .acknowledges_sha(state, state.deliverable_head())
     {
         return false;
     }
