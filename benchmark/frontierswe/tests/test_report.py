@@ -12,7 +12,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lionclaw_frontierswe.report import (  # noqa: E402
     aggregate_usage,
     finalize_report,
+    model_identity,
     parse_codex_usage,
+)
+from runtime_config import (  # noqa: E402
+    codex_runtime_profile,
+    resolve_codex_config_model,
 )
 
 
@@ -22,6 +27,8 @@ def receipt(
     input_tokens: int,
     output_tokens: int,
     cost: dict[str, str] | None = None,
+    configuration: dict | None = None,
+    instrument_runtime: dict | None = None,
 ) -> dict:
     usage: dict = {
         "input_tokens": input_tokens,
@@ -29,8 +36,12 @@ def receipt(
     }
     if cost is not None:
         usage["cost"] = cost
+    request = {"role_instance": role}
+    if instrument_runtime is not None:
+        request["instrument_identity"] = {"runtime": instrument_runtime}
     return {
-        "source": {"request": {"role_instance": role}},
+        "source": {"request": request},
+        "effective_runtime_configuration": configuration or {},
         "runtime_usage": {"status": "reported", "usage": usage},
     }
 
@@ -89,6 +100,7 @@ class UsageTests(unittest.TestCase):
         )
         self.assertEqual(usage["cost"]["status"], "not_reported")
         self.assertEqual(usage["cost"]["currencies"], {})
+        self.assertIn("published pricing", usage["cost"]["explanation"])
 
     def test_codex_usage_uses_most_complete_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -103,7 +115,9 @@ class UsageTests(unittest.TestCase):
                                 "usage": {
                                     "input_tokens": 30,
                                     "cached_input_tokens": 10,
+                                    "cache_write_input_tokens": 2,
                                     "output_tokens": 7,
+                                    "reasoning_output_tokens": 3,
                                 },
                             }
                         ),
@@ -115,9 +129,60 @@ class UsageTests(unittest.TestCase):
                 {
                     "input_tokens": 30,
                     "cached_input_tokens": 10,
+                    "cache_write_input_tokens": 2,
                     "output_tokens": 7,
+                    "reasoning_tokens": 3,
                 },
             )
+
+    def test_model_identity_records_roles_and_lead_model(self) -> None:
+        identity = model_identity(
+            {
+                "team": {"roles": {"worker": {"runtime": "codex"}}},
+                "role_attempt_receipts": [
+                    receipt(
+                        "worker",
+                        input_tokens=1,
+                        output_tokens=1,
+                        configuration={
+                            "requested_model": "gpt-x",
+                            "applied_model": "gpt-x",
+                            "model_confirmation": "observed",
+                        },
+                        instrument_runtime={"runtime": "codex", "model": "gpt-x"},
+                    )
+                ],
+            },
+            [{"model": "gpt-x"}],
+            {
+                "resolved_model": "gpt-x",
+                "resolved_model_source": "codex_config",
+                "role_model_policy": "not requested",
+            },
+        )
+
+        self.assertEqual(
+            identity["role_attempts"]["worker"]["requested_model"], "gpt-x"
+        )
+        self.assertEqual(identity["role_attempts"]["worker"]["runtime"], "codex")
+        self.assertEqual(
+            identity["role_attempts"]["worker"]["instrument_model"], "gpt-x"
+        )
+        self.assertEqual(identity["benchmark_lead"]["models"], ["gpt-x"])
+        self.assertEqual(identity["benchmark_context"]["resolved_model"], "gpt-x")
+
+
+class RuntimeConfigTests(unittest.TestCase):
+    def test_resolves_codex_model_from_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.toml").write_text('model = "gpt-test"\n')
+            self.assertEqual(resolve_codex_config_model(root), "gpt-test")
+
+    def test_codex_runtime_profile_contains_explicit_model(self) -> None:
+        profile = codex_runtime_profile('gpt-"quoted"')
+        self.assertIn('driver = "codex"', profile)
+        self.assertIn('model = "gpt-\\"quoted\\""', profile)
 
 
 class FinalizeTests(unittest.TestCase):

@@ -13,10 +13,16 @@ from typing import Any
 TOKEN_FIELDS = (
     "input_tokens",
     "cached_input_tokens",
+    "cache_write_input_tokens",
     "output_tokens",
     "reasoning_tokens",
+    "reasoning_output_tokens",
     "total_tokens",
 )
+
+TOKEN_ALIASES = {
+    "reasoning_output_tokens": "reasoning_tokens",
+}
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -35,11 +41,12 @@ def parse_codex_usage(log_path: Path) -> dict[str, int]:
 
     def visit(value: Any) -> None:
         if isinstance(value, dict):
-            candidate = {
-                field: item
-                for field in TOKEN_FIELDS
-                if isinstance((item := value.get(field)), int)
-            }
+            candidate: dict[str, int] = {}
+            for field in TOKEN_FIELDS:
+                item = value.get(field)
+                if not isinstance(item, int):
+                    continue
+                candidate[TOKEN_ALIASES.get(field, field)] = item
             if "input_tokens" in candidate or "output_tokens" in candidate:
                 candidates.append(candidate)
             for item in value.values():
@@ -67,8 +74,83 @@ def _role_instance(receipt: dict[str, Any]) -> str:
     )
 
 
+def _role_runtime(canonical_report: dict[str, Any], role: str) -> str | None:
+    runtime = (
+        canonical_report.get("team", {})
+        .get("roles", {})
+        .get(role, {})
+        .get("runtime")
+    )
+    return runtime if isinstance(runtime, str) else None
+
+
+def _runtime_configuration(receipt: dict[str, Any]) -> dict[str, Any]:
+    value = receipt.get("effective_runtime_configuration")
+    return value if isinstance(value, dict) else {}
+
+
+def _instrument_runtime(receipt: dict[str, Any]) -> dict[str, Any]:
+    value = (
+        receipt.get("source", {})
+        .get("request", {})
+        .get("instrument_identity", {})
+        .get("runtime")
+    )
+    return value if isinstance(value, dict) else {}
+
+
+def model_identity(
+    canonical_report: dict[str, Any],
+    lead_attempts: list[dict[str, Any]],
+    benchmark_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    roles: dict[str, dict[str, Any]] = {}
+    for receipt in canonical_report.get("role_attempt_receipts", []):
+        role = _role_instance(receipt)
+        config = _runtime_configuration(receipt)
+        instrument = _instrument_runtime(receipt)
+        roles[role] = {
+            "runtime": _role_runtime(canonical_report, role),
+            "instrument_runtime": instrument.get("runtime"),
+            "instrument_model": instrument.get("model"),
+            "requested_model": config.get("requested_model"),
+            "applied_model": config.get("applied_model"),
+            "model_confirmation": config.get("model_confirmation"),
+            "requested_mode": config.get("requested_mode"),
+            "applied_mode": config.get("applied_mode"),
+            "mode_confirmation": config.get("mode_confirmation"),
+        }
+
+    lead_models = sorted(
+        {
+            attempt.get("model")
+            for attempt in lead_attempts
+            if isinstance(attempt.get("model"), str) and attempt.get("model")
+        }
+    )
+    return {
+        "role_attempts": dict(sorted(roles.items())),
+        "benchmark_lead": {
+            "runtime": "codex_exec",
+            "models": lead_models,
+            "source": (
+                "supervisor passed --model to codex exec"
+                if lead_models
+                else "codex exec model was not configured explicitly"
+            ),
+        },
+        "benchmark_context": {
+            key: value
+            for key, value in (benchmark_context or {}).items()
+            if value not in (None, "")
+        },
+    }
+
+
 def aggregate_usage(
-    canonical_report: dict[str, Any], lead_attempts: list[dict[str, Any]]
+    canonical_report: dict[str, Any],
+    lead_attempts: list[dict[str, Any]],
+    benchmark_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     role_tokens: Counter[str] = Counter()
     role_rounds: Counter[str] = Counter()
@@ -87,7 +169,7 @@ def aggregate_usage(
         for field in TOKEN_FIELDS:
             value = usage.get(field)
             if isinstance(value, int):
-                role_tokens[field] += value
+                role_tokens[TOKEN_ALIASES.get(field, field)] += value
         cost = usage.get("cost")
         if not isinstance(cost, dict):
             continue
@@ -128,6 +210,12 @@ def aggregate_usage(
     }
     if not currencies:
         cost["currencies"] = {}
+        cost["explanation"] = (
+            "No RuntimeUsageCost was reported by LionClaw role receipts or by "
+            "the Codex benchmark lead JSONL stream. Downstream comparison must "
+            "price the recorded token counters using the recorded model identity "
+            "and the applicable published pricing snapshot."
+        )
 
     return {
         "rounds": {
@@ -142,6 +230,9 @@ def aggregate_usage(
             "method": "sum of counters reported by each completed runtime turn",
         },
         "cost": cost,
+        "model_identity": model_identity(
+            canonical_report, lead_attempts, benchmark_context
+        ),
     }
 
 
@@ -149,8 +240,9 @@ def build_pending_report(
     canonical_report: dict[str, Any],
     status: dict[str, Any],
     lead_attempts: list[dict[str, Any]],
+    benchmark_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    usage = aggregate_usage(canonical_report, lead_attempts)
+    usage = aggregate_usage(canonical_report, lead_attempts, benchmark_context)
     usd = usage["cost"]["currencies"].get("USD")
     combined = usage["tokens"]["combined"]
     return {

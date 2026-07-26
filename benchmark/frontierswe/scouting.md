@@ -89,20 +89,25 @@ exposing or duplicating hidden grader material and would violate the
 worker-independent proof boundary. Harbor's post-agent reward is the benchmark
 outcome recorded in the finalized mission report.
 
-## Bring-up blocker found live
+## Fix-round bring-up result
 
-The task container, custom Harbor agent, post-agent hidden verifier, and report
-finalizer ran unattended. LionClaw itself could not leave initial planning.
-`crates/lionclaw-model/src/step.rs` has a planning step that dispatches the
-configured `proposes-plan` role, and `scripts/mission-eval.sh` expects
-`lionclaw mission advance` to drive that step. However, the CLI starts its
-detached driver only for `Ready` and `CleanupBlocked`; initial planning is
-reported as `AwaitingPlan`. Three `mission advance --wait` calls therefore
-returned `awaiting a plan` without ever starting the planner.
+The fix round rebased onto SCHEMA 32 / REDUCER 60 and reran the task from a
+fresh mission. `AwaitingPlan` advertises `mission plan propose`, so the external
+benchmark lead now authors a plan from the objective and task files and hands
+that proposal to the supervisor. The supervisor validates every state-changing
+request against canonical `mission status --json` / `mission guide --json`
+legal actions, then executes the corresponding LionClaw command outside the
+lead sandbox.
 
-Authoring or injecting a plan in the external benchmark supervisor would move
-planning responsibility out of the confined mission role and hide the kernel
-gap. The supervisor now fails closed when canonical `next_actions` does not
-advertise `mission advance` from initial planning. Fixing the CLI dispatch
-condition is a kernel change and is explicitly outside Slice 10a's allowed
-lane.
+The completed rerun reached terminal LionClaw state `done:unverified` for
+mission `m17365ad1f80d`, below the mission type's `attested` stop bar. Harbor
+then ran the hidden verifier and reported reward 0.0 with correctness
+0.9764705882352941: accept 168/174, reject 81/81, correctness gate failed.
+Cost remained `not_reported`; the report records lead token counters, role
+rounds, and resolved model identity so downstream pricing can be computed from
+a published pricing snapshot if runtime-side costs remain unavailable.
+
+The result is a valid Slice 10a pipeline bring-up artifact, not a publishable
+benchmark measurement. It remains invalidated by unenforced rootless Podman CPU,
+memory, and storage ceilings, plus LionClaw's broader worker egress compared
+with FrontierSWE's official agent-domain allowlist.

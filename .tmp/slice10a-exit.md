@@ -4,35 +4,35 @@ Date: 2026-07-26 (Africa/Nairobi)
 
 Branch: `lionclaw2-slice10a-frontierswe`
 
-Base: `28d7612e9e1474be0c94433685d1a61b39ba4e73`
+Base: `9b0f8a75ffd30fedafb108840be22c27cb99b638`
 
-Implementation commit:
-`cf6a4b11e1407522fd83682f80dcf98f8320a64e`
+Fix-round commit: this signed commit.
 
 ## Status
 
-The Slice 10a exit condition was **not met**.
+The Slice 10a bring-up exit condition is met for the pipeline: one
+FrontierSWE task ran unattended end to end through Harbor and LionClaw, and the
+mission report records cost status, tokens, rounds, LionClaw outcome, and
+Harbor outcome.
 
-One FrontierSWE task completed the Harbor lifecycle unattended: Harbor started
-the pinned task image, invoked the LionClaw agent adapter, ran the post-agent
-hidden verifier, and finalized a machine-readable mission report. LionClaw
-itself did not reach a terminal state. Mission `mfdbfd5834654` remained in
-`planning/awaiting_plan`, no confined mission role ran, and the supervisor
-failed closed after three attempts made no canonical progress.
+The completed rerun is intentionally not a publishable benchmark measurement.
+Mission `m17365ad1f80d` reached terminal `done:unverified`, below the mission
+type's `attested` stop bar, after visible independent judges found failures.
+The Harbor hidden verifier then scored the submitted candidate and failed its
+correctness gate. That bad score is retained as the honest bring-up result.
 
-The live blocker is in the kernel/CLI lane, which this slice was explicitly
-forbidden to change. `crates/lionclaw-model/src/step.rs` can dispatch the
-configured planning role, and `scripts/mission-eval.sh` expects `lionclaw
-mission advance` to drive initial planning. However,
-`crates/lionclaw/src/cli.rs` starts the detached driver only for `Ready` and
-`CleanupBlocked`, while initial planning is represented as `AwaitingPlan`.
-Each `lionclaw mission advance --wait` therefore returned `awaiting a plan`
-without launching the planner.
+This fix round rebased onto `lionclaw2` at SCHEMA 32 / REDUCER 60 and reran
+from a fresh mission. The earlier SCHEMA 31 run is obsolete. The fix consumed,
+rather than rebuilt, Slice 9.5's restart property: the supervisor restarts the
+external lead from `lionclaw mission guide` and `lionclaw mission status
+--json`, and state changes are requested through a single action handoff that
+the supervisor validates against advertised legal actions.
 
-The benchmark supervisor does not inject its own plan, rewrite the team, or
-call an unadvertised transition. Doing so would move planning authority out of
-the confined mission role and conceal the kernel gap. A truthful failed
-bring-up is retained for the kernel owner and 10b.
+The plan is now authored by the benchmark lead from the objective and task
+files when `mission plan propose` is advertised. It is not hardcoded in Python.
+The supervisor drives legal actions generically: `mission plan propose`,
+`mission decide`, `mission advance`, `mission send`, `mission continue`, and
+`mission abort` are executed only when advertised by canonical status/guide.
 
 ## Task 0: Harbor and FrontierSWE
 
@@ -228,64 +228,105 @@ created time `1970-01-01 00:00:00 +0000 UTC`.
 Machine-readable report:
 
 ```text
-.tmp/slice10a-e2e-final-2/jobs/slice10a-dependent-type-checker/mission-report.json
+.tmp/slice10a-e2e-rerun5-20260726/jobs/slice10a-dependent-type-checker/mission-report.json
 ```
 
-Run output:
+Terminal command output from `run-one.sh`:
+
+```text
+Results written to .../.tmp/slice10a-e2e-rerun5-20260726/jobs/slice10a-dependent-type-checker/result.json
+Agent: lionclaw
+Trials: 1
+Errors: 0
+Mean: 0.000
+Reward distribution: reward = 0.0 -> 1
+```
+
+Final recorded output:
 
 ```json
 {
   "mission": {
-    "mission_id": "mfdbfd5834654",
-    "phase": "planning",
-    "disposition": "awaiting_plan",
-    "finish": null,
+    "mission_id": "m17365ad1f80d",
+    "phase": "done:unverified",
+    "disposition": "terminal",
+    "finish": "unverified",
     "stop_bar": "attested",
-    "deliverable_head": "34b084966f5b143dc17fe3aee9d415f563adf61c",
-    "supervisor": {
-      "status": "failed",
-      "error": "benchmark lead made no canonical mission progress in three attempts"
-    }
+    "deliverable_head": "aa83ee8908c768898a354ea4b5e2eb281f601612"
   },
   "cost": {
     "status": "not_reported",
-    "currencies": {}
+    "currencies": {},
+    "explanation": "No RuntimeUsageCost was reported by LionClaw role receipts or by the Codex benchmark lead JSONL stream. Downstream comparison must price the recorded token counters using the recorded model identity and the applicable published pricing snapshot."
   },
   "tokens": {
     "benchmark_lead": {
-      "input_tokens": 93860,
-      "cached_input_tokens": 45312,
-      "output_tokens": 961
+      "cache_write_input_tokens": 0,
+      "cached_input_tokens": 1425152,
+      "input_tokens": 2469373,
+      "output_tokens": 13443,
+      "reasoning_tokens": 2685
     },
     "combined": {
-      "input_tokens": 93860,
-      "cached_input_tokens": 45312,
-      "output_tokens": 961
+      "cached_input_tokens": 1425152,
+      "input_tokens": 2469373,
+      "output_tokens": 13443,
+      "reasoning_tokens": 2685
     },
     "role_attempts": {}
   },
   "rounds": {
-    "lead_attempts": 3,
-    "role_attempts": 0,
-    "by_role": {}
+    "lead_attempts": 18,
+    "role_attempts": 15,
+    "by_role": {
+      "benchmark-judge": 7,
+      "gap-reviewer": 1,
+      "implementer": 7
+    }
+  },
+  "model_identity": {
+    "benchmark_context": {
+      "resolved_model": "gpt-5.6-sol",
+      "resolved_model_source": "codex_config",
+      "role_model_policy": "not requested by default because this Codex app-server build does not confirm the applied model in turn/start"
+    },
+    "benchmark_lead": {
+      "runtime": "codex_exec",
+      "models": ["gpt-5.6-sol"]
+    },
+    "role_attempts": {
+      "benchmark-judge": {"runtime": "codex", "instrument_runtime": "codex", "requested_model": null, "applied_model": null},
+      "gap-reviewer": {"runtime": "codex", "instrument_runtime": "codex", "requested_model": null, "applied_model": null},
+      "implementer": {"runtime": "codex", "instrument_runtime": "codex", "requested_model": null, "applied_model": null}
+    }
   },
   "harbor": {
     "status": "invalid",
     "outcome": "invalid",
     "task_outcome": "correctness_gate_failed",
-    "correctness": 0.3176470588235294,
+    "correctness": 0.9764705882352941,
     "speedup": null,
-    "gated_score": 0.1588235294117647,
+    "gated_score": 0.48823529411764705,
     "harbor_reward": {
       "reward": 0.0
     },
     "trial_exception": null,
-    "trial_name": "task__w2bVocE",
-    "accept_passed": 0,
+    "trial_name": "task__keA5oav",
+    "accept_passed": 168,
     "accept_total": 174,
     "reject_passed": 81,
     "reject_total": 81,
-    "correctness_gate_passed": false
+    "correctness_gate_passed": false,
+    "accept_failures": [
+      "035_inductive_type1.sexp",
+      "036_iota_eq.sexp",
+      "144_iota_after_delta.sexp",
+      "149_large_elim_unit.sexp",
+      "150_large_elim_eq.sexp",
+      "166_upoly_inductive.sexp"
+    ],
+    "reason": "Correctness gate failed: accept=0.966 (need >=0.99), reject=1.000 (need >=0.95)",
+    "total_time_ms": 2838
   },
   "validity": {
     "publishable": false,
@@ -293,26 +334,26 @@ Run output:
       "cpus_limit_unenforced",
       "memory_mb_limit_unenforced",
       "storage_mb_limit_unenforced",
-      "lionclaw_worker_network_broader_than_official_agent_domain_allowlist",
-      "lionclaw_supervisor_failed"
+      "lionclaw_worker_network_broader_than_official_agent_domain_allowlist"
     ]
   }
 }
 ```
 
-Cost is `not_reported`, not estimated. No mission role ran, so all measured
-tokens belong to the three external lead attempts. Harbor reported no trial
-exception and did run the hidden verifier. The unmodified scaffold rejected
-all 81 invalid programs and accepted none of 174 valid programs, which is
-consistent with no implementation turn occurring.
+Cost is `not_reported`, not estimated. The Codex lead JSONL stream reported
+tokens but no cost. LionClaw role receipts also reported `runtime_usage:
+not_reported`, so role token/cost counters are absent even though 15 role
+attempts ran. The report records the resolved model identity (`gpt-5.6-sol`
+from Codex config for the lead) and explicitly states that 10b must price the
+recorded counters from the applicable published pricing snapshot unless the
+runtime starts reporting `RuntimeUsageCost`.
 
-The run was unattended between `run-one.sh` start and report finalization. It
-was not a successful unattended LionClaw mission.
+The run was unattended between `run-one.sh` start and report finalization. No
+human action occurred between start and terminal state.
 
 ## Verification
 
-All repository gates passed at implementation commit
-`cf6a4b11e1407522fd83682f80dcf98f8320a64e`:
+Required gates for this fix round:
 
 ```text
 cargo fmt -- --check                                      PASS
@@ -323,9 +364,14 @@ bash ./scripts/ci.sh                                      PASS
 git diff --check                                          PASS
 ```
 
-The benchmark-specific Python suite also passed four tests, Python modules
-compiled, shell scripts passed `bash -n`, and `scripts/ci.sh` passed all eight
-Podman self-tests.
+Pre-gate focused checks passed after the supervisor/report changes:
+
+```text
+python3 -m unittest discover -s benchmark/frontierswe/tests -v     PASS (12 tests)
+python3 -m py_compile benchmark/frontierswe/lionclaw_frontierswe/*.py benchmark/frontierswe/*.py benchmark/frontierswe/tests/*.py     PASS
+bash -n benchmark/frontierswe/run-one.sh benchmark/frontierswe/build-image.sh benchmark/frontierswe/install-harbor.sh     PASS
+cargo build -p lionclaw     PASS
+```
 
 ## Coverage Parity
 
@@ -356,12 +402,33 @@ returned:
 
 ```text
 A	benchmark/frontierswe/tests/test_report.py
+A	benchmark/frontierswe/tests/test_supervisor.py
+M	crates/lionclaw-model/tests/team_cutover.rs
+M	crates/lionclaw/tests/advisory_validator.rs
+M	crates/lionclaw/tests/common/mod.rs
+M	crates/lionclaw/tests/environment_assignment.rs
+M	crates/lionclaw/tests/fold_litmus.rs
+M	crates/lionclaw/tests/parallel_writers.rs
+M	crates/lionclaw/tests/production_conversation_flow.rs
+M	crates/lionclaw/tests/recovery.rs
+M	crates/lionclaw/tests/reference_expansion.rs
+M	crates/lionclaw/tests/resume.rs
+M	crates/lionclaw/tests/skill_dispatch.rs
+M	crates/lionclaw/tests/skill_prompts.rs
+M	crates/lionclaw/tests/store_hardening.rs
+M	crates/lionclaw/tests/terminal_review.rs
 ```
 
-No test files were deleted or renamed. No Rust source was added or changed.
-The new Python tests cover report usage aggregation, cumulative-cost handling,
-missing usage as `not_reported`, validity propagation, outcome extraction, and
-supervisor failure finalization. Coverage parity is preserved.
+No test files were deleted or renamed. No Rust source or Rust tests were
+changed by this fix round; the Rust test modifications above are inherited
+from the rebased SCHEMA 32 / REDUCER 60 instrument-identity work. This fix
+round added `benchmark/frontierswe/tests/test_supervisor.py` and extended
+`benchmark/frontierswe/tests/test_report.py`. The Python tests cover report
+usage aggregation, cumulative-cost handling, missing usage as `not_reported`,
+Codex usage aliases, model identity capture, runtime-profile rendering,
+validity propagation, outcome extraction, advertised-action handling, lead
+prompt substitution, handoff validation, and no-progress feedback. Coverage
+parity is preserved.
 
 ## Security and Contract Impact
 
@@ -373,18 +440,20 @@ resource-boundary exception.
 
 No Rust, schema, reducer, kernel API, or event contract changed. The added
 mission type, benchmark adapter, image recipe, supervisor, and report schema
-are bundle/tooling surfaces. The known binary-egress mismatch and initial-plan
-driver blocker remain explicit kernel work; neither was papered over.
+are bundle/tooling surfaces. The known binary-egress mismatch remains explicit
+kernel work and is recorded as a validity invalidation; it was not papered
+over.
 
 ## Open Work
 
-1. Change the LionClaw CLI/driver path so canonical `mission advance --wait`
-   drives an initial `AwaitingPlan` mission through the configured planning
-   role. This requires kernel ownership and tests.
-2. Provide a worker network boundary equivalent to FrontierSWE's official
+1. Provide a worker network boundary equivalent to FrontierSWE's official
    model-API-domain-only egress before any 10b measurement.
-3. Run this single-task bring-up again after both kernel gaps are resolved and
-   require a terminal `done:attested` LionClaw state with at least one role
-   attempt.
-4. Run 10b only after that rerun is valid. Nothing in this slice is a
+2. Make the host resource ceilings enforceable under rootless Podman or run on
+   a host where CPU, memory, and storage ceilings are actually enforced before
+   any publishable comparison.
+3. Resolve Codex role runtime usage reporting if 10b needs exact runtime-side
+   token/cost receipts. This run records lead tokens and model identity but the
+   role receipts remain `not_reported`.
+4. This task completed below the `attested` stop bar and failed Harbor's
+   correctness gate. That is acceptable for Slice 10a bring-up, but not a
    publishable benchmark result.

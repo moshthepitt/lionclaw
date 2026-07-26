@@ -25,6 +25,10 @@ class LionClawAgent(BaseAgent):
         supervisor_module: str,
         lead_prompt: str,
         codex_bin: str = "codex",
+        lead_model: str | None = None,
+        resolved_model: str | None = None,
+        resolved_model_source: str | None = None,
+        role_model_request: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -34,13 +38,17 @@ class LionClawAgent(BaseAgent):
         self.supervisor_module = supervisor_module
         self.lead_prompt = Path(lead_prompt).resolve()
         self.codex_bin = codex_bin
+        self.lead_model = lead_model
+        self.resolved_model = resolved_model
+        self.resolved_model_source = resolved_model_source
+        self.role_model_request = role_model_request
 
     @staticmethod
     def name() -> str:
         return "lionclaw"
 
     def version(self) -> str:
-        return "slice10a-v1"
+        return "slice10a-v3"
 
     async def setup(self, environment: BaseEnvironment) -> None:
         del environment
@@ -98,7 +106,7 @@ class LionClawAgent(BaseAgent):
             "to instruction.md.\n"
         )
         report_path = self.logs_dir / "lionclaw-mission-report.json"
-        process = await asyncio.create_subprocess_exec(
+        supervisor_command = [
             "python3",
             "-m",
             self.supervisor_module,
@@ -120,6 +128,19 @@ class LionClawAgent(BaseAgent):
             str(self.lionclaw_bin),
             "--codex-bin",
             self.codex_bin,
+        ]
+        if self.lead_model:
+            supervisor_command.extend(["--lead-model", self.lead_model])
+        if self.resolved_model:
+            supervisor_command.extend(["--resolved-model", self.resolved_model])
+        if self.resolved_model_source:
+            supervisor_command.extend(
+                ["--resolved-model-source", self.resolved_model_source]
+            )
+        if self.role_model_request:
+            supervisor_command.extend(["--role-model-request", self.role_model_request])
+        process = await asyncio.create_subprocess_exec(
+            *supervisor_command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -163,4 +184,7 @@ class LionClawAgent(BaseAgent):
             "lionclaw_deliverable_head": deliverable_sha,
             "lionclaw_report": str(report_path),
             "supervisor_exit_code": process.returncode,
+            "resolved_model": self.resolved_model,
+            "resolved_model_source": self.resolved_model_source,
+            "role_model_request": self.role_model_request,
         }
