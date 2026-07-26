@@ -1,0 +1,39 @@
+ARG LIONCLAW_DEV_IMAGE=localhost/lionclaw-runtime-dev@sha256:590c4259f72f669976690983cf1af2c7f2a2b2164eeeaa4a1dac72c76b490762
+FROM ${LIONCLAW_DEV_IMAGE}
+
+USER root
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    TASK_BUDGET_SECS=28800 \
+    UV_LINK_MODE=copy
+
+WORKDIR /app
+COPY environment/workspace/ /app/
+
+RUN chmod +x /app/entrypoint.sh /app/timer.sh \
+    && mkdir -p /app/type-checker/src /logs/agent /logs/verifier \
+    && cp /app/scaffold/Cargo.toml /app/type-checker/Cargo.toml \
+    && cp /app/scaffold/src/main.rs /app/type-checker/src/main.rs \
+    && cat >/etc/profile.d/frontier-task-init.sh <<'EOF'
+if [ -x /app/timer.sh ] && [ "${FRONTIER_TIMER_BOOTSTRAP:-0}" != "1" ]; then
+  timer_pid_file=/app/.timer/timer.pid
+  if [ ! -s "$timer_pid_file" ] || ! kill -0 "$(cat "$timer_pid_file" 2>/dev/null)" 2>/dev/null; then
+    FRONTIER_TIMER_BOOTSTRAP=1 env -u BASH_ENV -u ENV /app/timer.sh >/dev/null 2>&1 &
+  fi
+fi
+EOF
+
+ENV BASH_ENV=/etc/profile.d/frontier-task-init.sh
+
+RUN chown -R lionclaw:lionclaw /app /logs \
+    && rustc --version | grep '1.96.1' \
+    && cargo --version \
+    && codex --version \
+    && opencode --version \
+    && uv --version
+
+USER root
+WORKDIR /workspace
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["tail", "-f", "/dev/null"]
