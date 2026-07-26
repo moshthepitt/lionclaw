@@ -234,7 +234,7 @@ fn orphaned_gap_review_request(
         &prompt_hash,
     );
     let event = lionclaw::store::NewEvent::new(MissionEvent::RoleTurnRequested {
-        role_instance,
+        role_instance: role_instance.clone(),
         team_revision,
         task_id: None,
         assertion_ids: vec![],
@@ -244,6 +244,9 @@ fn orphaned_gap_review_request(
         prompt_hash,
         base_sha: state.current_sha.clone(),
         environment_digest: state.environment_digest().to_string(),
+        instrument_identity: state
+            .role_instrument_identity_for_revision(&role_instance, team_revision)
+            .expect("role instrument identity"),
         dependency_refs: vec![],
         assignment_epoch,
         message_boundary: state.head,
@@ -513,6 +516,7 @@ async fn gap_review_receives_its_declared_skill_packages() {
                 name: "gap-check".to_string(),
                 root: skill_root.clone(),
                 description: "gap check".to_string(),
+                digest: "0".repeat(64),
             },
         );
         definition
@@ -591,8 +595,11 @@ async fn blocking_gaps_park_then_accept_closes_with_acknowledged_gaps() {
         .as_ref()
         .expect("acceptance recorded");
     assert_eq!(accepted.kind, ReviewAcceptanceKind::AcknowledgedGaps);
-    assert_eq!(accepted.judged_sha, HEAD_SHA);
-    assert_eq!(accepted.environment_digest, state.environment_digest());
+    assert_eq!(accepted.freshness.judged_sha, HEAD_SHA);
+    assert_eq!(
+        accepted.freshness.environment_digest,
+        state.environment_digest()
+    );
     // The receipt preserves the exact reason without claiming a caller actor.
     assert_eq!(accepted.justification, "gap is acceptable for this release");
 }
@@ -632,8 +639,8 @@ async fn accepted_blocking_gap_review_reopens_after_environment_change() {
         .as_ref()
         .expect("acceptance recorded");
     assert_eq!(acceptance.kind, ReviewAcceptanceKind::AcknowledgedGaps);
-    assert_eq!(acceptance.judged_sha, HEAD_SHA);
-    assert_eq!(acceptance.environment_digest, image_a);
+    assert_eq!(acceptance.freshness.judged_sha, HEAD_SHA);
+    assert_eq!(acceptance.freshness.environment_digest, image_a);
     assert!(acceptance.is_fresh_at(&accepted));
     assert_eq!(ready_to_finish(&accepted), Some(FinishClass::Verified));
 
@@ -655,7 +662,7 @@ async fn accepted_blocking_gap_review_reopens_after_environment_change() {
         .as_ref()
         .expect("historical acceptance remains inspectable");
     assert_eq!(stale.environment_digest(), image_b);
-    assert_eq!(stale_acceptance.environment_digest, image_a);
+    assert_eq!(stale_acceptance.freshness.environment_digest, image_a);
     assert!(!stale_acceptance.is_fresh_at(&stale));
     assert!(stale.gap_review.fresh_acceptance(&stale).is_none());
     assert_eq!(ready_to_finish(&stale), None);

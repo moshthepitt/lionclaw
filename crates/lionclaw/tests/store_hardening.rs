@@ -69,7 +69,7 @@ fn role_request(
                     .collect()
             });
     NewEvent::new(MissionEvent::RoleTurnRequested {
-        role_instance,
+        role_instance: role_instance.clone(),
         team_revision: team.revision,
         task_id,
         assertion_ids,
@@ -79,6 +79,9 @@ fn role_request(
         prompt_hash: PROMPT_HASH.into(),
         base_sha: assignment.base_sha,
         environment_digest: state.environment_digest().to_string(),
+        instrument_identity: state
+            .role_instrument_identity_for_revision(&role_instance, team.revision)
+            .expect("role instrument identity"),
         dependency_refs: assignment.dependency_refs,
         assignment_epoch: assignment.generation,
         message_boundary: state.head,

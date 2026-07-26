@@ -1117,8 +1117,8 @@ async fn check_gap_review() -> Result<()> {
     match &done.gap_review.accepted {
         Some(a)
             if a.kind == ReviewAcceptanceKind::AcknowledgedGaps
-                && a.judged_sha == base
-                && a.environment_digest == done.environment_digest() =>
+                && a.freshness.judged_sha == base
+                && a.freshness.environment_digest == done.environment_digest() =>
         {
             Ok(())
         }
@@ -1205,6 +1205,7 @@ async fn check_runtime_skill_mount() -> Result<()> {
         &[crate::mission_type::SkillPackage {
             name: "mission-probe".to_string(),
             root: skill.path().to_path_buf(),
+            digest: "0".repeat(64),
             description: "mission skill probe".to_string(),
         }],
         profile.skills_dir.as_ref(),

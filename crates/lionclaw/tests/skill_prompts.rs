@@ -46,6 +46,7 @@ fn mission_type_with_skill(
                 name: "test-method".to_string(),
                 root,
                 description: "A bounded native method".to_string(),
+                digest: "0".repeat(64),
             },
         );
         if let Some(assigned_role) = assigned_role {

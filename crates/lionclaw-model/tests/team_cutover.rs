@@ -8,9 +8,10 @@ use lionclaw_model::{
     MissionProposal, MissionState, MissionTypeRef, OracleName, OutputSemantics, PayloadRef, Plan,
     PlanProposal, QueuedMessage, RecoveryConfig, Requirement, RequirementDisposition,
     RequirementId, RequirementKind, RoleAttemptDisposition, RoleInstance, RoleInstanceId,
-    RolePromptTemplate, RoleTurnSuccess, RuntimeConfigurationEvidence, StepDecision, StopBar, Task,
-    TaskId, TaskRoleAssignment, TaskRuntimeState, TaskStatus, TeamRevision, TypedFailure,
-    ValidationItem, VersionStamps, WorkspacePreparation, SCHEMA_VERSION,
+    RoleInstrumentIdentity, RolePromptTemplate, RoleTurnSuccess, RuntimeConfigurationEvidence,
+    RuntimeInstrumentIdentity, StepDecision, StopBar, Task, TaskId, TaskRoleAssignment,
+    TaskRuntimeState, TaskStatus, TeamRevision, TypedFailure, ValidationItem, VersionStamps,
+    WorkspacePreparation, SCHEMA_VERSION,
 };
 
 const BASE_ENVIRONMENT_DIGEST: &str = "image";
@@ -32,6 +33,75 @@ fn role(id: &str, output: OutputSemantics) -> RoleInstance {
         resources: Default::default(),
         deadline_secs: None,
     }
+}
+
+fn runtime_identities(team: &TeamRevision) -> BTreeMap<RoleInstanceId, RuntimeInstrumentIdentity> {
+    team.roles
+        .iter()
+        .map(|(id, role)| {
+            (
+                id.clone(),
+                RuntimeInstrumentIdentity {
+                    runtime: role.runtime.clone(),
+                    model: None,
+                    mode: None,
+                },
+            )
+        })
+        .collect()
+}
+
+fn team_event(team: TeamRevision) -> MissionEvent {
+    let runtime_identities = runtime_identities(&team);
+    MissionEvent::TeamConfigured {
+        team,
+        runtime_identities,
+    }
+}
+
+fn role_instrument_from_prefix(
+    events: &[EventEnvelope],
+    role_instance: &RoleInstanceId,
+    team_revision: u32,
+) -> RoleInstrumentIdentity {
+    fold(events.iter().cloned())
+        .expect("prefix folds")
+        .role_instrument_identity_for_revision(role_instance, team_revision)
+        .expect("role instrument identity")
+}
+
+fn role_instrument_for_revision(
+    team_revision: u32,
+    role_instance: &RoleInstanceId,
+) -> RoleInstrumentIdentity {
+    let mut events = vec![
+        event(
+            1,
+            MissionEvent::MissionCreated {
+                objective: "instrument helper".into(),
+                mission_type: MissionTypeRef {
+                    name: "test".into(),
+                    digest: "digest".into(),
+                },
+                image_id: "image".into(),
+                workspace_dir: "/workspace".into(),
+                base_sha: "base".into(),
+                config: MissionConfig {
+                    ceilings: AuthorityCeilings {
+                        writes: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                delegation: lionclaw_model::DelegationSet::none(),
+            },
+        ),
+        event(2, team_event(team(0, false))),
+    ];
+    if team_revision != 0 {
+        events.push(event(3, team_event(team(team_revision, true))));
+    }
+    role_instrument_from_prefix(&events, role_instance, team_revision)
 }
 
 #[test]
@@ -146,12 +216,7 @@ fn role_resource_overrides_are_bounded_by_mission_resource_ceilings() {
                 delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
-        event(
-            2,
-            MissionEvent::TeamConfigured {
-                team: team(0, true),
-            },
-        ),
+        event(2, team_event(team(0, true))),
     ])
     .unwrap();
     let proposal = MissionProposal {
@@ -200,13 +265,8 @@ fn over_ceiling_team_configured_event_is_ignored_during_replay() {
                 delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
-        event(
-            2,
-            MissionEvent::TeamConfigured {
-                team: team(0, true),
-            },
-        ),
-        event(3, MissionEvent::TeamConfigured { team: forged }),
+        event(2, team_event(team(0, true))),
+        event(3, team_event(forged)),
     ])
     .unwrap();
 
@@ -219,6 +279,7 @@ fn sunset_wire_shapes_have_no_planning_or_role_bridges() {
     let config = MissionConfig {
         stop: StopBar::Verified,
         oracles: BTreeSet::from([OracleName::new("cargo-test").expect("oracle")]),
+        skills: BTreeMap::new(),
         ceilings: AuthorityCeilings::default(),
         resource_ceilings: Default::default(),
         oracle_resources: Default::default(),
@@ -262,6 +323,7 @@ fn sunset_wire_shapes_have_no_planning_or_role_bridges() {
         prompt_hash: "prompt".into(),
         base_sha: "base".into(),
         environment_digest: BASE_ENVIRONMENT_DIGEST.into(),
+        instrument_identity: role_instrument_for_revision(1, &instance("engineer")),
         dependency_refs: Vec::new(),
         assignment_epoch: 1,
         message_boundary: 0,
@@ -375,6 +437,7 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
     let config = MissionConfig {
         stop: StopBar::Verified,
         oracles: BTreeSet::from([OracleName::new("test").unwrap()]),
+        skills: BTreeMap::new(),
         ceilings: AuthorityCeilings {
             writes: true,
             ..Default::default()
@@ -398,12 +461,7 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
                 delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
-        event(
-            2,
-            MissionEvent::TeamConfigured {
-                team: team(0, false),
-            },
-        ),
+        event(2, team_event(team(0, false))),
         event(
             3,
             MissionEvent::ProposalRecorded {
@@ -428,12 +486,7 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
                 requirement_changes: Vec::new(),
             },
         ),
-        event(
-            5,
-            MissionEvent::TeamConfigured {
-                team: accepted_team,
-            },
-        ),
+        event(5, team_event(accepted_team)),
     ])
     .expect("accepted mission plan");
     let left = AssertionId::new("A-LEFT").unwrap();
@@ -523,6 +576,7 @@ fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
     let config = MissionConfig {
         stop: StopBar::Verified,
         oracles: BTreeSet::from([OracleName::new("test").unwrap()]),
+        skills: BTreeMap::new(),
         ceilings: AuthorityCeilings {
             writes: true,
             ..Default::default()
@@ -559,12 +613,7 @@ fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
                 delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
-        event(
-            2,
-            MissionEvent::TeamConfigured {
-                team: team(0, false),
-            },
-        ),
+        event(2, team_event(team(0, false))),
         event(
             3,
             MissionEvent::ProposalRecorded {
@@ -581,12 +630,7 @@ fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
                 requirement_changes: Vec::new(),
             },
         ),
-        event(
-            5,
-            MissionEvent::TeamConfigured {
-                team: proposal.team.unwrap(),
-            },
-        ),
+        event(5, team_event(proposal.team.unwrap())),
     ])
     .unwrap();
 
@@ -620,18 +664,8 @@ fn a_skipped_team_revision_is_ignored_during_replay() {
                 delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
-        event(
-            2,
-            MissionEvent::TeamConfigured {
-                team: team(0, false),
-            },
-        ),
-        event(
-            3,
-            MissionEvent::TeamConfigured {
-                team: team(2, false),
-            },
-        ),
+        event(2, team_event(team(0, false))),
+        event(3, team_event(team(2, false))),
     ])
     .unwrap();
     assert_eq!(state.team.unwrap().revision, 0);
@@ -674,12 +708,7 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
                 delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
-        event(
-            2,
-            MissionEvent::TeamConfigured {
-                team: team(0, false),
-            },
-        ),
+        event(2, team_event(team(0, false))),
         event(
             3,
             MissionEvent::ProposalRecorded {
@@ -704,36 +733,33 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
                 requirement_changes: Vec::new(),
             },
         ),
-        event(
-            5,
-            MissionEvent::TeamConfigured {
-                team: accepted_team,
-            },
-        ),
-        event(
-            6,
-            MissionEvent::RoleTurnRequested {
-                role_instance: instance("engineer"),
-                team_revision: 1,
-                task_id: Some(TaskId::new("implement").unwrap()),
-                assertion_ids: vec![AssertionId::new("A-1").unwrap()],
-                attempt_no: 1,
-                effect_id: effect_id.clone(),
-                prompt_template: RolePromptTemplate::Execution,
-                prompt_hash: "prompt".into(),
-                base_sha: "base".into(),
-                environment_digest: BASE_ENVIRONMENT_DIGEST.into(),
-                dependency_refs: Vec::new(),
-                assignment_epoch: 1,
-                message_boundary: 5,
-                presented_messages: Vec::new(),
-                workspace_preparation: WorkspacePreparation::ResetForAssignment,
-                requested_at_ms: 6,
-                deadline_ms: 60,
-                budget_deadline_ms: 120,
-            },
-        ),
+        event(5, team_event(accepted_team)),
     ];
+    let instrument_identity = role_instrument_from_prefix(&events, &instance("engineer"), 1);
+    events.push(event(
+        6,
+        MissionEvent::RoleTurnRequested {
+            role_instance: instance("engineer"),
+            team_revision: 1,
+            task_id: Some(TaskId::new("implement").unwrap()),
+            assertion_ids: vec![AssertionId::new("A-1").unwrap()],
+            attempt_no: 1,
+            effect_id: effect_id.clone(),
+            prompt_template: RolePromptTemplate::Execution,
+            prompt_hash: "prompt".into(),
+            base_sha: "base".into(),
+            environment_digest: BASE_ENVIRONMENT_DIGEST.into(),
+            instrument_identity,
+            dependency_refs: Vec::new(),
+            assignment_epoch: 1,
+            message_boundary: 5,
+            presented_messages: Vec::new(),
+            workspace_preparation: WorkspacePreparation::ResetForAssignment,
+            requested_at_ms: 6,
+            deadline_ms: 60,
+            budget_deadline_ms: 120,
+        },
+    ));
     events.push(event(
         7,
         MissionEvent::RoleTurnCompleted {
@@ -796,12 +822,7 @@ fn accepted_advisory_state() -> MissionState {
                 delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
-        event(
-            2,
-            MissionEvent::TeamConfigured {
-                team: team(0, false),
-            },
-        ),
+        event(2, team_event(team(0, false))),
         event(
             3,
             MissionEvent::ProposalRecorded {
@@ -826,12 +847,7 @@ fn accepted_advisory_state() -> MissionState {
                 requirement_changes: Vec::new(),
             },
         ),
-        event(
-            5,
-            MissionEvent::TeamConfigured {
-                team: accepted_team,
-            },
-        ),
+        event(5, team_event(accepted_team)),
     ])
     .unwrap()
 }
@@ -857,7 +873,7 @@ fn reviewer_request(
         event(
             sequence_no,
             MissionEvent::RoleTurnRequested {
-                role_instance: role,
+                role_instance: role.clone(),
                 team_revision: 1,
                 task_id: None,
                 assertion_ids: vec![assertion],
@@ -867,6 +883,9 @@ fn reviewer_request(
                 prompt_hash: prompt_hash.into(),
                 base_sha: "base".into(),
                 environment_digest: BASE_ENVIRONMENT_DIGEST.into(),
+                instrument_identity: accepted_advisory_state()
+                    .role_instrument_identity_for_revision(&role, 1)
+                    .unwrap(),
                 dependency_refs: Vec::new(),
                 assignment_epoch: 1,
                 message_boundary: sequence_no - 1,

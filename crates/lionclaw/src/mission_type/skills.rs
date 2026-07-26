@@ -61,12 +61,13 @@ pub(crate) fn load_skills(
                     ),
                 });
             }
-            package_digests.insert(name.clone(), validated.digest);
+            package_digests.insert(name.clone(), validated.digest.clone());
             packages.insert(
                 name.clone(),
                 SkillPackage {
                     name,
                     root: path,
+                    digest: validated.digest,
                     description: validated.description,
                 },
             );
@@ -89,6 +90,7 @@ pub(crate) fn load_skill_package(root: &Path) -> Result<(SkillPackage, String), 
         SkillPackage {
             name: validated.name,
             root: root.to_path_buf(),
+            digest: validated.digest.clone(),
             description: validated.description,
         },
         validated.digest,

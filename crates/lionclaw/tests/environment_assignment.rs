@@ -330,7 +330,7 @@ async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle(
         image_a_state.head,
         &[
             NewEvent::new(MissionEvent::RoleTurnRequested {
-                role_instance,
+                role_instance: role_instance.clone(),
                 team_revision: team.revision,
                 task_id: Some(task_id),
                 assertion_ids: vec![assertion_id.clone()],
@@ -340,6 +340,9 @@ async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle(
                 prompt_hash: prompt_hash.clone(),
                 base_sha: assignment.base_sha.clone(),
                 environment_digest: image_a_state.environment_digest().to_string(),
+                instrument_identity: image_a_state
+                    .role_instrument_identity_for_revision(&role_instance, team.revision)
+                    .expect("role instrument identity"),
                 dependency_refs: assignment.dependency_refs.clone(),
                 assignment_epoch: assignment.generation,
                 message_boundary: image_a_state.head,
@@ -678,6 +681,9 @@ async fn environment_assignment_rejects_tags_and_inflight_races() {
             prompt_hash,
             base_sha: after_tag.deliverable_head().to_string(),
             environment_digest: after_tag.environment_digest().to_string(),
+            instrument_identity: after_tag
+                .role_instrument_identity_for_revision(&planner, team.revision)
+                .expect("role instrument identity"),
             dependency_refs: Vec::new(),
             assignment_epoch: 1,
             message_boundary: after_tag.head,

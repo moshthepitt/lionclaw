@@ -41,11 +41,12 @@ pub use event::{
     EffectEventClass, EffectResource, EnvironmentAssignment, EnvironmentPreflight, EventEnvelope,
     ExecutionPolicy, Gap, GapSeverity, Handoff, MessageReference, MissionConfig, MissionEvent,
     MissionProposal, MissionSkill, MissionTypeRef, OracleRunSuccess, PayloadRef, PreparedInputRef,
-    RecoveryConfig, RolePromptTemplate, RoleTurnSuccess, RuntimeConfigurationEvidence, StopBar,
-    TaskCandidateRef, UnavailableReferenceCause, ValidationItem, VersionStamps,
-    WorkspacePreparation, MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES,
-    MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES, MAX_QUEUED_MESSAGES_PER_CONVERSATION,
-    MAX_ROLE_REPORT_BYTES, SCHEMA_VERSION,
+    RecoveryConfig, RoleInstrumentIdentity, RolePromptTemplate, RoleProofFreshness,
+    RoleTurnSuccess, RuntimeConfigurationEvidence, RuntimeInstrumentIdentity,
+    SkillInstrumentIdentity, StopBar, TaskCandidateRef, UnavailableReferenceCause, ValidationItem,
+    VersionStamps, WorkspacePreparation, MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES,
+    MAX_MESSAGE_BYTES, MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES,
+    MAX_QUEUED_MESSAGES_PER_CONVERSATION, MAX_ROLE_REPORT_BYTES, SCHEMA_VERSION,
 };
 pub use failure::{
     bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,

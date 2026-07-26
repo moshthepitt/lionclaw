@@ -13,10 +13,10 @@ use super::verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 59 keeps every proof receipt and gap-review acceptance fresh only
-/// under the current deliverable head and environment digest, and
-/// capacity-bounds oracle batches.
-pub const REDUCER_VERSION: u32 = 59;
+/// Reducer 60 keeps every judged role receipt and gap-review acceptance fresh
+/// only under the current deliverable head, environment digest, and role
+/// instrument identity, and capacity-bounds oracle batches.
+pub const REDUCER_VERSION: u32 = 60;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -54,6 +54,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         delegation: delegation.clone(),
         team: None,
         team_history: BTreeMap::new(),
+        runtime_identity_history: BTreeMap::new(),
         skills: BTreeMap::new(),
         phase: MissionPhase::Planning,
         plan: None,
@@ -96,7 +97,10 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     let seq = envelope.sequence_no;
     match &envelope.event {
         MissionEvent::MissionCreated { .. } => {}
-        MissionEvent::TeamConfigured { team } => apply_team(state, team),
+        MissionEvent::TeamConfigured {
+            team,
+            runtime_identities,
+        } => apply_team(state, team, runtime_identities),
         MissionEvent::SkillAdded { skill } => {
             if valid_skill(skill) {
                 state.skills.insert(skill.name.clone(), skill.clone());
@@ -339,7 +343,11 @@ fn valid_proposal(state: &MissionState, proposal: &super::MissionProposal) -> bo
     super::validate_mission_proposal(state, proposal).is_ok()
 }
 
-fn apply_team(state: &mut MissionState, team: &super::TeamRevision) {
+fn apply_team(
+    state: &mut MissionState,
+    team: &super::TeamRevision,
+    runtime_identities: &BTreeMap<RoleInstanceId, super::RuntimeInstrumentIdentity>,
+) {
     let expected = state
         .team
         .as_ref()
@@ -362,6 +370,7 @@ fn apply_team(state: &mut MissionState, team: &super::TeamRevision) {
                 .within(&state.config.resource_ceilings)
                 .is_err()
         })
+        || !runtime_identities_match_team(team, runtime_identities)
         || plan.is_some_and(|plan| !super::validate_plan(plan, team, &state.config).is_empty())
     {
         return;
@@ -376,6 +385,9 @@ fn apply_team(state: &mut MissionState, team: &super::TeamRevision) {
         }
     }
     state.team_history.insert(team.revision, team.clone());
+    state
+        .runtime_identity_history
+        .insert(team.revision, runtime_identities.clone());
     state.team = Some(team.clone());
     if state.proposal_approved
         && state
@@ -386,6 +398,29 @@ fn apply_team(state: &mut MissionState, team: &super::TeamRevision) {
     {
         promote_proposal_plan(state);
     }
+}
+
+fn runtime_identities_match_team(
+    team: &super::TeamRevision,
+    runtime_identities: &BTreeMap<RoleInstanceId, super::RuntimeInstrumentIdentity>,
+) -> bool {
+    if runtime_identities.len() != team.roles.len() {
+        return false;
+    }
+    team.roles.iter().all(|(id, role)| {
+        runtime_identities.get(id).is_some_and(|identity| {
+            identity.runtime == role.runtime
+                && !identity.runtime.trim().is_empty()
+                && identity
+                    .model
+                    .as_ref()
+                    .is_none_or(|model| !model.trim().is_empty())
+                && identity
+                    .mode
+                    .as_ref()
+                    .is_none_or(|mode| !mode.trim().is_empty())
+        })
+    })
 }
 
 fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
@@ -400,6 +435,7 @@ fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
         prompt_hash,
         base_sha,
         environment_digest,
+        instrument_identity,
         dependency_refs,
         assignment_epoch,
         message_boundary,
@@ -428,6 +464,8 @@ fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
         )
         && *prompt_template == super::role_prompt_template(role.output)
         && environment_digest == state.environment_digest()
+        && state.role_instrument_identity_for_revision(role_instance, *team_revision)
+            == Some(instrument_identity.clone())
         && state.role_dispatch_contract_matches(
             role_instance,
             *team_revision,
@@ -1199,32 +1237,36 @@ fn apply_decision(
             ready_planning_conversation(state);
         }
         (super::DecisionAction::Accept, AttentionKind::GapReviewGaps) => {
-            let judged_sha = state
+            let freshness = state
                 .gap_review_receipt()
                 .map(|receipt| match &receipt.source {
-                    super::RoleEffectSource::Turn { request, .. } => &request.base_sha,
-                })
-                .cloned();
-            if let Some(judged_sha) = judged_sha {
+                    super::RoleEffectSource::Turn { request, .. } => request.freshness(),
+                });
+            if let Some(freshness) = freshness {
                 state.gap_review.accepted = Some(ReviewAcceptance {
                     kind: ReviewAcceptanceKind::AcknowledgedGaps,
-                    judged_sha,
-                    environment_digest: state.environment_digest().to_string(),
+                    freshness,
                     justification: justification.to_string(),
                 });
             }
         }
         (super::DecisionAction::Accept, AttentionKind::GapReviewFailed) => {
+            let freshness = state
+                .gap_review_receipt()
+                .map(|receipt| match &receipt.source {
+                    super::RoleEffectSource::Turn { request, .. } => request.freshness(),
+                });
             if let Some(outcome) = state.gap_review.outcome.take() {
                 state.parked_effects.remove(outcome.effect_id());
             }
             state.gap_review.consecutive_failures = 0;
-            state.gap_review.accepted = Some(ReviewAcceptance {
-                kind: ReviewAcceptanceKind::Waived,
-                judged_sha: state.deliverable_head().to_string(),
-                environment_digest: state.environment_digest().to_string(),
-                justification: justification.to_string(),
-            });
+            if let Some(freshness) = freshness {
+                state.gap_review.accepted = Some(ReviewAcceptance {
+                    kind: ReviewAcceptanceKind::Waived,
+                    freshness,
+                    justification: justification.to_string(),
+                });
+            }
         }
         (super::DecisionAction::Accept, _) => {
             if let Some(task_id) = &item.task_id {

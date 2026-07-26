@@ -10,7 +10,8 @@ use lionclaw::mission_type::{MissionType, MissionTypeDefinition};
 use lionclaw::model::{
     Assertion, AssertionId, AuthorityCeilings, AuthorityGrants, MissionProposal, OracleName,
     OutputSemantics, Plan, PlanProposal, Requirement, RequirementDisposition, RequirementId,
-    RequirementKind, RoleInstance, RoleInstanceId, StopBar, Task, TeamRevision,
+    RequirementKind, RoleInstance, RoleInstanceId, RuntimeInstrumentIdentity, StopBar, Task,
+    TeamRevision,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
@@ -379,26 +380,82 @@ pub async fn harness_with_type(
     role_runner: MockRoleRunner,
     oracle_runner: MockOracleRunner,
 ) -> TestHarness {
+    harness_with_type_and_runtime_identities(
+        workspace,
+        mission_type,
+        role_runner,
+        oracle_runner,
+        default_runtime_identities(),
+    )
+    .await
+}
+
+pub fn default_runtime_identities() -> BTreeMap<String, RuntimeInstrumentIdentity> {
+    BTreeMap::from([
+        (
+            "codex".to_string(),
+            RuntimeInstrumentIdentity {
+                runtime: "codex".to_string(),
+                model: None,
+                mode: None,
+            },
+        ),
+        (
+            "opencode".to_string(),
+            RuntimeInstrumentIdentity {
+                runtime: "opencode".to_string(),
+                model: None,
+                mode: None,
+            },
+        ),
+    ])
+}
+
+pub async fn harness_with_type_and_runtime_identities(
+    workspace: &Path,
+    mission_type: MissionType,
+    role_runner: MockRoleRunner,
+    oracle_runner: MockOracleRunner,
+    runtime_identities: BTreeMap<String, RuntimeInstrumentIdentity>,
+) -> TestHarness {
     initialize_repository(workspace);
-    let store = MissionStore::open(workspace).await.expect("open store");
     let role_runner = Arc::new(role_runner);
     let oracle_runner = Arc::new(oracle_runner);
-    let engine = Engine::new(
-        store,
+    let engine = engine_with_runtime_identities(
+        workspace,
         mission_type,
-        "localhost/lionclaw-runtime-dev:v1".to_string(),
-        EngineServices::new(
-            role_runner.clone(),
-            oracle_runner.clone(),
-            Arc::new(NoopEffectCleaner),
-            Arc::new(MockClock::default()),
-        ),
-    );
+        role_runner.clone(),
+        oracle_runner.clone(),
+        runtime_identities,
+    )
+    .await;
     TestHarness {
         engine,
         role_runner,
         oracle_runner,
     }
+}
+
+pub async fn engine_with_runtime_identities(
+    workspace: &Path,
+    mission_type: MissionType,
+    role_runner: Arc<MockRoleRunner>,
+    oracle_runner: Arc<MockOracleRunner>,
+    runtime_identities: BTreeMap<String, RuntimeInstrumentIdentity>,
+) -> Engine {
+    let store = MissionStore::open(workspace).await.expect("open store");
+    Engine::new(
+        store,
+        mission_type,
+        "localhost/lionclaw-runtime-dev:v1".to_string(),
+        EngineServices::new(
+            role_runner,
+            oracle_runner,
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        )
+        .with_runtime_identities(runtime_identities),
+    )
 }
 
 pub fn blocking_gap() -> lionclaw::model::Gap {

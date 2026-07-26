@@ -119,7 +119,7 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
     .await
     .expect("reserve the orphan outcome identity");
     let request = lionclaw::store::NewEvent::new(MissionEvent::RoleTurnRequested {
-        role_instance,
+        role_instance: role_instance.clone(),
         team_revision: 1,
         task_id: Some(task_id),
         assertion_ids: vec![AssertionId::new("TESTS-PASS").unwrap()],
@@ -129,6 +129,9 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
         prompt_hash: prompt_hash.into(),
         base_sha: BASE_SHA.into(),
         environment_digest: state.environment_digest().to_string(),
+        instrument_identity: state
+            .role_instrument_identity_for_revision(&role_instance, 1)
+            .expect("role instrument identity"),
         dependency_refs: vec![],
         assignment_epoch: 1,
         message_boundary: head,

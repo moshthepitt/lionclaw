@@ -8,6 +8,7 @@
 //! reaps its resources and records an interrupted failure; it never guesses
 //! whether an external turn completed and never silently replays one.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +22,8 @@ use crate::model::{
     ready_to_finish, step, validate_mission_proposal, EffectEventClass, EffectId, Handoff,
     InflightEffect, MissionEvent, MissionId, MissionPhase, MissionProposal, MissionState,
     OracleDispatchIntent, OracleRunSuccess, PayloadRef, ProposalError, RoleDispatchIntent,
-    RoleInstance, RoleTurnSuccess, StepDecision, TaskId, MAX_ROLE_REPORT_BYTES,
+    RoleInstance, RoleInstanceId, RoleTurnSuccess, RuntimeInstrumentIdentity, StepDecision, TaskId,
+    MAX_ROLE_REPORT_BYTES,
 };
 use crate::ports::{
     ArtifactCapture, Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl,
@@ -43,6 +45,7 @@ pub struct Engine {
     oracle_runner: Arc<dyn OracleRunner>,
     effect_cleaner: Arc<dyn EffectCleaner>,
     clock: Arc<dyn Clock>,
+    runtime_identities: BTreeMap<String, RuntimeInstrumentIdentity>,
 }
 
 pub struct EngineServices {
@@ -50,6 +53,7 @@ pub struct EngineServices {
     oracle_runner: Arc<dyn OracleRunner>,
     effect_cleaner: Arc<dyn EffectCleaner>,
     clock: Arc<dyn Clock>,
+    runtime_identities: BTreeMap<String, RuntimeInstrumentIdentity>,
 }
 
 enum EffectCleanupDisposition {
@@ -133,8 +137,33 @@ impl EngineServices {
             oracle_runner,
             effect_cleaner,
             clock,
+            runtime_identities: default_runtime_identities(),
         }
     }
+
+    pub fn with_runtime_identities(
+        mut self,
+        identities: BTreeMap<String, RuntimeInstrumentIdentity>,
+    ) -> Self {
+        self.runtime_identities = identities;
+        self
+    }
+}
+
+fn default_runtime_identities() -> BTreeMap<String, RuntimeInstrumentIdentity> {
+    ["codex", "opencode"]
+        .into_iter()
+        .map(|runtime| {
+            (
+                runtime.to_string(),
+                RuntimeInstrumentIdentity {
+                    runtime: runtime.to_string(),
+                    model: None,
+                    mode: None,
+                },
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -449,24 +478,27 @@ impl Engine {
         role.skills
             .iter()
             .map(|name| {
-                if let Some(package) = self.mission_type.skills.get(name) {
-                    return Ok(package.clone());
+                if let Some(recorded) = state.skills.get(name) {
+                    let root = self.store.mission_skills_dir(&state.mission_id).join(name);
+                    let (package, digest) = crate::mission_type::load_skill_package(&root)
+                        .map_err(|error| {
+                            format!("mission skill '{name}' is unavailable: {error}")
+                        })?;
+                    if package.name != recorded.name
+                        || package.description != recorded.description
+                        || digest != recorded.digest
+                    {
+                        return Err(format!(
+                            "mission skill '{name}' differs from its SkillAdded fact"
+                        ));
+                    }
+                    return Ok(package);
                 }
-                let recorded = state.skills.get(name).ok_or_else(|| {
-                    format!("role '{}' references missing skill '{name}'", role.id)
-                })?;
-                let root = self.store.mission_skills_dir(&state.mission_id).join(name);
-                let (package, digest) = crate::mission_type::load_skill_package(&root)
-                    .map_err(|error| format!("mission skill '{name}' is unavailable: {error}"))?;
-                if package.name != recorded.name
-                    || package.description != recorded.description
-                    || digest != recorded.digest
-                {
-                    return Err(format!(
-                        "mission skill '{name}' differs from its SkillAdded fact"
-                    ));
-                }
-                Ok(package)
+                self.mission_type
+                    .skills
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("role '{}' references missing skill '{name}'", role.id))
             })
             .collect()
     }
@@ -485,6 +517,7 @@ impl Engine {
             oracle_runner: services.oracle_runner,
             effect_cleaner: services.effect_cleaner,
             clock: services.clock,
+            runtime_identities: services.runtime_identities,
         }
     }
 
@@ -502,6 +535,75 @@ impl Engine {
             name: self.mission_type.name.clone(),
             digest: self.mission_type.digest().to_string(),
         }
+    }
+
+    fn resolve_team_runtime_identities(
+        &self,
+        team: &crate::model::TeamRevision,
+    ) -> Result<BTreeMap<RoleInstanceId, RuntimeInstrumentIdentity>> {
+        team.roles
+            .iter()
+            .map(|(role_id, role)| {
+                let identity = self
+                    .runtime_identities
+                    .get(&role.runtime)
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "role '{}' resolves to unavailable runtime identity '{}'",
+                            role.id, role.runtime
+                        )
+                    })?;
+                ensure!(
+                    identity.runtime == role.runtime,
+                    "runtime identity '{}' does not match role '{}' runtime '{}'",
+                    identity.runtime,
+                    role.id,
+                    role.runtime
+                );
+                Ok((role_id.clone(), identity))
+            })
+            .collect()
+    }
+
+    fn runtime_identity_mismatch(
+        &self,
+        role: &RoleInstance,
+        recorded: &RuntimeInstrumentIdentity,
+    ) -> Option<String> {
+        match self.runtime_identities.get(&role.runtime) {
+            Some(current) if current == recorded => None,
+            Some(current) => Some(format!(
+                "runtime profile '{}' changed since team revision was recorded: recorded {:?}, current {:?}",
+                role.runtime, recorded, current
+            )),
+            None => Some(format!(
+                "runtime profile '{}' is unavailable for role '{}'",
+                role.runtime, role.id
+            )),
+        }
+    }
+
+    fn ensure_current_team_runtime_identities(&self, state: &MissionState) -> Result<()> {
+        let Some(team) = state.team.as_ref() else {
+            return Ok(());
+        };
+        let recorded = state
+            .runtime_identity_history
+            .get(&team.revision)
+            .with_context(|| {
+                format!(
+                    "team revision {} has no recorded runtime identities",
+                    team.revision
+                )
+            })?;
+        let current = self.resolve_team_runtime_identities(team)?;
+        ensure!(
+            &current == recorded,
+            "runtime profile identity changed since team revision {} was recorded; record a new team revision before minting more proof or finishing",
+            team.revision
+        );
+        Ok(())
     }
 
     /// Create a mission. `base_sha` is the target repo's HEAD, observed by
@@ -529,6 +631,8 @@ impl Engine {
     ) -> Result<MissionId> {
         self.mission_type.validate_at(now_ms)?;
         let config = self.mission_type.mission_config();
+        let runtime_identities =
+            self.resolve_team_runtime_identities(&self.mission_type.default_team)?;
         let created = NewEvent::new(MissionEvent::MissionCreated {
             objective: objective.to_string(),
             mission_type: self.mission_type_ref(),
@@ -547,6 +651,7 @@ impl Engine {
                     created,
                     NewEvent::new(MissionEvent::TeamConfigured {
                         team: self.mission_type.default_team.clone(),
+                        runtime_identities,
                     }),
                 ],
                 now_ms,
@@ -615,11 +720,15 @@ impl Engine {
                 }
             }
         }
+        let runtime_identities = self.resolve_team_runtime_identities(&team)?;
         self.store
             .append(
                 mission_id,
                 state.head,
-                &[NewEvent::new(MissionEvent::TeamConfigured { team })],
+                &[NewEvent::new(MissionEvent::TeamConfigured {
+                    team,
+                    runtime_identities,
+                })],
                 self.clock.now_ms(),
             )
             .await?;
@@ -661,15 +770,35 @@ impl Engine {
         action: crate::model::DecisionAction,
         justification: &str,
     ) -> Result<()> {
-        record_decision(
-            &self.store,
-            self.clock.now_ms(),
-            mission_id,
-            attention_id,
-            action,
-            justification,
-        )
-        .await
+        let state = self.load_state(mission_id).await?;
+        crate::model::validate_decision(&state, attention_id, &action, justification)?;
+        let requirement_changes = decision_requirement_changes(&state, attention_id, &action);
+        let mut events = vec![NewEvent::new(MissionEvent::DecisionRecorded {
+            attention_id: attention_id.to_string(),
+            action: action.clone(),
+            justification: justification.to_string(),
+            requirement_changes,
+        })];
+        if action == crate::model::DecisionAction::Approve {
+            if let Some(team) = approved_team_proposal(&state, attention_id) {
+                let runtime_identities = self.resolve_team_runtime_identities(&team)?;
+                events.push(NewEvent::new(MissionEvent::TeamConfigured {
+                    team,
+                    runtime_identities,
+                }));
+            }
+        }
+        self.store
+            .append(mission_id, state.head, &events, self.clock.now_ms())
+            .await?;
+        reconcile_disposable_conversation_resources(&self.store, mission_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "decision was recorded durably for mission '{mission_id}', but disposable resource cleanup failed; run 'lionclaw mission advance {mission_id}' to retry"
+                )
+            })?;
+        Ok(())
     }
 
     /// Abort any nonterminal mission. The closure fact is appended before an
@@ -680,6 +809,8 @@ impl Engine {
 
     /// Finish a mission that currently satisfies its declared proof bar.
     pub async fn finish(&self, mission_id: &MissionId, reason: &str) -> Result<()> {
+        let state = self.load_state(mission_id).await?;
+        self.ensure_current_team_runtime_identities(&state)?;
         record_finish(&self.store, self.clock.now_ms(), mission_id, reason).await
     }
 
@@ -777,6 +908,7 @@ impl Engine {
             match step(&state) {
                 StepDecision::Idle => {
                     if let Some(finish) = ready_to_finish(&state) {
+                        self.ensure_current_team_runtime_identities(&state)?;
                         self.append_fact(
                             &state.mission_id,
                             state.head,
@@ -1112,6 +1244,7 @@ impl Engine {
         let Some((automatic, reason)) = checkpoint else {
             let current = self.load_state(&state.mission_id).await?;
             if let Some(finish) = ready_to_finish(&current) {
+                self.ensure_current_team_runtime_identities(&current)?;
                 self.append_fact(
                     &current.mission_id,
                     current.head,
@@ -1366,6 +1499,7 @@ impl Engine {
             output,
             base_sha,
             environment_digest,
+            instrument_identity,
             dependency_refs,
             assignment_epoch,
             workspace_preparation,
@@ -1403,6 +1537,12 @@ impl Engine {
             return Ok(completed(Err(TypedFailure::permanent(
                 "role.output_contract",
                 "the pinned mission role no longer matches the effect output contract",
+            ))));
+        }
+        if let Some(detail) = self.runtime_identity_mismatch(role, &instrument_identity.runtime) {
+            return Ok(completed(Err(TypedFailure::permanent(
+                "runtime.instrument_changed",
+                detail,
             ))));
         }
         let prompt_text = match self
@@ -2077,6 +2217,18 @@ impl Engine {
         let dependency_refs = assignment.dependency_refs;
         let assignment_epoch = assignment.generation;
         let workspace_preparation = assignment.workspace_preparation;
+        let instrument_identity = state
+            .role_instrument_identity_for_revision(&intent.role_instance, intent.team_revision)
+            .with_context(|| {
+                format!(
+                    "role '{}' has no complete instrument identity",
+                    intent.role_instance
+                )
+            })?;
+        if let Some(detail) = self.runtime_identity_mismatch(role, &instrument_identity.runtime) {
+            bail!("{detail}");
+        }
+        let prompt_template = crate::model::role_prompt_template(intent.output);
         let effect_id = EffectId::for_role_turn(
             &state.mission_id,
             &intent.role_instance,
@@ -2104,10 +2256,11 @@ impl Engine {
             assertion_ids: intent.targets.clone(),
             attempt_no: intent.attempt_no,
             effect_id: effect_id.clone(),
-            prompt_template: crate::model::role_prompt_template(intent.output),
+            prompt_template,
             prompt_hash: prompt_hash.clone(),
             base_sha,
             environment_digest: state.environment_digest().to_string(),
+            instrument_identity,
             dependency_refs,
             assignment_epoch,
             message_boundary,
@@ -2432,6 +2585,36 @@ fn settlement_failure(
     Some(cancellation.into_failure(evidence))
 }
 
+fn decision_requirement_changes(
+    state: &MissionState,
+    attention_id: &str,
+    action: &crate::model::DecisionAction,
+) -> Vec<crate::model::RequirementId> {
+    if action != &crate::model::DecisionAction::Approve {
+        return Vec::new();
+    }
+    state
+        .open_attention
+        .get(attention_id)
+        .filter(|item| item.kind == crate::model::AttentionKind::PlanProposal)
+        .and(state.proposal.as_ref())
+        .and_then(|proposal| proposal.plan.as_ref())
+        .map(|proposal| proposal.requirement_changes.clone())
+        .unwrap_or_default()
+}
+
+fn approved_team_proposal(
+    state: &MissionState,
+    attention_id: &str,
+) -> Option<crate::model::TeamRevision> {
+    state
+        .open_attention
+        .get(attention_id)
+        .filter(|item| item.kind == crate::model::AttentionKind::PlanProposal)
+        .and(state.proposal.as_ref())
+        .and_then(|proposal| proposal.team.clone())
+}
+
 /// Record a decision without a full engine (the CLI's `decide` needs
 /// only the store). Folds current state, validates fail-closed, appends.
 pub async fn record_decision(
@@ -2447,36 +2630,19 @@ pub async fn record_decision(
     // already specific: unknown item vs illegal action for the item's kind), so
     // a JSON caller sees the real reason, not a flattened string.
     crate::model::validate_decision(&state, attention_id, &action, justification)?;
-    let requirement_changes = if action == crate::model::DecisionAction::Approve {
-        state
-            .open_attention
-            .get(attention_id)
-            .filter(|item| item.kind == crate::model::AttentionKind::PlanProposal)
-            .and(state.proposal.as_ref())
-            .and_then(|proposal| proposal.plan.as_ref())
-            .map(|proposal| proposal.requirement_changes.clone())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    if action == crate::model::DecisionAction::Approve
+        && approved_team_proposal(&state, attention_id).is_some()
+    {
+        bail!("team proposal approval requires an engine with resolved runtime identities");
+    }
+    let requirement_changes = decision_requirement_changes(&state, attention_id, &action);
     let decision = NewEvent::new(MissionEvent::DecisionRecorded {
         attention_id: attention_id.to_string(),
         action: action.clone(),
         justification: justification.to_string(),
         requirement_changes,
     });
-    let mut events = vec![decision];
-    if action == crate::model::DecisionAction::Approve {
-        if let Some(team) = state
-            .open_attention
-            .get(attention_id)
-            .filter(|item| item.kind == crate::model::AttentionKind::PlanProposal)
-            .and(state.proposal.as_ref())
-            .and_then(|proposal| proposal.team.clone())
-        {
-            events.push(NewEvent::new(MissionEvent::TeamConfigured { team }));
-        }
-    }
+    let events = vec![decision];
     store
         .append(mission_id, state.head, &events, now_ms)
         .await?;

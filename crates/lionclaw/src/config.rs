@@ -259,6 +259,24 @@ impl RuntimeProfiles {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.profiles.keys().map(String::as_str)
     }
+
+    pub(crate) fn instrument_identities(
+        &self,
+    ) -> BTreeMap<String, crate::model::RuntimeInstrumentIdentity> {
+        self.profiles
+            .iter()
+            .map(|(name, profile)| {
+                (
+                    name.clone(),
+                    crate::model::RuntimeInstrumentIdentity {
+                        runtime: profile.name.clone(),
+                        model: profile.model.clone(),
+                        mode: profile.mode.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]

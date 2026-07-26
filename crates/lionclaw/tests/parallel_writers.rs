@@ -14,8 +14,8 @@ use lionclaw::model::{
     Assertion, AssertionId, AuthorityCeilings, AuthorityGrants, DecisionAction, EffectId,
     EventEnvelope, ExecutionPolicy, FinishClass, Handoff, MissionConfig, MissionEvent,
     MissionPhase, MissionProposal, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal,
-    RoleInstance, RoleInstanceId, RolePromptTemplate, StopBar, Task, TaskCandidateRef,
-    TeamRevision, VersionStamps, WorkspacePreparation, SCHEMA_VERSION,
+    RoleInstance, RoleInstanceId, RolePromptTemplate, RuntimeInstrumentIdentity, StopBar, Task,
+    TaskCandidateRef, TeamRevision, VersionStamps, WorkspacePreparation, SCHEMA_VERSION,
 };
 use lionclaw::ports::{
     OracleOutcome, OracleRunRequest, OracleRunner, RoleRunner, RoleTurnOutcome, RoleTurnRequest,
@@ -798,9 +798,7 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
     prefix.push(envelope(
         &mission_id,
         2,
-        MissionEvent::TeamConfigured {
-            team: common::team(0, None, false),
-        },
+        team_event(common::team(0, None, false)),
     ));
     prefix.push(envelope(
         &mission_id,
@@ -828,13 +826,10 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
             requirement_changes: vec![],
         },
     ));
-    prefix.push(envelope(
-        &mission_id,
-        5,
-        MissionEvent::TeamConfigured { team },
-    ));
-    let left_request = role_request(&mission_id, 6, LEFT, "left-writer", 1, &base, vec![]);
-    let right_request = role_request(&mission_id, 7, RIGHT, "right-writer", 1, &base, vec![]);
+    prefix.push(envelope(&mission_id, 5, team_event(team)));
+    let prefix_state = lionclaw::model::fold(prefix.clone()).expect("prefix fold");
+    let left_request = role_request(&prefix_state, 6, LEFT, "left-writer", 1, &base, vec![]);
+    let right_request = role_request(&prefix_state, 7, RIGHT, "right-writer", 1, &base, vec![]);
     let left_done = role_success(left_request.effect_id(), "left-head");
     let right_done = role_success(right_request.effect_id(), "right-head");
 
@@ -845,7 +840,7 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
     left_first.push(envelope(&mission_id, 9, right_done.clone()));
     let mut right_first = prefix.clone();
     right_first.push(role_request(
-        &mission_id,
+        &prefix_state,
         6,
         RIGHT,
         "right-writer",
@@ -854,7 +849,7 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
         vec![],
     ));
     right_first.push(role_request(
-        &mission_id,
+        &prefix_state,
         7,
         LEFT,
         "left-writer",
@@ -878,7 +873,7 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
     );
 
     let stale = role_request(
-        &mission_id,
+        &prefix_state,
         10,
         MERGE,
         "integrator",
@@ -900,7 +895,7 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
     assert!(stale_state.inflight.is_empty());
 
     let fan_in = role_request(
-        &mission_id,
+        &prefix_state,
         11,
         MERGE,
         "integrator",
@@ -1421,8 +1416,29 @@ fn envelope(
     }
 }
 
+fn team_event(team: TeamRevision) -> MissionEvent {
+    let runtime_identities = team
+        .roles
+        .iter()
+        .map(|(id, role)| {
+            (
+                id.clone(),
+                RuntimeInstrumentIdentity {
+                    runtime: role.runtime.clone(),
+                    model: None,
+                    mode: None,
+                },
+            )
+        })
+        .collect();
+    MissionEvent::TeamConfigured {
+        team,
+        runtime_identities,
+    }
+}
+
 fn role_request(
-    mission_id: &lionclaw::model::MissionId,
+    state: &lionclaw::model::MissionState,
     sequence_no: u64,
     task: &str,
     role: &str,
@@ -1431,23 +1447,24 @@ fn role_request(
     dependency_refs: Vec<TaskCandidateRef>,
 ) -> EventEnvelope {
     let role_instance = RoleInstanceId::new(role).unwrap();
+    let team_revision = state.team.as_ref().expect("team").revision;
     let task_id = Some(task.parse_task());
     let prompt_hash = format!("{task}-{attempt_no}");
     let effect_id = EffectId::for_role_turn(
-        mission_id,
+        &state.mission_id,
         &role_instance,
-        1,
+        team_revision,
         task_id.as_ref(),
         attempt_no,
         1,
         &prompt_hash,
     );
     envelope(
-        mission_id,
+        &state.mission_id,
         sequence_no,
         MissionEvent::RoleTurnRequested {
-            role_instance,
-            team_revision: 1,
+            role_instance: role_instance.clone(),
+            team_revision,
             task_id,
             assertion_ids: vec![],
             attempt_no,
@@ -1456,6 +1473,9 @@ fn role_request(
             prompt_hash,
             base_sha: base_sha.to_string(),
             environment_digest: "image".to_string(),
+            instrument_identity: state
+                .role_instrument_identity_for_revision(&role_instance, team_revision)
+                .expect("role instrument identity"),
             dependency_refs,
             assignment_epoch: 1,
             message_boundary: sequence_no - 1,

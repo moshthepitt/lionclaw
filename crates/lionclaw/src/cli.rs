@@ -796,7 +796,9 @@ async fn dispatch_mission(
         MissionCommand::Skill(cmd) => cmd_mission_skill(cmd, transports)
             .await
             .map(|()| ExitCode::SUCCESS),
-        MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Decide(args) => cmd_decide(args, transports)
+            .await
+            .map(|()| ExitCode::SUCCESS),
         MissionCommand::Finish(args) => cmd_finish(args, transports)
             .await
             .map(|()| ExitCode::SUCCESS),
@@ -899,6 +901,7 @@ async fn assemble_engine(
 ) -> Result<Engine> {
     workspace::ensure_excluded(repo).await?;
     default_profile.confinement.oci_mut().image = Some(image_id.clone());
+    let runtime_identities = profiles.instrument_identities();
     let role_runner = Arc::new(match &transports.runtime {
         Some((drivers, auth)) => {
             OciRoleRunner::with_registries(profiles, ceiling, drivers.clone(), auth.clone())
@@ -921,7 +924,8 @@ async fn assemble_engine(
             oracle_runner,
             effect_cleaner,
             Arc::new(SystemClock),
-        ),
+        )
+        .with_runtime_identities(runtime_identities),
     ))
 }
 
@@ -2130,20 +2134,14 @@ async fn cmd_environment_use(
     Ok(())
 }
 
-async fn cmd_decide(args: DecideArgs) -> Result<()> {
+async fn cmd_decide(args: DecideArgs, transports: &MissionTransports) -> Result<()> {
     let action = parse_decision_action(&args.action)?;
-    let mission_id = MissionId::parse(&args.mission_id)?;
     let justification = decision_text(&args, &action)?;
-    let (_repo, store) = open_store(args.repo).await?;
-    crate::engine::record_decision(
-        &store,
-        SystemClock.now_ms(),
-        &mission_id,
-        &args.item,
-        action,
-        &justification,
-    )
-    .await?;
+    let (mission_id, engine) =
+        mission_engine(args.repo, Some(args.mission_id.as_str()), transports).await?;
+    engine
+        .decide(&mission_id, &args.item, action, &justification)
+        .await?;
     println!(
         "recorded decision on '{}' for mission {mission_id}",
         args.item

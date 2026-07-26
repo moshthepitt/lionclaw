@@ -67,6 +67,7 @@ pub(crate) fn has_shebang(path: &Path) -> bool {
 pub struct SkillPackage {
     pub name: String,
     pub root: PathBuf,
+    pub digest: String,
     /// The validated, whitespace-trimmed `description` from `SKILL.md`
     /// frontmatter — carried into the role prompt's assigned-skill section.
     pub description: String,
@@ -263,6 +264,20 @@ impl MissionType {
         crate::model::MissionConfig {
             stop: self.stop,
             oracles: self.oracles.keys().cloned().collect(),
+            skills: self
+                .skills
+                .values()
+                .map(|skill| {
+                    (
+                        skill.name.clone(),
+                        crate::model::MissionSkill {
+                            name: skill.name.clone(),
+                            digest: skill.digest.clone(),
+                            description: skill.description.clone(),
+                        },
+                    )
+                })
+                .collect(),
             ceilings: self.ceilings.clone(),
             resource_ceilings: self.resource_ceilings.clone(),
             oracle_resources: self.oracle_resources.clone(),

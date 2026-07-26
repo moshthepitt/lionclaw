@@ -25,6 +25,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
                 name: "engineering".to_string(),
                 root: package_root.clone(),
                 description: "engineering skill".to_string(),
+                digest: "0".repeat(64),
             },
         );
         let implementer = definition

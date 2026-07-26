@@ -21,12 +21,10 @@ use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailureEvidence};
 
-/// Version 31 is the Slice 9.5 plan-contract closeout surface: role successes
-/// carry prepared-input digests, missions can durably assign a digest-pinned
-/// runtime environment after OCI preflight, effect requests bind the resolved
-/// environment digest they ran under, and human gap-review acceptances bind to
-/// the environment digest they were granted under.
-pub const SCHEMA_VERSION: u32 = 31;
+/// Version 32 makes judged role identity a first-class freshness term: team
+/// revisions carry resolved runtime/model identity, skill digests are part of
+/// mission config/state, and role requests bind the judging role instrument.
+pub const SCHEMA_VERSION: u32 = 32;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -61,6 +59,52 @@ pub const fn role_prompt_template(output: OutputSemantics) -> RolePromptTemplate
         }
         OutputSemantics::EmitsVerdict => RolePromptTemplate::Judgment,
         OutputSemantics::EmitsGapVerdict => RolePromptTemplate::GapReview,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeInstrumentIdentity {
+    pub runtime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillInstrumentIdentity {
+    pub name: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleInstrumentIdentity {
+    pub role_instance: RoleInstanceId,
+    /// Hash of the role fields that determine how this role judges: output
+    /// contract, instructions, environment, authority, resources, and deadline.
+    pub role_digest: String,
+    pub runtime: RuntimeInstrumentIdentity,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillInstrumentIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleProofFreshness {
+    pub judged_sha: String,
+    pub environment_digest: String,
+    pub instrument_identity: RoleInstrumentIdentity,
+}
+
+impl RoleProofFreshness {
+    pub fn is_fresh_at(&self, state: &super::state::MissionState) -> bool {
+        self.judged_sha == state.deliverable_head()
+            && self.environment_digest == state.environment_digest()
+            && state.role_instrument_identity(&self.instrument_identity.role_instance)
+                == Some(self.instrument_identity.clone())
     }
 }
 
@@ -190,6 +234,7 @@ pub struct MissionTypeRef {
 pub struct MissionConfig {
     pub stop: StopBar,
     pub oracles: BTreeSet<OracleName>,
+    pub skills: BTreeMap<String, MissionSkill>,
     #[serde(default)]
     pub ceilings: super::AuthorityCeilings,
     #[serde(default, skip_serializing_if = "super::ConfinementResources::is_empty")]
@@ -211,6 +256,7 @@ impl Default for MissionConfig {
         Self {
             stop: StopBar::Verified,
             oracles: BTreeSet::new(),
+            skills: BTreeMap::new(),
             ceilings: super::AuthorityCeilings::default(),
             resource_ceilings: super::ConfinementResources::default(),
             oracle_resources: BTreeMap::new(),
@@ -630,6 +676,7 @@ pub enum MissionEvent {
     },
     TeamConfigured {
         team: super::TeamRevision,
+        runtime_identities: BTreeMap<RoleInstanceId, RuntimeInstrumentIdentity>,
     },
     SkillAdded {
         skill: MissionSkill,
@@ -662,6 +709,8 @@ pub enum MissionEvent {
         base_sha: String,
         /// Resolved immutable environment digest at dispatch time.
         environment_digest: String,
+        /// Resolved judging role instrument identity at dispatch.
+        instrument_identity: RoleInstrumentIdentity,
         /// Candidate commits this task depends on, in plan-authored dependency
         /// order. Empty for root tasks and taskless turns.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

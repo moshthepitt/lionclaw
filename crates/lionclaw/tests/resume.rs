@@ -8,26 +8,23 @@ use common::{
 };
 use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{
-    EffectId, MissionEvent, MissionPhase, OracleName, RoleInstanceId, RolePromptTemplate, TaskId,
-    WorkspacePreparation,
+    EffectId, MissionEvent, MissionPhase, MissionState, OracleName, RoleInstanceId,
+    RolePromptTemplate, TaskId, WorkspacePreparation,
 };
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 const PROMPT_HASH: &str = "cf07194ee232eb531e15f690000d19846dea69cf05504782658afcfacb9228a2";
 
-fn role_request(
-    mission_id: &lionclaw::model::MissionId,
-    head: u64,
-    environment_digest: &str,
-) -> (EffectId, MissionEvent) {
+fn role_request(state: &MissionState) -> (EffectId, MissionEvent) {
     let role = RoleInstanceId::new("implementer").unwrap();
     let task = TaskId::new("fix").unwrap();
-    let effect = EffectId::for_role_turn(mission_id, &role, 1, Some(&task), 1, 1, PROMPT_HASH);
+    let effect =
+        EffectId::for_role_turn(&state.mission_id, &role, 1, Some(&task), 1, 1, PROMPT_HASH);
     (
         effect.clone(),
         MissionEvent::RoleTurnRequested {
-            role_instance: role,
+            role_instance: role.clone(),
             team_revision: 1,
             task_id: Some(task),
             assertion_ids: vec![lionclaw::model::AssertionId::new("TESTS-PASS").unwrap()],
@@ -36,10 +33,13 @@ fn role_request(
             prompt_template: RolePromptTemplate::Execution,
             prompt_hash: PROMPT_HASH.to_string(),
             base_sha: BASE_SHA.to_string(),
-            environment_digest: environment_digest.to_string(),
+            environment_digest: state.environment_digest().to_string(),
+            instrument_identity: state
+                .role_instrument_identity_for_revision(&role, 1)
+                .expect("role instrument identity"),
             dependency_refs: vec![],
             assignment_epoch: 1,
-            message_boundary: head,
+            message_boundary: state.head,
             presented_messages: vec![],
             workspace_preparation: WorkspacePreparation::ResetForAssignment,
             requested_at_ms: 0,
@@ -104,7 +104,7 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
         .unwrap();
     approve_plan(&harness.engine, &id).await;
     let state = harness.engine.load_state(&id).await.unwrap();
-    let (effect, request) = role_request(&id, state.head, state.environment_digest());
+    let (effect, request) = role_request(&state);
     fault_append_events(
         dir.path(),
         &id,
@@ -231,7 +231,7 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
         .unwrap();
     approve_plan(&harness.engine, &id).await;
     let state = harness.engine.load_state(&id).await.unwrap();
-    let (effect, request) = role_request(&id, state.head, state.environment_digest());
+    let (effect, request) = role_request(&state);
     fault_append_events(
         dir.path(),
         &id,

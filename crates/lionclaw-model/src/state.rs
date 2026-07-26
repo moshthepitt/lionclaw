@@ -3,13 +3,15 @@
 //! rebuilt state equality. Wall-clock time never enters this type.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::event::{
     EffectResource, EnvironmentAssignment, MissionConfig, MissionTypeRef, PayloadRef,
-    PreparedInputRef, RuntimeConfigurationEvidence, TaskCandidateRef,
+    PreparedInputRef, RoleInstrumentIdentity, RoleProofFreshness, RuntimeConfigurationEvidence,
+    RuntimeInstrumentIdentity, SkillInstrumentIdentity, TaskCandidateRef,
 };
-use super::ids::{AssertionId, MissionId, OracleName, RoleInstanceId, TaskId};
-use super::plan::{Assertion, Plan};
+use super::ids::{lowercase_hex, AssertionId, MissionId, OracleName, RoleInstanceId, TaskId};
+use super::plan::{Assertion, OutputSemantics, Plan};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{RuntimeUsage, TypedFailure, TypedFailureEvidence};
@@ -263,6 +265,7 @@ pub struct RoleTurnProvenance {
     pub prompt_hash: String,
     pub base_sha: String,
     pub environment_digest: String,
+    pub instrument_identity: RoleInstrumentIdentity,
     pub dependency_refs: Vec<TaskCandidateRef>,
     pub workspace_preparation: super::WorkspacePreparation,
     pub message_boundary: u64,
@@ -270,9 +273,16 @@ pub struct RoleTurnProvenance {
 }
 
 impl RoleTurnProvenance {
+    pub fn freshness(&self) -> RoleProofFreshness {
+        RoleProofFreshness {
+            judged_sha: self.base_sha.clone(),
+            environment_digest: self.environment_digest.clone(),
+            instrument_identity: self.instrument_identity.clone(),
+        }
+    }
+
     pub fn is_fresh_at(&self, state: &MissionState) -> bool {
-        self.base_sha == state.deliverable_head()
-            && self.environment_digest == state.environment_digest()
+        self.freshness().is_fresh_at(state)
     }
 }
 
@@ -711,7 +721,7 @@ impl GapReviewState {
     pub fn acknowledges_sha(&self, state: &MissionState, judged_sha: &str) -> bool {
         self.accepted.as_ref().is_some_and(|a| {
             a.kind == ReviewAcceptanceKind::AcknowledgedGaps
-                && a.judged_sha == judged_sha
+                && a.freshness.judged_sha == judged_sha
                 && a.is_fresh_at(state)
         })
     }
@@ -772,18 +782,16 @@ pub enum ReferenceRecipientPolicy {
 /// the review outright. One value, so waived-and-acknowledged is unrepresentable;
 /// the receipt distinguishes the kinds and cites why it was accepted.
 ///
-/// Both kinds are keyed to the head and environment they were granted at: a
-/// later artifact commit or environment change stales the acceptance and
-/// re-opens the review, so neither an acknowledgment nor a waiver is ever
-/// inherited by work the human never saw or ran under a different instrument.
+/// Both kinds are keyed to the proof freshness they were granted at: a later
+/// artifact commit, environment change, or role instrument change stales the
+/// acceptance and re-opens the review, so neither an acknowledgment nor a
+/// waiver is ever inherited by work the human never saw or by a different
+/// judging instrument.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewAcceptance {
     pub kind: ReviewAcceptanceKind,
-    /// `current_sha` at the moment of acceptance (for an acknowledgment this
-    /// is also the verdict's `judged_sha` — the gap item only raises fresh).
-    pub judged_sha: String,
-    /// Resolved immutable environment digest at the moment of acceptance.
-    pub environment_digest: String,
+    /// The exact proof conditions the human accepted or waived.
+    pub freshness: RoleProofFreshness,
     pub justification: String,
 }
 
@@ -797,11 +805,10 @@ pub enum ReviewAcceptanceKind {
 }
 
 impl ReviewAcceptance {
-    /// Same freshness law as verdicts: an acceptance holds only at the head
-    /// and environment it was granted at.
+    /// Same freshness law as judged receipts: an acceptance holds only under
+    /// the exact role proof conditions it was granted at.
     pub fn is_fresh_at(&self, state: &MissionState) -> bool {
-        self.judged_sha == state.deliverable_head()
-            && self.environment_digest == state.environment_digest()
+        self.freshness.is_fresh_at(state)
     }
 }
 
@@ -897,6 +904,7 @@ pub enum InflightEffect {
         prompt_hash: String,
         base_sha: String,
         environment_digest: String,
+        instrument_identity: Box<RoleInstrumentIdentity>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         dependency_refs: Vec<TaskCandidateRef>,
         assignment_epoch: u32,
@@ -961,6 +969,7 @@ impl InflightEffect {
             prompt_hash,
             base_sha,
             environment_digest,
+            instrument_identity,
             dependency_refs,
             assignment_epoch,
             message_boundary,
@@ -982,6 +991,7 @@ impl InflightEffect {
             prompt_hash: prompt_hash.clone(),
             base_sha: base_sha.clone(),
             environment_digest: environment_digest.clone(),
+            instrument_identity: instrument_identity.as_ref().clone(),
             dependency_refs: dependency_refs.clone(),
             workspace_preparation: workspace_preparation.clone(),
             message_boundary: *message_boundary,
@@ -1042,6 +1052,7 @@ impl InflightEffect {
                 prompt_hash,
                 base_sha,
                 environment_digest,
+                instrument_identity,
                 dependency_refs,
                 assignment_epoch,
                 message_boundary,
@@ -1066,6 +1077,7 @@ impl InflightEffect {
                         prompt_hash: prompt_hash.clone(),
                         base_sha: base_sha.clone(),
                         environment_digest: environment_digest.clone(),
+                        instrument_identity: Box::new(instrument_identity.clone()),
                         dependency_refs: dependency_refs.clone(),
                         assignment_epoch: *assignment_epoch,
                         message_boundary: *message_boundary,
@@ -1139,6 +1151,8 @@ pub struct MissionState {
     pub delegation: super::DelegationSet,
     pub team: Option<super::TeamRevision>,
     pub team_history: BTreeMap<u32, super::TeamRevision>,
+    pub runtime_identity_history:
+        BTreeMap<u32, BTreeMap<RoleInstanceId, RuntimeInstrumentIdentity>>,
     #[serde(default)]
     pub skills: BTreeMap<String, super::MissionSkill>,
     pub phase: MissionPhase,
@@ -1216,6 +1230,77 @@ pub struct MissionState {
     pub gap_review: GapReviewState,
     /// Sequence number of the last folded event (optimistic-concurrency head).
     pub head: u64,
+}
+
+fn role_instrument_digest(role: &super::RoleInstance) -> String {
+    let mut digest = Sha256::new();
+    feed_str(&mut digest, "schema", "lionclaw.role-instrument.v1");
+    feed_str(&mut digest, "output", output_slug(role.output));
+    feed_str(&mut digest, "instructions", &role.instructions);
+    feed_map(&mut digest, "environment", role.environment.iter());
+    feed_bool(&mut digest, "grants.secrets", role.grants.secrets);
+    feed_bool(&mut digest, "grants.network", role.grants.network);
+    feed_bool(&mut digest, "grants.install", role.grants.install);
+    feed_bool(&mut digest, "grants.writes", role.grants.writes);
+    feed_set(&mut digest, "grants.devices", role.grants.devices.iter());
+    feed_set(
+        &mut digest,
+        "grants.inputs",
+        role.grants.inputs.iter().map(ToString::to_string),
+    );
+    feed_set(&mut digest, "resources.tmpfs", role.resources.tmpfs.iter());
+    feed_option_u64(&mut digest, "deadline_secs", role.deadline_secs);
+    lowercase_hex(&digest.finalize())
+}
+
+fn output_slug(output: OutputSemantics) -> &'static str {
+    match output {
+        OutputSemantics::ProducesReport => "produces-report",
+        OutputSemantics::ProducesArtifact => "produces-artifact",
+        OutputSemantics::EmitsVerdict => "emits-verdict",
+        OutputSemantics::EmitsGapVerdict => "emits-gap-verdict",
+        OutputSemantics::ProposesPlan => "proposes-plan",
+    }
+}
+
+fn feed_str(digest: &mut Sha256, label: &str, value: &str) {
+    digest.update((label.len() as u64).to_be_bytes());
+    digest.update(label.as_bytes());
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value.as_bytes());
+}
+
+fn feed_bool(digest: &mut Sha256, label: &str, value: bool) {
+    feed_str(digest, label, if value { "true" } else { "false" });
+}
+
+fn feed_option_u64(digest: &mut Sha256, label: &str, value: Option<u64>) {
+    match value {
+        Some(value) => feed_str(digest, label, &value.to_string()),
+        None => feed_str(digest, label, ""),
+    }
+}
+
+fn feed_map<'a, I>(digest: &mut Sha256, label: &str, entries: I)
+where
+    I: Iterator<Item = (&'a String, &'a String)>,
+{
+    feed_str(digest, label, "map");
+    for (key, value) in entries {
+        feed_str(digest, "key", key);
+        feed_str(digest, "value", value);
+    }
+}
+
+fn feed_set<'a, I, S>(digest: &mut Sha256, label: &str, entries: I)
+where
+    I: Iterator<Item = S>,
+    S: AsRef<str> + 'a,
+{
+    feed_str(digest, label, "set");
+    for entry in entries {
+        feed_str(digest, "item", entry.as_ref());
+    }
 }
 
 impl MissionState {
@@ -1345,12 +1430,9 @@ impl MissionState {
         {
             return None;
         }
-        let role = self
-            .team_history
-            .get(&request.team_revision)?
-            .role(&request.role_instance)?;
+        let current_team = self.team.as_ref()?;
+        let role = current_team.role(&request.role_instance)?;
         if role.output != super::OutputSemantics::EmitsVerdict
-            || request.team_revision != self.team.as_ref()?.revision
             || *plan_revision != self.revision
             || !request.is_fresh_at(self)
             || !self
@@ -1751,6 +1833,51 @@ impl MissionState {
 
     pub fn environment_digest(&self) -> &str {
         &self.image_id
+    }
+
+    pub fn role_instrument_identity(
+        &self,
+        role_instance: &RoleInstanceId,
+    ) -> Option<RoleInstrumentIdentity> {
+        let team_revision = self.team.as_ref()?.revision;
+        self.role_instrument_identity_for_revision(role_instance, team_revision)
+    }
+
+    pub fn role_instrument_identity_for_revision(
+        &self,
+        role_instance: &RoleInstanceId,
+        team_revision: u32,
+    ) -> Option<RoleInstrumentIdentity> {
+        let team = self.team_history.get(&team_revision)?;
+        let role = team.role(role_instance)?;
+        let runtime = self
+            .runtime_identity_history
+            .get(&team_revision)?
+            .get(role_instance)?
+            .clone();
+        if runtime.runtime != role.runtime {
+            return None;
+        }
+        let mut skills = role
+            .skills
+            .iter()
+            .map(|name| {
+                self.skills
+                    .get(name)
+                    .or_else(|| self.config.skills.get(name))
+                    .map(|skill| SkillInstrumentIdentity {
+                        name: skill.name.clone(),
+                        digest: skill.digest.clone(),
+                    })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        skills.sort_by(|left, right| left.name.cmp(&right.name));
+        Some(RoleInstrumentIdentity {
+            role_instance: role_instance.clone(),
+            role_digest: role_instrument_digest(role),
+            runtime,
+            skills,
+        })
     }
 
     pub fn deliverable_task_id(&self) -> Option<&TaskId> {
