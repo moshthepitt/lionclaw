@@ -339,6 +339,22 @@ git diff --name-status -M 28d7612e..HEAD -- \
 Result:
 
 ```text
+(no output)
+```
+
+The requested pathspec does not select the nested benchmark test file. A
+broader explicit inventory:
+
+```bash
+git diff --name-status -M 28d7612e..HEAD -- \
+  'benchmark/frontierswe/tests/**' \
+  'crates/*/tests/**' \
+  'crates/*/src/**/*tests*.rs'
+```
+
+returned:
+
+```text
 A	benchmark/frontierswe/tests/test_report.py
 ```
 
