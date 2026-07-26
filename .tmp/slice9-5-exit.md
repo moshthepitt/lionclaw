@@ -2,7 +2,7 @@
 
 Branch: `lionclaw2-a1-runtime-slice-9-5`
 Base: `d3f6b9cd` (`lionclaw2`, signed Slice 9 head)
-Validated product/code head: `749fd677e8d448acecedd32f44ed00bb35fcd5e8`
+Validated product/code head: `204bcfa472c8921b278142995ef3f14a60f18ff4`
 Exit note: committed as a signed forward-only bookkeeping commit on top.
 
 ## Commits
@@ -27,6 +27,18 @@ Exit note: committed as a signed forward-only bookkeeping commit on top.
   - `REDUCER_VERSION 58`: replay also binds advisory/gap-review freshness to
     the mission environment and dispatch capacity is enforced across batched
     oracle/judge effects.
+- `81a4ea7d` `Bind gap review acceptance to environment`
+  - signed by `Kelvin Jayanoris <kelvin@jayanoris.com>`
+  - `SCHEMA_VERSION 31`: human gap-review acceptances carry the environment
+    digest they acknowledged or waived under.
+  - `REDUCER_VERSION 59`: replay requires both deliverable SHA and
+    environment digest before an acceptance can close a gap review.
+- `f91093b8` `Update production flow version sentinel`
+  - signed by `Kelvin Jayanoris <kelvin@jayanoris.com>`
+  - sentinel-only test update for `SCHEMA_VERSION 31` / `REDUCER_VERSION 59`.
+- `204bcfa4` `Update reference expansion version sentinel`
+  - signed by `Kelvin Jayanoris <kelvin@jayanoris.com>`
+  - sentinel-only test update for `SCHEMA_VERSION 31` / `REDUCER_VERSION 59`.
 
 ## What Landed
 
@@ -47,6 +59,9 @@ Exit note: committed as a signed forward-only bookkeeping commit on top.
   receipts, and terminal gap-review requests. Changing the mission environment
   makes prior proofs/reviews visibly stale and demand-driven proof reruns the
   relevant oracle.
+- Added environment-bound freshness for human gap-review acceptances and
+  waivers, so an acknowledged blocking-gap review under image A cannot close a
+  mission after `environment use` assigns image B.
 - Completed the mission-level install-policy surface audit and kept the
   workspace-local prefix playbook rule visible in the shipped software-dev
   mission type.
@@ -75,10 +90,11 @@ Exit note: committed as a signed forward-only bookkeeping commit on top.
 
 ## Freshness Amendment
 
-- `AuthoritativeVerdict` and `RoleTurnProvenance` now carry
-  `environment_digest`; request provenance freshness compares both current
-  deliverable SHA and current environment digest at
-  `crates/lionclaw-model/src/state.rs:253`.
+- `AuthoritativeVerdict`, `RoleTurnProvenance`, and `ReviewAcceptance` now
+  carry `environment_digest`; request/acceptance freshness compares both
+  current deliverable SHA and current environment digest at
+  `crates/lionclaw-model/src/state.rs:253` and
+  `crates/lionclaw-model/src/state.rs:799`.
 - `RoleTurnRequested` records the resolved environment digest at
   `crates/lionclaw-model/src/event.rs:647`; oracle requests carry the same
   term at `crates/lionclaw-model/src/event.rs:698`.
@@ -92,6 +108,10 @@ Exit note: committed as a signed forward-only bookkeeping commit on top.
 - Advisory and gap-review stale-proof regressions are in
   `crates/lionclaw/tests/advisory_validator.rs:102` and
   `crates/lionclaw/tests/terminal_review.rs:254`.
+- The fix-round gap-review acceptance regression is
+  `crates/lionclaw/tests/terminal_review.rs:601`: a blocking gap review under
+  image A is accepted, `environment use` assigns image B, the acceptance goes
+  stale, finish is no longer legal, and the gap reviewer reruns under image B.
 
 Instrument-identity audit:
 
@@ -216,7 +236,7 @@ $ git grep -h -E '^\s*#\[(tokio::test|test)' d3f6b9cd -- 'crates/*/tests/*.rs' '
 234
 
 $ git grep -h -E '^\s*#\[(tokio::test|test)' HEAD -- 'crates/*/tests/*.rs' 'crates/*/tests/**/*.rs' | wc -l
-244
+245
 ```
 
 All Rust test-function counts from the same command:
@@ -226,24 +246,24 @@ $ git grep -h -E '^\s*#\[(tokio::test|test)' d3f6b9cd -- 'crates/*/tests/*.rs' '
 318
 
 $ git grep -h -E '^\s*#\[(tokio::test|test)' HEAD -- 'crates/*/tests/*.rs' 'crates/*/tests/**/*.rs' 'crates/*/src/**/*.rs' | wc -l
-328
+329
 ```
 
 No test files were deleted. No deletion justifications are required.
 
-Overall source delta at validated product/code head:
+Overall branch delta at final head, including this exit note:
 
 ```text
 $ git diff --shortstat d3f6b9cd..HEAD
-39 files changed, 2112 insertions(+), 165 deletions(-)
+40 files changed, 2680 insertions(+), 193 deletions(-)
 ```
 
 ## Acceptance Mission
 
-Fresh product/code-head build used for live acceptance:
+Fresh product/code-head build used for the successful live acceptance:
 
 ```text
-CARGO_TARGET_DIR=/tmp/lionclaw-slice95-accept-target-20260725 cargo build -p lionclaw
+CARGO_TARGET_DIR=/tmp/lionclaw-slice95-fix-target-20260726 cargo build -p lionclaw
 ```
 
 Image used for `environment use`:
@@ -256,42 +276,122 @@ Image used for `environment use`:
 Mission type verification:
 
 - command:
-  `/tmp/lionclaw-slice95-accept-target-20260725/debug/lionclaw mission type show /home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-a1-runtime-slice-9-5/mission-types/software-dev --json`
+  `/tmp/lionclaw-slice95-fix-target-20260726/debug/lionclaw mission type show /home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-a1-runtime-slice-9-5/mission-types/software-dev --json`
 - result: valid
 - digest:
-  `e72101295f033a69f50dc08d7ef12d9802c6c3af6e5419865f4b5a93038a1349`
+  `e82ba11d695024403462fdf59b195354c6f2a94403d0ecceb08d6db09c79634a`
 
-First mission:
+Successful fix-round mission:
 
-- id: `m5de04bfb790b`
-- fixture base SHA: `f246f3828b81d4588d40d87d53add97abf114bde`
-- outcome: `environment use` succeeded and a subsequent turn ran under the
-  digest-pinned environment. The lead was killed and restarted, and guide/status
-  orientation was exercised. The mission later parked during continuation on a
-  retained-checkout commit-capture failure. A repeated public-control decision
-  hit the same protection, so I stopped that attempt instead of forcing it.
+- id: `m125f9f0f13d7`
+- acceptance root:
+  `/tmp/lionclaw-slice95-fix-accept-20260726b`
+- fixture base SHA:
+  `b520464c1891632417ad99fdfb67549e57895af2`
+- delivered SHA:
+  `838db8dc16ce1ec9555d45b31ba50250745247ef`
+- applied branch:
+  `lionclaw/m125f9f0f13d7`
+- killed lead harness PID: `602514`
+- event log path:
+  `/tmp/lionclaw-slice95-fix-accept-20260726b/evidence/event-log.txt`
+- final status path:
+  `/tmp/lionclaw-slice95-fix-accept-20260726b/evidence/final-status.json`
+- exact restarted guide path:
+  `/tmp/lionclaw-slice95-fix-accept-20260726b/evidence/restarted-guide.txt`
 
-Retry mission:
+Acceptance fixture repairs:
 
-- id: `m0f5adc52f6a5`
-- fixture base SHA: `adff0d4cca0a0e2123cfeb856f914bd07ea680d7`
-- outcome: `environment use` again succeeded and the forced lead-restart path
-  was exercised. The next advance failed because the fake ACP harness polluted
-  stdout with the `git commit` summary, producing
-  `invalid ACP JSON-RPC line: [detached HEAD fdbd7f5] slice95 seed acceptance marker`.
+- The fake ACP writes only JSON-RPC on stdout; fixture diagnostics go to stderr.
+- The first worker turn created only an uncommitted marker and no handoff,
+  causing a legal `awaiting_lead` checkpoint.
+- The restarted lead consumed `mission guide` plus `status --json`, sent the
+  next lead message, and the second worker turn resumed with
+  `workspace_preparation: preserve`, observed the marker, removed it, committed
+  only `src/lib.rs`, and wrote the work handoff.
 
-Acceptance status:
+Exact guide output consumed by the restarted lead:
 
-- No successful acceptance mission reached both `mission_finished` and
-  `result_applied`.
-- The acceptance obligation remains open. This is not waived.
-- No third live mission was run because the handoff allowed at most one retry.
-- The temporary acceptance root
-  `/tmp/lionclaw-slice95-accept-20260725-001` and target directory
-  `/tmp/lionclaw-slice95-accept-target-20260725` were no longer present when
-  this exit note was finalized, so the exact prior `mission guide` output,
-  `mission status --json`, and event logs cannot be reprinted from disk here.
-  The review lead should treat live acceptance as parked/open, not complete.
+```text
+mission m125f9f0f13d7 guide
+objective: Fix the fixture library so answer() returns 42 while preserving the existing test and prove it through the cargo-test oracle.
+state: running (awaiting_lead)
+commit: b520464c1891
+environment: sha256:e2e555ab56f4a7a60f194fd7a08638480b972c88c1ced36dda5aeda03045d29a
+  assignment 1: localhost/lionclaw-runtime-dev@sha256:590c4259f72f669976690983cf1af2c7f2a2b2164eeeaa4a1dac72c76b490762 via podman
+  conversation implementer: lifecycle=awaiting_lead queued=0 delivery_through=6 resume=canonical_reconstruction legal_actions=mission send
+    final response: I wrote a preserved workspace marker and need lead confirmation before completing.
+next: mission send | mission abort
+```
+
+Final `status --json` excerpt:
+
+```json
+{
+  "mission_id": "m125f9f0f13d7",
+  "disposition": "terminal",
+  "phase": "done:verified",
+  "finish": "verified",
+  "cleanup_failure": null,
+  "deliverable_head": "838db8dc16ce1ec9555d45b31ba50250745247ef",
+  "environment": {
+    "image_id": "sha256:e2e555ab56f4a7a60f194fd7a08638480b972c88c1ced36dda5aeda03045d29a",
+    "active_assignment": {
+      "image_ref": "localhost/lionclaw-runtime-dev@sha256:590c4259f72f669976690983cf1af2c7f2a2b2164eeeaa4a1dac72c76b490762",
+      "image_id": "sha256:e2e555ab56f4a7a60f194fd7a08638480b972c88c1ced36dda5aeda03045d29a",
+      "preflight": {
+        "engine": "podman",
+        "image_ref": "localhost/lionclaw-runtime-dev@sha256:590c4259f72f669976690983cf1af2c7f2a2b2164eeeaa4a1dac72c76b490762",
+        "image_id": "sha256:e2e555ab56f4a7a60f194fd7a08638480b972c88c1ced36dda5aeda03045d29a"
+      }
+    }
+  },
+  "gap_review": {
+    "verdict": "clean",
+    "fresh": true,
+    "attempts": 1,
+    "judged_sha": "838db8dc16ce1ec9555d45b31ba50250745247ef",
+    "gaps": {
+      "blocking": 0,
+      "major": 0,
+      "minor": 0
+    }
+  },
+  "contract": [
+    {
+      "id": "ASSERT-FIXED",
+      "authoritative_pass": true,
+      "advisory": "pending"
+    }
+  ]
+}
+```
+
+Event log:
+
+```text
+   1 mission_created
+   2 team_configured
+   3 environment_assigned
+   4 proposal_recorded
+   5 decision_recorded
+   6 team_configured
+   7 role_turn_requested
+   8 role_turn_completed
+   9 message_sent
+  10 role_turn_requested
+  11 role_turn_completed
+  12 oracle_run_requested
+  13 oracle_run_completed
+  14 role_turn_requested
+  15 role_turn_completed
+  16 mission_finished
+  17 result_applied
+```
+
+Acceptance status: complete. The mission used the digest-pinned host-built
+image via `environment use`, continued a preserved worker checkout after lead
+restart, reached `mission_finished`, and recorded `result_applied`.
 
 ## Impact Statements
 
@@ -305,11 +405,11 @@ Security impact:
 
 API/event contract impact:
 
-- `SCHEMA_VERSION` is now `30` because mission environment assignments and
-  role/oracle effect request/receipt shapes carry environment/prepared-input
-  terms.
-- `REDUCER_VERSION` is now `58` because replay freshness and dispatch capacity
-  semantics changed.
+- `SCHEMA_VERSION` is now `31` because mission environment assignments,
+  role/oracle effect request/receipt shapes, and gap-review acceptances carry
+  environment/prepared-input terms.
+- `REDUCER_VERSION` is now `59` because replay freshness, human gap-review
+  acceptance freshness, and dispatch capacity semantics changed.
 - The schema changes are within the Slice 9.5 mandate.
 
 Docs/mission-type impact:
