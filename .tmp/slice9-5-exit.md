@@ -417,3 +417,32 @@ Docs/mission-type impact:
 - The software-dev playbook exposes the workspace-local prefix install rule and
   terminal gap-review quality rule.
 - `mission guide` is an operator projection, not an authority surface.
+
+## Acceptance History (restored by review lead)
+
+The successful mission `m125f9f0f13d7` was the third live acceptance attempt.
+The fix-round edit to this note replaced the earlier record rather than adding
+to it; the full original text remains in history at commit `1ddde2cd`. Restated
+here so this note stands alone.
+
+Two earlier acceptance missions failed, both from defects in the acceptance
+fixture, not in the product:
+
+- `m5de04bfb790b` — `environment use` succeeded and a later turn ran under the
+  digest-pinned image; the lead was killed and restarted and guide/status
+  orientation was exercised. The mission then parked because the fake ACP
+  committed directly inside the retained no-handoff checkout, leaving
+  uncaptured commits. `role_runner` correctly refused to recreate that
+  checkout. A repeated public-control decision hit the same protection and the
+  attempt was stopped rather than forced.
+- `m0f5adc52f6a5` — `environment use` and the forced lead-restart path were
+  exercised again. The next advance failed because the fake ACP wrote its
+  `git commit` summary to stdout, producing
+  `invalid ACP JSON-RPC line: [detached HEAD fdbd7f5] slice95 seed acceptance marker`.
+  ACP stdout carries JSON-RPC only, so the driver's rejection was correct.
+
+Neither failure was an `environment use` or `mission guide` implementation
+failure, and neither guard was weakened to accommodate the fixture: the diff
+`749fd677..HEAD` over `crates/lionclaw/src/runner/`, `crates/lionclaw/src/driver*`
+and `crates/lionclaw-runtime*` is empty. The fixture was repaired instead, as
+recorded under "Acceptance fixture repairs".
