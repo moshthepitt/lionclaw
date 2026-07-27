@@ -925,13 +925,7 @@ async fn command_retry_is_reoffered_only_for_a_changed_outcome() {
 #[tokio::test]
 async fn revising_one_of_multiple_proof_failures_replans_with_every_receipt() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut mission_type = test_mission_type();
-    mission_type.edit_for_testing(|definition| {
-        definition.oracles.insert(
-            OracleName::new("lint").unwrap(),
-            "/nonexistent-mission-type/oracles/lint".into(),
-        );
-    });
+    let (mission_type, plan) = plan_with_lint_oracle();
     let h = common::harness_with_type(
         dir.path(),
         mission_type,
@@ -939,17 +933,6 @@ async fn revising_one_of_multiple_proof_failures_replans_with_every_receipt() {
         MockOracleRunner::exiting(1),
     )
     .await;
-    let mut plan = simple_plan();
-    plan.requirements
-        .push(covered_requirement("LINT-GREEN", "LINT-PASS"));
-    plan.assertions.push(Assertion {
-        id: AssertionId::new("LINT-PASS").unwrap(),
-        prose: "lint exits 0".into(),
-        oracle: Some(OracleName::new("lint").unwrap()),
-    });
-    plan.tasks[0]
-        .targets
-        .push(AssertionId::new("LINT-PASS").unwrap());
     let mission_id = h
         .engine
         .create_mission(
@@ -1025,6 +1008,130 @@ async fn revising_one_of_multiple_proof_failures_replans_with_every_receipt() {
             .expect("render planning evidence");
     assert!(rendered.contains("source: oracle cargo-test"));
     assert!(rendered.contains("source: oracle lint"));
+}
+
+#[tokio::test]
+async fn sequential_mixed_failure_revisions_preserve_every_feedback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mission_type, plan) = plan_with_lint_oracle();
+    let h = common::harness_with_type(
+        dir.path(),
+        mission_type,
+        review_runner(vec![]),
+        MockOracleRunner::new(Box::new(|request| {
+            if request.oracle.to_string() == "lint" {
+                Err(lionclaw::model::TypedFailure::permanent(
+                    "oracle.fixture",
+                    "lint runtime failed",
+                ))
+            } else {
+                Ok(lionclaw::ports::OracleOutcome {
+                    exit_code: 1,
+                    exit_signal: None,
+                    stdout: b"cargo test failed".to_vec(),
+                    stderr: Vec::new(),
+                    prepared_inputs: Vec::new(),
+                    duration_ms: 1,
+                })
+            }
+        })),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "preserve every failure during replanning",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, plan))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+
+    let failed = h.engine.advance(&mission_id).await.expect("mixed failures");
+    assert!(failed
+        .state
+        .open_attention
+        .contains_key("proof_failed:oracle:cargo-test"));
+    assert!(failed
+        .state
+        .open_attention
+        .contains_key("oracle_failed:lint"));
+
+    h.engine
+        .decide(
+            &mission_id,
+            "proof_failed:oracle:cargo-test",
+            DecisionAction::Revise,
+            "replan for the failed command proof",
+        )
+        .await
+        .expect("revise proof failure");
+    h.engine
+        .decide(
+            &mission_id,
+            "oracle_failed:lint",
+            DecisionAction::Revise,
+            "replan for the oracle runtime failure",
+        )
+        .await
+        .expect("revise oracle failure");
+
+    let replanning = h.engine.load_state(&mission_id).await.expect("state");
+    assert_eq!(replanning.phase, MissionPhase::Planning);
+    assert!(replanning.open_attention.is_empty());
+    assert!(replanning.oracle_failures.is_empty());
+    assert_eq!(replanning.authoritative_receipts.len(), 1);
+    let Some(lionclaw::model::PlanningRefinement::FailureEvidence(feedback)) =
+        &replanning.planning_input.refinement
+    else {
+        panic!("mixed failure evidence must reach replanning");
+    };
+    assert_eq!(feedback.len(), 2);
+    assert_eq!(
+        feedback
+            .iter()
+            .map(|item| item.summary.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Required command proof 'cargo-test' failed.",
+            "Oracle 'lint' is parked."
+        ]
+    );
+    assert!(matches!(
+        feedback[0].evidence,
+        lionclaw::model::DecisionEvidence::AuthoritativeReceipts { .. }
+    ));
+    assert!(matches!(
+        feedback[1].evidence,
+        lionclaw::model::DecisionEvidence::None
+    ));
+}
+
+fn plan_with_lint_oracle() -> (lionclaw::mission_type::MissionType, lionclaw::model::Plan) {
+    let mut mission_type = test_mission_type();
+    mission_type.edit_for_testing(|definition| {
+        definition.oracles.insert(
+            OracleName::new("lint").unwrap(),
+            "/nonexistent-mission-type/oracles/lint".into(),
+        );
+    });
+    let mut plan = simple_plan();
+    plan.requirements
+        .push(covered_requirement("LINT-GREEN", "LINT-PASS"));
+    plan.assertions.push(Assertion {
+        id: AssertionId::new("LINT-PASS").unwrap(),
+        prose: "lint exits 0".into(),
+        oracle: Some(OracleName::new("lint").unwrap()),
+    });
+    plan.tasks[0]
+        .targets
+        .push(AssertionId::new("LINT-PASS").unwrap());
+    (mission_type, plan)
 }
 
 #[tokio::test]

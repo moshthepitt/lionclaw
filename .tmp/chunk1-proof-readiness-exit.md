@@ -14,9 +14,15 @@ Accepted base: `33ee8a47826cf269af61a7d5051e2724f1385e11`
   - Added one derived proof-readiness calculation, one command/judgment
     proof-failure recovery path, immutable authoritative receipt storage,
     receipt-derived manual retry suppression, and fail-closed decision guards.
-- Final review-remediation and bookkeeping commit:
+- `1ce9e8ca86884be00494924b2045b0d5a0abcc74`
+  `Close Chunk 1 review gaps`
+  - GPG good signature from `Kelvin Jayanoris <kelvin@jayanoris.com>`.
   - Makes proof-failure `Revise` atomically carry every current failure into
     planning, corrects the shipped operator skill, and adds this exit note.
+- Final branch-review remediation commit:
+  - Preserves existing failure refinement across sequential mixed-kind
+    revisions, corrects the coverage reconciliation command, and removes one
+    stale symbol reference.
   - The commit carrying this file is GPG-signed. Its hash cannot be embedded
     here without rewriting history; verify with `git log --show-signature -1`.
 
@@ -55,6 +61,19 @@ right: [Retry, Repair, Revise]
 This showed that judgment anti-thrash compared verdict items but omitted the
 exact accepted report, unlike command proof's exact stdout/stderr comparison.
 
+The branch-wide review regression
+`sequential_mixed_failure_revisions_preserve_every_feedback` failed before its
+fix:
+
+```text
+left: 1
+right: 2
+```
+
+One drained oracle batch had produced a failed command verdict and a separate
+oracle runtime failure. Revising both attention items sequentially replaced the
+first refinement instead of preserving both.
+
 After the fix, one `Revise` on either of two failed command proofs:
 
 - enters `MissionPhase::Planning` immediately;
@@ -74,6 +93,9 @@ After the fix, one `Revise` on either of two failed command proofs:
 - `Revise` is mission-level: it atomically clears all current proof failures
   and passes every exact failure record through the existing complete-plan
   refinement slot.
+- Every later failure-led `Revise` appends its exact feedback to that ordered
+  refinement, so mixed proof, oracle-runtime, node, gate, or review failures
+  cannot erase evidence accepted by an earlier revision.
 - Historical command and judgment receipts remain append-only.
 - A first failure may expose manual `Retry`; an identical repeat suppresses it
   without a counter. Changed command diagnostics, judgment evidence, or proof
@@ -87,10 +109,11 @@ After the fix, one `Revise` on either of two failed command proofs:
 
 - `SCHEMA_VERSION`: remains `33`.
   - No event-log payload changed.
-- `REDUCER_VERSION`: `61 -> 63`.
+- `REDUCER_VERSION`: `61 -> 64`.
   - `62` introduced receipt-ledger proof derivation and unified recovery.
   - `63` makes proof-driven replanning consume every current failure and changes
     the folded planning refinement from one feedback record to an ordered list.
+  - `64` preserves that ordered list across sequential mixed-kind revisions.
 - Public folded model changes:
   - `AssertionState` stores a current authoritative receipt ID rather than a
     copied verdict.
@@ -125,12 +148,10 @@ Required reconciliation command:
 
 ```text
 git diff --name-status -M 33ee8a47 -- \
-  '*/tests/' 'crates/*/src/**/*tests*.rs'
+  ':(glob)crates/*/tests/**' ':(glob)crates/*/src/**/*tests*.rs'
 ```
 
-Output: empty.
-
-Supplemental test inventory:
+Output:
 
 ```text
 M crates/lionclaw-model/tests/team_cutover.rs
@@ -148,7 +169,14 @@ M crates/lionclaw/tests/resume.rs
 M crates/lionclaw/tests/terminal_review.rs
 ```
 
-No test file or prior coverage was deleted.
+Deletion reconciliation command:
+
+```text
+git diff --name-status --diff-filter=D -M 33ee8a47 -- \
+  ':(glob)crates/*/tests/**' ':(glob)crates/*/src/**/*tests*.rs'
+```
+
+Output: empty. No test file or prior coverage was deleted.
 
 ## Verification
 
@@ -185,13 +213,20 @@ their code sources of truth.
 
 ## Review and Scope
 
-The external review reported:
+The first external review reported:
 
 1. multiple proof failures could overwrite replanning evidence;
 2. the shipped skill taught obsolete below-proof-bar acceptance language;
 3. no Chunk 1 exit record documented RED/GREEN, API, or security impact.
 
-All three findings are addressed in the final forward-only commit.
+The branch-wide rereview then reported:
+
+1. sequential revisions across mixed failure kinds could still overwrite
+   earlier replanning evidence;
+2. the exit-note coverage pathspec returned an empty inventory;
+3. one model comment still named the removed `classify_finish` helper.
+
+All six findings are addressed by forward-only commits.
 
 No Chunk 2 `Next` work, benchmark-specific behavior, remediation budget,
 durable retry counter, new automatic retry, mission-type logic, confinement

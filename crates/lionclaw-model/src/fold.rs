@@ -15,9 +15,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 63 derives required proof once from immutable receipt ledgers,
-/// uses one failure path, and replans from every current proof failure.
-pub const REDUCER_VERSION: u32 = 63;
+/// Reducer 64 derives required proof once from immutable receipt ledgers,
+/// uses one failure path, and preserves every failure-led revision.
+pub const REDUCER_VERSION: u32 = 64;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -1392,21 +1392,27 @@ fn revision_feedback(
     selected: &AttentionItem,
     justification: &str,
 ) -> Vec<super::FailureFeedback> {
+    let mut feedback = match &state.planning_input.refinement {
+        Some(PlanningRefinement::FailureEvidence(feedback)) => feedback.clone(),
+        Some(PlanningRefinement::Guidance(_)) | None => Vec::new(),
+    };
     let as_feedback = |item: &AttentionItem| super::FailureFeedback {
         summary: item.report.clone(),
         evidence: item.evidence.clone(),
         justification: justification.to_string(),
     };
     if selected.kind == AttentionKind::ProofFailed {
-        state
-            .open_attention
-            .values()
-            .filter(|item| item.kind == AttentionKind::ProofFailed)
-            .map(as_feedback)
-            .collect()
+        feedback.extend(
+            state
+                .open_attention
+                .values()
+                .filter(|item| item.kind == AttentionKind::ProofFailed)
+                .map(as_feedback),
+        );
     } else {
-        vec![as_feedback(selected)]
+        feedback.push(as_feedback(selected));
     }
+    feedback
 }
 
 fn clear_failed_proof(state: &mut MissionState, failure: &ProofFailure) {

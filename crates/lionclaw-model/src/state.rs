@@ -682,8 +682,8 @@ pub struct SupersededAssertion {
     pub superseded_at_revision: u32,
 }
 
-/// The gap-review ledger: fold-owned, advisory-only (never read by
-/// `classify_finish`). All-default == "no review has run".
+/// The gap-review ledger: fold-owned and advisory-only. All-default means no
+/// review has run.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GapReviewState {
     /// Dispatch counter (mirrors `oracle_attempts`): folded from
