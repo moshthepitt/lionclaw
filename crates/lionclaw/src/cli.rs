@@ -1753,7 +1753,6 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "image_id": state.image_id,
                 "environment": environment_json(state),
                 "team": state.team,
-                "delegation": state.delegation,
                 "stop_bar": state.config.stop.slug(),
                 "base_sha": state.base_sha,
                 "current_sha": state.deliverable_head(),
@@ -2754,19 +2753,7 @@ async fn cmd_advance(
             eprintln!("note: closed with the gap review waived; see 'mission report'");
         }
     }
-    // The exit code reflects the honesty bar: a mission that finished below the
-    // stop bar its mission type declares exits nonzero, so a caller or CI can
-    // gate on "actually verified" without parsing output.
-    Ok(match &state.phase {
-        MissionPhase::Done { finish } if !state.config.stop.satisfied_by(*finish) => {
-            eprintln!(
-                "finished {finish:?}, below the mission type's stop bar {:?}",
-                state.config.stop
-            );
-            std::process::ExitCode::FAILURE
-        }
-        _ => std::process::ExitCode::SUCCESS,
-    })
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 async fn cmd_driver(
@@ -3593,7 +3580,6 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         "next_actions": view.next_actions(),
         "revision": state.revision,
         "team_revision": state.team.as_ref().map(|team| team.revision),
-        "delegation": state.delegation,
         "environment": environment_json(state),
         "current_sha": state.deliverable_head(),
         "deliverable_head": state.deliverable_head(),
@@ -4288,10 +4274,8 @@ fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serd
         return serde_json::Value::Null;
     }
     let tr = &state.gap_review;
-    // A terminal mission owes nothing: whatever is not settled by a fresh
-    // verdict or a fresh waiver was deliberately skipped (a below-bar finish
-    // never burns a review; an abort ends everything) — never report it as
-    // still "owed".
+    // A terminal mission owes nothing: a successful finish requires a settled
+    // review, while an abort ends every remaining obligation.
     let done = state.phase.is_terminal();
     let proof_failed = state.open_attention.values().any(|item| {
         matches!(
@@ -4399,9 +4383,7 @@ fn review_line(state: &crate::model::MissionState, blobs: &BlobStore) -> Option<
         "skipped" if matches!(state.phase, MissionPhase::Aborted { .. }) => {
             "review: none — the mission was aborted before a review settled".to_string()
         }
-        "skipped" => {
-            "review: skipped — the finish is below the stop bar; no review is owed".to_string()
-        }
+        "skipped" => "review: deferred — required proof is not settled".to_string(),
         _ => "review: owed — not yet judged at the final commit".to_string(),
     })
 }

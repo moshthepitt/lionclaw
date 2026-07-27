@@ -50,33 +50,3 @@ A mission type declares the image it runs under in its `mission.toml`
 (`image = "localhost/lionclaw-runtime-dev:v1"`); build the image under that tag,
 or override per mission with `lionclaw mission start --image <ref>`. The tag is
 resolved to a content id once at `start` and pinned for the mission's life.
-
-## FrontierSWE Dependent Type Checker Image
-
-`containers/frontierswe-dependent-type-checker/Containerfile` composes the
-pinned dependent-type-checker toolchain and prepared public workspace onto the
-digest-pinned LionClaw dev image. It deliberately contains no Harbor tests,
-reference implementation, or scoring data. Build it only on the host; image
-building from a confined mission is outside LionClaw's authority model.
-
-Fetch the pinned task and build the image with:
-
-```bash
-python3 benchmark/frontierswe/fetch_task.py \
-  --output .tmp/frontierswe-dependent-type-checker
-benchmark/frontierswe/build-image.sh \
-  .tmp/frontierswe-dependent-type-checker
-```
-
-The build script prints the immutable repository digest. Record that exact
-`name@sha256:...` reference in the mission type and benchmark bundle before a
-run. The build context comes from the pinned FrontierSWE commit in
-`benchmark/frontierswe/bundle.toml`; mutable upstream image tags are never used
-as a build base.
-
-The bundle uses a native Podman Harbor environment adapter. It accepts only a
-prebuilt digest, preserves the image during Harbor cleanup, and enforces the
-task container's `network=none`. On a host without delegated CPU, memory, or
-storage quota controls, the adapter fails closed unless a bring-up run
-explicitly enables `allow_unenforced_resources=true`. That exception is
-recorded as a non-publishable invalidation in the mission report.

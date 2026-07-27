@@ -21,10 +21,9 @@ use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailureEvidence};
 
-/// Version 32 makes judged role identity a first-class freshness term: team
-/// revisions carry resolved runtime/model identity, skill digests are part of
-/// mission config/state, and role requests bind the judging role instrument.
-pub const SCHEMA_VERSION: u32 = 32;
+/// Version 33 removes the unused mission delegation payload. Product-created
+/// missions never configured it, and closure authority now has one path.
+pub const SCHEMA_VERSION: u32 = 33;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -610,49 +609,6 @@ pub enum EffectResource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DelegationSet {
-    #[serde(default)]
-    pub ratification: bool,
-    #[serde(default)]
-    pub proof_bar_weakening: bool,
-    #[serde(default)]
-    pub finish: bool,
-    #[serde(default)]
-    pub abort: bool,
-    #[serde(default)]
-    pub apply: bool,
-}
-
-impl DelegationSet {
-    pub const fn none() -> Self {
-        Self {
-            ratification: false,
-            proof_bar_weakening: false,
-            finish: false,
-            abort: false,
-            apply: false,
-        }
-    }
-
-    pub const fn fully_delegated() -> Self {
-        Self {
-            ratification: true,
-            proof_bar_weakening: true,
-            finish: true,
-            abort: true,
-            apply: true,
-        }
-    }
-}
-
-impl Default for DelegationSet {
-    fn default() -> Self {
-        Self::none()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum MissionEvent {
@@ -667,7 +623,6 @@ pub enum MissionEvent {
         /// HEAD of the target repo when the mission was created.
         base_sha: String,
         config: MissionConfig,
-        delegation: DelegationSet,
     },
     ProposalRecorded {
         proposal: Box<MissionProposal>,

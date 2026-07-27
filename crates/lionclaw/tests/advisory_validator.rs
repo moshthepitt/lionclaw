@@ -504,16 +504,20 @@ async fn skill_added_reopens_only_receipts_judged_with_that_skill() {
 }
 
 #[tokio::test]
-async fn advisory_fail_is_unverified() {
+async fn advisory_fail_parks_for_generic_recovery() {
     let state = run(false).await;
     let assertion = lionclaw::model::AssertionId::new("STYLE-OK").unwrap();
     assert_eq!(state.advisory_status(&assertion), AdvisoryStatus::Failed);
+    assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+    assert_eq!(lionclaw::model::ready_to_finish(&state), None);
+    let attention = &state.open_attention["proof_bar_unmet:mission"];
     assert_eq!(
-        state.phase,
-        MissionPhase::Done {
-            finish: FinishClass::Unverified
-        }
+        attention.kind,
+        lionclaw::model::AttentionKind::ProofBarUnmet
     );
+    assert_eq!(attention.assertion_ids, [assertion]);
+    let actions = lionclaw::engine::MissionView::from_state(state, false).next_actions();
+    assert_eq!(actions, ["mission decide", "mission abort"]);
 }
 
 #[tokio::test]

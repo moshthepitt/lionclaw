@@ -17,9 +17,9 @@ use lionclaw::engine::MissionDisposition;
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::PreparedInput;
 use lionclaw::model::{
-    Assertion, AssertionId, FinishClass, InputName, MissionPhase, OracleName, OutputSemantics,
-    RoleInstanceId, RuntimeUsage, RuntimeUsageCost, RuntimeUsageCostScope, RuntimeUsageDetails,
-    TaskStatus,
+    Assertion, AssertionId, DecisionAction, FinishClass, InputName, MissionPhase, OracleName,
+    OutputSemantics, RoleInstanceId, RuntimeUsage, RuntimeUsageCost, RuntimeUsageCostScope,
+    RuntimeUsageDetails, TaskStatus,
 };
 use lionclaw::testing::{MockClock, NoopEffectCleaner};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -744,7 +744,7 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
 }
 
 #[tokio::test]
-async fn failing_oracle_never_reports_verified() {
+async fn failing_oracle_and_waiver_never_satisfy_the_stop_bar() {
     let dir = tempfile::tempdir().expect("tempdir");
     let h = harness(
         dir.path(),
@@ -788,6 +788,28 @@ async fn failing_oracle_never_reports_verified() {
         .expect("verdict");
     assert!(!verdict.passed());
     assert_eq!(verdict.exit_code(), 1);
+
+    h.engine
+        .decide(
+            &mission_id,
+            "oracle_verdict_failed:cargo-test",
+            DecisionAction::Accept,
+            "record the unavailable proof without claiming success",
+        )
+        .await
+        .expect("waive failed oracle");
+    let waived = h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("waived state");
+    assert_eq!(waived.phase, MissionPhase::AttentionNeeded);
+    assert_eq!(lionclaw::model::ready_to_finish(&waived), None);
+    let attention = &waived.open_attention["proof_bar_unmet:mission"];
+    assert_eq!(
+        lionclaw::model::decision::allowed_actions(attention.kind),
+        [DecisionAction::Retry, DecisionAction::Revise]
+    );
 }
 
 #[tokio::test]

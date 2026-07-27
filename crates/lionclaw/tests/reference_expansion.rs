@@ -249,7 +249,7 @@ async fn accepted_commit_object_fault_settles_once_and_does_not_block_later_mess
 }
 
 async fn prove_commit_object_fault_settles_once(fault: CommitObjectFault) {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (32, 60));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (33, 61));
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let h = checkpoint_harness(dir.path(), prompts.clone()).await;

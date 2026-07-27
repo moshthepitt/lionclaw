@@ -63,6 +63,13 @@ mod tests {
     #[test]
     fn materialized_bundle_preserves_files_and_executable_bits() {
         let bundle = BundledMissionTypes::materialize().unwrap();
+        let mut mission_types = std::fs::read_dir(bundle.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        mission_types.sort();
+        assert_eq!(mission_types, ["metric-driven", "software-dev"]);
+
         let root = bundle.root().join("software-dev");
         assert!(root.join("mission.toml").is_file());
         assert!(root.join("skills/scrutiny-validator/SKILL.md").is_file());

@@ -13,10 +13,9 @@ use super::verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 60 keeps every judged role receipt and gap-review acceptance fresh
-/// only under the current deliverable head, environment digest, and role
-/// instrument identity, and capacity-bounds oracle batches.
-pub const REDUCER_VERSION: u32 = 60;
+/// Reducer 61 parks failed required judgments and permits closure only when the
+/// derived finish class satisfies the mission's declared stop bar.
+pub const REDUCER_VERSION: u32 = 61;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -37,7 +36,6 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         workspace_dir,
         base_sha,
         config,
-        delegation,
     } = &envelope.event
     else {
         return None;
@@ -51,7 +49,6 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         workspace_dir: workspace_dir.clone(),
         base_sha: base_sha.clone(),
         config: config.clone(),
-        delegation: delegation.clone(),
         team: None,
         team_history: BTreeMap::new(),
         runtime_identity_history: BTreeMap::new(),
@@ -1173,6 +1170,9 @@ fn apply_decision(
             }
             state.gap_review.accepted = None;
         }
+        (super::DecisionAction::Retry, AttentionKind::ProofBarUnmet) => {
+            retry_unmet_proof(state, &item);
+        }
         (super::DecisionAction::Retry, AttentionKind::NodeFailed) => {
             retry_failed_node(state, &item);
         }
@@ -1222,6 +1222,8 @@ fn apply_decision(
         (super::DecisionAction::Revise, _) => {
             if item.kind == AttentionKind::NodeFailed {
                 retry_failed_node(state, &item);
+            } else if item.kind == AttentionKind::ProofBarUnmet {
+                retry_unmet_proof(state, &item);
             }
             state.phase = MissionPhase::Planning;
             state.proposal = None;
@@ -1346,6 +1348,46 @@ fn retry_failed_node(state: &mut MissionState, item: &AttentionItem) {
             if let Some(conversation) = state.conversations.get_mut(&role_instance) {
                 conversation.lifecycle = ConversationLifecycle::Ready;
             }
+        }
+    }
+}
+
+fn retry_unmet_proof(state: &mut MissionState, item: &AttentionItem) {
+    let failed_effects = item
+        .evidence
+        .role_attempts()
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for assertion_id in &item.assertion_ids {
+        let retry_confined = state
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.assertion_requires_confined_proof(assertion_id));
+        let retry_judged = state
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.assertion_requires_judged_proof(assertion_id));
+        let oracle = retry_confined
+            .then(|| {
+                state
+                    .contract
+                    .get(assertion_id)
+                    .and_then(|assertion| assertion.oracle.clone())
+            })
+            .flatten();
+        if let Some(assertion) = state.contract.get_mut(assertion_id) {
+            if retry_judged {
+                assertion
+                    .last_advisory
+                    .retain(|_, effect_id| !failed_effects.contains(effect_id));
+            }
+            if retry_confined {
+                assertion.last_authoritative = None;
+            }
+        }
+        if let Some(oracle) = oracle {
+            state.waived_oracles.remove(&oracle);
         }
     }
 }
@@ -1574,6 +1616,30 @@ fn derive(state: &mut MissionState) {
             },
         );
     }
+    if attention.is_empty() {
+        if let Some(finish) = settled_finish_candidate(state)
+            .filter(|finish| !state.config.stop.satisfied_by(*finish))
+        {
+            let (assertion_ids, effect_ids) = unmet_proof_evidence(state);
+            let id = "proof_bar_unmet:mission".to_string();
+            attention.insert(
+                id.clone(),
+                AttentionItem {
+                    id,
+                    kind: AttentionKind::ProofBarUnmet,
+                    task_id: None,
+                    oracle: None,
+                    assertion_ids,
+                    evidence: super::DecisionEvidence::RoleAttempts { effect_ids },
+                    report: format!(
+                        "Settled proof class '{}' is below the declared stop bar '{}'.",
+                        finish.slug(),
+                        state.config.stop.slug()
+                    ),
+                },
+            );
+        }
+    }
     if state.config.requires_gap_review {
         match &state.gap_review.outcome {
             Some(ReviewOutcome::Failed { effect_id })
@@ -1668,14 +1734,53 @@ fn derive(state: &mut MissionState) {
     state.phase = MissionPhase::Running;
 }
 
-pub fn ready_to_finish(state: &MissionState) -> Option<FinishClass> {
+fn unmet_proof_evidence(state: &MissionState) -> (Vec<AssertionId>, Vec<super::EffectId>) {
+    let Some(plan) = &state.plan else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut assertion_ids = Vec::new();
+    let mut effect_ids = BTreeSet::new();
+    for (assertion_id, assertion) in &state.contract {
+        let confined_unmet = plan.assertion_requires_confined_proof(assertion_id)
+            && assertion
+                .last_authoritative
+                .as_ref()
+                .filter(|verdict| verdict.is_fresh_at(state))
+                .is_none_or(|verdict| !verdict.passed());
+        let judged_unmet = plan.assertion_requires_judged_proof(assertion_id)
+            && state.advisory_status(assertion_id) != super::AdvisoryStatus::Passed;
+        if !confined_unmet && !judged_unmet {
+            continue;
+        }
+        assertion_ids.push(assertion_id.clone());
+        let Some(panel) = state
+            .team
+            .as_ref()
+            .and_then(|team| team.judgment_assignments.get(assertion_id))
+        else {
+            continue;
+        };
+        for validator in panel {
+            let Some(effect_id) = assertion.last_advisory.get(validator) else {
+                continue;
+            };
+            if state
+                .advisory_receipt(assertion_id, validator, effect_id)
+                .is_some_and(|(_, passed)| !passed)
+            {
+                effect_ids.insert(effect_id.clone());
+            }
+        }
+    }
+    (assertion_ids, effect_ids.into_iter().collect())
+}
+
+fn settled_finish_candidate(state: &MissionState) -> Option<FinishClass> {
     if state.phase.is_terminal()
         || state.plan.is_none()
         || !state.inflight.is_empty()
-        || !state.open_attention.is_empty()
         || oracle_obligation_outstanding(state)
-        || advisory_obligation_outstanding(state)
-        || gap_review_outstanding(state)
+        || advisory_obligation_pending(state)
     {
         return None;
     }
@@ -1687,7 +1792,14 @@ pub fn ready_to_finish(state: &MissionState) -> Option<FinishClass> {
     tasks_settled.then(|| classify_finish(state))
 }
 
-pub(crate) fn advisory_obligation_outstanding(state: &MissionState) -> bool {
+pub fn ready_to_finish(state: &MissionState) -> Option<FinishClass> {
+    if !state.open_attention.is_empty() || gap_review_outstanding(state) {
+        return None;
+    }
+    settled_finish_candidate(state).filter(|finish| state.config.stop.satisfied_by(*finish))
+}
+
+fn advisory_obligation_pending(state: &MissionState) -> bool {
     let Some(plan) = &state.plan else {
         return false;
     };

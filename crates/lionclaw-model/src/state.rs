@@ -839,6 +839,8 @@ pub enum AttentionKind {
     GateCheckpoint,
     /// A complete plan proposal awaits approval before promotion.
     PlanProposal,
+    /// Required proof settled below the mission's declared stop bar.
+    ProofBarUnmet,
     /// The gap review's blocking verdict awaits a human (revise to
     /// remediate / retry to re-run / accept to acknowledge-and-close /
     /// abort). Raised only when the mission would otherwise close, so
@@ -862,6 +864,7 @@ impl AttentionKind {
             Self::GateFailed => "gate_failed",
             Self::GateCheckpoint => "gate_checkpoint",
             Self::PlanProposal => "plan_proposal",
+            Self::ProofBarUnmet => "proof_bar_unmet",
             Self::GapReviewGaps => "gap_review_gaps",
             Self::GapReviewFailed => "gap_review_failed",
         }
@@ -1148,7 +1151,6 @@ pub struct MissionState {
     /// Target repo HEAD at mission creation.
     pub base_sha: String,
     pub config: MissionConfig,
-    pub delegation: super::DelegationSet,
     pub team: Option<super::TeamRevision>,
     pub team_history: BTreeMap<u32, super::TeamRevision>,
     pub runtime_identity_history:

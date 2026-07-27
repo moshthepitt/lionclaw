@@ -792,7 +792,6 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
                 ]),
                 ..Default::default()
             },
-            delegation: Default::default(),
         },
     }];
     prefix.push(envelope(

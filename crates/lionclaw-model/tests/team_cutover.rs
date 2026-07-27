@@ -93,7 +93,6 @@ fn role_instrument_for_revision(
                     },
                     ..Default::default()
                 },
-                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(2, team_event(team(0, false))),
@@ -213,7 +212,6 @@ fn role_resource_overrides_are_bounded_by_mission_resource_ceilings() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
-                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(2, team_event(team(0, true))),
@@ -262,7 +260,6 @@ fn over_ceiling_team_configured_event_is_ignored_during_replay() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
-                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(2, team_event(team(0, true))),
@@ -458,7 +455,6 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
-                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(2, team_event(team(0, false))),
@@ -610,7 +606,6 @@ fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
-                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(2, team_event(team(0, false))),
@@ -661,7 +656,6 @@ fn a_skipped_team_revision_is_ignored_during_replay() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
-                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(2, team_event(team(0, false))),
@@ -705,7 +699,6 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
-                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(2, team_event(team(0, false))),
@@ -819,7 +812,6 @@ fn accepted_advisory_state() -> MissionState {
                     },
                     ..Default::default()
                 },
-                delegation: lionclaw_model::DelegationSet::none(),
             },
         ),
         event(2, team_event(team(0, false))),
@@ -979,6 +971,119 @@ fn attested_closure_waits_for_every_assigned_judge() {
             finish: lionclaw_model::FinishClass::Attested
         }
     );
+}
+
+fn failed_required_judgment_state() -> MissionState {
+    let mut state = accepted_advisory_state();
+    state
+        .tasks
+        .get_mut(&TaskId::new("implement").unwrap())
+        .unwrap()
+        .status = TaskStatus::Cleared;
+    let (effect_id, request) = reviewer_request(6, 1, "failed-judgment");
+    apply(&mut state, &request);
+    apply(
+        &mut state,
+        &event(
+            7,
+            MissionEvent::RoleTurnCompleted {
+                effect_id,
+                outcome: Ok(validate_success(
+                    vec![ValidationItem {
+                        item_id: AssertionId::new("A-1").unwrap(),
+                        passed: false,
+                    }],
+                    false,
+                )),
+            },
+        ),
+    );
+    state
+}
+
+#[test]
+fn failed_required_judgment_parks_and_rejects_below_bar_finish() {
+    let state = failed_required_judgment_state();
+    let assertion_id = AssertionId::new("A-1").unwrap();
+    assert_eq!(state.advisory_status(&assertion_id), AdvisoryStatus::Failed);
+    assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+    assert_eq!(ready_to_finish(&state), None);
+    assert_eq!(step(&state), StepDecision::Park);
+
+    let attention = &state.open_attention["proof_bar_unmet:mission"];
+    assert_eq!(attention.kind, AttentionKind::ProofBarUnmet);
+    assert_eq!(attention.assertion_ids, [assertion_id]);
+    assert_eq!(
+        lionclaw_model::decision::allowed_actions(attention.kind),
+        [DecisionAction::Retry, DecisionAction::Revise]
+    );
+    assert!(matches!(
+        &attention.evidence,
+        lionclaw_model::DecisionEvidence::RoleAttempts { effect_ids }
+            if effect_ids.len() == 1
+    ));
+
+    for finish in [
+        lionclaw_model::FinishClass::Unverified,
+        lionclaw_model::FinishClass::Attested,
+    ] {
+        let mut forged = state.clone();
+        apply(
+            &mut forged,
+            &event(
+                8,
+                MissionEvent::MissionFinished {
+                    finish,
+                    reason: "forged below-bar finish".into(),
+                },
+            ),
+        );
+        assert_eq!(forged.phase, MissionPhase::AttentionNeeded);
+    }
+}
+
+#[test]
+fn failed_required_judgment_recovery_retries_or_replans() {
+    let state = failed_required_judgment_state();
+    let attention_id = "proof_bar_unmet:mission";
+
+    let mut retry = state.clone();
+    apply(
+        &mut retry,
+        &event(
+            8,
+            MissionEvent::DecisionRecorded {
+                attention_id: attention_id.into(),
+                action: DecisionAction::Retry,
+                justification: "rerun the failed required judgment".into(),
+                requirement_changes: Vec::new(),
+            },
+        ),
+    );
+    assert_eq!(
+        retry.advisory_status(&AssertionId::new("A-1").unwrap()),
+        AdvisoryStatus::Pending
+    );
+    assert!(matches!(step(&retry), StepDecision::DispatchRole(_)));
+
+    let mut revise = state;
+    apply(
+        &mut revise,
+        &event(
+            8,
+            MissionEvent::DecisionRecorded {
+                attention_id: attention_id.into(),
+                action: DecisionAction::Revise,
+                justification: "revise the work using the failed judgment".into(),
+                requirement_changes: Vec::new(),
+            },
+        ),
+    );
+    assert_eq!(revise.phase, MissionPhase::Planning);
+    assert!(matches!(
+        revise.planning_input.refinement,
+        Some(lionclaw_model::PlanningRefinement::FailureEvidence(_))
+    ));
 }
 
 #[test]

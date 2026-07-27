@@ -640,7 +640,6 @@ impl Engine {
             workspace_dir: workspace_dir.to_string(),
             base_sha: base_sha.to_string(),
             config,
-            delegation: crate::model::DelegationSet::none(),
         });
         self.store
             .create_mission_with_events(
@@ -2714,13 +2713,6 @@ pub async fn record_finish(
     let Some(finish) = ready_to_finish(&state) else {
         bail!("mission '{mission_id}' is not ready to finish");
     };
-    if !state.config.stop.satisfied_by(finish) {
-        bail!(
-            "mission '{mission_id}' only finishes {}, below the declared stop bar {}",
-            finish.slug(),
-            state.config.stop.slug()
-        );
-    }
     store
         .append(
             mission_id,

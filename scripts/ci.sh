@@ -9,7 +9,6 @@ cargo check --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test --workspace
-python3 -m unittest discover -s benchmark/frontierswe/tests
 
 # Runtime invariant guard: the mission self-test drives the real stack (real
 # podman confinement + real engine-run oracle). Model-auth-free, but it needs

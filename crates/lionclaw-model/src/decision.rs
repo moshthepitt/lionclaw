@@ -31,6 +31,7 @@ const ORACLE_VERDICT_FAILED: &[DecisionAction] = &[
 ];
 const GATE_FAILED: &[DecisionAction] = &[DecisionAction::Revise, DecisionAction::Accept];
 const GATE_CHECKPOINT: &[DecisionAction] = &[DecisionAction::Approve];
+const PROOF_BAR_UNMET: &[DecisionAction] = &[DecisionAction::Retry, DecisionAction::Revise];
 const TERMINAL_REVIEW_GAPS: &[DecisionAction] = &[
     DecisionAction::Retry,
     DecisionAction::Revise,
@@ -51,6 +52,7 @@ pub fn allowed_actions(kind: AttentionKind) -> &'static [DecisionAction] {
         AttentionKind::OracleVerdictFailed => ORACLE_VERDICT_FAILED,
         AttentionKind::GateFailed => GATE_FAILED,
         AttentionKind::GateCheckpoint => GATE_CHECKPOINT,
+        AttentionKind::ProofBarUnmet => PROOF_BAR_UNMET,
         AttentionKind::GapReviewGaps => TERMINAL_REVIEW_GAPS,
         AttentionKind::GapReviewFailed => TERMINAL_REVIEW_FAILED,
     }
