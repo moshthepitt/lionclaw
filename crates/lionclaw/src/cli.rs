@@ -4054,13 +4054,20 @@ fn planning_input_json(
         }),
         Some(crate::model::PlanningRefinement::FailureEvidence(feedback)) => serde_json::json!({
             "kind": "failure_evidence",
-            "summary": feedback.summary,
-            "justification": feedback.justification,
-            "evidence": crate::evidence::decision_evidence_json(
-                blobs,
-                state,
-                &feedback.evidence,
-            )?,
+            "failures": feedback
+                .iter()
+                .map(|item| -> Result<_> {
+                    Ok(serde_json::json!({
+                        "summary": item.summary,
+                        "justification": item.justification,
+                        "evidence": crate::evidence::decision_evidence_json(
+                            blobs,
+                            state,
+                            &item.evidence,
+                        )?,
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?,
         }),
         None => serde_json::Value::Null,
     };
@@ -4099,7 +4106,7 @@ fn print_planning_input(
         }
         Some(crate::model::PlanningRefinement::FailureEvidence(feedback)) => {
             println!("{indent}  failure evidence:");
-            for line in crate::evidence::render_feedback(blobs, state, feedback)?.lines() {
+            for line in crate::evidence::render_feedbacks(blobs, state, feedback)?.lines() {
                 println!("{indent}    {line}");
             }
         }

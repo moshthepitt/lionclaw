@@ -711,6 +711,8 @@ async fn revising_terminal_gaps_carries_the_review_report_into_planning() {
     else {
         panic!("terminal review revise must carry structured failure evidence");
     };
+    assert_eq!(feedback.len(), 1);
+    let feedback = &feedback[0];
     assert_eq!(feedback.justification, "repair the observed behavior");
     let lionclaw::model::DecisionEvidence::RoleAttempts { effect_ids } = &feedback.evidence else {
         panic!("terminal review feedback must retain exact role receipt identities");

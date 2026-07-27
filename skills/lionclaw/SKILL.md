@@ -40,11 +40,12 @@ binary separately from its skill instructions.
    `mission abort --reason <reason>`. LionClaw has no
    `--yes` approval bypass; do not invent one.
 7. Use `mission decide` only for an action listed on an open attention item.
-   Non-revise actions require `--justification`. Preserve acceptance below the
-   mission's proof bar for the human unless the initiating request explicitly
-   delegates that decision. Routine retry, repair, and evidence-led replanning
-   may be driven autonomously when the listed action is supported by the
-   evidence.
+   Non-revise actions require `--justification`. Required proof failure can
+   never be accepted: a `ProofFailed` item never exposes `Accept`. Preserve any
+   listed terminal-review `Accept` decision for the human unless the initiating
+   request explicitly delegates that decision. Routine retry, repair, and
+   evidence-led replanning may be driven autonomously when the listed action is
+   supported by the evidence.
    `mission abort --reason <reason>` is independently legal for every
    nonterminal mission and never accepts or verifies work.
 8. A concurrent observer may use `mission status --watch` and can target the
@@ -54,7 +55,8 @@ binary separately from its skill instructions.
    the driver. If the driver dies, the next `mission advance` attributes the
    interruption to each inherited effect while preserving task workspaces.
 9. Finish by reading `lionclaw mission report` and state clearly what was
-   verified, accepted below bar, or left unresolved.
+   verified, attested, accepted with review gaps, waived at review, or left
+   unresolved.
 
 Use `lionclaw --help`, subcommand `--help`, or the bundled `lionclaw(1)` manual
 for the command contract. Mission-specific behavior belongs to the selected

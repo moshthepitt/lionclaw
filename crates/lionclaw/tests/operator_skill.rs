@@ -28,6 +28,18 @@ fn delegated_ratification_uses_the_same_unbounded_revision_loop() {
 }
 
 #[test]
+fn required_proof_failure_is_never_taught_as_acceptance() {
+    assert!(SKILL.contains(
+        "Required proof failure can\n   never be accepted: a `ProofFailed` item never exposes `Accept`."
+    ));
+    assert!(
+        SKILL.contains("Preserve any\n   listed terminal-review `Accept` decision for the human")
+    );
+    assert!(!SKILL.contains("acceptance below the\n   mission's proof bar"));
+    assert!(!SKILL.contains("accepted below bar"));
+}
+
+#[test]
 fn the_skill_uses_wait_as_the_one_blocking_surface_and_documents_controls() {
     assert!(SKILL.contains(
         "Run `lionclaw mission advance --wait` as the lead's blocking orchestration\n   primitive."

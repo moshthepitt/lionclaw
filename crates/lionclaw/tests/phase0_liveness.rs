@@ -329,10 +329,10 @@ async fn every_historical_wedge_seed_has_a_replay_safe_exit() {
     assert!(matches!(
         replanning_state.planning_input.refinement,
         Some(lionclaw::model::PlanningRefinement::FailureEvidence(ref feedback))
-            if matches!(
-                feedback.evidence,
+            if feedback.iter().any(|item| matches!(
+                item.evidence,
                 lionclaw::model::DecisionEvidence::RoleAttempts { .. }
-            )
+            ))
     ));
     let replanning_events = failed.engine.store().load(&failed_id).await.unwrap();
 

@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -920,6 +920,111 @@ async fn command_retry_is_reoffered_only_for_a_changed_outcome() {
         )
         .await
         .expect_err("identical repeated failure must suppress retry");
+}
+
+#[tokio::test]
+async fn revising_one_of_multiple_proof_failures_replans_with_every_receipt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mission_type = test_mission_type();
+    mission_type.edit_for_testing(|definition| {
+        definition.oracles.insert(
+            OracleName::new("lint").unwrap(),
+            "/nonexistent-mission-type/oracles/lint".into(),
+        );
+    });
+    let h = common::harness_with_type(
+        dir.path(),
+        mission_type,
+        review_runner(vec![]),
+        MockOracleRunner::exiting(1),
+    )
+    .await;
+    let mut plan = simple_plan();
+    plan.requirements
+        .push(covered_requirement("LINT-GREEN", "LINT-PASS"));
+    plan.assertions.push(Assertion {
+        id: AssertionId::new("LINT-PASS").unwrap(),
+        prose: "lint exits 0".into(),
+        oracle: Some(OracleName::new("lint").unwrap()),
+    });
+    plan.tasks[0]
+        .targets
+        .push(AssertionId::new("LINT-PASS").unwrap());
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "repair every failed proof",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, plan))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+
+    let failed = h.engine.advance(&mission_id).await.expect("failed proofs");
+    let failed_attention = failed
+        .state
+        .open_attention
+        .values()
+        .filter(|item| item.kind == lionclaw::model::AttentionKind::ProofFailed)
+        .collect::<Vec<_>>();
+    assert_eq!(failed_attention.len(), 2);
+    assert_eq!(failed.state.authoritative_receipts.len(), 2);
+    let expected_receipts = failed_attention
+        .iter()
+        .map(|item| {
+            item.evidence
+                .authoritative_receipts()
+                .first()
+                .expect("command failure receipt")
+                .clone()
+        })
+        .collect::<Vec<_>>();
+
+    h.engine
+        .decide(
+            &mission_id,
+            &failed_attention[0].id,
+            DecisionAction::Revise,
+            "revise for every failed proof",
+        )
+        .await
+        .expect("revise");
+    let replanning = h.engine.load_state(&mission_id).await.expect("state");
+    assert_eq!(replanning.phase, MissionPhase::Planning);
+    assert!(replanning.open_attention.is_empty());
+    assert_eq!(replanning.authoritative_receipts.len(), 2);
+    let Some(lionclaw::model::PlanningRefinement::FailureEvidence(feedback)) =
+        &replanning.planning_input.refinement
+    else {
+        panic!("proof failures must reach replanning");
+    };
+    assert_eq!(feedback.len(), 2);
+    assert!(feedback
+        .iter()
+        .all(|item| item.justification == "revise for every failed proof"));
+    let replanning_receipts = feedback
+        .iter()
+        .flat_map(|item| item.evidence.authoritative_receipts().iter().cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(replanning_receipts, expected_receipts);
+    assert_eq!(
+        replanning_receipts.into_iter().collect::<BTreeSet<_>>(),
+        replanning
+            .authoritative_receipts
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    );
+    let rendered =
+        lionclaw::evidence::render_feedbacks(h.engine.store().blobs(), &replanning, feedback)
+            .expect("render planning evidence");
+    assert!(rendered.contains("source: oracle cargo-test"));
+    assert!(rendered.contains("source: oracle lint"));
 }
 
 #[tokio::test]

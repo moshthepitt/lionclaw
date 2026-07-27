@@ -15,9 +15,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 62 derives required proof once from immutable receipt ledgers and
-/// uses one failure path for command and judged verdicts.
-pub const REDUCER_VERSION: u32 = 62;
+/// Reducer 63 derives required proof once from immutable receipt ledgers,
+/// uses one failure path, and replans from every current proof failure.
+pub const REDUCER_VERSION: u32 = 63;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -1200,6 +1200,7 @@ fn apply_decision(
             ready_planning_conversation(state);
         }
         (super::DecisionAction::Revise, _) => {
+            let feedback = revision_feedback(state, &item, justification);
             match item.kind {
                 AttentionKind::NodeFailed => retry_failed_node(state, &item),
                 AttentionKind::OracleFailed => retry_failed_oracle(state, &item),
@@ -1217,13 +1218,7 @@ fn apply_decision(
             state.proposal = None;
             state.proposal_approved = false;
             state.gap_review.accepted = None;
-            state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(Box::new(
-                super::FailureFeedback {
-                    summary: item.report,
-                    evidence: item.evidence,
-                    justification: justification.to_string(),
-                },
-            )));
+            state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(feedback));
             ready_planning_conversation(state);
         }
         (super::DecisionAction::Accept, AttentionKind::GapReviewGaps) => {
@@ -1345,6 +1340,16 @@ fn apply_proof_recovery(
     action: &super::DecisionAction,
     justification: &str,
 ) {
+    if action == &super::DecisionAction::Revise {
+        let ProofReadiness::Failed(failures) = proof_readiness(state) else {
+            return;
+        };
+        for failure in &failures {
+            clear_failed_proof(state, failure);
+        }
+        return;
+    }
+
     let Some(failure) = super::verdict::proof_failure_for_attention(state, item) else {
         return;
     };
@@ -1380,6 +1385,28 @@ fn apply_proof_recovery(
         mark_downstream_stale(state, &task_id);
     }
     state.gap_review = Default::default();
+}
+
+fn revision_feedback(
+    state: &MissionState,
+    selected: &AttentionItem,
+    justification: &str,
+) -> Vec<super::FailureFeedback> {
+    let as_feedback = |item: &AttentionItem| super::FailureFeedback {
+        summary: item.report.clone(),
+        evidence: item.evidence.clone(),
+        justification: justification.to_string(),
+    };
+    if selected.kind == AttentionKind::ProofFailed {
+        state
+            .open_attention
+            .values()
+            .filter(|item| item.kind == AttentionKind::ProofFailed)
+            .map(as_feedback)
+            .collect()
+    } else {
+        vec![as_feedback(selected)]
+    }
 }
 
 fn clear_failed_proof(state: &mut MissionState, failure: &ProofFailure) {

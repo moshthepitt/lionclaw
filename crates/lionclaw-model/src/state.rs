@@ -621,7 +621,7 @@ pub struct FailureFeedback {
 #[serde(rename_all = "snake_case")]
 pub enum PlanningRefinement {
     Guidance(String),
-    FailureEvidence(Box<FailureFeedback>),
+    FailureEvidence(Vec<FailureFeedback>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1358,10 +1358,14 @@ impl MissionState {
             .refinement
             .as_ref()
             .and_then(|refinement| match refinement {
-                PlanningRefinement::FailureEvidence(feedback) => Some(feedback),
+                PlanningRefinement::FailureEvidence(feedback) => Some(feedback.as_slice()),
                 PlanningRefinement::Guidance(_) => None,
             })
-            .is_some_and(|feedback| feedback.evidence.role_attempts().contains(effect_id));
+            .is_some_and(|feedback| {
+                feedback
+                    .iter()
+                    .any(|item| item.evidence.role_attempts().contains(effect_id))
+            });
         let current_attention = self
             .open_attention
             .values()

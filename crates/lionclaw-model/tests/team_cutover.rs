@@ -890,10 +890,18 @@ fn reviewer_request(
 }
 
 fn validate_success(items: Vec<ValidationItem>, passed: bool) -> RoleTurnSuccess {
+    validate_success_with_report(items, passed, "judgment")
+}
+
+fn validate_success_with_report(
+    items: Vec<ValidationItem>,
+    passed: bool,
+    report: &str,
+) -> RoleTurnSuccess {
     RoleTurnSuccess {
         handoff: Some(Handoff::Validate {
             done: true,
-            report: PayloadRef::inline("judgment"),
+            report: PayloadRef::inline(report),
             items,
             passed,
             request_attention: false,
@@ -1147,8 +1155,9 @@ fn failed_required_judgment_recovery_retries_or_replans() {
     else {
         panic!("failed judgment evidence must reach replanning");
     };
+    assert_eq!(feedback.len(), 1);
     assert!(matches!(
-        &feedback.evidence,
+        &feedback[0].evidence,
         lionclaw_model::DecisionEvidence::RoleAttempts { effect_ids }
             if effect_ids == core::slice::from_ref(&failed_effect)
     ));
@@ -1217,6 +1226,52 @@ fn repeated_identical_required_judgment_suppresses_retry() {
         current
     );
     assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+}
+
+#[test]
+fn changed_judgment_evidence_offers_a_new_retry() {
+    let mut state = failed_required_judgment_state();
+    let attention_id = "proof_failed:judgment:reviewer:A-1";
+    apply(
+        &mut state,
+        &event(
+            8,
+            MissionEvent::DecisionRecorded {
+                attention_id: attention_id.into(),
+                action: DecisionAction::Retry,
+                justification: "retry after the first report".into(),
+                requirement_changes: Vec::new(),
+            },
+        ),
+    );
+    let (second_effect, request) = reviewer_request(9, 2, "failed-judgment");
+    apply(&mut state, &request);
+    apply(
+        &mut state,
+        &event(
+            10,
+            MissionEvent::RoleTurnCompleted {
+                effect_id: second_effect,
+                outcome: Ok(validate_success_with_report(
+                    vec![ValidationItem {
+                        item_id: AssertionId::new("A-1").unwrap(),
+                        passed: false,
+                    }],
+                    false,
+                    "changed judgment evidence",
+                )),
+            },
+        ),
+    );
+
+    assert_eq!(
+        lionclaw_model::decision::legal_actions(&state, &state.open_attention[attention_id]),
+        [
+            DecisionAction::Retry,
+            DecisionAction::Repair,
+            DecisionAction::Revise
+        ]
+    );
 }
 
 #[test]

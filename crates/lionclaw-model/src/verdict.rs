@@ -464,6 +464,7 @@ fn same_judgment_identity(
 
 fn same_judgment_outcome(left: &RoleAttemptReceipt, right: &RoleAttemptReceipt) -> bool {
     left.settled_handoff() == right.settled_handoff()
+        && left.accepted_report() == right.accepted_report()
 }
 
 #[cfg(test)]

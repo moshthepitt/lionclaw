@@ -77,6 +77,21 @@ pub fn render_feedback(
     Ok(rendered)
 }
 
+pub fn render_feedbacks(
+    blobs: &BlobStore,
+    state: &MissionState,
+    feedback: &[FailureFeedback],
+) -> Result<String> {
+    let mut rendered = String::new();
+    for item in feedback {
+        if !rendered.is_empty() {
+            rendered.push_str("\n\n");
+        }
+        rendered.push_str(&render_feedback(blobs, state, item)?);
+    }
+    Ok(rendered)
+}
+
 pub fn decision_evidence_json(
     blobs: &BlobStore,
     state: &MissionState,

@@ -2089,7 +2089,7 @@ impl Engine {
             }
             Some(crate::model::PlanningRefinement::FailureEvidence(feedback)) => {
                 Some(PlanningPromptRefinement::FailureEvidence(
-                    crate::evidence::render_feedback(self.store.blobs(), state, feedback)?,
+                    crate::evidence::render_feedbacks(self.store.blobs(), state, feedback)?,
                 ))
             }
             None => None,
