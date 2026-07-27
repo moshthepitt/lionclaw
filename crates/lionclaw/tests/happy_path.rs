@@ -17,9 +17,10 @@ use lionclaw::engine::MissionDisposition;
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::PreparedInput;
 use lionclaw::model::{
-    Assertion, AssertionId, DecisionAction, FinishClass, InputName, MissionPhase, OracleName,
-    OutputSemantics, RoleInstanceId, RuntimeUsage, RuntimeUsageCost, RuntimeUsageCostScope,
-    RuntimeUsageDetails, TaskStatus,
+    apply, Assertion, AssertionId, DecisionAction, EventEnvelope, FinishClass, InputName,
+    MissionEvent, MissionPhase, OracleName, OutputSemantics, RoleInstanceId, RuntimeUsage,
+    RuntimeUsageCost, RuntimeUsageCostScope, RuntimeUsageDetails, TaskStatus, VersionStamps,
+    SCHEMA_VERSION,
 };
 use lionclaw::testing::{MockClock, NoopEffectCleaner};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -1011,19 +1012,19 @@ async fn revising_one_of_multiple_proof_failures_replans_with_every_receipt() {
 }
 
 #[tokio::test]
-async fn sequential_mixed_failure_revisions_preserve_every_feedback() {
+async fn mixed_failures_are_fail_closed_and_preserve_every_feedback() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mission_type, plan) = plan_with_lint_oracle();
+    let lint_failure =
+        lionclaw::model::TypedFailure::permanent("oracle.fixture", "lint runtime failed");
+    let runner_failure = lint_failure.clone();
     let h = common::harness_with_type(
         dir.path(),
         mission_type,
         review_runner(vec![]),
-        MockOracleRunner::new(Box::new(|request| {
+        MockOracleRunner::new(Box::new(move |request| {
             if request.oracle.to_string() == "lint" {
-                Err(lionclaw::model::TypedFailure::permanent(
-                    "oracle.fixture",
-                    "lint runtime failed",
-                ))
+                Err(runner_failure.clone())
             } else {
                 Ok(lionclaw::ports::OracleOutcome {
                     exit_code: 1,
@@ -1061,6 +1062,54 @@ async fn sequential_mixed_failure_revisions_preserve_every_feedback() {
         .state
         .open_attention
         .contains_key("oracle_failed:lint"));
+
+    let error = h
+        .engine
+        .decide(
+            &mission_id,
+            "oracle_failed:lint",
+            DecisionAction::Accept,
+            "forged oracle runtime waiver",
+        )
+        .await
+        .expect_err("oracle runtime failure cannot be accepted");
+    assert!(
+        error.to_string().contains("not valid"),
+        "unexpected error: {error:#}"
+    );
+    let rejected = h
+        .engine
+        .load_state(&mission_id)
+        .await
+        .expect("rejected state");
+    assert!(rejected.open_attention.contains_key("oracle_failed:lint"));
+    let lint = OracleName::new("lint").unwrap();
+    assert_eq!(rejected.oracle_failures[&lint], lint_failure);
+
+    let mut forged = rejected;
+    let forged_sequence = forged.head + 1;
+    apply(
+        &mut forged,
+        &EventEnvelope {
+            mission_id: mission_id.clone(),
+            sequence_no: forged_sequence,
+            recorded_at_ms: 0,
+            stamps: VersionStamps {
+                schema_version: SCHEMA_VERSION,
+                engine_version: env!("CARGO_PKG_VERSION").to_string(),
+                prompt_hash: None,
+            },
+            event: MissionEvent::DecisionRecorded {
+                attention_id: "oracle_failed:lint".into(),
+                action: DecisionAction::Accept,
+                justification: "forged oracle runtime waiver".into(),
+                requirement_changes: Vec::new(),
+            },
+        },
+    );
+    assert_eq!(forged.phase, MissionPhase::AttentionNeeded);
+    assert!(forged.open_attention.contains_key("oracle_failed:lint"));
+    assert_eq!(forged.oracle_failures[&lint], lint_failure);
 
     h.engine
         .decide(
@@ -1109,10 +1158,7 @@ async fn sequential_mixed_failure_revisions_preserve_every_feedback() {
     assert_eq!(
         feedback[1].evidence,
         lionclaw::model::DecisionEvidence::OracleRuntimeFailure {
-            failure: lionclaw::model::TypedFailure::permanent(
-                "oracle.fixture",
-                "lint runtime failed",
-            ),
+            failure: lint_failure,
         }
     );
     let rendered =

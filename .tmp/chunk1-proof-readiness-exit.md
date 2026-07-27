@@ -24,9 +24,13 @@ Accepted base: `33ee8a47826cf269af61a7d5051e2724f1385e11`
   - Preserves existing failure refinement across sequential mixed-kind
     revisions, corrects the coverage reconciliation command, and removes one
     stale symbol reference.
-- Final RoboRev remediation commit:
+- `cabda894de61df95272ddb6ca831e5f36c069598`
+  `Retain oracle runtime failure evidence`
   - Carries the exact typed oracle runtime failure through attention and into
     replanning instead of retaining only a generic parked-oracle summary.
+- Final RoboRev coverage commit:
+  - Proves that parked oracle runtime failure cannot be accepted through the
+    engine API or forged away through direct event replay.
   - The commit carrying this file is GPG-signed. Its hash cannot be embedded
     here without rewriting history; verify with `git log --show-signature -1`.
 
@@ -66,8 +70,8 @@ This showed that judgment anti-thrash compared verdict items but omitted the
 exact accepted report, unlike command proof's exact stdout/stderr comparison.
 
 The branch-wide review regression
-`sequential_mixed_failure_revisions_preserve_every_feedback` failed before its
-fix:
+`mixed_failures_are_fail_closed_and_preserve_every_feedback` failed before its
+evidence-preservation fix:
 
 ```text
 left: 1
@@ -249,7 +253,11 @@ The first full-range RoboRev pass then reported that oracle runtime attention
 still carried `DecisionEvidence::None`, losing its typed payload when a
 revision cleared `oracle_failures`.
 
-All seven findings are addressed by forward-only commits.
+The second full-range RoboRev pass reported that the same `OracleFailed`
+honesty boundary lacked fault-injection coverage for API rejection and inert
+folding of a forged `Accept` event.
+
+All eight findings are addressed by forward-only commits.
 
 No Chunk 2 `Next` work, benchmark-specific behavior, remediation budget,
 durable retry counter, new automatic retry, mission-type logic, confinement
