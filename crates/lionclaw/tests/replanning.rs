@@ -320,7 +320,7 @@ async fn corrected_assertions_visibly_supersede_and_stale_prior_receipts() {
     h.engine.advance(&id).await.unwrap();
     let state = h.engine.load_state(&id).await.unwrap();
     assert!(state.contract[&AssertionId::new("TESTS-PASS").unwrap()]
-        .last_authoritative
+        .last_authoritative_receipt
         .is_some());
 
     let mut changed = simple_plan();
@@ -357,10 +357,10 @@ async fn corrected_assertions_visibly_supersede_and_stale_prior_receipts() {
 
     let state = h.engine.load_state(&id).await.unwrap();
     let active = &state.contract[&assertion_id];
-    assert!(active.last_authoritative.is_none());
+    assert!(active.last_authoritative_receipt.is_none());
     let retired = state.superseded_assertions.last().unwrap();
     assert_eq!(retired.assertion.prose, "cargo test exits 0");
-    assert!(retired.state.last_authoritative.is_some());
+    assert!(retired.state.last_authoritative_receipt.is_some());
     assert_eq!(retired.replacement_ids, vec![assertion_id]);
     assert_eq!(retired.superseded_at_revision, 2);
 }

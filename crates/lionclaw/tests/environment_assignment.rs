@@ -401,9 +401,8 @@ async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle(
     )
     .await;
     let proved = h.engine.store().require_state(&mission_id).await.unwrap();
-    let verdict = proved.contract[&assertion_id]
-        .last_authoritative
-        .as_ref()
+    let verdict = proved
+        .authoritative_verdict(&proved.contract[&assertion_id])
         .expect("proof under image A");
     assert_eq!(verdict.environment_digest(), image_a);
     assert!(verdict.is_fresh_at(&proved));
@@ -423,9 +422,8 @@ async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle(
     )
     .await;
     let stale = h.engine.store().require_state(&mission_id).await.unwrap();
-    let stale_verdict = stale.contract[&assertion_id]
-        .last_authoritative
-        .as_ref()
+    let stale_verdict = stale
+        .authoritative_verdict(&stale.contract[&assertion_id])
         .expect("historical proof remains inspectable");
     assert_eq!(stale_verdict.environment_digest(), image_a);
     assert!(!stale_verdict.is_fresh_at(&stale));
@@ -454,9 +452,9 @@ async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle(
         })
         .collect::<Vec<_>>();
     assert_eq!(requests, vec![(1, image_a.as_str()), (2, image_b.as_str())]);
-    let final_verdict = rerun.state.contract[&assertion_id]
-        .last_authoritative
-        .as_ref()
+    let final_verdict = rerun
+        .state
+        .authoritative_verdict(&rerun.state.contract[&assertion_id])
         .expect("proof under image B");
     assert_eq!(final_verdict.environment_digest(), image_b);
     assert!(final_verdict.is_fresh_at(&rerun.state));

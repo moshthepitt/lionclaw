@@ -18,20 +18,9 @@ const NODE_FAILED: &[DecisionAction] = &[
     DecisionAction::Accept,
 ];
 const NODE_ATTENTION: &[DecisionAction] = &[DecisionAction::Accept];
-const ORACLE_FAILED: &[DecisionAction] = &[
-    DecisionAction::Retry,
-    DecisionAction::Revise,
-    DecisionAction::Accept,
-];
-const ORACLE_VERDICT_FAILED: &[DecisionAction] = &[
-    DecisionAction::Retry,
-    DecisionAction::Repair,
-    DecisionAction::Revise,
-    DecisionAction::Accept,
-];
+const ORACLE_FAILED: &[DecisionAction] = &[DecisionAction::Retry, DecisionAction::Revise];
 const GATE_FAILED: &[DecisionAction] = &[DecisionAction::Revise, DecisionAction::Accept];
 const GATE_CHECKPOINT: &[DecisionAction] = &[DecisionAction::Approve];
-const PROOF_BAR_UNMET: &[DecisionAction] = &[DecisionAction::Retry, DecisionAction::Revise];
 const TERMINAL_REVIEW_GAPS: &[DecisionAction] = &[
     DecisionAction::Retry,
     DecisionAction::Revise,
@@ -43,19 +32,35 @@ const TERMINAL_REVIEW_FAILED: &[DecisionAction] = &[
     DecisionAction::Accept,
 ];
 
-pub fn allowed_actions(kind: AttentionKind) -> &'static [DecisionAction] {
-    match kind {
-        AttentionKind::PlanProposal => PLAN_PROPOSAL,
-        AttentionKind::NodeFailed => NODE_FAILED,
-        AttentionKind::NodeAttention => NODE_ATTENTION,
-        AttentionKind::OracleFailed => ORACLE_FAILED,
-        AttentionKind::OracleVerdictFailed => ORACLE_VERDICT_FAILED,
-        AttentionKind::GateFailed => GATE_FAILED,
-        AttentionKind::GateCheckpoint => GATE_CHECKPOINT,
-        AttentionKind::ProofBarUnmet => PROOF_BAR_UNMET,
-        AttentionKind::GapReviewGaps => TERMINAL_REVIEW_GAPS,
-        AttentionKind::GapReviewFailed => TERMINAL_REVIEW_FAILED,
+pub fn legal_actions(state: &MissionState, item: &super::AttentionItem) -> Vec<DecisionAction> {
+    let mut actions = match item.kind {
+        AttentionKind::PlanProposal => PLAN_PROPOSAL.to_vec(),
+        AttentionKind::NodeFailed => NODE_FAILED.to_vec(),
+        AttentionKind::NodeAttention => NODE_ATTENTION.to_vec(),
+        AttentionKind::OracleFailed => ORACLE_FAILED.to_vec(),
+        AttentionKind::GateFailed => GATE_FAILED.to_vec(),
+        AttentionKind::GateCheckpoint => GATE_CHECKPOINT.to_vec(),
+        AttentionKind::GapReviewGaps => TERMINAL_REVIEW_GAPS.to_vec(),
+        AttentionKind::GapReviewFailed => TERMINAL_REVIEW_FAILED.to_vec(),
+        AttentionKind::ProofFailed => {
+            let Some(failure) = super::verdict::proof_failure_for_attention(state, item) else {
+                return Vec::new();
+            };
+            let mut actions = Vec::new();
+            if failure.retry_available(state) {
+                actions.push(DecisionAction::Retry);
+            }
+            if failure.effect_id().is_some() {
+                actions.push(DecisionAction::Repair);
+            }
+            actions.push(DecisionAction::Revise);
+            actions
+        }
+    };
+    if item.kind == AttentionKind::NodeFailed && item.task_id.is_none() {
+        actions.retain(|action| action != &DecisionAction::Accept);
     }
+    actions
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -80,11 +85,7 @@ pub fn validate_decision(
     let Some(item) = state.open_attention.get(attention_id) else {
         return Err(DecisionError::UnknownItem(attention_id.to_string()));
     };
-    let taskless_role_failure_accept = item.kind == AttentionKind::NodeFailed
-        && item.task_id.is_none()
-        && action == &DecisionAction::Accept;
-    let legal = allowed_actions(item.kind).contains(action) && !taskless_role_failure_accept;
-    if !legal {
+    if !legal_actions(state, item).contains(action) {
         return Err(DecisionError::InvalidAction {
             action: action.clone(),
             kind: item.kind,

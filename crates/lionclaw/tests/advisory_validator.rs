@@ -202,7 +202,9 @@ fn oracle_attention_id(state: &lionclaw::model::MissionState) -> String {
     state
         .open_attention
         .values()
-        .find(|item| item.kind == lionclaw::model::AttentionKind::OracleVerdictFailed)
+        .find(|item| {
+            item.kind == lionclaw::model::AttentionKind::ProofFailed && item.oracle.is_some()
+        })
         .expect("oracle verdict attention")
         .id
         .clone()
@@ -510,11 +512,8 @@ async fn advisory_fail_parks_for_generic_recovery() {
     assert_eq!(state.advisory_status(&assertion), AdvisoryStatus::Failed);
     assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     assert_eq!(lionclaw::model::ready_to_finish(&state), None);
-    let attention = &state.open_attention["proof_bar_unmet:mission"];
-    assert_eq!(
-        attention.kind,
-        lionclaw::model::AttentionKind::ProofBarUnmet
-    );
+    let attention = &state.open_attention["proof_failed:judgment:reviewer:STYLE-OK"];
+    assert_eq!(attention.kind, lionclaw::model::AttentionKind::ProofFailed);
     assert_eq!(attention.assertion_ids, [assertion]);
     let actions = lionclaw::engine::MissionView::from_state(state, false).next_actions();
     assert_eq!(actions, ["mission decide", "mission abort"]);
@@ -739,7 +738,9 @@ async fn replacement_validator_requires_new_receipt_and_retains_prior_evidence()
     let oracle_attention = pending
         .open_attention
         .values()
-        .find(|item| item.kind == lionclaw::model::AttentionKind::OracleVerdictFailed)
+        .find(|item| {
+            item.kind == lionclaw::model::AttentionKind::ProofFailed && item.oracle.is_some()
+        })
         .unwrap()
         .id
         .clone();

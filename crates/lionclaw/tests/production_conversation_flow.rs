@@ -1425,7 +1425,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (33, 61));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (33, 62));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -2087,7 +2087,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             && state
                 .open_attention
                 .values()
-                .any(|attention| matches!(attention.kind, AttentionKind::OracleVerdictFailed))
+                .any(|attention| matches!(attention.kind, AttentionKind::ProofFailed))
         {
             break;
         }
@@ -2097,7 +2097,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .open_attention
         .iter()
         .find_map(|(id, attention)| {
-            matches!(attention.kind, AttentionKind::OracleVerdictFailed).then_some(id)
+            matches!(attention.kind, AttentionKind::ProofFailed).then_some(id)
         })
         .unwrap_or_else(|| panic!("failed oracle attention: {:#?}", failed.open_attention));
     cli::run_with_transports(
@@ -2146,7 +2146,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .clone();
     let receipt = parked
         .authoritative_receipts
-        .iter()
+        .keys()
         .next()
         .expect("authoritative validator receipt")
         .clone();
@@ -3127,7 +3127,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             .open_attention
             .iter()
             .find_map(|(id, attention)| {
-                matches!(attention.kind, AttentionKind::OracleVerdictFailed).then(|| id.clone())
+                matches!(attention.kind, AttentionKind::ProofFailed).then(|| id.clone())
             })
             .unwrap_or_else(|| panic!("failed oracle attention: {:#?}", moved.open_attention));
         cli::run(
@@ -5005,7 +5005,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let failed_oracle = store.require_state(&mission).await.unwrap();
     let receipt = failed_oracle
         .authoritative_receipts
-        .iter()
+        .keys()
         .next()
         .expect("production oracle receipt")
         .clone();
@@ -5389,7 +5389,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let foreign_failed = store.require_state(&foreign).await.unwrap();
     let foreign_receipt = foreign_failed
         .authoritative_receipts
-        .iter()
+        .keys()
         .next()
         .unwrap()
         .clone();

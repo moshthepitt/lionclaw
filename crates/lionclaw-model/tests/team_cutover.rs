@@ -501,7 +501,7 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
             AssertionState {
                 oracle: Some(OracleName::new("left").unwrap()),
                 last_advisory: BTreeMap::new(),
-                last_authoritative: None,
+                last_authoritative_receipt: None,
             },
         ),
         (
@@ -509,7 +509,7 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
             AssertionState {
                 oracle: Some(OracleName::new("right").unwrap()),
                 last_advisory: BTreeMap::new(),
-                last_authoritative: None,
+                last_authoritative_receipt: None,
             },
         ),
     ]);
@@ -535,12 +535,10 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
             .iter()
             .filter(|(assertion_id, assertion)| {
                 plan.assertion_requires_confined_proof(assertion_id)
-                    && assertion.oracle.as_ref().is_some_and(|oracle| {
-                        !state.waived_oracles.contains(oracle)
-                            && assertion
-                                .last_authoritative
-                                .as_ref()
-                                .is_none_or(|verdict| !verdict.is_fresh_at(&state))
+                    && assertion.oracle.as_ref().is_some_and(|_| {
+                        state
+                            .authoritative_verdict(assertion)
+                            .is_none_or(|verdict| !verdict.is_fresh_at(&state))
                     })
             })
             .count(),
@@ -1010,12 +1008,19 @@ fn failed_required_judgment_parks_and_rejects_below_bar_finish() {
     assert_eq!(ready_to_finish(&state), None);
     assert_eq!(step(&state), StepDecision::Park);
 
-    let attention = &state.open_attention["proof_bar_unmet:mission"];
-    assert_eq!(attention.kind, AttentionKind::ProofBarUnmet);
-    assert_eq!(attention.assertion_ids, [assertion_id]);
+    let attention = &state.open_attention["proof_failed:judgment:reviewer:A-1"];
+    assert_eq!(attention.kind, AttentionKind::ProofFailed);
     assert_eq!(
-        lionclaw_model::decision::allowed_actions(attention.kind),
-        [DecisionAction::Retry, DecisionAction::Revise]
+        attention.assertion_ids.as_slice(),
+        core::slice::from_ref(&assertion_id)
+    );
+    assert_eq!(
+        lionclaw_model::decision::legal_actions(&state, attention),
+        [
+            DecisionAction::Retry,
+            DecisionAction::Repair,
+            DecisionAction::Revise
+        ]
     );
     assert!(matches!(
         &attention.evidence,
@@ -1040,12 +1045,46 @@ fn failed_required_judgment_parks_and_rejects_below_bar_finish() {
         );
         assert_eq!(forged.phase, MissionPhase::AttentionNeeded);
     }
+
+    let failed_effect = attention
+        .evidence
+        .role_attempts()
+        .first()
+        .expect("failed judgment receipt")
+        .clone();
+    let mut forged = state;
+    apply(
+        &mut forged,
+        &event(
+            8,
+            MissionEvent::DecisionRecorded {
+                attention_id: "proof_failed:judgment:reviewer:A-1".into(),
+                action: DecisionAction::Accept,
+                justification: "forged proof waiver".into(),
+                requirement_changes: Vec::new(),
+            },
+        ),
+    );
+    assert_eq!(forged.phase, MissionPhase::AttentionNeeded);
+    assert!(forged
+        .open_attention
+        .contains_key("proof_failed:judgment:reviewer:A-1"));
+    assert_eq!(
+        forged.contract[&assertion_id].last_advisory[&instance("reviewer")],
+        failed_effect
+    );
 }
 
 #[test]
 fn failed_required_judgment_recovery_retries_or_replans() {
     let state = failed_required_judgment_state();
-    let attention_id = "proof_bar_unmet:mission";
+    let attention_id = "proof_failed:judgment:reviewer:A-1";
+    let failed_effect = state.open_attention[attention_id]
+        .evidence
+        .role_attempts()
+        .first()
+        .expect("failed judgment receipt")
+        .clone();
 
     let mut retry = state.clone();
     apply(
@@ -1060,11 +1099,34 @@ fn failed_required_judgment_recovery_retries_or_replans() {
             },
         ),
     );
+    assert!(retry.role_attempt_receipts.contains_key(&failed_effect));
     assert_eq!(
         retry.advisory_status(&AssertionId::new("A-1").unwrap()),
         AdvisoryStatus::Pending
     );
     assert!(matches!(step(&retry), StepDecision::DispatchRole(_)));
+
+    let mut repair = state.clone();
+    apply(
+        &mut repair,
+        &event(
+            8,
+            MissionEvent::DecisionRecorded {
+                attention_id: attention_id.into(),
+                action: DecisionAction::Repair,
+                justification: "repair the work using the failed judgment".into(),
+                requirement_changes: Vec::new(),
+            },
+        ),
+    );
+    assert!(repair.role_attempt_receipts.contains_key(&failed_effect));
+    let repaired_task = &repair.tasks[&TaskId::new("implement").unwrap()];
+    assert_eq!(repaired_task.status, TaskStatus::Pending);
+    assert!(matches!(
+        repaired_task.feedback.last().map(|feedback| &feedback.evidence),
+        Some(lionclaw_model::DecisionEvidence::RoleAttempts { effect_ids })
+            if effect_ids == core::slice::from_ref(&failed_effect)
+    ));
 
     let mut revise = state;
     apply(
@@ -1080,10 +1142,125 @@ fn failed_required_judgment_recovery_retries_or_replans() {
         ),
     );
     assert_eq!(revise.phase, MissionPhase::Planning);
+    let Some(lionclaw_model::PlanningRefinement::FailureEvidence(feedback)) =
+        &revise.planning_input.refinement
+    else {
+        panic!("failed judgment evidence must reach replanning");
+    };
     assert!(matches!(
-        revise.planning_input.refinement,
-        Some(lionclaw_model::PlanningRefinement::FailureEvidence(_))
+        &feedback.evidence,
+        lionclaw_model::DecisionEvidence::RoleAttempts { effect_ids }
+            if effect_ids == core::slice::from_ref(&failed_effect)
     ));
+    assert!(revise.role_attempt_receipts.contains_key(&failed_effect));
+}
+
+#[test]
+fn repeated_identical_required_judgment_suppresses_retry() {
+    let mut state = failed_required_judgment_state();
+    let attention_id = "proof_failed:judgment:reviewer:A-1";
+    apply(
+        &mut state,
+        &event(
+            8,
+            MissionEvent::DecisionRecorded {
+                attention_id: attention_id.into(),
+                action: DecisionAction::Retry,
+                justification: "one manual retry".into(),
+                requirement_changes: Vec::new(),
+            },
+        ),
+    );
+    let (second_effect, request) = reviewer_request(9, 2, "failed-judgment");
+    apply(&mut state, &request);
+    apply(
+        &mut state,
+        &event(
+            10,
+            MissionEvent::RoleTurnCompleted {
+                effect_id: second_effect.clone(),
+                outcome: Ok(validate_success(
+                    vec![ValidationItem {
+                        item_id: AssertionId::new("A-1").unwrap(),
+                        passed: false,
+                    }],
+                    false,
+                )),
+            },
+        ),
+    );
+
+    let attention = &state.open_attention[attention_id];
+    assert_eq!(
+        lionclaw_model::decision::legal_actions(&state, attention),
+        [DecisionAction::Repair, DecisionAction::Revise]
+    );
+    assert!(state.role_attempt_receipts.contains_key(&second_effect));
+    let current = state.contract[&AssertionId::new("A-1").unwrap()].last_advisory
+        [&instance("reviewer")]
+        .clone();
+
+    apply(
+        &mut state,
+        &event(
+            11,
+            MissionEvent::DecisionRecorded {
+                attention_id: attention_id.into(),
+                action: DecisionAction::Retry,
+                justification: "forged repeated retry".into(),
+                requirement_changes: Vec::new(),
+            },
+        ),
+    );
+    assert_eq!(
+        state.contract[&AssertionId::new("A-1").unwrap()].last_advisory[&instance("reviewer")],
+        current
+    );
+    assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+}
+
+#[test]
+fn changed_judgment_identity_offers_a_new_retry() {
+    let mut state = failed_required_judgment_state();
+    let attention_id = "proof_failed:judgment:reviewer:A-1";
+    apply(
+        &mut state,
+        &event(
+            8,
+            MissionEvent::DecisionRecorded {
+                attention_id: attention_id.into(),
+                action: DecisionAction::Retry,
+                justification: "retry with a changed prompt".into(),
+                requirement_changes: Vec::new(),
+            },
+        ),
+    );
+    let (second_effect, request) = reviewer_request(9, 2, "changed-judgment-prompt");
+    apply(&mut state, &request);
+    apply(
+        &mut state,
+        &event(
+            10,
+            MissionEvent::RoleTurnCompleted {
+                effect_id: second_effect,
+                outcome: Ok(validate_success(
+                    vec![ValidationItem {
+                        item_id: AssertionId::new("A-1").unwrap(),
+                        passed: false,
+                    }],
+                    false,
+                )),
+            },
+        ),
+    );
+    assert_eq!(
+        lionclaw_model::decision::legal_actions(&state, &state.open_attention[attention_id]),
+        [
+            DecisionAction::Retry,
+            DecisionAction::Repair,
+            DecisionAction::Revise
+        ]
+    );
 }
 
 #[test]

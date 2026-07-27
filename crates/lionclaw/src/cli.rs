@@ -1661,23 +1661,20 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     struct ReportRow {
         id: String,
         oracle: Option<String>,
-        /// The oracle never ran and never will (a human waived it) — the row
-        /// says so in both formats, never "owed".
-        waived: bool,
         verdict: Option<serde_json::Value>,
         advisory_results: Vec<serde_json::Value>,
     }
     let mut rows = Vec::new();
     for (aid, a) in &state.contract {
-        let verdict = if let Some(v) = a.last_authoritative.as_ref() {
-            let (stdout, stderr) = v.evidence();
-            let evidence = crate::model::FailureEvidence {
-                exit_code: v.exit_code(),
-                exit_signal: v.exit_signal(),
-                stdout: stdout.clone(),
-                stderr: stderr.clone(),
-            };
+        let verdict = if let Some((effect_id, v)) =
+            a.last_authoritative_receipt.as_ref().and_then(|effect_id| {
+                state
+                    .authoritative_receipts
+                    .get(effect_id)
+                    .map(|verdict| (effect_id, verdict))
+            }) {
             Some(serde_json::json!({
+                "effect_id": effect_id,
                 "oracle": v.oracle().as_str(),
                 "passed": v.passed(),
                 "exit_code": v.exit_code(),
@@ -1686,7 +1683,11 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "environment_digest": v.environment_digest(),
                 "fresh": v.is_fresh_at(state),
                 "prepared_inputs": v.prepared_inputs(),
-                "evidence": crate::evidence::evidence_json(store.blobs(), &evidence)?,
+                "evidence": crate::evidence::authoritative_receipt_json(
+                    store.blobs(),
+                    effect_id,
+                    v,
+                ),
             }))
         } else {
             None
@@ -1694,10 +1695,6 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         rows.push(ReportRow {
             id: aid.as_str().to_string(),
             oracle: a.oracle.as_ref().map(|o| o.as_str().to_string()),
-            waived: a
-                .oracle
-                .as_ref()
-                .is_some_and(|o| state.waived_oracles.contains(o)),
             verdict,
             advisory_results: assertion_advisory_json(state, aid, a, store.blobs(), true),
         });
@@ -1775,7 +1772,6 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "assertions": rows.iter().map(|row| serde_json::json!({
                     "id": row.id,
                     "oracle": row.oracle,
-                    "waived": row.waived,
                     "verdict": row.verdict,
                     "advisory_results": row.advisory_results,
                 })).collect::<Vec<_>>(),
@@ -1787,7 +1783,6 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 })).collect::<Vec<_>>(),
                 "not_verified_by_oracle": uncovered,
                 "superseded_assertions": superseded_assertions_json(state, store.blobs()),
-                "waived_oracles": state.waived_oracles.iter().map(|o| o.as_str()).collect::<Vec<_>>(),
                 "acknowledged_gates": state.acknowledged_gates.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
                 "oracle_failures": state.oracle_failures,
                 "gap_review": review,
@@ -1913,7 +1908,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                     if fresh {
                         ""
                     } else {
-                            " [STALE - not at the current commit/environment]"
+                        " [STALE - not at the current commit/environment]"
                     },
                 );
                 let prepared = v["prepared_inputs"]
@@ -1932,25 +1927,29 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                     println!("      prepared inputs: {}", prepared.join(", "));
                 }
                 if !passed {
-                    let assertion = state.contract.get(
-                        &crate::model::AssertionId::new(id).expect("stored assertion id")
-                    ).expect("stored assertion");
-                    let verdict = assertion.last_authoritative.as_ref().expect("report verdict");
-                    let (stdout, stderr) = verdict.evidence();
-                    let evidence = crate::model::FailureEvidence {
-                        exit_code: verdict.exit_code(),
-                        exit_signal: verdict.exit_signal(),
-                        stdout: stdout.clone(),
-                        stderr: stderr.clone(),
-                    };
-                    for line in crate::evidence::render_evidence(store.blobs(), &evidence)?.lines() {
+                    let assertion = state
+                        .contract
+                        .get(&crate::model::AssertionId::new(id).expect("stored assertion id"))
+                        .expect("stored assertion");
+                    let effect_id = assertion
+                        .last_authoritative_receipt
+                        .as_ref()
+                        .expect("report verdict receipt");
+                    let verdict = state
+                        .authoritative_receipts
+                        .get(effect_id)
+                        .expect("report verdict");
+                    for line in crate::evidence::render_authoritative_receipt(
+                        store.blobs(),
+                        effect_id,
+                        verdict,
+                    )
+                    .lines()
+                    {
                         println!("      {line}");
                     }
                 }
             }
-            None if row.waived => println!(
-                "    {id}: WAIVED — its oracle failed to run and a human accepted closing without it"
-            ),
             None if row.oracle.is_some() => println!("    {id}: (oracle owed, not yet run)"),
             None => println!("    {id}: advisory only — no oracle can prove this"),
         }
@@ -2823,9 +2822,8 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
             println!("{line}");
         }
         for (id, assertion) in &state.contract {
-            let auth = assertion
-                .last_authoritative
-                .as_ref()
+            let auth = state
+                .authoritative_verdict(assertion)
                 .map(|v| if v.passed() { "pass" } else { "fail" })
                 .unwrap_or("—");
             println!("  {id}: authoritative={auth}");
@@ -3607,10 +3605,9 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
                     blobs,
                     true,
                 ),
-                "authoritative_pass": assertion
-                    .last_authoritative
-                    .as_ref()
-                    .map(|verdict| verdict.passed()),
+                "authoritative_pass": state
+                    .authoritative_verdict(assertion)
+                    .map(crate::model::AuthoritativeVerdict::passed),
             })
         }).collect::<Vec<_>>(),
         "superseded_assertions": superseded_assertions_json(state, blobs),
@@ -3700,8 +3697,8 @@ fn superseded_assertions_json(
                     blobs,
                     false,
                 ),
-                "authoritative_pass": entry.state.last_authoritative.as_ref()
-                    .map(|verdict| verdict.passed()),
+                "authoritative_pass": state.authoritative_verdict(&entry.state)
+                    .map(crate::model::AuthoritativeVerdict::passed),
             })
         })
         .collect()
@@ -4192,7 +4189,7 @@ fn attention_json(
         "kind": item.kind.slug(),
         "report": item.report,
         "assertion_ids": item.assertion_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
-        "actions": crate::model::decision::allowed_actions(item.kind)
+        "actions": crate::model::decision::legal_actions(state, item)
             .iter()
             .map(crate::model::DecisionAction::slug)
             .collect::<Vec<_>>(),
@@ -4207,7 +4204,7 @@ fn print_attention(
     indent: &str,
 ) -> Result<()> {
     println!("{indent}[{}] {}", item.id, item.report);
-    let actions = crate::model::decision::allowed_actions(item.kind)
+    let actions = crate::model::decision::legal_actions(state, item)
         .iter()
         .map(crate::model::DecisionAction::slug)
         .collect::<Vec<_>>()
@@ -4280,7 +4277,7 @@ fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serd
     let proof_failed = state.open_attention.values().any(|item| {
         matches!(
             item.kind,
-            AttentionKind::OracleFailed | AttentionKind::OracleVerdictFailed
+            AttentionKind::OracleFailed | AttentionKind::ProofFailed
         )
     });
     let waived = tr.waived_at(state);

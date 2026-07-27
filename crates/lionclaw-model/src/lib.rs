@@ -34,7 +34,7 @@ pub mod step;
 pub mod team;
 pub mod verdict;
 
-pub use decision::{validate_decision, DecisionError};
+pub use decision::{legal_actions, validate_decision, DecisionError};
 pub use event::{
     resolve_execution_deadline_ms, role_prompt_template, role_success_contract_error,
     ArtifactOutcome, BlobRef, ContinueMode, ControlAction, DecisionAction, EffectEventClass,
@@ -69,13 +69,13 @@ pub use plan_validation::{
 pub use state::{
     resolve_role_assignment, resolve_task_assignment, AdvisoryStatus, AssertionState,
     AttentionItem, AttentionKind, ConversationLifecycle, ConversationState, DecisionEvidence,
-    DeliveryMarker, DurableCancellation, EffectCleanupFailure, FailureEvidence, FailureFeedback,
-    GapReviewState, InflightEffect, MissionPhase, MissionState, ParkedEffect, PlanningInput,
-    PlanningRefinement, QueuedMessage, ReferenceRecipientPolicy, ReviewAcceptance,
-    ReviewAcceptanceKind, ReviewOutcome, RoleAssignment, RoleAssignmentContext,
-    RoleAttemptAuthority, RoleAttemptDisposition, RoleAttemptEvidenceUse, RoleAttemptGeneration,
-    RoleAttemptReceipt, RoleEffectSource, RoleTurnProvenance, SettledHandoff, SupersededAssertion,
-    TaskAttemptOutcome, TaskRoleAssignment, TaskRuntimeState, TaskStatus, TaskWorkspaceProvenance,
+    DeliveryMarker, DurableCancellation, EffectCleanupFailure, FailureFeedback, GapReviewState,
+    InflightEffect, MissionPhase, MissionState, ParkedEffect, PlanningInput, PlanningRefinement,
+    QueuedMessage, ReferenceRecipientPolicy, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
+    RoleAssignment, RoleAssignmentContext, RoleAttemptAuthority, RoleAttemptDisposition,
+    RoleAttemptEvidenceUse, RoleAttemptGeneration, RoleAttemptReceipt, RoleEffectSource,
+    RoleTurnProvenance, SettledHandoff, SupersededAssertion, TaskAttemptOutcome,
+    TaskRoleAssignment, TaskRuntimeState, TaskStatus, TaskWorkspaceProvenance,
 };
 pub use step::{step, OracleDispatchIntent, RoleDispatchIntent, StepDecision};
 pub use team::{
@@ -83,4 +83,4 @@ pub use team::{
     ConfinementResources, ConfinementTmpfsResource, MissionGuidance, RoleInstance, TeamRevision,
     KERNEL_ENVIRONMENT_KEYS, MAX_GUIDANCE_BYTES, MAX_TMPFS_RESOURCE_OVERRIDES,
 };
-pub use verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
+pub use verdict::{AuthoritativeVerdict, FinishClass};

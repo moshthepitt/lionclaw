@@ -9,13 +9,15 @@ use super::state::{
     RoleAttemptDisposition, RoleAttemptReceipt, SettledHandoff, TaskAttemptOutcome,
     TaskRoleAssignment, TaskRuntimeState, TaskStatus,
 };
-use super::verdict::{classify_finish, AuthoritativeVerdict, FinishClass};
+use super::verdict::{
+    proof_readiness, AuthoritativeVerdict, FinishClass, ProofFailure, ProofReadiness, ProofSource,
+};
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 61 parks failed required judgments and permits closure only when the
-/// derived finish class satisfies the mission's declared stop bar.
-pub const REDUCER_VERSION: u32 = 61;
+/// Reducer 62 derives required proof once from immutable receipt ledgers and
+/// uses one failure path for command and judged verdicts.
+pub const REDUCER_VERSION: u32 = 62;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -69,7 +71,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         role_attempt_receipts: BTreeMap::new(),
         conversations: BTreeMap::new(),
         retained_workspace_archives: BTreeMap::new(),
-        authoritative_receipts: BTreeSet::new(),
+        authoritative_receipts: BTreeMap::new(),
         reachable_commits: BTreeSet::from([base_sha.clone()]),
         stop_requests: BTreeMap::new(),
         reached_deadlines: BTreeMap::new(),
@@ -81,7 +83,6 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         acknowledged_gates: BTreeSet::new(),
         flagged_tasks: BTreeSet::new(),
         oracle_failures: BTreeMap::new(),
-        waived_oracles: BTreeSet::new(),
         gap_review: Default::default(),
         head: envelope.sequence_no,
     })
@@ -1038,19 +1039,23 @@ fn apply_oracle_outcome(
                 )
             });
             let verdict = AuthoritativeVerdict::from_oracle_success(
+                assertion_ids.to_vec(),
                 oracle.clone(),
                 judged_sha.to_string(),
                 environment_digest,
+                attempt_no,
                 success,
             );
             for assertion_id in assertion_ids {
                 if let Some(assertion) = state.contract.get_mut(assertion_id) {
                     if assertion.oracle.as_ref() == Some(oracle) {
-                        assertion.last_authoritative = Some(verdict.clone());
+                        assertion.last_authoritative_receipt = Some(effect_id.clone());
                     }
                 }
             }
-            state.authoritative_receipts.insert(effect_id.clone());
+            state
+                .authoritative_receipts
+                .insert(effect_id.clone(), verdict);
         }
     }
 }
@@ -1136,7 +1141,9 @@ fn apply_decision(
     let Some(item) = state.open_attention.get(attention_id).cloned() else {
         return;
     };
-    if justification.trim().is_empty() {
+    if justification.trim().is_empty()
+        || !super::decision::legal_actions(state, &item).contains(action)
+    {
         return;
     }
     match (action, item.kind) {
@@ -1170,44 +1177,17 @@ fn apply_decision(
             }
             state.gap_review.accepted = None;
         }
-        (super::DecisionAction::Retry, AttentionKind::ProofBarUnmet) => {
-            retry_unmet_proof(state, &item);
-        }
         (super::DecisionAction::Retry, AttentionKind::NodeFailed) => {
             retry_failed_node(state, &item);
         }
-        (super::DecisionAction::Retry, AttentionKind::OracleVerdictFailed) => {
-            clear_authoritative_verdicts(state, &item.assertion_ids);
+        (super::DecisionAction::Retry, AttentionKind::OracleFailed) => {
+            retry_failed_oracle(state, &item);
         }
-        (super::DecisionAction::Repair, AttentionKind::OracleVerdictFailed) => {
-            let feedback = super::FailureFeedback {
-                summary: item.report.clone(),
-                evidence: item.evidence.clone(),
-                justification: justification.to_string(),
-            };
-            let repair_base = state.deliverable_head().to_string();
-            clear_authoritative_verdicts(state, &item.assertion_ids);
-            let mut repaired_tasks = Vec::new();
-            if let Some(plan) = &state.plan {
-                for task in plan.tasks.iter().filter(|task| {
-                    task.targets
-                        .iter()
-                        .any(|target| item.assertion_ids.contains(target))
-                }) {
-                    repaired_tasks.push(task.id.clone());
-                    if let Some(runtime) = state.tasks.get_mut(&task.id) {
-                        runtime.status = TaskStatus::Pending;
-                        runtime.consecutive_failures = 0;
-                        runtime.candidate_sha = None;
-                        runtime.pending_base_sha = Some(repair_base.clone());
-                        runtime.feedback.push(feedback.clone());
-                    }
-                }
-            }
-            for task_id in repaired_tasks {
-                mark_downstream_stale(state, &task_id);
-            }
-            state.gap_review = Default::default();
+        (super::DecisionAction::Retry, AttentionKind::ProofFailed) => {
+            apply_proof_recovery(state, &item, action, justification);
+        }
+        (super::DecisionAction::Repair, AttentionKind::ProofFailed) => {
+            apply_proof_recovery(state, &item, action, justification);
         }
         (super::DecisionAction::Repair, _) => {}
         (super::DecisionAction::Revise, AttentionKind::PlanProposal) => {
@@ -1220,10 +1200,18 @@ fn apply_decision(
             ready_planning_conversation(state);
         }
         (super::DecisionAction::Revise, _) => {
-            if item.kind == AttentionKind::NodeFailed {
-                retry_failed_node(state, &item);
-            } else if item.kind == AttentionKind::ProofBarUnmet {
-                retry_unmet_proof(state, &item);
+            match item.kind {
+                AttentionKind::NodeFailed => retry_failed_node(state, &item),
+                AttentionKind::OracleFailed => retry_failed_oracle(state, &item),
+                AttentionKind::ProofFailed => {
+                    apply_proof_recovery(state, &item, action, justification)
+                }
+                AttentionKind::NodeAttention
+                | AttentionKind::GateFailed
+                | AttentionKind::GateCheckpoint
+                | AttentionKind::PlanProposal
+                | AttentionKind::GapReviewGaps
+                | AttentionKind::GapReviewFailed => {}
             }
             state.phase = MissionPhase::Planning;
             state.proposal = None;
@@ -1286,9 +1274,6 @@ fn apply_decision(
                     task.pending_base_sha = None;
                 }
             }
-            if let Some(oracle) = &item.oracle {
-                state.waived_oracles.insert(oracle.clone());
-            }
         }
         _ => {}
     }
@@ -1326,14 +1311,6 @@ fn ready_planning_conversation(state: &mut MissionState) {
     }
 }
 
-fn clear_authoritative_verdicts(state: &mut MissionState, assertion_ids: &[AssertionId]) {
-    for assertion_id in assertion_ids {
-        if let Some(assertion) = state.contract.get_mut(assertion_id) {
-            assertion.last_authoritative = None;
-        }
-    }
-}
-
 fn retry_failed_node(state: &mut MissionState, item: &AttentionItem) {
     if let Some(task_id) = &item.task_id {
         if let Some(task) = state.tasks.get_mut(task_id) {
@@ -1352,42 +1329,79 @@ fn retry_failed_node(state: &mut MissionState, item: &AttentionItem) {
     }
 }
 
-fn retry_unmet_proof(state: &mut MissionState, item: &AttentionItem) {
-    let failed_effects = item
-        .evidence
-        .role_attempts()
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    for assertion_id in &item.assertion_ids {
-        let retry_confined = state
-            .plan
-            .as_ref()
-            .is_some_and(|plan| plan.assertion_requires_confined_proof(assertion_id));
-        let retry_judged = state
-            .plan
-            .as_ref()
-            .is_some_and(|plan| plan.assertion_requires_judged_proof(assertion_id));
-        let oracle = retry_confined
-            .then(|| {
-                state
-                    .contract
-                    .get(assertion_id)
-                    .and_then(|assertion| assertion.oracle.clone())
-            })
-            .flatten();
-        if let Some(assertion) = state.contract.get_mut(assertion_id) {
-            if retry_judged {
-                assertion
-                    .last_advisory
-                    .retain(|_, effect_id| !failed_effects.contains(effect_id));
-            }
-            if retry_confined {
-                assertion.last_authoritative = None;
+fn retry_failed_oracle(state: &mut MissionState, item: &AttentionItem) {
+    let Some(oracle) = &item.oracle else {
+        return;
+    };
+    state.oracle_failures.remove(oracle);
+    state.parked_effects.retain(
+        |_, parked| !matches!(parked, ParkedEffect::OracleRun { oracle: parked } if parked == oracle),
+    );
+}
+
+fn apply_proof_recovery(
+    state: &mut MissionState,
+    item: &AttentionItem,
+    action: &super::DecisionAction,
+    justification: &str,
+) {
+    let Some(failure) = super::verdict::proof_failure_for_attention(state, item) else {
+        return;
+    };
+    clear_failed_proof(state, &failure);
+    if action != &super::DecisionAction::Repair {
+        return;
+    }
+
+    let feedback = super::FailureFeedback {
+        summary: item.report.clone(),
+        evidence: item.evidence.clone(),
+        justification: justification.to_string(),
+    };
+    let repair_base = state.deliverable_head().to_string();
+    let mut repaired_tasks = Vec::new();
+    if let Some(plan) = &state.plan {
+        for task in plan.tasks.iter().filter(|task| {
+            task.targets
+                .iter()
+                .any(|target| failure.assertion_ids().contains(target))
+        }) {
+            repaired_tasks.push(task.id.clone());
+            if let Some(runtime) = state.tasks.get_mut(&task.id) {
+                runtime.status = TaskStatus::Pending;
+                runtime.consecutive_failures = 0;
+                runtime.candidate_sha = None;
+                runtime.pending_base_sha = Some(repair_base.clone());
+                runtime.feedback.push(feedback.clone());
             }
         }
-        if let Some(oracle) = oracle {
-            state.waived_oracles.remove(&oracle);
+    }
+    for task_id in repaired_tasks {
+        mark_downstream_stale(state, &task_id);
+    }
+    state.gap_review = Default::default();
+}
+
+fn clear_failed_proof(state: &mut MissionState, failure: &ProofFailure) {
+    let ProofFailure::Receipt { source, effect_id } = failure else {
+        return;
+    };
+    for assertion_id in source.assertion_ids() {
+        let Some(assertion) = state.contract.get_mut(assertion_id) else {
+            continue;
+        };
+        match source {
+            ProofSource::Command { .. }
+                if assertion.last_authoritative_receipt.as_ref() == Some(effect_id) =>
+            {
+                assertion.last_authoritative_receipt = None;
+            }
+            ProofSource::Judgment { role_instance, .. }
+                if assertion.last_advisory.get(role_instance) == Some(effect_id) =>
+            {
+                assertion.last_advisory.remove(role_instance);
+            }
+            ProofSource::Command { .. } | ProofSource::Judgment { .. } => {}
         }
     }
 }
@@ -1442,7 +1456,7 @@ fn promote_proposal_plan(state: &mut MissionState) {
                 AssertionState {
                     oracle: assertion.oracle.clone(),
                     last_advisory: BTreeMap::new(),
-                    last_authoritative: None,
+                    last_authoritative_receipt: None,
                 },
             )
         })
@@ -1569,73 +1583,62 @@ fn derive(state: &mut MissionState) {
             );
         }
     }
-    let mut failed_by_oracle: BTreeMap<
-        super::OracleName,
-        (Vec<AssertionId>, super::FailureEvidence),
-    > = BTreeMap::new();
-    for (assertion_id, assertion) in &state.contract {
-        let Some(verdict) = assertion
-            .last_authoritative
-            .as_ref()
-            .filter(|verdict| verdict.is_fresh_at(state) && !verdict.passed())
-        else {
-            continue;
-        };
-        if state.waived_oracles.contains(verdict.oracle()) {
-            continue;
-        }
-        let (stdout, stderr) = verdict.evidence();
-        failed_by_oracle
-            .entry(verdict.oracle().clone())
-            .or_insert_with(|| {
-                (
-                    Vec::new(),
-                    super::FailureEvidence {
-                        exit_code: verdict.exit_code(),
-                        exit_signal: verdict.exit_signal(),
-                        stdout: stdout.clone(),
-                        stderr: stderr.clone(),
+    if let ProofReadiness::Failed(failures) = proof_readiness(state) {
+        for failure in failures {
+            let assertion_ids = failure.assertion_ids().to_vec();
+            let (id, oracle, evidence, report) = match &failure {
+                ProofFailure::Receipt {
+                    source: ProofSource::Command { oracle, .. },
+                    effect_id,
+                } => (
+                    format!("proof_failed:oracle:{oracle}"),
+                    Some(oracle.clone()),
+                    super::DecisionEvidence::AuthoritativeReceipts {
+                        effect_ids: vec![effect_id.clone()],
                     },
-                )
-            })
-            .0
-            .push(assertion_id.clone());
-    }
-    for (oracle, (assertion_ids, evidence)) in failed_by_oracle {
-        let id = format!("oracle_verdict_failed:{oracle}");
-        attention.insert(
-            id.clone(),
-            AttentionItem {
-                id,
-                kind: AttentionKind::OracleVerdictFailed,
-                task_id: None,
-                oracle: Some(oracle),
-                assertion_ids,
-                evidence: super::DecisionEvidence::OracleVerdict { evidence },
-                report: "An authoritative oracle verdict failed.".to_string(),
-            },
-        );
-    }
-    if attention.is_empty() {
-        if let Some(finish) = settled_finish_candidate(state)
-            .filter(|finish| !state.config.stop.satisfied_by(*finish))
-        {
-            let (assertion_ids, effect_ids) = unmet_proof_evidence(state);
-            let id = "proof_bar_unmet:mission".to_string();
-            attention.insert(
-                id.clone(),
-                AttentionItem {
-                    id,
-                    kind: AttentionKind::ProofBarUnmet,
-                    task_id: None,
-                    oracle: None,
-                    assertion_ids,
-                    evidence: super::DecisionEvidence::RoleAttempts { effect_ids },
-                    report: format!(
+                    format!("Required command proof '{oracle}' failed."),
+                ),
+                ProofFailure::Receipt {
+                    source:
+                        ProofSource::Judgment {
+                            role_instance,
+                            assertion_ids,
+                        },
+                    effect_id,
+                } => {
+                    let anchor = assertion_ids
+                        .first()
+                        .map_or_else(|| role_instance.to_string(), ToString::to_string);
+                    (
+                        format!("proof_failed:judgment:{role_instance}:{anchor}"),
+                        None,
+                        super::DecisionEvidence::RoleAttempts {
+                            effect_ids: vec![effect_id.clone()],
+                        },
+                        format!("Required judgment by '{role_instance}' failed."),
+                    )
+                }
+                ProofFailure::StopBar { finish, .. } => (
+                    "proof_failed:mission".to_string(),
+                    None,
+                    super::DecisionEvidence::None,
+                    format!(
                         "Settled proof class '{}' is below the declared stop bar '{}'.",
                         finish.slug(),
                         state.config.stop.slug()
                     ),
+                ),
+            };
+            attention.insert(
+                id.clone(),
+                AttentionItem {
+                    id,
+                    kind: AttentionKind::ProofFailed,
+                    task_id: None,
+                    oracle,
+                    assertion_ids,
+                    evidence,
+                    report,
                 },
             );
         }
@@ -1692,7 +1695,7 @@ fn derive(state: &mut MissionState) {
                     .filter(|task| task.status != TaskStatus::Superseded)
                     .all(|task| task.status == TaskStatus::Cleared)
                     && state.inflight.is_empty()
-                    && !oracle_obligation_outstanding(state);
+                    && matches!(proof_readiness(state), ProofReadiness::Satisfied(_));
                 if blocking
                     && work_settled
                     && !state
@@ -1734,53 +1737,12 @@ fn derive(state: &mut MissionState) {
     state.phase = MissionPhase::Running;
 }
 
-fn unmet_proof_evidence(state: &MissionState) -> (Vec<AssertionId>, Vec<super::EffectId>) {
-    let Some(plan) = &state.plan else {
-        return (Vec::new(), Vec::new());
-    };
-    let mut assertion_ids = Vec::new();
-    let mut effect_ids = BTreeSet::new();
-    for (assertion_id, assertion) in &state.contract {
-        let confined_unmet = plan.assertion_requires_confined_proof(assertion_id)
-            && assertion
-                .last_authoritative
-                .as_ref()
-                .filter(|verdict| verdict.is_fresh_at(state))
-                .is_none_or(|verdict| !verdict.passed());
-        let judged_unmet = plan.assertion_requires_judged_proof(assertion_id)
-            && state.advisory_status(assertion_id) != super::AdvisoryStatus::Passed;
-        if !confined_unmet && !judged_unmet {
-            continue;
-        }
-        assertion_ids.push(assertion_id.clone());
-        let Some(panel) = state
-            .team
-            .as_ref()
-            .and_then(|team| team.judgment_assignments.get(assertion_id))
-        else {
-            continue;
-        };
-        for validator in panel {
-            let Some(effect_id) = assertion.last_advisory.get(validator) else {
-                continue;
-            };
-            if state
-                .advisory_receipt(assertion_id, validator, effect_id)
-                .is_some_and(|(_, passed)| !passed)
-            {
-                effect_ids.insert(effect_id.clone());
-            }
-        }
-    }
-    (assertion_ids, effect_ids.into_iter().collect())
-}
-
-fn settled_finish_candidate(state: &MissionState) -> Option<FinishClass> {
+pub fn ready_to_finish(state: &MissionState) -> Option<FinishClass> {
     if state.phase.is_terminal()
         || state.plan.is_none()
         || !state.inflight.is_empty()
-        || oracle_obligation_outstanding(state)
-        || advisory_obligation_pending(state)
+        || !state.open_attention.is_empty()
+        || gap_review_outstanding(state)
     {
         return None;
     }
@@ -1789,40 +1751,13 @@ fn settled_finish_candidate(state: &MissionState) -> Option<FinishClass> {
         .values()
         .filter(|task| task.status != TaskStatus::Superseded)
         .all(|task| task.status == TaskStatus::Cleared);
-    tasks_settled.then(|| classify_finish(state))
-}
-
-pub fn ready_to_finish(state: &MissionState) -> Option<FinishClass> {
-    if !state.open_attention.is_empty() || gap_review_outstanding(state) {
+    if !tasks_settled {
         return None;
     }
-    settled_finish_candidate(state).filter(|finish| state.config.stop.satisfied_by(*finish))
-}
-
-fn advisory_obligation_pending(state: &MissionState) -> bool {
-    let Some(plan) = &state.plan else {
-        return false;
-    };
-    state.contract.keys().any(|assertion_id| {
-        plan.assertion_requires_judged_proof(assertion_id)
-            && state.advisory_status(assertion_id) == super::AdvisoryStatus::Pending
-    })
-}
-
-pub(crate) fn oracle_obligation_outstanding(state: &MissionState) -> bool {
-    let Some(plan) = &state.plan else {
-        return false;
-    };
-    state.contract.iter().any(|(assertion_id, assertion)| {
-        plan.assertion_requires_confined_proof(assertion_id)
-            && assertion.oracle.as_ref().is_some_and(|oracle| {
-                !state.waived_oracles.contains(oracle)
-                    && assertion
-                        .last_authoritative
-                        .as_ref()
-                        .is_none_or(|verdict| !verdict.is_fresh_at(state))
-            })
-    })
+    match proof_readiness(state) {
+        ProofReadiness::Satisfied(finish) => Some(finish),
+        ProofReadiness::Pending(_) | ProofReadiness::Failed(_) => None,
+    }
 }
 
 pub(crate) fn gap_review_outstanding(state: &MissionState) -> bool {

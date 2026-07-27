@@ -166,7 +166,7 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
     assert!(ready
         .contract
         .values()
-        .all(|assertion| assertion.last_authoritative.is_none()));
+        .all(|assertion| assertion.last_authoritative_receipt.is_none()));
 
     let oracle = OracleName::new("cargo-test").unwrap();
     let effect = EffectId::for_oracle_request(&id, &oracle, HEAD_SHA, 1);

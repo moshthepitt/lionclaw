@@ -249,7 +249,7 @@ async fn accepted_commit_object_fault_settles_once_and_does_not_block_later_mess
 }
 
 async fn prove_commit_object_fault_settles_once(fault: CommitObjectFault) {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (33, 61));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (33, 62));
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let h = checkpoint_harness(dir.path(), prompts.clone()).await;
@@ -537,7 +537,7 @@ async fn oversized_authoritative_receipt_is_rejected_with_exact_typed_truth() {
     }
     let store = MissionStore::open(dir.path()).await.unwrap();
     let failed = store.require_state(&mission).await.unwrap();
-    let receipt = failed.authoritative_receipts.iter().next().unwrap().clone();
+    let receipt = failed.authoritative_receipts.keys().next().unwrap().clone();
     let receipt_is_blob_backed = store
         .load(&mission)
         .await
@@ -665,7 +665,7 @@ async fn prove_receipt_blob_fault_settles_once(fault: ReceiptBlobFault) {
     let failed = store.require_state(&mission).await.unwrap();
     let receipt = failed
         .authoritative_receipts
-        .iter()
+        .keys()
         .next()
         .unwrap_or_else(|| panic!("receipt was not minted: {failed:#?}"))
         .clone();
@@ -814,7 +814,7 @@ async fn assert_rejected_receipt_completion_cannot_supply_reference_prose(
     prefix.push(legitimate);
 
     let replayed = lionclaw::model::fold(prefix.clone()).unwrap();
-    assert!(replayed.authoritative_receipts.contains(receipt));
+    assert!(replayed.authoritative_receipts.contains_key(receipt));
     let materialized = lionclaw::reference_materialization::materialize_references(
         &replayed,
         &prefix,

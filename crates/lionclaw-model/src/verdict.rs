@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::event::{OracleRunSuccess, PayloadRef, PreparedInputRef, StopBar};
-use super::ids::OracleName;
-use super::state::{AdvisoryStatus, MissionState};
+use super::ids::{AssertionId, EffectId, OracleName, RoleInstanceId};
+use super::state::{MissionState, RoleAttemptReceipt, RoleEffectSource};
 use crate::prelude::*;
 
 /// A worker-independent, reproducible verdict from an engine-run oracle,
@@ -18,9 +18,11 @@ use crate::prelude::*;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthoritativeVerdict {
     passed: bool,
+    assertion_ids: Vec<AssertionId>,
     oracle: OracleName,
     judged_sha: String,
     environment_digest: String,
+    attempt_no: u32,
     exit_code: i32,
     exit_signal: Option<i32>,
     stdout: PayloadRef,
@@ -31,16 +33,20 @@ pub struct AuthoritativeVerdict {
 
 impl AuthoritativeVerdict {
     pub(crate) fn from_oracle_success(
+        assertion_ids: Vec<AssertionId>,
         oracle: OracleName,
         judged_sha: String,
         environment_digest: String,
+        attempt_no: u32,
         success: &OracleRunSuccess,
     ) -> Self {
         Self {
             passed: success.exit_code == 0 && success.exit_signal.is_none(),
+            assertion_ids,
             oracle,
             judged_sha,
             environment_digest,
+            attempt_no,
             exit_code: success.exit_code,
             exit_signal: success.exit_signal,
             stdout: success.stdout.clone(),
@@ -53,6 +59,10 @@ impl AuthoritativeVerdict {
         self.passed
     }
 
+    pub fn assertion_ids(&self) -> &[AssertionId] {
+        &self.assertion_ids
+    }
+
     pub fn oracle(&self) -> &OracleName {
         &self.oracle
     }
@@ -63,6 +73,10 @@ impl AuthoritativeVerdict {
 
     pub fn environment_digest(&self) -> &str {
         &self.environment_digest
+    }
+
+    pub fn attempt_no(&self) -> u32 {
+        self.attempt_no
     }
 
     /// Whether this verdict judged the mission's current artifact commit under
@@ -87,6 +101,117 @@ impl AuthoritativeVerdict {
 
     pub fn prepared_inputs(&self) -> &[PreparedInputRef] {
         &self.prepared_inputs
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        self.assertion_ids == other.assertion_ids
+            && self.oracle == other.oracle
+            && self.judged_sha == other.judged_sha
+            && self.environment_digest == other.environment_digest
+            && self.prepared_inputs == other.prepared_inputs
+    }
+
+    fn same_outcome(&self, other: &Self) -> bool {
+        self.exit_code == other.exit_code
+            && self.exit_signal == other.exit_signal
+            && self.stdout == other.stdout
+            && self.stderr == other.stderr
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProofSource {
+    Command {
+        oracle: OracleName,
+        assertion_ids: Vec<AssertionId>,
+    },
+    Judgment {
+        role_instance: RoleInstanceId,
+        assertion_ids: Vec<AssertionId>,
+    },
+}
+
+impl ProofSource {
+    pub(crate) fn assertion_ids(&self) -> &[AssertionId] {
+        match self {
+            Self::Command { assertion_ids, .. } | Self::Judgment { assertion_ids, .. } => {
+                assertion_ids
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProofFailure {
+    Receipt {
+        source: ProofSource,
+        effect_id: EffectId,
+    },
+    StopBar {
+        finish: FinishClass,
+        assertion_ids: Vec<AssertionId>,
+    },
+}
+
+impl ProofFailure {
+    pub(crate) fn effect_id(&self) -> Option<&EffectId> {
+        match self {
+            Self::Receipt { effect_id, .. } => Some(effect_id),
+            Self::StopBar { .. } => None,
+        }
+    }
+
+    pub(crate) fn assertion_ids(&self) -> &[AssertionId] {
+        match self {
+            Self::Receipt { source, .. } => source.assertion_ids(),
+            Self::StopBar { assertion_ids, .. } => assertion_ids,
+        }
+    }
+
+    pub(crate) fn retry_available(&self, state: &MissionState) -> bool {
+        match self {
+            Self::Receipt {
+                source: ProofSource::Command { .. },
+                effect_id,
+            } => command_retry_available(state, effect_id),
+            Self::Receipt {
+                source: ProofSource::Judgment { .. },
+                effect_id,
+            } => judgment_retry_available(state, effect_id),
+            Self::StopBar { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProofReadiness {
+    Pending(Vec<ProofSource>),
+    Failed(Vec<ProofFailure>),
+    Satisfied(FinishClass),
+}
+
+pub(crate) fn proof_failure_for_attention(
+    state: &MissionState,
+    item: &super::AttentionItem,
+) -> Option<ProofFailure> {
+    if item.kind != super::AttentionKind::ProofFailed {
+        return None;
+    }
+    let ProofReadiness::Failed(failures) = proof_readiness(state) else {
+        return None;
+    };
+    let receipt_id = item
+        .evidence
+        .authoritative_receipts()
+        .first()
+        .or_else(|| item.evidence.role_attempts().first());
+    match receipt_id {
+        Some(receipt_id) => failures
+            .into_iter()
+            .find(|failure| failure.effect_id() == Some(receipt_id)),
+        None => failures
+            .into_iter()
+            .find(|failure| matches!(failure, ProofFailure::StopBar { .. })),
     }
 }
 
@@ -130,61 +255,215 @@ impl StopBar {
     }
 }
 
-/// Classify a finished mission. Freshness: an authoritative verdict counts
-/// only if it judged the mission's current artifact commit under the mission's
-/// current immutable runtime environment.
-///
-/// A fresh authoritative **fail** is ground truth and dominates: it forces
-/// Unverified no matter what an advisory verdict claims. "Internally
-/// consistent" means advisory-only green with *no* fresh authoritative
-/// contradiction — never a green advisory papering over a real oracle
-/// failure.
-pub fn classify_finish(state: &MissionState) -> FinishClass {
+/// Derive every required proof obligation once. Failed proof dominates pending
+/// work, and only a fresh all-green proof set can satisfy the declared stop bar.
+pub(crate) fn proof_readiness(state: &MissionState) -> ProofReadiness {
     let Some(plan) = &state.plan else {
-        return FinishClass::Unverified;
+        return ProofReadiness::Pending(Vec::new());
     };
     if state.contract.is_empty() {
-        return FinishClass::Unverified;
+        return ProofReadiness::Pending(Vec::new());
     }
+
+    let mut pending_commands: BTreeMap<OracleName, Vec<AssertionId>> = BTreeMap::new();
+    let mut pending_judgments = Vec::new();
+    let mut failed_commands: BTreeMap<(OracleName, EffectId), Vec<AssertionId>> = BTreeMap::new();
+    let mut failed_judgments: BTreeMap<(RoleInstanceId, EffectId), Vec<AssertionId>> =
+        BTreeMap::new();
     let mut all_authoritative_pass = true;
     let mut all_green = true;
+
     for (assertion_id, assertion) in &state.contract {
-        let fresh = assertion
-            .last_authoritative
+        let fresh_authoritative = assertion
+            .last_authoritative_receipt
             .as_ref()
-            .filter(|v| v.is_fresh_at(state));
-        match fresh {
-            Some(v) if v.passed() => {}
-            Some(_) => {
-                // Fresh authoritative fail: ground truth, dominates advisory.
-                all_authoritative_pass = false;
-                all_green = false;
-            }
-            None => {
-                all_authoritative_pass = false;
-            }
-        }
+            .and_then(|effect_id| {
+                state
+                    .authoritative_receipts
+                    .get(effect_id)
+                    .map(|verdict| (effect_id, verdict))
+            })
+            .filter(|(_, verdict)| verdict.is_fresh_at(state));
+
         if plan.assertion_requires_confined_proof(assertion_id) {
-            if !matches!(fresh, Some(v) if v.passed()) {
-                all_green = false;
+            match fresh_authoritative {
+                Some((_, verdict)) if verdict.passed() => {}
+                Some((effect_id, verdict)) => {
+                    failed_commands
+                        .entry((verdict.oracle().clone(), effect_id.clone()))
+                        .or_default()
+                        .push(assertion_id.clone());
+                    all_authoritative_pass = false;
+                    all_green = false;
+                }
+                None => {
+                    if let Some(oracle) = &assertion.oracle {
+                        pending_commands
+                            .entry(oracle.clone())
+                            .or_default()
+                            .push(assertion_id.clone());
+                    }
+                    all_authoritative_pass = false;
+                    all_green = false;
+                }
             }
         } else if plan.assertion_requires_judged_proof(assertion_id) {
             all_authoritative_pass = false;
-            if state.advisory_status(assertion_id) != AdvisoryStatus::Passed {
+            let Some(panel) = state
+                .team
+                .as_ref()
+                .and_then(|team| team.judgment_assignments.get(assertion_id))
+            else {
                 all_green = false;
+                continue;
+            };
+            for role_instance in panel {
+                let receipt = assertion
+                    .last_advisory
+                    .get(role_instance)
+                    .and_then(|effect_id| {
+                        state
+                            .advisory_receipt(assertion_id, role_instance, effect_id)
+                            .map(|(receipt, passed)| (effect_id, receipt, passed))
+                    });
+                match receipt {
+                    Some((_, _, true)) => {}
+                    Some((effect_id, _, false)) => {
+                        failed_judgments
+                            .entry((role_instance.clone(), effect_id.clone()))
+                            .or_default()
+                            .push(assertion_id.clone());
+                        all_green = false;
+                    }
+                    None => {
+                        pending_judgments.push(ProofSource::Judgment {
+                            role_instance: role_instance.clone(),
+                            assertion_ids: vec![assertion_id.clone()],
+                        });
+                        all_green = false;
+                    }
+                }
             }
         } else {
-            all_authoritative_pass = false;
+            if !matches!(fresh_authoritative, Some((_, verdict)) if verdict.passed()) {
+                all_authoritative_pass = false;
+            }
             all_green = false;
         }
     }
-    if all_authoritative_pass {
+
+    let mut failures = Vec::new();
+    failures.extend(
+        failed_commands
+            .into_iter()
+            .map(
+                |((oracle, effect_id), assertion_ids)| ProofFailure::Receipt {
+                    source: ProofSource::Command {
+                        oracle,
+                        assertion_ids,
+                    },
+                    effect_id,
+                },
+            ),
+    );
+    failures.extend(failed_judgments.into_iter().map(
+        |((role_instance, effect_id), assertion_ids)| ProofFailure::Receipt {
+            source: ProofSource::Judgment {
+                role_instance,
+                assertion_ids,
+            },
+            effect_id,
+        },
+    ));
+    if !failures.is_empty() {
+        return ProofReadiness::Failed(failures);
+    }
+
+    let mut pending = pending_judgments;
+    pending.extend(pending_commands.into_iter().map(|(oracle, assertion_ids)| {
+        ProofSource::Command {
+            oracle,
+            assertion_ids,
+        }
+    }));
+    if !pending.is_empty() {
+        return ProofReadiness::Pending(pending);
+    }
+
+    let finish = if all_authoritative_pass {
         FinishClass::Verified
     } else if all_green {
         FinishClass::Attested
     } else {
         FinishClass::Unverified
+    };
+    if state.config.stop.satisfied_by(finish) {
+        ProofReadiness::Satisfied(finish)
+    } else {
+        ProofReadiness::Failed(vec![ProofFailure::StopBar {
+            finish,
+            assertion_ids: state.contract.keys().cloned().collect(),
+        }])
     }
+}
+
+fn command_retry_available(state: &MissionState, effect_id: &EffectId) -> bool {
+    let Some(current) = state.authoritative_receipts.get(effect_id) else {
+        return false;
+    };
+    state
+        .authoritative_receipts
+        .values()
+        .filter(|receipt| {
+            receipt.attempt_no() < current.attempt_no() && receipt.same_identity(current)
+        })
+        .max_by_key(|receipt| receipt.attempt_no())
+        .is_none_or(|previous| !previous.same_outcome(current))
+}
+
+fn judgment_retry_available(state: &MissionState, effect_id: &EffectId) -> bool {
+    let Some(current) = state.role_attempt_receipts.get(effect_id) else {
+        return false;
+    };
+    let RoleEffectSource::Turn {
+        request: current_request,
+        plan_revision: current_revision,
+    } = &current.source;
+    state
+        .role_attempt_receipts
+        .values()
+        .filter_map(|receipt| {
+            let RoleEffectSource::Turn {
+                request,
+                plan_revision,
+            } = &receipt.source;
+            (*plan_revision == *current_revision
+                && request.attempt_no < current_request.attempt_no
+                && same_judgment_identity(request, current_request))
+            .then_some((request.attempt_no, receipt))
+        })
+        .max_by_key(|(attempt_no, _)| *attempt_no)
+        .is_none_or(|(_, previous)| !same_judgment_outcome(previous, current))
+}
+
+fn same_judgment_identity(
+    left: &super::RoleTurnProvenance,
+    right: &super::RoleTurnProvenance,
+) -> bool {
+    left.role_instance == right.role_instance
+        && left.team_revision == right.team_revision
+        && left.task_id == right.task_id
+        && left.assertion_ids == right.assertion_ids
+        && left.assignment_epoch == right.assignment_epoch
+        && left.prompt_template == right.prompt_template
+        && left.prompt_hash == right.prompt_hash
+        && left.base_sha == right.base_sha
+        && left.environment_digest == right.environment_digest
+        && left.instrument_identity == right.instrument_identity
+}
+
+fn same_judgment_outcome(left: &RoleAttemptReceipt, right: &RoleAttemptReceipt) -> bool {
+    left.settled_handoff() == right.settled_handoff()
 }
 
 #[cfg(test)]

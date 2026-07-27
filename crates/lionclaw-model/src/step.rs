@@ -1,11 +1,12 @@
 //! Pure team-driven dispatch.
 
-use super::fold::{gap_review_outstanding, oracle_obligation_outstanding};
+use super::fold::gap_review_outstanding;
 use super::ids::{AssertionId, OracleName, RoleInstanceId, TaskId};
 use super::state::{
     ConversationLifecycle, DeliveryMarker, InflightEffect, MissionPhase, MissionState,
     ReviewOutcome, TaskStatus,
 };
+use super::verdict::{proof_readiness, ProofReadiness, ProofSource};
 use crate::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,45 +278,41 @@ fn step_running(state: &MissionState) -> StepDecision {
     let Some(team) = state.team.as_ref() else {
         return StepDecision::Idle;
     };
+    let pending_proof = match proof_readiness(state) {
+        ProofReadiness::Pending(sources) => sources,
+        ProofReadiness::Failed(_) => return StepDecision::Idle,
+        ProofReadiness::Satisfied(_) => Vec::new(),
+    };
+    let proof_pending = !pending_proof.is_empty();
     let mut judgment_intents = Vec::new();
     let mut reserved_judges = reserved_roles;
-    for (assertion_id, panel) in &team.judgment_assignments {
-        if !plan.assertion_requires_judged_proof(assertion_id) {
+    for source in &pending_proof {
+        let ProofSource::Judgment {
+            role_instance,
+            assertion_ids,
+        } = source
+        else {
+            continue;
+        };
+        if reserved_judges.contains(role_instance)
+            || !state.taskless_assignment_dispatchable(role_instance, assertion_ids)
+        {
             continue;
         }
-        for role_id in panel {
-            if reserved_judges.contains(role_id) {
-                continue;
+        if let Some(intent) = role_intent(
+            state,
+            role_instance,
+            None,
+            "Judge the assigned assertions.".to_string(),
+            assertion_ids.clone(),
+            state.deliverable_head().to_string(),
+            Vec::new(),
+        ) {
+            reserved_judges.insert(role_instance.clone());
+            judgment_intents.push(intent);
+            if judgment_intents.len() == remaining_capacity {
+                break;
             }
-            let already_settled = state
-                .contract
-                .get(assertion_id)
-                .and_then(|assertion| assertion.last_advisory.get(role_id))
-                .and_then(|effect| state.advisory_receipt(assertion_id, role_id, effect))
-                .is_some();
-            if !already_settled
-                && state
-                    .taskless_assignment_dispatchable(role_id, core::slice::from_ref(assertion_id))
-            {
-                if let Some(intent) = role_intent(
-                    state,
-                    role_id,
-                    None,
-                    "Judge the assigned assertions.".to_string(),
-                    vec![assertion_id.clone()],
-                    state.deliverable_head().to_string(),
-                    Vec::new(),
-                ) {
-                    reserved_judges.insert(role_id.clone());
-                    judgment_intents.push(intent);
-                    if judgment_intents.len() == remaining_capacity {
-                        break;
-                    }
-                }
-            }
-        }
-        if judgment_intents.len() == remaining_capacity {
-            break;
         }
     }
     match judgment_intents.len() {
@@ -328,28 +325,23 @@ fn step_running(state: &MissionState) -> StepDecision {
         return StepDecision::Idle;
     }
 
-    if oracle_obligation_outstanding(state) {
-        let mut by_oracle: BTreeMap<OracleName, Vec<AssertionId>> = BTreeMap::new();
-        for (assertion_id, assertion) in state
-            .contract
-            .iter()
-            .filter(|(assertion_id, _)| plan.assertion_requires_confined_proof(assertion_id))
-        {
-            let Some(oracle) = &assertion.oracle else {
-                continue;
-            };
-            if !state.oracle_dispatchable(oracle) || by_oracle.contains_key(oracle) {
-                continue;
-            }
-            let owed = state.owed_assertions_for_oracle(oracle);
-            if !owed.is_empty() {
-                debug_assert!(owed.contains(assertion_id));
-                by_oracle.insert(oracle.clone(), owed);
-                if by_oracle.len() == remaining_capacity {
-                    break;
-                }
+    let mut by_oracle: BTreeMap<OracleName, Vec<AssertionId>> = BTreeMap::new();
+    for source in pending_proof {
+        let ProofSource::Command {
+            oracle,
+            assertion_ids,
+        } = source
+        else {
+            continue;
+        };
+        if state.oracle_dispatchable(&oracle) {
+            by_oracle.insert(oracle, assertion_ids);
+            if by_oracle.len() == remaining_capacity {
+                break;
             }
         }
+    }
+    if !by_oracle.is_empty() {
         return StepDecision::RunOracles(
             by_oracle
                 .into_iter()
@@ -361,6 +353,10 @@ fn step_running(state: &MissionState) -> StepDecision {
                 })
                 .collect(),
         );
+    }
+
+    if proof_pending {
+        return StepDecision::Idle;
     }
 
     if gap_review_outstanding(state) {

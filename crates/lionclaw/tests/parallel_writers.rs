@@ -514,7 +514,7 @@ async fn repairing_a_non_sink_task_reowes_integration_and_proof_at_the_new_head(
     h.engine
         .decide(
             &mission_id,
-            "oracle_verdict_failed:cargo-left",
+            "proof_failed:oracle:cargo-left",
             DecisionAction::Repair,
             "repair the left-side assertion",
         )
@@ -700,7 +700,7 @@ async fn serial_single_writer_repair_flow_keeps_slice8_projection() {
     engine
         .decide(
             &mission_id,
-            "oracle_verdict_failed:cargo-test",
+            "proof_failed:oracle:cargo-test",
             DecisionAction::Repair,
             "repair serial task",
         )

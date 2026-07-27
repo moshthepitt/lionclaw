@@ -4,34 +4,59 @@
 use anyhow::Result;
 
 use crate::model::{
-    DecisionEvidence, EffectId, FailureEvidence, FailureFeedback, MissionState, PayloadRef,
+    AuthoritativeVerdict, DecisionEvidence, EffectId, FailureFeedback, MissionState, PayloadRef,
     RoleAttemptDisposition, RoleAttemptReceipt, RoleEffectSource, RuntimeUsage,
 };
 use crate::store::BlobStore;
 
 const HALF_EXCERPT_BYTES: usize = 4096;
 
-pub fn render_evidence(blobs: &BlobStore, evidence: &FailureEvidence) -> Result<String> {
-    let stdout = render_payload(blobs, &evidence.stdout);
-    let stderr = render_payload(blobs, &evidence.stderr);
-    Ok(format!(
-        "exit code: {}\nsignal: {}\nstdout:\n{}\nstderr:\n{}",
-        evidence.exit_code,
-        evidence
-            .exit_signal
+pub fn render_authoritative_receipt(
+    blobs: &BlobStore,
+    effect_id: &EffectId,
+    verdict: &AuthoritativeVerdict,
+) -> String {
+    let (stdout, stderr) = verdict.evidence();
+    format!(
+        "effect: {effect_id}\nsource: oracle {}\nassertions: {}\nattempt: {}\njudged artifact: {}\nenvironment: {}\nexit code: {}\nsignal: {}\nstdout:\n{}\nstderr:\n{}",
+        verdict.oracle(),
+        verdict
+            .assertion_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        verdict.attempt_no(),
+        verdict.judged_sha(),
+        verdict.environment_digest(),
+        verdict.exit_code(),
+        verdict
+            .exit_signal()
             .map_or_else(|| "none".to_string(), |signal| signal.to_string()),
-        stdout,
-        stderr,
-    ))
+        render_payload(blobs, stdout),
+        render_payload(blobs, stderr),
+    )
 }
 
-pub fn evidence_json(blobs: &BlobStore, evidence: &FailureEvidence) -> Result<serde_json::Value> {
-    Ok(serde_json::json!({
-        "exit_code": evidence.exit_code,
-        "exit_signal": evidence.exit_signal,
-        "stdout": render_payload(blobs, &evidence.stdout),
-        "stderr": render_payload(blobs, &evidence.stderr),
-    }))
+pub fn authoritative_receipt_json(
+    blobs: &BlobStore,
+    effect_id: &EffectId,
+    verdict: &AuthoritativeVerdict,
+) -> serde_json::Value {
+    let (stdout, stderr) = verdict.evidence();
+    serde_json::json!({
+        "effect_id": effect_id,
+        "oracle": verdict.oracle(),
+        "assertion_ids": verdict.assertion_ids(),
+        "attempt_no": verdict.attempt_no(),
+        "judged_sha": verdict.judged_sha(),
+        "environment_digest": verdict.environment_digest(),
+        "exit_code": verdict.exit_code(),
+        "exit_signal": verdict.exit_signal(),
+        "stdout": render_payload(blobs, stdout),
+        "stderr": render_payload(blobs, stderr),
+        "prepared_inputs": verdict.prepared_inputs(),
+    })
 }
 
 pub fn render_feedback(
@@ -66,13 +91,22 @@ pub fn decision_evidence_json(
                 .map(|effect_id| role_attempt_reference_json(blobs, state, effect_id))
                 .collect::<Vec<_>>(),
         }),
+        DecisionEvidence::AuthoritativeReceipts { effect_ids } => serde_json::json!({
+            "kind": "authoritative_receipts",
+            "receipts": effect_ids
+                .iter()
+                .map(|effect_id| state.authoritative_receipts.get(effect_id).map_or_else(
+                    || serde_json::json!({
+                        "effect_id": effect_id,
+                        "authority": "unavailable",
+                    }),
+                    |verdict| authoritative_receipt_json(blobs, effect_id, verdict),
+                ))
+                .collect::<Vec<_>>(),
+        }),
         DecisionEvidence::OracleRuntimeFailure { failure } => serde_json::json!({
             "kind": "oracle_runtime_failure",
             "failure": failure,
-        }),
-        DecisionEvidence::OracleVerdict { evidence } => serde_json::json!({
-            "kind": "oracle_verdict",
-            "evidence": evidence_json(blobs, evidence)?,
         }),
     })
 }
@@ -100,8 +134,21 @@ pub fn render_decision_evidence(
             }
             rendered
         }
+        DecisionEvidence::AuthoritativeReceipts { effect_ids } => {
+            let mut rendered = String::new();
+            for effect_id in effect_ids {
+                if !rendered.is_empty() {
+                    rendered.push('\n');
+                }
+                rendered.push_str("Authoritative receipt:\n");
+                rendered.push_str(&state.authoritative_receipts.get(effect_id).map_or_else(
+                    || format!("effect: {effect_id}\nauthority: unavailable"),
+                    |verdict| render_authoritative_receipt(blobs, effect_id, verdict),
+                ));
+            }
+            rendered
+        }
         DecisionEvidence::OracleRuntimeFailure { failure } => render_typed_failure(failure),
-        DecisionEvidence::OracleVerdict { evidence } => render_evidence(blobs, evidence)?,
     })
 }
 

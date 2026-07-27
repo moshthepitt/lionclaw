@@ -102,7 +102,7 @@ impl<'a> ReferenceMaterializer<'a> {
             let materialized: Result<(String, String, Vec<u8>)> = async {
                 Ok(match reference {
                     MessageReference::AuthoritativeReceipt { effect_id } => {
-                        if !self.state.authoritative_receipts.contains(effect_id) {
+                        if !self.state.authoritative_receipts.contains_key(effect_id) {
                             bail!("authoritative receipt {effect_id} is not valid in this mission");
                         }
                         let success =
@@ -359,7 +359,7 @@ fn capture_reference_authority(
     } = &envelope.event
     {
         if requested_receipts.contains(effect_id)
-            && state.authoritative_receipts.contains(effect_id)
+            && state.authoritative_receipts.contains_key(effect_id)
         {
             authority
                 .receipts

@@ -569,26 +569,19 @@ impl TaskRuntimeState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FailureEvidence {
-    pub exit_code: i32,
-    pub exit_signal: Option<i32>,
-    pub stdout: PayloadRef,
-    pub stderr: PayloadRef,
-}
-
 /// Exact evidence behind an operator decision or replanning input.
 ///
 /// Role-derived facts retain only receipt identities and resolve their content
-/// through `MissionState::role_attempt_receipts`. Oracle failures are not role
-/// attempts and retain their own typed payload.
+/// through `MissionState::role_attempt_receipts`. Completed oracle runs resolve
+/// through `MissionState::authoritative_receipts`; runtime failures retain
+/// their typed payload because they did not mint an authoritative receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DecisionEvidence {
     None,
     RoleAttempts { effect_ids: Vec<super::EffectId> },
+    AuthoritativeReceipts { effect_ids: Vec<super::EffectId> },
     OracleRuntimeFailure { failure: TypedFailure },
-    OracleVerdict { evidence: FailureEvidence },
 }
 
 impl DecisionEvidence {
@@ -603,7 +596,16 @@ impl DecisionEvidence {
     pub fn role_attempts(&self) -> &[super::EffectId] {
         match self {
             Self::RoleAttempts { effect_ids } => effect_ids,
-            Self::None | Self::OracleRuntimeFailure { .. } | Self::OracleVerdict { .. } => &[],
+            Self::None | Self::AuthoritativeReceipts { .. } | Self::OracleRuntimeFailure { .. } => {
+                &[]
+            }
+        }
+    }
+
+    pub fn authoritative_receipts(&self) -> &[super::EffectId] {
+        match self {
+            Self::AuthoritativeReceipts { effect_ids } => effect_ids,
+            Self::None | Self::RoleAttempts { .. } | Self::OracleRuntimeFailure { .. } => &[],
         }
     }
 }
@@ -665,8 +667,9 @@ pub struct AssertionState {
     pub oracle: Option<OracleName>,
     /// Last evidence-bearing verdict per assigned judgment role instance.
     pub last_advisory: BTreeMap<RoleInstanceId, super::EffectId>,
-    /// Only the fold can mint this, and only from `OracleRunCompleted`.
-    pub last_authoritative: Option<AuthoritativeVerdict>,
+    /// Current engine-run receipt. Only the fold can mint its referenced
+    /// verdict, and only from `OracleRunCompleted`.
+    pub last_authoritative_receipt: Option<super::EffectId>,
 }
 
 /// An assertion receipt retired by an explicit correction. It remains
@@ -833,14 +836,12 @@ pub enum AttentionKind {
     /// An oracle failed to *run* (infrastructure), distinct from a nonzero
     /// exit (which is a valid verdict).
     OracleFailed,
-    /// An oracle ran and returned an authoritative nonzero verdict.
-    OracleVerdictFailed,
+    /// Fresh required command or judged proof returned a non-passing verdict.
+    ProofFailed,
     GateFailed,
     GateCheckpoint,
     /// A complete plan proposal awaits approval before promotion.
     PlanProposal,
-    /// Required proof settled below the mission's declared stop bar.
-    ProofBarUnmet,
     /// The gap review's blocking verdict awaits a human (revise to
     /// remediate / retry to re-run / accept to acknowledge-and-close /
     /// abort). Raised only when the mission would otherwise close, so
@@ -860,11 +861,10 @@ impl AttentionKind {
             Self::NodeFailed => "node_failed",
             Self::NodeAttention => "node_attention",
             Self::OracleFailed => "oracle_failed",
-            Self::OracleVerdictFailed => "oracle_verdict_failed",
+            Self::ProofFailed => "proof_failed",
             Self::GateFailed => "gate_failed",
             Self::GateCheckpoint => "gate_checkpoint",
             Self::PlanProposal => "plan_proposal",
-            Self::ProofBarUnmet => "proof_bar_unmet",
             Self::GapReviewGaps => "gap_review_gaps",
             Self::GapReviewFailed => "gap_review_failed",
         }
@@ -1184,9 +1184,10 @@ pub struct MissionState {
     /// Monotonic evidence of retained writer archives, keyed by task.
     #[serde(default)]
     pub retained_workspace_archives: BTreeMap<TaskId, BTreeSet<super::EffectId>>,
-    /// Exact same-mission evidence identities eligible for message references.
+    /// Append-only authoritative command receipts. Assertions retain current
+    /// receipt IDs and resolve verdicts through this map.
     #[serde(default)]
-    pub authoritative_receipts: BTreeSet<super::EffectId>,
+    pub authoritative_receipts: BTreeMap<super::EffectId, AuthoritativeVerdict>,
     /// Commits established by mission creation or accepted artifact outcomes.
     #[serde(default)]
     pub reachable_commits: BTreeSet<String>,
@@ -1222,10 +1223,6 @@ pub struct MissionState {
     /// nonzero exit) → mapped to the failure detail, until a decision clears
     /// them. Prevents a broken oracle from re-requesting forever.
     pub oracle_failures: BTreeMap<OracleName, TypedFailure>,
-    /// Oracles whose obligation a human waived (`accept` on an oracle
-    /// failure): the mission may finish, but never *verified* — there is no
-    /// authoritative verdict.
-    pub waived_oracles: BTreeSet<OracleName>,
     /// Terminal-review runtime (config-gated; default-empty for every
     /// pre-feature mission and snapshot).
     #[serde(default)]
@@ -2042,6 +2039,16 @@ impl MissionState {
         &self.tasks
     }
 
+    pub fn authoritative_verdict(
+        &self,
+        assertion: &AssertionState,
+    ) -> Option<&AuthoritativeVerdict> {
+        assertion
+            .last_authoritative_receipt
+            .as_ref()
+            .and_then(|effect_id| self.authoritative_receipts.get(effect_id))
+    }
+
     pub(crate) fn oracle_automatic_retry_remaining(&self, oracle: &OracleName) -> bool {
         self.oracle_failures
             .get(oracle)
@@ -2063,9 +2070,8 @@ impl MissionState {
             .filter(|(assertion_id, assertion)| {
                 assertion.oracle.as_ref() == Some(oracle)
                     && plan.assertion_requires_confined_proof(assertion_id)
-                    && assertion
-                        .last_authoritative
-                        .as_ref()
+                    && self
+                        .authoritative_verdict(assertion)
                         .is_none_or(|verdict| !verdict.is_fresh_at(self))
             })
             .map(|(id, _)| id.clone())
@@ -2073,8 +2079,6 @@ impl MissionState {
     }
 
     pub(crate) fn oracle_dispatchable(&self, oracle: &OracleName) -> bool {
-        !self.waived_oracles.contains(oracle)
-            && (!self.oracle_failures.contains_key(oracle)
-                || self.oracle_automatic_retry_remaining(oracle))
+        !self.oracle_failures.contains_key(oracle) || self.oracle_automatic_retry_remaining(oracle)
     }
 }

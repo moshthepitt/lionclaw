@@ -263,7 +263,7 @@ async fn passing_oracle_yields_verified_finish() {
         .values()
         .all(|t| t.status == TaskStatus::Cleared));
     let assertion = state.contract.values().next().expect("assertion");
-    let verdict = assertion.last_authoritative.as_ref().expect("verdict");
+    let verdict = state.authoritative_verdict(assertion).expect("verdict");
     assert!(verdict.passed());
     assert_eq!(verdict.judged_sha(), HEAD_SHA);
     assert_eq!(verdict.exit_code(), 0);
@@ -625,7 +625,7 @@ async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
         .state
         .contract
         .values()
-        .all(|assertion| assertion.last_authoritative.is_none()));
+        .all(|assertion| assertion.last_authoritative_receipt.is_none()));
 
     let checkpoint = h.engine.advance(&mission_id).await.unwrap();
     assert_eq!(checkpoint.disposition, MissionDisposition::Ready);
@@ -634,7 +634,7 @@ async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
             .state
             .contract
             .values()
-            .filter(|assertion| assertion.last_authoritative.is_some())
+            .filter(|assertion| assertion.last_authoritative_receipt.is_some())
             .count(),
         2
     );
@@ -744,7 +744,7 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
 }
 
 #[tokio::test]
-async fn failing_oracle_and_waiver_never_satisfy_the_stop_bar() {
+async fn failing_required_oracle_cannot_be_accepted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let h = harness(
         dir.path(),
@@ -770,46 +770,156 @@ async fn failing_oracle_and_waiver_never_satisfy_the_stop_bar() {
     assert_eq!(outcome.disposition, MissionDisposition::Parked);
     let attention: Vec<_> = outcome.state.open_attention.values().collect();
     assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0].id, "oracle_verdict_failed:cargo-test");
+    assert_eq!(attention[0].id, "proof_failed:oracle:cargo-test");
     assert_eq!(attention[0].assertion_ids[0].as_str(), "TESTS-PASS");
     assert!(matches!(
         &attention[0].evidence,
-        lionclaw::model::DecisionEvidence::OracleVerdict { evidence }
-            if evidence.exit_code == 1
+        lionclaw::model::DecisionEvidence::AuthoritativeReceipts { effect_ids }
+            if effect_ids.len() == 1
     ));
     let state = h.engine.load_state(&mission_id).await.expect("state");
     let verdict = state
         .contract
         .values()
         .next()
-        .expect("assertion")
-        .last_authoritative
-        .as_ref()
+        .and_then(|assertion| state.authoritative_verdict(assertion))
         .expect("verdict");
     assert!(!verdict.passed());
     assert_eq!(verdict.exit_code(), 1);
 
-    h.engine
+    let error = h
+        .engine
         .decide(
             &mission_id,
-            "oracle_verdict_failed:cargo-test",
+            "proof_failed:oracle:cargo-test",
             DecisionAction::Accept,
-            "record the unavailable proof without claiming success",
+            "required proof cannot be waived",
         )
         .await
-        .expect("waive failed oracle");
-    let waived = h
+        .expect_err("accept must be rejected for failed required proof");
+    assert!(
+        error.to_string().contains("not valid"),
+        "unexpected error: {error:#}"
+    );
+    let parked = h
         .engine
         .load_state(&mission_id)
         .await
-        .expect("waived state");
-    assert_eq!(waived.phase, MissionPhase::AttentionNeeded);
-    assert_eq!(lionclaw::model::ready_to_finish(&waived), None);
-    let attention = &waived.open_attention["proof_bar_unmet:mission"];
+        .expect("parked state");
+    assert_eq!(parked.phase, MissionPhase::AttentionNeeded);
+    assert_eq!(lionclaw::model::ready_to_finish(&parked), None);
+    assert!(parked
+        .open_attention
+        .contains_key("proof_failed:oracle:cargo-test"));
+}
+
+#[tokio::test]
+async fn command_retry_is_reoffered_only_for_a_changed_outcome() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let oracle_attempts = attempts.clone();
+    let h = harness(
+        dir.path(),
+        review_runner(vec![]),
+        MockOracleRunner::new(Box::new(move |_| {
+            let attempt = oracle_attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(lionclaw::ports::OracleOutcome {
+                exit_code: 1,
+                exit_signal: None,
+                stdout: if attempt == 0 {
+                    b"first failure".to_vec()
+                } else {
+                    b"changed failure".to_vec()
+                },
+                stderr: Vec::new(),
+                prepared_inputs: Vec::new(),
+                duration_ms: 1,
+            })
+        })),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "exercise proof retry",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+
+    let first = h.engine.advance(&mission_id).await.expect("first failure");
+    let attention_id = "proof_failed:oracle:cargo-test";
     assert_eq!(
-        lionclaw::model::decision::allowed_actions(attention.kind),
-        [DecisionAction::Retry, DecisionAction::Revise]
+        lionclaw::model::legal_actions(&first.state, &first.state.open_attention[attention_id]),
+        [
+            DecisionAction::Retry,
+            DecisionAction::Repair,
+            DecisionAction::Revise
+        ]
     );
+    assert_eq!(first.state.authoritative_receipts.len(), 1);
+
+    h.engine
+        .decide(
+            &mission_id,
+            attention_id,
+            DecisionAction::Retry,
+            "retry the first failure",
+        )
+        .await
+        .expect("first retry");
+    let changed = h
+        .engine
+        .advance(&mission_id)
+        .await
+        .expect("changed failure");
+    assert_eq!(
+        lionclaw::model::legal_actions(&changed.state, &changed.state.open_attention[attention_id]),
+        [
+            DecisionAction::Retry,
+            DecisionAction::Repair,
+            DecisionAction::Revise
+        ]
+    );
+    assert_eq!(changed.state.authoritative_receipts.len(), 2);
+
+    h.engine
+        .decide(
+            &mission_id,
+            attention_id,
+            DecisionAction::Retry,
+            "retry the changed failure",
+        )
+        .await
+        .expect("second retry");
+    let repeated = h
+        .engine
+        .advance(&mission_id)
+        .await
+        .expect("repeated failure");
+    assert_eq!(
+        lionclaw::model::legal_actions(
+            &repeated.state,
+            &repeated.state.open_attention[attention_id]
+        ),
+        [DecisionAction::Repair, DecisionAction::Revise]
+    );
+    assert_eq!(repeated.state.authoritative_receipts.len(), 3);
+    h.engine
+        .decide(
+            &mission_id,
+            attention_id,
+            DecisionAction::Retry,
+            "forged repeated retry",
+        )
+        .await
+        .expect_err("identical repeated failure must suppress retry");
 }
 
 #[tokio::test]

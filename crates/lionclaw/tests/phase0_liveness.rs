@@ -78,9 +78,9 @@ fn assert_advertised_actions_are_legal(view: &MissionView) {
 fn assert_decisions_change_authority(state: &lionclaw::model::MissionState) -> bool {
     let mut found = false;
     for item in state.open_attention.values() {
-        for action in lionclaw::model::decision::allowed_actions(item.kind) {
+        for action in lionclaw::model::decision::legal_actions(state, item) {
             found = true;
-            let requirement_changes = if action == &DecisionAction::Approve {
+            let requirement_changes = if action == DecisionAction::Approve {
                 state
                     .proposal
                     .as_ref()

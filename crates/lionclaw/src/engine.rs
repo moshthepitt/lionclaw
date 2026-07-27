@@ -3070,7 +3070,7 @@ pub async fn record_message(
     for reference in &references {
         let valid = match reference {
             crate::model::MessageReference::AuthoritativeReceipt { effect_id } => {
-                state.authoritative_receipts.contains(effect_id)
+                state.authoritative_receipts.contains_key(effect_id)
             }
             crate::model::MessageReference::ParkEvidence { effect_id } => {
                 state.parked_effects.contains_key(effect_id)

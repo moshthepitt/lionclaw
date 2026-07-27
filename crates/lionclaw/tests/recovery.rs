@@ -710,22 +710,40 @@ async fn oracle_repair_reopens_the_owner_with_both_evidence_streams() {
         .await
         .unwrap();
     approve_plan(&h.engine, &id).await;
-    assert_eq!(
-        h.engine.advance(&id).await.unwrap().disposition,
-        MissionDisposition::Parked
-    );
+    let failed = h.engine.advance(&id).await.unwrap();
+    assert_eq!(failed.disposition, MissionDisposition::Parked);
+    let failed_receipt = failed
+        .state
+        .authoritative_receipts
+        .keys()
+        .next()
+        .expect("failed command receipt")
+        .clone();
     h.engine
         .decide(
             &id,
-            "oracle_verdict_failed:cargo-test",
+            "proof_failed:oracle:cargo-test",
             DecisionAction::Repair,
             "fix the compiler error",
         )
         .await
         .unwrap();
+    let repairing = h.engine.load_state(&id).await.unwrap();
+    assert!(repairing
+        .authoritative_receipts
+        .contains_key(&failed_receipt));
+    assert!(repairing
+        .contract
+        .values()
+        .all(|assertion| assertion.last_authoritative_receipt.is_none()));
     let view = h.engine.advance(&id).await.unwrap();
     assert_eq!(view.disposition, MissionDisposition::Terminal);
     assert!(matches!(view.state.phase, MissionPhase::Done { .. }));
+    assert_eq!(view.state.authoritative_receipts.len(), 2);
+    assert!(view
+        .state
+        .authoritative_receipts
+        .contains_key(&failed_receipt));
     let prompts = prompts.lock().unwrap();
     assert_eq!(prompts.len(), 2);
     for expected in [

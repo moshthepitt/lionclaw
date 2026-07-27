@@ -834,7 +834,7 @@ async fn check_prepared_input() -> Result<()> {
         .contract
         .values()
         .next()
-        .and_then(|assertion| assertion.last_authoritative.as_ref())
+        .and_then(|assertion| state.authoritative_verdict(assertion))
         .context("prepared-input oracle verdict missing")?;
     let input = verdict
         .prepared_inputs()
@@ -927,7 +927,7 @@ async fn check_oracle_honesty() -> Result<()> {
         .contract
         .values()
         .next()
-        .and_then(|assertion| assertion.last_authoritative.as_ref())
+        .and_then(|assertion| state.authoritative_verdict(assertion))
         .context("failing oracle produced no authoritative verdict")?;
     if verdict.passed() {
         anyhow::bail!("the genuinely broken tree received an authoritative pass");
@@ -935,7 +935,7 @@ async fn check_oracle_honesty() -> Result<()> {
     if outcome.disposition != MissionDisposition::Parked
         || !state
             .open_attention
-            .contains_key("oracle_verdict_failed:cargo-test")
+            .contains_key("proof_failed:oracle:cargo-test")
     {
         anyhow::bail!("failing oracle did not park on its repair path: {outcome:?}");
     }
