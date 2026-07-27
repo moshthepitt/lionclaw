@@ -1,5 +1,7 @@
 //! Pure event fold for the team-owned runtime model.
 
+use alloc::collections::btree_map::Entry;
+
 use super::event::{ControlAction, EventEnvelope, Handoff, MissionEvent};
 use super::ids::{AssertionId, RoleInstanceId, TaskId};
 use super::state::{
@@ -15,9 +17,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 65 derives required proof once from immutable receipt ledgers,
+/// Reducer 66 derives required proof once from immutable receipt ledgers,
 /// uses one failure path, and preserves exact evidence across every revision.
-pub const REDUCER_VERSION: u32 = 65;
+pub const REDUCER_VERSION: u32 = 66;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -152,8 +154,10 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 )
                 && judged_sha == state.deliverable_head()
                 && environment_digest == state.environment_digest()
+                && state.next_oracle_attempt(oracle) == Some(*attempt_no)
                 && !assertion_ids.is_empty()
-                && assertion_ids == &state.owed_assertions_for_oracle(oracle);
+                && assertion_ids == &state.owed_assertions_for_oracle(oracle)
+                && !state.authoritative_receipts.contains_key(effect_id);
             if canonical && !state.inflight.contains_key(effect_id) {
                 state.oracle_attempts.insert(oracle.clone(), *attempt_no);
                 state.inflight.insert(
@@ -1030,14 +1034,6 @@ fn apply_oracle_outcome(
             );
         }
         Ok(success) => {
-            state.oracle_failures.remove(oracle);
-            state.parked_effects.retain(|_, parked| {
-                !matches!(
-                    parked,
-                    ParkedEffect::OracleRun { oracle: parked_oracle }
-                        if parked_oracle == oracle
-                )
-            });
             let verdict = AuthoritativeVerdict::from_oracle_success(
                 assertion_ids.to_vec(),
                 oracle.clone(),
@@ -1046,6 +1042,19 @@ fn apply_oracle_outcome(
                 attempt_no,
                 success,
             );
+            let Entry::Vacant(receipt) = state.authoritative_receipts.entry(effect_id.clone())
+            else {
+                return;
+            };
+            receipt.insert(verdict);
+            state.oracle_failures.remove(oracle);
+            state.parked_effects.retain(|_, parked| {
+                !matches!(
+                    parked,
+                    ParkedEffect::OracleRun { oracle: parked_oracle }
+                        if parked_oracle == oracle
+                )
+            });
             for assertion_id in assertion_ids {
                 if let Some(assertion) = state.contract.get_mut(assertion_id) {
                     if assertion.oracle.as_ref() == Some(oracle) {
@@ -1053,9 +1062,6 @@ fn apply_oracle_outcome(
                     }
                 }
             }
-            state
-                .authoritative_receipts
-                .insert(effect_id.clone(), verdict);
         }
     }
 }

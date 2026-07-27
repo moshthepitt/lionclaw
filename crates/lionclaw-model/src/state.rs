@@ -2065,6 +2065,14 @@ impl MissionState {
                 < self.config.recovery.max_attempts
     }
 
+    pub(crate) fn next_oracle_attempt(&self, oracle: &OracleName) -> Option<u32> {
+        self.oracle_attempts
+            .get(oracle)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)
+    }
+
     pub(crate) fn owed_assertions_for_oracle(&self, oracle: &OracleName) -> Vec<AssertionId> {
         let Some(plan) = &self.plan else {
             return Vec::new();

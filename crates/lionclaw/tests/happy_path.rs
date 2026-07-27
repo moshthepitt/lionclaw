@@ -815,6 +815,98 @@ async fn failing_required_oracle_cannot_be_accepted() {
 }
 
 #[tokio::test]
+async fn replayed_oracle_attempt_cannot_replace_authoritative_receipt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        review_runner(vec![]),
+        MockOracleRunner::exiting(1),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "keep authoritative receipts immutable",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+
+    let failed = h.engine.advance(&mission_id).await.expect("failed proof");
+    let (receipt_id, failed_verdict) = failed
+        .state
+        .authoritative_receipts
+        .first_key_value()
+        .expect("failed authoritative receipt");
+    let receipt_id = receipt_id.clone();
+    let failed_verdict = failed_verdict.clone();
+    assert!(!failed_verdict.passed());
+    h.engine
+        .decide(
+            &mission_id,
+            "proof_failed:oracle:cargo-test",
+            DecisionAction::Retry,
+            "clear the failed current pointer",
+        )
+        .await
+        .expect("retry");
+
+    let mut replayed = h.engine.load_state(&mission_id).await.expect("retry state");
+    let oracle = OracleName::new("cargo-test").unwrap();
+    let assertion_ids = vec![AssertionId::new("TESTS-PASS").unwrap()];
+    let judged_sha = replayed.deliverable_head().to_string();
+    let environment_digest = replayed.environment_digest().to_string();
+    let request = next_envelope(
+        &replayed,
+        MissionEvent::OracleRunRequested {
+            assertion_ids: assertion_ids.clone(),
+            oracle: oracle.clone(),
+            judged_sha: judged_sha.clone(),
+            environment_digest,
+            attempt_no: 1,
+            effect_id: receipt_id.clone(),
+            requested_at_ms: 0,
+            deadline_ms: 30_000,
+        },
+    );
+    apply(&mut replayed, &request);
+    assert!(!replayed.inflight.contains_key(&receipt_id));
+    let completion = next_envelope(
+        &replayed,
+        MissionEvent::OracleRunCompleted {
+            assertion_ids,
+            oracle: oracle.clone(),
+            judged_sha,
+            attempt_no: 1,
+            effect_id: receipt_id.clone(),
+            outcome: Ok(lionclaw::model::OracleRunSuccess {
+                exit_code: 0,
+                exit_signal: None,
+                stdout: lionclaw::model::PayloadRef::inline("forged pass"),
+                stderr: lionclaw::model::PayloadRef::inline(""),
+                prepared_inputs: Vec::new(),
+                duration_ms: 1,
+            }),
+        },
+    );
+    apply(&mut replayed, &completion);
+
+    assert_eq!(replayed.authoritative_receipts[&receipt_id], failed_verdict);
+    assert!(replayed
+        .contract
+        .values()
+        .all(|assertion| assertion.last_authoritative_receipt.is_none()));
+    assert_eq!(lionclaw::model::ready_to_finish(&replayed), None);
+    assert_eq!(replayed.oracle_attempts[&oracle], 1);
+}
+
+#[tokio::test]
 async fn command_retry_is_reoffered_only_for_a_changed_outcome() {
     let dir = tempfile::tempdir().expect("tempdir");
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -1087,26 +1179,16 @@ async fn mixed_failures_are_fail_closed_and_preserve_every_feedback() {
     assert_eq!(rejected.oracle_failures[&lint], lint_failure);
 
     let mut forged = rejected;
-    let forged_sequence = forged.head + 1;
-    apply(
-        &mut forged,
-        &EventEnvelope {
-            mission_id: mission_id.clone(),
-            sequence_no: forged_sequence,
-            recorded_at_ms: 0,
-            stamps: VersionStamps {
-                schema_version: SCHEMA_VERSION,
-                engine_version: env!("CARGO_PKG_VERSION").to_string(),
-                prompt_hash: None,
-            },
-            event: MissionEvent::DecisionRecorded {
-                attention_id: "oracle_failed:lint".into(),
-                action: DecisionAction::Accept,
-                justification: "forged oracle runtime waiver".into(),
-                requirement_changes: Vec::new(),
-            },
+    let forged_event = next_envelope(
+        &forged,
+        MissionEvent::DecisionRecorded {
+            attention_id: "oracle_failed:lint".into(),
+            action: DecisionAction::Accept,
+            justification: "forged oracle runtime waiver".into(),
+            requirement_changes: Vec::new(),
         },
     );
+    apply(&mut forged, &forged_event);
     assert_eq!(forged.phase, MissionPhase::AttentionNeeded);
     assert!(forged.open_attention.contains_key("oracle_failed:lint"));
     assert_eq!(forged.oracle_failures[&lint], lint_failure);
@@ -1188,6 +1270,20 @@ fn plan_with_lint_oracle() -> (lionclaw::mission_type::MissionType, lionclaw::mo
         .targets
         .push(AssertionId::new("LINT-PASS").unwrap());
     (mission_type, plan)
+}
+
+fn next_envelope(state: &lionclaw::model::MissionState, event: MissionEvent) -> EventEnvelope {
+    EventEnvelope {
+        mission_id: state.mission_id.clone(),
+        sequence_no: state.head + 1,
+        recorded_at_ms: 0,
+        stamps: VersionStamps {
+            schema_version: SCHEMA_VERSION,
+            engine_version: env!("CARGO_PKG_VERSION").to_string(),
+            prompt_hash: None,
+        },
+        event,
+    }
 }
 
 #[tokio::test]

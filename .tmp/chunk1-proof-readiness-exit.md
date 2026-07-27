@@ -28,9 +28,13 @@ Accepted base: `33ee8a47826cf269af61a7d5051e2724f1385e11`
   `Retain oracle runtime failure evidence`
   - Carries the exact typed oracle runtime failure through attention and into
     replanning instead of retaining only a generic parked-oracle summary.
-- Final RoboRev coverage commit:
+- `f3af2d8ab0f3c1d09b206e9f2b8e9adbfc63bbf1`
+  `Prove oracle failure acceptance is fail closed`
   - Proves that parked oracle runtime failure cannot be accepted through the
     engine API or forged away through direct event replay.
+- Final RoboRev replay-hardening commit:
+  - Makes oracle attempt admission monotonic and authoritative receipt
+    insertion write-once, with an old-attempt replay regression.
   - The commit carrying this file is GPG-signed. Its hash cannot be embedded
     here without rewriting history; verify with `git log --show-signature -1`.
 
@@ -94,6 +98,19 @@ right: OracleRuntimeFailure { failure: PermanentRuntime { ... } }
 After the fix, that same regression requires the exact typed failure and its
 rendered category, code, and detail after `oracle_failures` has been cleared.
 
+The replay regression
+`replayed_oracle_attempt_cannot_replace_authoritative_receipt` then failed
+before receipt hardening:
+
+```text
+left: AuthoritativeVerdict { passed: true, stdout: "forged pass", ... }
+right: AuthoritativeVerdict { passed: false, stdout: "oracle exit 1", ... }
+```
+
+After the fix, a reused attempt and effect ID never re-enters `inflight`; its
+completion is inert, the original receipt is unchanged, no assertion points to
+the forged outcome, and finish authorization remains absent.
+
 After the fix, one `Revise` on either of two failed command proofs:
 
 - enters `MissionPhase::Planning` immediately;
@@ -119,6 +136,9 @@ After the fix, one `Revise` on either of two failed command proofs:
 - Oracle runtime failure feedback retains its typed category, code, detail,
   diagnostics, and applied runtime configuration after the failure map clears.
 - Historical command and judgment receipts remain append-only.
+- Oracle dispatch and fold admission share one checked next-attempt projection;
+  stale, skipped, exhausted, and previously receipted identities are rejected,
+  and successful receipt insertion requires a vacant ledger entry.
 - A first failure may expose manual `Retry`; an identical repeat suppresses it
   without a counter. Changed command diagnostics, judgment evidence, or proof
   identity re-offer it. `Repair`, `Revise`, and universal `Abort` remain.
@@ -131,12 +151,14 @@ After the fix, one `Revise` on either of two failed command proofs:
 
 - `SCHEMA_VERSION`: remains `33`.
   - No event-log payload changed.
-- `REDUCER_VERSION`: `61 -> 65`.
+- `REDUCER_VERSION`: `61 -> 66`.
   - `62` introduced receipt-ledger proof derivation and unified recovery.
   - `63` makes proof-driven replanning consume every current failure and changes
     the folded planning refinement from one feedback record to an ordered list.
   - `64` preserves that ordered list across sequential mixed-kind revisions.
   - `65` attaches exact typed oracle runtime evidence to its folded attention.
+  - `66` makes oracle attempt admission monotonic and command receipts
+    write-once.
 - Public folded model changes:
   - `AssertionState` stores a current authoritative receipt ID rather than a
     copied verdict.
@@ -161,7 +183,8 @@ After the fix, one `Revise` on either of two failed command proofs:
   finish authority still flows through `ready_to_finish`, and the fold
   revalidates legal decisions against current derived state.
 - Receipt provenance: strengthened. Current assertion pointers resolve through
-  immutable command and role receipt ledgers; recovery never deletes history.
+  immutable command and role receipt ledgers; recovery never deletes history,
+  and replay cannot overwrite a command receipt under a reused effect ID.
 - Secrets, egress, capability ceilings, confinement, runtime authentication,
   and writable-role authority: unchanged.
 
@@ -257,7 +280,11 @@ The second full-range RoboRev pass reported that the same `OracleFailed`
 honesty boundary lacked fault-injection coverage for API rejection and inert
 folding of a forged `Accept` event.
 
-All eight findings are addressed by forward-only commits.
+The third full-range RoboRev pass found that an old oracle request could reuse
+its effect ID and overwrite a failed authoritative receipt with a forged
+passing completion.
+
+All nine findings are addressed by forward-only commits.
 
 No Chunk 2 `Next` work, benchmark-specific behavior, remediation budget,
 durable retry counter, new automatic retry, mission-type logic, confinement

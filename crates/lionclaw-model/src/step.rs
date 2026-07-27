@@ -342,17 +342,20 @@ fn step_running(state: &MissionState) -> StepDecision {
         }
     }
     if !by_oracle.is_empty() {
-        return StepDecision::RunOracles(
-            by_oracle
-                .into_iter()
-                .map(|(oracle, assertion_ids)| OracleDispatchIntent {
-                    attempt_no: state.oracle_attempts.get(&oracle).copied().unwrap_or(0) + 1,
+        let intents = by_oracle
+            .into_iter()
+            .filter_map(|(oracle, assertion_ids)| {
+                Some(OracleDispatchIntent {
+                    attempt_no: state.next_oracle_attempt(&oracle)?,
                     oracle,
                     assertion_ids,
                     judged_sha: state.deliverable_head().to_string(),
                 })
-                .collect(),
-        );
+            })
+            .collect::<Vec<_>>();
+        if !intents.is_empty() {
+            return StepDecision::RunOracles(intents);
+        }
     }
 
     if proof_pending {
