@@ -19,10 +19,14 @@ Accepted base: `33ee8a47826cf269af61a7d5051e2724f1385e11`
   - GPG good signature from `Kelvin Jayanoris <kelvin@jayanoris.com>`.
   - Makes proof-failure `Revise` atomically carry every current failure into
     planning, corrects the shipped operator skill, and adds this exit note.
-- Final branch-review remediation commit:
+- `d49ada653613c98df74b2084594f984ad5a6a801`
+  `Preserve mixed revision evidence`
   - Preserves existing failure refinement across sequential mixed-kind
     revisions, corrects the coverage reconciliation command, and removes one
     stale symbol reference.
+- Final RoboRev remediation commit:
+  - Carries the exact typed oracle runtime failure through attention and into
+    replanning instead of retaining only a generic parked-oracle summary.
   - The commit carrying this file is GPG-signed. Its hash cannot be embedded
     here without rewriting history; verify with `git log --show-signature -1`.
 
@@ -74,6 +78,18 @@ One drained oracle batch had produced a failed command verdict and a separate
 oracle runtime failure. Revising both attention items sequentially replaced the
 first refinement instead of preserving both.
 
+RoboRev then found that the mixed regression expected
+`DecisionEvidence::None` for the oracle runtime failure. The strengthened
+regression failed before the evidence fix:
+
+```text
+left: None
+right: OracleRuntimeFailure { failure: PermanentRuntime { ... } }
+```
+
+After the fix, that same regression requires the exact typed failure and its
+rendered category, code, and detail after `oracle_failures` has been cleared.
+
 After the fix, one `Revise` on either of two failed command proofs:
 
 - enters `MissionPhase::Planning` immediately;
@@ -96,6 +112,8 @@ After the fix, one `Revise` on either of two failed command proofs:
 - Every later failure-led `Revise` appends its exact feedback to that ordered
   refinement, so mixed proof, oracle-runtime, node, gate, or review failures
   cannot erase evidence accepted by an earlier revision.
+- Oracle runtime failure feedback retains its typed category, code, detail,
+  diagnostics, and applied runtime configuration after the failure map clears.
 - Historical command and judgment receipts remain append-only.
 - A first failure may expose manual `Retry`; an identical repeat suppresses it
   without a counter. Changed command diagnostics, judgment evidence, or proof
@@ -109,11 +127,12 @@ After the fix, one `Revise` on either of two failed command proofs:
 
 - `SCHEMA_VERSION`: remains `33`.
   - No event-log payload changed.
-- `REDUCER_VERSION`: `61 -> 64`.
+- `REDUCER_VERSION`: `61 -> 65`.
   - `62` introduced receipt-ledger proof derivation and unified recovery.
   - `63` makes proof-driven replanning consume every current failure and changes
     the folded planning refinement from one feedback record to an ordered list.
   - `64` preserves that ordered list across sequential mixed-kind revisions.
+  - `65` attaches exact typed oracle runtime evidence to its folded attention.
 - Public folded model changes:
   - `AssertionState` stores a current authoritative receipt ID rather than a
     copied verdict.
@@ -226,7 +245,11 @@ The branch-wide rereview then reported:
 2. the exit-note coverage pathspec returned an empty inventory;
 3. one model comment still named the removed `classify_finish` helper.
 
-All six findings are addressed by forward-only commits.
+The first full-range RoboRev pass then reported that oracle runtime attention
+still carried `DecisionEvidence::None`, losing its typed payload when a
+revision cleared `oracle_failures`.
+
+All seven findings are addressed by forward-only commits.
 
 No Chunk 2 `Next` work, benchmark-specific behavior, remediation budget,
 durable retry counter, new automatic retry, mission-type logic, confinement

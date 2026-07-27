@@ -15,9 +15,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 64 derives required proof once from immutable receipt ledgers,
-/// uses one failure path, and preserves every failure-led revision.
-pub const REDUCER_VERSION: u32 = 64;
+/// Reducer 65 derives required proof once from immutable receipt ledgers,
+/// uses one failure path, and preserves exact evidence across every revision.
+pub const REDUCER_VERSION: u32 = 65;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -1599,7 +1599,7 @@ fn derive(state: &mut MissionState) {
             );
         }
     }
-    for oracle in state.oracle_failures.keys() {
+    for (oracle, failure) in &state.oracle_failures {
         if !state.oracle_automatic_retry_remaining(oracle) {
             let id = format!("oracle_failed:{oracle}");
             attention.insert(
@@ -1610,7 +1610,9 @@ fn derive(state: &mut MissionState) {
                     task_id: None,
                     oracle: Some(oracle.clone()),
                     assertion_ids: state.owed_assertions_for_oracle(oracle),
-                    evidence: super::DecisionEvidence::None,
+                    evidence: super::DecisionEvidence::OracleRuntimeFailure {
+                        failure: failure.clone(),
+                    },
                     report: format!("Oracle '{oracle}' is parked."),
                 },
             );

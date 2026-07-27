@@ -1106,10 +1106,20 @@ async fn sequential_mixed_failure_revisions_preserve_every_feedback() {
         feedback[0].evidence,
         lionclaw::model::DecisionEvidence::AuthoritativeReceipts { .. }
     ));
-    assert!(matches!(
+    assert_eq!(
         feedback[1].evidence,
-        lionclaw::model::DecisionEvidence::None
-    ));
+        lionclaw::model::DecisionEvidence::OracleRuntimeFailure {
+            failure: lionclaw::model::TypedFailure::permanent(
+                "oracle.fixture",
+                "lint runtime failed",
+            ),
+        }
+    );
+    let rendered =
+        lionclaw::evidence::render_feedbacks(h.engine.store().blobs(), &replanning, feedback)
+            .expect("render mixed failure evidence");
+    assert!(rendered.contains("permanent_runtime: lint runtime failed"));
+    assert!(rendered.contains("code: oracle.fixture"));
 }
 
 fn plan_with_lint_oracle() -> (lionclaw::mission_type::MissionType, lionclaw::model::Plan) {
