@@ -16,11 +16,25 @@ left: ["choices", "effects", "issues", "state"]
 right: ["choices", "effects"]
 ```
 
+The final authority audit added two more RED regressions:
+
+- a terminal mission still accepted plan, team, and mission-skill mutations;
+- failed terminal conversation cleanup changed the filesystem but remained
+  absent from `Next` and had no durable completion fact.
+
 After the cutover:
 
 - every nonterminal state exposes at least one exact effect or choice;
 - every nonterminal state exposes `Abort`;
 - active effects expose their exact control choices;
+- inherited requests expose exact `RecoverEffect` intents, while fresh role and
+  oracle dispatches execute only the request identities materialized from the
+  current projection;
+- settled conversation scratch remains an exact `CleanupConversation` intent
+  until its completion fact folds;
+- plan proposals, team revisions, mission skills, and environment assignments
+  are advertised only as legal administrative choices, and terminal missions
+  reject them without appending;
 - proposals, failures, messages, finish, and apply expose exact targets and
   parameters;
 - green proof offers `Finish` without appending `MissionFinished`;
@@ -36,8 +50,17 @@ After the cutover:
 - `next(&MissionState) -> Next` is the only workflow projection.
 - `Next` contains typed `EffectIntent` and exact `Choice` values. The pure model
   retains the existing typed role and oracle dispatch payloads.
+- The driver has no private owned-effect set or second execute-versus-recover
+  state machine. A fresh dispatch carries its exact materialized effect IDs
+  through the same driver action; an inflight request inherited by a later
+  driver projects as `RecoverEffect`.
+- Disposable conversation scratch is owned by the exact folded role attempt.
+  `Next` projects cleanup before terminal apply or later work, and
+  `ConversationResourcesCleaned` is the sole fact that retires the obligation.
 - The engine executes only returned effects. Every workflow-changing command
   validates its exact current choice before recording an event.
+- Administrative events are independently admitted by the fold only when the
+  same exact choice is current, so raw or stale appended events are inert.
 - `status --json`, `guide`, reports, inbox output, and human command guidance
   serialize or render the same `Next`.
 - Nonterminal `MissionPhase`, `StepDecision`, `MissionDisposition`,
@@ -58,16 +81,17 @@ After the cutover:
   each CLI route.
 - Role prompt reconstruction folds once at the durable request's recorded
   message boundary and validates the exact intent tuple.
-- Role setup is split across two ordinary boxed async boundaries. Reverting
-  that split reproduced a stack overflow in
+- Role setup and the composed driver future use ordinary boxed async
+  boundaries. Removing those boundaries reproduced a stack overflow in
   `production_retained_state_limit_preserves_turn_and_refuses_handoff`; the
-  structural split passes the production regression without changing policy or
-  resource authority.
+  production regression passes on the default Tokio worker stack without
+  changing policy or resource authority.
 
 ## Versions and Contracts
 
-- `SCHEMA_VERSION`: remains `33`; no event payload changed.
-- `REDUCER_VERSION`: `66 -> 67`.
+- `SCHEMA_VERSION`: `33 -> 34` for exact conversation cleanup completion facts.
+- `REDUCER_VERSION`: `66 -> 68` across the original workflow replacement and
+  the follow-up administrative/cleanup authority hardening.
 - Folded state replaces nonterminal `phase` and stored `open_attention` with an
   optional `terminal` fact and optional `applied_result`.
 - CLI JSON removes `phase`, `disposition`, attention/issues, `next_actions`,
@@ -80,11 +104,15 @@ After the cutover:
 - The determinism wall is unchanged: `lionclaw-model` gained no I/O, clock,
   randomness, async runtime, or model dependency.
 - Workflow admission is stricter: commands and folded decisions require an
-  exact current choice, including finish when other work is owed.
+  exact current choice, including administrative mutations and finish when
+  other work is owed.
+- Terminal cleanup is fail-closed and retry-visible. Removing scratch without
+  recording its exact completion leaves the same cleanup intent projected;
+  no role or oracle is rerun to repair it.
 - Secrets, egress, confinement, capability ceilings, runtime authentication,
   and writable-role authority are unchanged.
-- The role-runner async split changes future construction only; it grants no
-  new authority and alters no runtime policy.
+- The async boxing changes future layout only; it grants no new authority and
+  alters no runtime policy.
 
 ## Coverage Parity
 
@@ -96,10 +124,14 @@ unadvertised transition rejection, queued-work finish rejection, prefix-stable
 rejection, and complete human decision commands.
 
 Two adversarial QA rounds followed the initial implementation. The first found
-and fixed exact apply admission and incomplete human choice rendering. The
-second rechecked replay, recovery, concurrency, terminal cleanup, JSON parity,
-and command completeness; it found and fixed the missing reducer-side manual
-control guard and removed a duplicated task-acceptance predicate.
+and fixed exact apply admission, incomplete human choice rendering, terminal
+administrative bypasses, and hidden cleanup/effect ownership. The second
+rechecked replay, recovery, concurrency, terminal cleanup, JSON parity, command
+completeness, and default-stack execution. It found and fixed the missing
+reducer-side manual control guard, role-cleanup-before-policy-park ordering,
+default-stack future growth, guidance ordering, and pure-model fixtures. It
+also removed a duplicated task-acceptance predicate and a no-op oracle cleanup
+call.
 
 ## Verification
 

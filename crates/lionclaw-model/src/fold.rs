@@ -16,9 +16,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 67 removes persisted non-terminal workflow state. Durable replay
-/// stores facts; `next` derives effects and choices.
-pub const REDUCER_VERSION: u32 = 67;
+/// Reducer 68 makes administrative authority and conversation cleanup part of
+/// the single `next` workflow projection.
+pub const REDUCER_VERSION: u32 = 68;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -101,7 +101,11 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             runtime_identities,
         } => apply_team(state, team, runtime_identities),
         MissionEvent::SkillAdded { skill } => {
-            if valid_skill(skill) {
+            if super::next(state)
+                .choices
+                .contains(&super::Choice::AddMissionSkill)
+                && valid_skill(skill)
+            {
                 state.skills.insert(skill.name.clone(), skill.clone());
             }
         }
@@ -120,7 +124,10 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             reason,
         ),
         MissionEvent::ProposalRecorded { proposal, .. } => {
-            if valid_proposal(state, proposal) {
+            if super::next(state).choices.contains(&super::Choice::ProposePlan {
+                base_revision: state.revision,
+            }) && valid_proposal(state, proposal)
+            {
                 state.proposal = Some((**proposal).clone());
                 state.proposal_approved = false;
             }
@@ -215,6 +222,24 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 });
             }
         }
+        MissionEvent::ConversationResourcesCleaned {
+            role_instance,
+            effect_id,
+        } => {
+            if super::next(state).effects.iter().any(|intent| {
+                matches!(
+                    intent,
+                    super::EffectIntent::CleanupConversation {
+                        role_instance: legal_role,
+                        effect_id: legal_effect,
+                    } if legal_role == role_instance && legal_effect == effect_id
+                )
+            }) {
+                if let Some(conversation) = state.conversations.get_mut(role_instance) {
+                    conversation.disposable_resource_owner = None;
+                }
+            }
+        }
         MissionEvent::MissionAborted { reason } => {
             if state.terminal.is_none() && !reason.trim().is_empty() {
                 state.terminal = Some(TerminalState::Aborted {
@@ -303,8 +328,14 @@ fn apply_environment_assignment(
     team_revision: Option<u32>,
     reason: &str,
 ) {
-    if state.is_terminal()
-        || !state.inflight.is_empty()
+    let authorized = team_revision.is_some_and(|revision| {
+        super::next(state)
+            .choices
+            .contains(&super::Choice::AssignEnvironment {
+                team_revision: revision,
+            })
+    });
+    if !authorized
         || reason.trim().is_empty()
         || !valid_environment_image_ref(image_ref)
         || !valid_environment_image_id(image_id)
@@ -375,7 +406,10 @@ fn apply_team(
         .and_then(|proposal| proposal.plan.as_ref())
         .map(|proposal| &proposal.plan)
         .or(state.plan.as_ref());
-    if team.revision != expected
+    if !super::next(state)
+        .choices
+        .contains(&super::Choice::ConfigureTeam { revision: expected })
+        || team.revision != expected
         || team.validate_shape().is_err()
         || team
             .roles
@@ -529,6 +563,7 @@ fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
         .or_insert_with(|| ConversationState {
             role_instance: role_instance.clone(),
             lifecycle: ConversationLifecycle::Ready,
+            disposable_resource_owner: None,
             queued: Vec::new(),
             consumed_through: 0,
             active_delivery: None,
@@ -570,6 +605,7 @@ fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
         });
     }
     conversation.lifecycle = ConversationLifecycle::Running;
+    conversation.disposable_resource_owner = Some(effect_id.clone());
     conversation.active_delivery = Some(ActiveDelivery {
         effect_id: effect_id.clone(),
         message_boundary: *message_boundary,

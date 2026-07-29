@@ -389,9 +389,9 @@ async fn abort_reloads_state_after_waiting_for_the_driver_lock() {
         .require_state(&mission_id)
         .await
         .expect("reconciled state");
-    assert_eq!(
-        reconciled.head, aborted.head,
-        "cleanup must append no events"
+    assert!(
+        reconciled.head > aborted.head,
+        "cleanup must append its durable completion fact"
     );
 }
 
@@ -451,6 +451,10 @@ async fn terminal_advance_retries_a_failed_abort_cleanup_without_rerunning_the_r
         state.terminal,
         Some(TerminalState::Aborted { .. })
     ));
+    assert!(
+        !lionclaw::model::next(&state).effects.is_empty(),
+        "failed terminal cleanup must remain visible in Next"
+    );
     let aborted_head = state.head;
     assert!(outside.join("sentinel").is_file());
 
@@ -483,7 +487,10 @@ async fn terminal_advance_retries_a_failed_abort_cleanup_without_rerunning_the_r
         .load_state(&mission_id)
         .await
         .expect("state after cleanup retry");
-    assert_eq!(retried.head, aborted_head, "cleanup must append no events");
+    assert!(
+        retried.head > aborted_head,
+        "successful cleanup must append its durable completion fact"
+    );
     assert!(matches!(
         retried.terminal,
         Some(TerminalState::Aborted { .. })

@@ -11,7 +11,9 @@ use common::{
     initialize_repository, proposal, review_runner, simple_plan, test_mission_type, BASE_SHA,
 };
 use lionclaw::engine::{Engine, EngineServices};
-use lionclaw::model::{Choice, DecisionAction, FinishClass, MissionEvent};
+use lionclaw::model::{
+    Choice, DecisionAction, FinishClass, MissionEvent, MissionProposal, MissionSkill,
+};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, NoopEffectCleaner};
 
@@ -29,6 +31,74 @@ async fn gated_engine(dir: &std::path::Path) -> Engine {
             Arc::new(MockClock::default()),
         ),
     )
+}
+
+#[tokio::test]
+async fn terminal_mission_rejects_every_administrative_mutation_without_appending() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = gated_engine(dir.path()).await;
+    let mission_id = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "closed administration",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    engine
+        .abort(&mission_id, "administration is closed")
+        .await
+        .expect("abort");
+    let before = engine
+        .load_state(&mission_id)
+        .await
+        .expect("terminal state");
+
+    assert!(engine
+        .propose_plan(
+            &mission_id,
+            MissionProposal {
+                plan: None,
+                team: Some({
+                    let mut team = before.team.clone().expect("team");
+                    team.revision += 1;
+                    team
+                }),
+            },
+        )
+        .await
+        .is_err());
+
+    let mut team = before.team.clone().expect("team");
+    team.revision += 1;
+    team.guidance = Some(lionclaw::model::MissionGuidance::new(
+        "terminal guidance must not land",
+    ));
+    assert!(engine.configure_team(&mission_id, team).await.is_err());
+
+    assert!(engine
+        .add_mission_skill(
+            &mission_id,
+            MissionSkill {
+                name: "closed-skill".to_string(),
+                digest: "a".repeat(64),
+                description: "must not be recorded after closure".to_string(),
+            },
+        )
+        .await
+        .is_err());
+
+    let after = engine
+        .load_state(&mission_id)
+        .await
+        .expect("unchanged state");
+    assert_eq!(
+        after.head, before.head,
+        "rejected commands appended an event"
+    );
+    assert_eq!(after.proposal, before.proposal);
+    assert_eq!(after.team, before.team);
+    assert_eq!(after.skills, before.skills);
 }
 
 #[tokio::test]
@@ -123,12 +193,16 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
         "Next must not grow another state or issue projection"
     );
     assert!(
-        !projected["choices"]
+        projected["choices"]
             .as_array()
             .unwrap()
             .iter()
             .any(|choice| choice["kind"] == "propose_plan"),
-        "a fully green mission must not restart planning implicitly"
+        "an idle nonterminal mission must retain explicit revision authority"
+    );
+    assert!(
+        ready.next.effects.is_empty(),
+        "an available proposal choice must not restart planning implicitly"
     );
     assert!(
         projected["choices"]

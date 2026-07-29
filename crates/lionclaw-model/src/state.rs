@@ -50,6 +50,10 @@ pub struct QueuedMessage {
 pub struct ConversationState {
     pub role_instance: RoleInstanceId,
     pub lifecycle: ConversationLifecycle,
+    /// Exact role attempt whose disposable conversation scratch still needs
+    /// reconciliation after this conversation settles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposable_resource_owner: Option<super::EffectId>,
     pub queued: Vec<QueuedMessage>,
     pub consumed_through: u64,
     pub active_delivery: Option<ActiveDelivery>,
@@ -1059,6 +1063,7 @@ impl InflightEffect {
             | MissionEvent::TeamConfigured { .. }
             | MissionEvent::SkillAdded { .. }
             | MissionEvent::EnvironmentAssigned { .. }
+            | MissionEvent::ConversationResourcesCleaned { .. }
             | MissionEvent::MessageSent { .. }
             | MissionEvent::RoleTurnCompleted { .. }
             | MissionEvent::OracleRunCompleted { .. }

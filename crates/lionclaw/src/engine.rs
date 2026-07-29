@@ -202,12 +202,13 @@ pub async fn load_mission_view(
 pub(crate) async fn reconcile_disposable_conversation_resources(
     store: &MissionStore,
     mission_id: &MissionId,
+    recorded_at_ms: i64,
 ) -> Result<()> {
     let lock_path = store.driver_lock_path(mission_id);
     let guard = tokio::task::spawn_blocking(move || DriverGuard::acquire(&lock_path))
         .await
         .context("joining disposable resource lock waiter")??;
-    reconcile_disposable_conversation_resources_with_guard(store, mission_id, &guard).await
+    execute_projected_conversation_cleanup(store, mission_id, recorded_at_ms, &guard).await
 }
 
 /// Reconcile only if no driver currently owns the mission. This is used by
@@ -220,52 +221,63 @@ pub(crate) async fn reconcile_disposable_conversation_resources_if_idle(
     let Some(guard) = DriverGuard::try_acquire(&store.driver_lock_path(mission_id))? else {
         return Ok(());
     };
-    reconcile_disposable_conversation_resources_with_guard(store, mission_id, &guard).await
+    execute_projected_conversation_cleanup(
+        store,
+        mission_id,
+        crate::ports::SystemClock.now_ms(),
+        &guard,
+    )
+    .await
 }
 
-async fn reconcile_disposable_conversation_resources_with_guard(
+/// Execute only the exact conversation cleanup intents projected by `next`.
+/// The successful event retires that intent; a failed removal leaves it
+/// projected for a later retry.
+async fn execute_projected_conversation_cleanup(
     store: &MissionStore,
     mission_id: &MissionId,
-    guard: &DriverGuard,
-) -> Result<()> {
-    let state = store.require_state(mission_id).await?;
-    cleanup_settled_conversation_scratch(store, &state, guard).await
-}
-
-/// Remove only disposable scratch for conversations whose folded lifecycle is
-/// settled and which have no inflight role owner. The driver guard makes the
-/// folded ownership check stable for the duration of the removal.
-async fn cleanup_settled_conversation_scratch(
-    store: &MissionStore,
-    state: &MissionState,
+    recorded_at_ms: i64,
     _driver_guard: &DriverGuard,
 ) -> Result<()> {
-    let mission_dirs = MissionDirs::new(store.lionclaw_dir(), &state.mission_id);
-    for (role_instance, conversation) in &state.conversations {
-        if !matches!(
-            conversation.lifecycle,
-            crate::model::ConversationLifecycle::Completed
-                | crate::model::ConversationLifecycle::Retired
-        ) || state.inflight.values().any(|effect| {
-            matches!(
-                effect,
-                InflightEffect::RoleTurn {
-                    role_instance: active,
-                    ..
-                } if active == role_instance
-            )
-        }) {
-            continue;
-        }
+    for _ in 0..MAX_LOOP_ITERATIONS {
+        let state = store.require_state(mission_id).await?;
+        let Some((role_instance, effect_id)) =
+            next(&state)
+                .effects
+                .into_iter()
+                .find_map(|intent| match intent {
+                    EffectIntent::CleanupConversation {
+                        role_instance,
+                        effect_id,
+                    } => Some((role_instance, effect_id)),
+                    EffectIntent::RecoverEffect { .. }
+                    | EffectIntent::DispatchRole(_)
+                    | EffectIntent::DispatchOracle(_) => None,
+                })
+        else {
+            return Ok(());
+        };
+        let mission_dirs = MissionDirs::new(store.lionclaw_dir(), mission_id);
         mission_dirs
-            .role(role_instance)
+            .role(&role_instance)
             .remove_disposable_scratch()
             .await
             .with_context(|| {
                 format!("cleaning disposable scratch for role instance '{role_instance}'")
             })?;
+        let event = NewEvent::new(MissionEvent::ConversationResourcesCleaned {
+            role_instance,
+            effect_id,
+        });
+        match store
+            .append(mission_id, state.head, &[event], recorded_at_ms)
+            .await
+        {
+            Ok(_) | Err(AppendError::Conflict { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        }
     }
-    Ok(())
+    bail!("conversation cleanup kept conflicting after {MAX_LOOP_ITERATIONS} retries")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -587,6 +599,14 @@ impl Engine {
         if !state.inflight.is_empty() {
             return Err(ProposeError::MissionBusy);
         }
+        let choice = Choice::ProposePlan {
+            base_revision: state.revision,
+        };
+        if !next(&state).choices.contains(&choice) {
+            return Err(ProposeError::Other(anyhow::anyhow!(
+                "mission '{mission_id}' does not currently allow plan proposals"
+            )));
+        }
         validate_mission_proposal(&state, &proposal)?;
         let proposal_json = serde_json::to_string(&proposal).map_err(anyhow::Error::from)?;
         let proposal_hash = hex::encode(Sha256::digest(proposal_json.as_bytes()));
@@ -610,6 +630,14 @@ impl Engine {
         team: crate::model::TeamRevision,
     ) -> Result<()> {
         let state = self.load_state(mission_id).await?;
+        let choice = Choice::ConfigureTeam {
+            revision: team.revision,
+        };
+        ensure!(
+            next(&state).choices.contains(&choice),
+            "mission '{mission_id}' does not currently allow team revision {}",
+            team.revision
+        );
         let proposal = MissionProposal {
             plan: None,
             team: Some(team.clone()),
@@ -656,6 +684,10 @@ impl Engine {
         skill: crate::model::MissionSkill,
     ) -> Result<()> {
         let state = self.load_state(mission_id).await?;
+        ensure!(
+            next(&state).choices.contains(&Choice::AddMissionSkill),
+            "mission '{mission_id}' does not currently allow mission skill changes"
+        );
         if let Some(existing) = state.skills.get(&skill.name) {
             if existing == &skill {
                 return Ok(());
@@ -706,7 +738,11 @@ impl Engine {
         self.store
             .append(mission_id, state.head, &events, self.clock.now_ms())
             .await?;
-        reconcile_disposable_conversation_resources(&self.store, mission_id)
+        reconcile_disposable_conversation_resources(
+            &self.store,
+            mission_id,
+            self.clock.now_ms(),
+        )
             .await
             .with_context(|| {
                 format!(
@@ -784,9 +820,10 @@ impl Engine {
         let reporter =
             ActivityReporter::start(self.store.clone(), mission_id.clone(), observed_activity);
         let drive_result = async {
-            self.drive(mission_id, activity).await?;
+            // The driver composes every effect implementation. Keep its large
+            // async state off the caller's thread stack.
+            Box::pin(self.drive(mission_id, activity, &guard)).await?;
             let state = self.load_state(mission_id).await?;
-            cleanup_settled_conversation_scratch(&self.store, &state, &guard).await?;
             // Persist a fold snapshot before parking or exiting so the next
             // invocation resumes without re-folding the whole log.
             self.store
@@ -806,125 +843,145 @@ impl Engine {
         &self,
         mission_id: &MissionId,
         activity: tokio::sync::watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
+        driver_guard: &DriverGuard,
     ) -> Result<()> {
-        let mut owned_effects = BTreeSet::new();
         for _ in 0..MAX_LOOP_ITERATIONS {
             let state = self.load_state(mission_id).await?;
             let projection = next(&state);
             if projection.effects.is_empty() {
                 return Ok(());
             }
-            let mut drive_effects = Vec::new();
+            let mut recovery_effects = Vec::new();
+            let mut has_conversation_cleanup = false;
             let mut role_intents = Vec::new();
             let mut oracle_intents = Vec::new();
             for effect in projection.effects {
                 match effect {
-                    EffectIntent::DriveEffect { effect_id } => drive_effects.push(effect_id),
+                    EffectIntent::RecoverEffect { effect_id } => recovery_effects.push(effect_id),
+                    EffectIntent::CleanupConversation { .. } => {
+                        has_conversation_cleanup = true;
+                    }
                     EffectIntent::DispatchRole(intent) => role_intents.push(intent),
                     EffectIntent::DispatchOracle(intent) => oracle_intents.push(intent),
                 }
             }
-            if !drive_effects.is_empty() {
-                if drive_effects
-                    .iter()
-                    .all(|effect_id| owned_effects.contains(effect_id))
-                {
-                    if Box::pin(self.drive_active(&state, activity.clone())).await? {
-                        continue;
+            if has_conversation_cleanup {
+                execute_projected_conversation_cleanup(
+                    &self.store,
+                    mission_id,
+                    self.clock.now_ms(),
+                    driver_guard,
+                )
+                .await?;
+                continue;
+            }
+            if !recovery_effects.is_empty() {
+                for effect_id in recovery_effects {
+                    if !self
+                        .recover_interrupted_effect(mission_id, &effect_id)
+                        .await?
+                    {
+                        return Ok(());
                     }
-                    return Ok(());
                 }
-                if self.recover_interrupted(mission_id).await? {
+                continue;
+            }
+            if !role_intents.is_empty() {
+                let effect_ids = self
+                    .materialize_role_turn_requests(&state, role_intents)
+                    .await?;
+                let active = self.load_state(mission_id).await?;
+                if Box::pin(self.drive_active(&active, effect_ids, activity.clone())).await? {
+                    continue;
+                }
+                execute_projected_conversation_cleanup(
+                    &self.store,
+                    mission_id,
+                    self.clock.now_ms(),
+                    driver_guard,
+                )
+                .await?;
+                return Ok(());
+            }
+            if !oracle_intents.is_empty() {
+                let effect_ids = self
+                    .materialize_oracle_requests(&state, oracle_intents)
+                    .await?;
+                let active = self.load_state(mission_id).await?;
+                if Box::pin(self.drive_active(&active, effect_ids, activity.clone())).await? {
                     continue;
                 }
                 return Ok(());
-            }
-            if !role_intents.is_empty() {
-                self.materialize_role_turn_requests(&state, role_intents)
-                    .await?;
-                owned_effects.extend(self.load_state(mission_id).await?.inflight.keys().cloned());
-                continue;
-            }
-            if !oracle_intents.is_empty() {
-                self.materialize_oracle_requests(&state, oracle_intents)
-                    .await?;
-                owned_effects.extend(self.load_state(mission_id).await?.inflight.keys().cloned());
-                continue;
             }
         }
         bail!("advance exceeded {MAX_LOOP_ITERATIONS} iterations; aborting as a safety stop")
     }
 
-    /// Abandon requests inherited from a previous driver process. The lock
-    /// proves no live driver still owns them; cleanup must finish before the
+    /// Abandon one request inherited from a previous driver process. The lock
+    /// proves no live driver still owns it; cleanup must finish before the
     /// interrupted outcome is recorded.
-    async fn recover_interrupted(&self, mission_id: &MissionId) -> Result<bool> {
-        loop {
-            let state = self.load_state(mission_id).await?;
-            let Some((effect_id, _)) = state.inflight.iter().next() else {
-                return Ok(true);
-            };
-            let recovered_failure = match self.cleanup_effect(&state, effect_id, true).await? {
-                EffectCleanupDisposition::Complete(failure) => failure,
-                EffectCleanupDisposition::Blocked => return Ok(false),
-            };
-            let current = self.load_state(mission_id).await?;
-            let Some(effect) = current.inflight.get(effect_id) else {
-                continue;
-            };
-            if let Some(cancellation) = current.durable_cancellation(effect_id) {
-                let failure = self.recover_role_failure(
-                    current.role_attempt_receipts.get(effect_id),
-                    cancellation.into_failure(Default::default()),
-                );
-                let outcome = failed_outcome(effect_id, effect, failure);
-                if self
-                    .append_outcome(&current.mission_id, effect_id, outcome, true)
-                    .await?
-                    .is_none()
-                {
-                    return Ok(false);
-                }
-                continue;
-            }
-            if let Some(failure) = recovered_failure {
-                let outcome = failed_outcome(effect_id, effect, failure);
-                if self
-                    .append_outcome(&current.mission_id, effect_id, outcome, true)
-                    .await?
-                    .is_none()
-                {
-                    return Ok(false);
-                }
-                continue;
-            }
-            let failure = current
-                .role_attempt_receipts
-                .get(effect_id)
-                .and_then(crate::model::RoleAttemptReceipt::rejection)
-                .cloned()
-                .unwrap_or_else(interrupted_failure);
-            let failure =
-                self.recover_role_failure(current.role_attempt_receipts.get(effect_id), failure);
+    async fn recover_interrupted_effect(
+        &self,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+    ) -> Result<bool> {
+        let state = self.load_state(mission_id).await?;
+        if !state.inflight.contains_key(effect_id) {
+            return Ok(true);
+        }
+        let recovered_failure = match self.cleanup_effect(&state, effect_id, true).await? {
+            EffectCleanupDisposition::Complete(failure) => failure,
+            EffectCleanupDisposition::Blocked => return Ok(false),
+        };
+        let current = self.load_state(mission_id).await?;
+        let Some(effect) = current.inflight.get(effect_id) else {
+            return Ok(true);
+        };
+        if let Some(cancellation) = current.durable_cancellation(effect_id) {
+            let failure = self.recover_role_failure(
+                current.role_attempt_receipts.get(effect_id),
+                cancellation.into_failure(Default::default()),
+            );
             let outcome = failed_outcome(effect_id, effect, failure);
-            if self
+            return Ok(self
                 .append_outcome(&current.mission_id, effect_id, outcome, true)
                 .await?
-                .is_none()
-            {
-                return Ok(false);
-            }
+                .is_some());
         }
+        if let Some(failure) = recovered_failure {
+            let outcome = failed_outcome(effect_id, effect, failure);
+            return Ok(self
+                .append_outcome(&current.mission_id, effect_id, outcome, true)
+                .await?
+                .is_some());
+        }
+        let failure = current
+            .role_attempt_receipts
+            .get(effect_id)
+            .and_then(crate::model::RoleAttemptReceipt::rejection)
+            .cloned()
+            .unwrap_or_else(interrupted_failure);
+        let failure =
+            self.recover_role_failure(current.role_attempt_receipts.get(effect_id), failure);
+        let outcome = failed_outcome(effect_id, effect, failure);
+        Ok(self
+            .append_outcome(&current.mission_id, effect_id, outcome, true)
+            .await?
+            .is_some())
     }
 
     async fn drive_active(
         &self,
         state: &MissionState,
+        effect_ids: Vec<EffectId>,
         activity: tokio::sync::watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
     ) -> Result<bool> {
-        let effect_ids: Vec<_> = state.inflight.keys().cloned().collect();
+        let effect_ids: Vec<_> = effect_ids
+            .into_iter()
+            .filter(|effect_id| state.inflight.contains_key(effect_id))
+            .collect();
         if effect_ids.is_empty() {
-            return Ok(false);
+            return Ok(true);
         }
         if effect_ids.len() == 1 {
             return Box::pin(self.drive_one(
@@ -2004,20 +2061,24 @@ impl Engine {
         &self,
         state: &MissionState,
         intents: Vec<RoleDispatchIntent>,
-    ) -> Result<()> {
+    ) -> Result<Vec<EffectId>> {
         let mut events = Vec::new();
+        let mut effect_ids = Vec::new();
         for intent in intents {
-            events.extend(self.build_role_turn_events(state, intent).await?);
+            let (effect_id, request_events) = self.build_role_turn_events(state, intent).await?;
+            effect_ids.push(effect_id);
+            events.extend(request_events);
         }
         self.append_idempotent(&state.mission_id, state.head, &events)
-            .await
+            .await?;
+        Ok(effect_ids)
     }
 
     async fn build_role_turn_events(
         &self,
         state: &MissionState,
         intent: RoleDispatchIntent,
-    ) -> Result<Vec<NewEvent>> {
+    ) -> Result<(EffectId, Vec<NewEvent>)> {
         let role = state
             .team
             .as_ref()
@@ -2169,12 +2230,12 @@ impl Engine {
                 ),
             );
             let completed = NewEvent::new(MissionEvent::RoleTurnCompleted {
-                effect_id,
+                effect_id: effect_id.clone(),
                 outcome: Err(failure),
             });
-            Ok(vec![event, completed])
+            Ok((effect_id, vec![event, completed]))
         } else {
-            Ok(vec![event])
+            Ok((effect_id, vec![event]))
         }
     }
 
@@ -2182,8 +2243,8 @@ impl Engine {
         &self,
         state: &MissionState,
         intents: Vec<OracleDispatchIntent>,
-    ) -> Result<()> {
-        let events: Vec<NewEvent> = intents
+    ) -> Result<Vec<EffectId>> {
+        let requests: Vec<(EffectId, NewEvent)> = intents
             .into_iter()
             .map(|intent| {
                 let effect_id = EffectId::for_oracle_request(
@@ -2195,23 +2256,35 @@ impl Engine {
                 let requested_at_ms = self.clock.now_ms();
                 let not_before_ms =
                     retry_not_before(requested_at_ms, state.oracle_failures.get(&intent.oracle));
-                Ok(NewEvent::new(MissionEvent::OracleRunRequested {
-                    assertion_ids: intent.assertion_ids,
-                    oracle: intent.oracle,
-                    judged_sha: intent.judged_sha,
-                    environment_digest: state.environment_digest().to_string(),
-                    attempt_no: intent.attempt_no,
-                    effect_id,
-                    requested_at_ms,
-                    deadline_ms: resolved_deadline(
-                        not_before_ms,
-                        state.config.execution.default_timeout_secs,
-                    )?,
-                }))
+                Ok((
+                    effect_id.clone(),
+                    NewEvent::new(MissionEvent::OracleRunRequested {
+                        assertion_ids: intent.assertion_ids,
+                        oracle: intent.oracle,
+                        judged_sha: intent.judged_sha,
+                        environment_digest: state.environment_digest().to_string(),
+                        attempt_no: intent.attempt_no,
+                        effect_id,
+                        requested_at_ms,
+                        deadline_ms: resolved_deadline(
+                            not_before_ms,
+                            state.config.execution.default_timeout_secs,
+                        )?,
+                    }),
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let effect_ids = requests
+            .iter()
+            .map(|(effect_id, _)| effect_id.clone())
+            .collect();
+        let events = requests
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect::<Vec<_>>();
         self.append_idempotent(&state.mission_id, state.head, &events)
-            .await
+            .await?;
+        Ok(effect_ids)
     }
 
     fn externalize_handoff(&self, handoff: &Handoff) -> Result<Handoff, TypedFailure> {
@@ -2545,7 +2618,7 @@ pub async fn record_decision(
     store
         .append(mission_id, state.head, &events, now_ms)
         .await?;
-    reconcile_disposable_conversation_resources(store, mission_id)
+    reconcile_disposable_conversation_resources(store, mission_id, now_ms)
         .await
         .with_context(|| {
             format!(
@@ -2584,7 +2657,7 @@ pub async fn record_abort(
             .await
         {
             Ok(_) => {
-                reconcile_disposable_conversation_resources(store, mission_id)
+                reconcile_disposable_conversation_resources(store, mission_id, now_ms)
                     .await
                     .with_context(|| {
                         format!(
@@ -2630,7 +2703,7 @@ pub async fn record_finish(
             now_ms,
         )
         .await?;
-    reconcile_disposable_conversation_resources(store, mission_id)
+    reconcile_disposable_conversation_resources(store, mission_id, now_ms)
         .await
         .with_context(|| {
             format!(

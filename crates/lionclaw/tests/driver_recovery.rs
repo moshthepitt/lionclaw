@@ -1939,7 +1939,7 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
         .next
         .effects
         .iter()
-        .any(|effect| matches!(effect, EffectIntent::DriveEffect { .. })));
+        .any(|effect| matches!(effect, EffectIntent::RecoverEffect { .. })));
     let failure = blocked.state.cleanup_failure.as_ref().unwrap();
     assert_eq!(failure.resource, EffectResource::EffectDirectory);
     assert_eq!(
@@ -2122,7 +2122,7 @@ async fn terminal_inflight_cleanup_is_recoverable_through_the_production_cli() {
         .next
         .effects
         .iter()
-        .any(|effect| matches!(effect, EffectIntent::DriveEffect { .. })));
+        .any(|effect| matches!(effect, EffectIntent::RecoverEffect { .. })));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(conversation_root.join("scratch/build-output").is_file());
 

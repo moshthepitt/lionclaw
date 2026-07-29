@@ -21,9 +21,9 @@ use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailureEvidence};
 
-/// Version 33 removes the unused mission delegation payload. Product-created
-/// missions never configured it, and closure authority now has one path.
-pub const SCHEMA_VERSION: u32 = 33;
+/// Version 34 records successful cleanup of one exact conversation resource
+/// generation so `next` owns terminal and nonterminal cleanup retries.
+pub const SCHEMA_VERSION: u32 = 34;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -727,6 +727,13 @@ pub enum MissionEvent {
         resource: EffectResource,
         failure: TypedFailure,
     },
+    /// Disposable scratch for one exact settled conversation attempt was
+    /// removed successfully. Retained work, runtime state, and evidence are
+    /// outside this receipt.
+    ConversationResourcesCleaned {
+        role_instance: RoleInstanceId,
+        effect_id: super::EffectId,
+    },
     MissionAborted {
         reason: String,
     },
@@ -853,6 +860,7 @@ impl MissionEvent {
             Self::OracleRunCompleted { .. } => "oracle_run_completed",
             Self::ControlRequested { .. } => "control_requested",
             Self::EffectCleanupFailed { .. } => "effect_cleanup_failed",
+            Self::ConversationResourcesCleaned { .. } => "conversation_resources_cleaned",
             Self::MissionAborted { .. } => "mission_aborted",
             Self::MissionFinished { .. } => "mission_finished",
             Self::ResultApplied { .. } => "result_applied",
@@ -881,6 +889,7 @@ impl MissionEvent {
             | Self::EnvironmentAssigned { .. }
             | Self::MessageSent { .. }
             | Self::ControlRequested { .. }
+            | Self::ConversationResourcesCleaned { .. }
             | Self::MissionAborted { .. }
             | Self::MissionFinished { .. }
             | Self::ResultApplied { .. }

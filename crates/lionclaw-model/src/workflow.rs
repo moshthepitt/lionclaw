@@ -23,7 +23,15 @@ pub struct Next {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectIntent {
-    DriveEffect { effect_id: EffectId },
+    /// Clean and settle an unfinished request inherited by this driver.
+    RecoverEffect {
+        effect_id: EffectId,
+    },
+    /// Remove disposable scratch after one exact role attempt settles.
+    CleanupConversation {
+        role_instance: RoleInstanceId,
+        effect_id: EffectId,
+    },
     DispatchRole(RoleDispatchIntent),
     DispatchOracle(OracleDispatchIntent),
 }
@@ -52,6 +60,16 @@ pub struct OracleDispatchIntent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Choice {
+    ProposePlan {
+        base_revision: u32,
+    },
+    ConfigureTeam {
+        revision: u32,
+    },
+    AddMissionSkill,
+    AssignEnvironment {
+        team_revision: u32,
+    },
     Decide {
         id: String,
         action: super::DecisionAction,
@@ -113,6 +131,17 @@ impl Choice {
 }
 
 pub fn next(state: &MissionState) -> Next {
+    let cleanup = conversation_cleanup_intents(state);
+    if !cleanup.is_empty() {
+        let mut choices = active_control_choices(state);
+        if state.terminal.is_none() {
+            choices.push(Choice::Abort);
+        }
+        return Next {
+            effects: cleanup,
+            choices,
+        };
+    }
     if state.terminal.is_some() {
         let effects = active_effects(state);
         let choices = terminal_choices(state);
@@ -175,6 +204,9 @@ fn complete_nonterminal(
             .cloned()
             .map(|role_instance| Choice::SendMessage { role_instance }),
     );
+    if state.inflight.is_empty() {
+        choices.extend(administrative_choices(state));
+    }
     choices.push(Choice::Abort);
     Next { effects, choices }
 }
@@ -184,8 +216,59 @@ fn active_effects(state: &MissionState) -> Vec<EffectIntent> {
         .inflight
         .keys()
         .cloned()
-        .map(|effect_id| EffectIntent::DriveEffect { effect_id })
+        .map(|effect_id| EffectIntent::RecoverEffect { effect_id })
         .collect()
+}
+
+fn conversation_cleanup_intents(state: &MissionState) -> Vec<EffectIntent> {
+    state
+        .conversations
+        .iter()
+        .filter(|(role_instance, conversation)| {
+            matches!(
+                conversation.lifecycle,
+                ConversationLifecycle::Completed | ConversationLifecycle::Retired
+            ) && !state.inflight.values().any(|effect| {
+                matches!(
+                    effect,
+                    InflightEffect::RoleTurn {
+                        role_instance: active,
+                        ..
+                    } if active == *role_instance
+                )
+            })
+        })
+        .filter_map(|(role_instance, conversation)| {
+            conversation
+                .disposable_resource_owner
+                .clone()
+                .map(|effect_id| EffectIntent::CleanupConversation {
+                    role_instance: role_instance.clone(),
+                    effect_id,
+                })
+        })
+        .collect()
+}
+
+fn administrative_choices(state: &MissionState) -> Vec<Choice> {
+    let mut choices = vec![
+        Choice::ProposePlan {
+            base_revision: state.revision,
+        },
+        Choice::ConfigureTeam {
+            revision: state
+                .team
+                .as_ref()
+                .map_or(0, |team| team.revision.saturating_add(1)),
+        },
+        Choice::AddMissionSkill,
+    ];
+    if let Some(team) = &state.team {
+        choices.push(Choice::AssignEnvironment {
+            team_revision: team.revision,
+        });
+    }
+    choices
 }
 
 fn active_control_choices(state: &MissionState) -> Vec<Choice> {

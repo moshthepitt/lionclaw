@@ -1235,6 +1235,18 @@ fn next_commands(view: &MissionView) -> Vec<String> {
     }
     for choice in &view.next.choices {
         let command = match choice {
+            Choice::ProposePlan { .. } => {
+                format!("mission plan propose {mission_id} --file PROPOSAL_FILE")
+            }
+            Choice::ConfigureTeam { .. } => format!(
+                "mission team guide-set --mission-id {mission_id} --file TEAM_GUIDANCE_FILE"
+            ),
+            Choice::AddMissionSkill => {
+                format!("mission skill add --mission-id {mission_id} --path SKILL_PATH")
+            }
+            Choice::AssignEnvironment { .. } => {
+                format!("mission environment use IMAGE --mission-id {mission_id} --reason REASON")
+            }
             Choice::Decide {
                 id,
                 action: DecisionAction::Revise,
@@ -1569,6 +1581,13 @@ async fn cmd_mission_skill(
         MissionSkillCommand::Add(args) => {
             let (mission_id, engine) =
                 mission_engine(args.repo, args.mission_id.as_deref(), transports).await?;
+            let state = engine.load_state(&mission_id).await?;
+            if !crate::model::next(&state)
+                .choices
+                .contains(&Choice::AddMissionSkill)
+            {
+                bail!("mission {mission_id} does not currently allow mission skill changes");
+            }
             let source = match (args.path, args.git) {
                 (Some(path), None) => SkillSource::Path(path),
                 (None, Some(git)) => SkillSource::Git {
@@ -2143,6 +2162,14 @@ async fn cmd_environment_use(
         );
     }
     let team = state.team.as_ref().context("mission has no active team")?;
+    if !crate::model::next(&state)
+        .choices
+        .contains(&Choice::AssignEnvironment {
+            team_revision: team.revision,
+        })
+    {
+        bail!("mission {mission_id} does not currently allow environment assignment");
+    }
     let runtime = team
         .role(&team.planning_assignment)
         .map(|role| role.runtime.clone())

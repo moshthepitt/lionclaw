@@ -45,8 +45,32 @@ fn has_current_recipient(state: &lionclaw::model::MissionState) -> bool {
 fn assert_advertised_actions_are_legal(view: &MissionView) {
     for effect in &view.next.effects {
         match effect {
-            EffectIntent::DriveEffect { effect_id } => {
+            EffectIntent::RecoverEffect { effect_id } => {
                 assert!(view.state.inflight.contains_key(effect_id));
+            }
+            EffectIntent::CleanupConversation {
+                role_instance,
+                effect_id,
+            } => {
+                let conversation = &view.state.conversations[role_instance];
+                assert_eq!(
+                    conversation.disposable_resource_owner.as_ref(),
+                    Some(effect_id)
+                );
+                assert!(matches!(
+                    conversation.lifecycle,
+                    lionclaw::model::ConversationLifecycle::Completed
+                        | lionclaw::model::ConversationLifecycle::Retired
+                ));
+                assert!(!view.state.inflight.values().any(|effect| {
+                    matches!(
+                        effect,
+                        lionclaw::model::InflightEffect::RoleTurn {
+                            role_instance: active,
+                            ..
+                        } if active == role_instance
+                    )
+                }));
             }
             EffectIntent::DispatchRole(_) | EffectIntent::DispatchOracle(_) => {
                 assert!(!view.state.is_terminal());
@@ -56,6 +80,34 @@ fn assert_advertised_actions_are_legal(view: &MissionView) {
     }
     for choice in &view.next.choices {
         match choice {
+            Choice::ProposePlan { base_revision } => {
+                assert_eq!(*base_revision, view.state.revision);
+                assert!(!view.state.is_terminal());
+                assert!(view.state.inflight.is_empty());
+            }
+            Choice::ConfigureTeam { revision } => {
+                assert_eq!(
+                    *revision,
+                    view.state
+                        .team
+                        .as_ref()
+                        .map_or(0, |team| team.revision.saturating_add(1))
+                );
+                assert!(!view.state.is_terminal());
+                assert!(view.state.inflight.is_empty());
+            }
+            Choice::AddMissionSkill => {
+                assert!(!view.state.is_terminal());
+                assert!(view.state.inflight.is_empty());
+            }
+            Choice::AssignEnvironment { team_revision } => {
+                assert_eq!(
+                    Some(*team_revision),
+                    view.state.team.as_ref().map(|team| team.revision)
+                );
+                assert!(!view.state.is_terminal());
+                assert!(view.state.inflight.is_empty());
+            }
             Choice::Decide { id, action } => {
                 lionclaw::model::validate_decision(&view.state, id, action, "liveness probe")
                     .expect("advertised decision must validate");

@@ -363,7 +363,7 @@ async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle(
             })
             .with_prompt_hash(prompt_hash),
             NewEvent::new(MissionEvent::RoleTurnCompleted {
-                effect_id: role_effect,
+                effect_id: role_effect.clone(),
                 outcome: Ok(RoleTurnSuccess {
                     handoff: Some(Handoff::Work {
                         done: true,
@@ -379,6 +379,10 @@ async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle(
                     runtime_usage: Default::default(),
                     prepared_inputs: Vec::new(),
                 }),
+            }),
+            NewEvent::new(MissionEvent::ConversationResourcesCleaned {
+                role_instance,
+                effect_id: role_effect,
             }),
             NewEvent::new(MissionEvent::OracleRunRequested {
                 assertion_ids: vec![assertion_id.clone()],

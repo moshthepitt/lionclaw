@@ -600,6 +600,24 @@ fn event(sequence_no: u64, event: MissionEvent) -> EventEnvelope {
     }
 }
 
+fn clean_conversation_resources(
+    state: &mut MissionState,
+    sequence_no: u64,
+    role_instance: RoleInstanceId,
+    effect_id: EffectId,
+) {
+    apply(
+        state,
+        &event(
+            sequence_no,
+            MissionEvent::ConversationResourcesCleaned {
+                role_instance,
+                effect_id,
+            },
+        ),
+    );
+}
+
 #[test]
 fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
     let config = MissionConfig {
@@ -981,7 +999,7 @@ fn attested_closure_waits_for_every_assigned_judge() {
         &event(
             8,
             MissionEvent::RoleTurnCompleted {
-                effect_id,
+                effect_id: effect_id.clone(),
                 outcome: Ok(validate_success(
                     vec![ValidationItem {
                         item_id: AssertionId::new("A-1").unwrap(),
@@ -992,6 +1010,7 @@ fn attested_closure_waits_for_every_assigned_judge() {
             },
         ),
     );
+    clean_conversation_resources(&mut state, 9, instance("reviewer"), effect_id);
     assert_eq!(
         finish_choice(&state),
         Some(lionclaw_model::FinishClass::Attested)
@@ -1022,7 +1041,7 @@ fn attested_closure_waits_for_every_assigned_judge() {
     apply(
         &mut queued,
         &event(
-            9,
+            10,
             MissionEvent::MissionFinished {
                 finish: lionclaw_model::FinishClass::Attested,
                 reason: "forged while a continuation is owed".into(),
@@ -1034,7 +1053,7 @@ fn attested_closure_waits_for_every_assigned_judge() {
     apply(
         &mut state,
         &event(
-            9,
+            10,
             MissionEvent::MissionFinished {
                 finish: lionclaw_model::FinishClass::Attested,
                 reason: "attested proof bar satisfied".into(),
@@ -1066,7 +1085,7 @@ fn attested_closure_waits_for_every_assigned_judge() {
     apply(
         &mut forged,
         &event(
-            10,
+            11,
             MissionEvent::ResultApplied {
                 branch: "unadvertised-branch".into(),
                 sha: sha.clone(),
@@ -1088,7 +1107,7 @@ fn attested_closure_waits_for_every_assigned_judge() {
     apply(
         &mut state,
         &event(
-            10,
+            11,
             MissionEvent::ResultApplied {
                 branch: branch.clone(),
                 sha: sha.clone(),
@@ -1123,7 +1142,7 @@ fn failed_required_judgment_state() -> MissionState {
         &event(
             7,
             MissionEvent::RoleTurnCompleted {
-                effect_id,
+                effect_id: effect_id.clone(),
                 outcome: Ok(validate_success(
                     vec![ValidationItem {
                         item_id: AssertionId::new("A-1").unwrap(),
@@ -1134,6 +1153,7 @@ fn failed_required_judgment_state() -> MissionState {
             },
         ),
     );
+    clean_conversation_resources(&mut state, 8, instance("reviewer"), effect_id);
     state
 }
 
@@ -1165,7 +1185,7 @@ fn failed_required_judgment_parks_and_rejects_below_bar_finish() {
         apply(
             &mut forged,
             &event(
-                8,
+                9,
                 MissionEvent::MissionFinished {
                     finish,
                     reason: "forged below-bar finish".into(),
@@ -1186,7 +1206,7 @@ fn failed_required_judgment_parks_and_rejects_below_bar_finish() {
     apply(
         &mut forged,
         &event(
-            8,
+            9,
             MissionEvent::DecisionRecorded {
                 attention_id: "proof_failed:judgment:reviewer:A-1".into(),
                 action: DecisionAction::Accept,
@@ -1221,7 +1241,7 @@ fn failed_required_judgment_recovery_retries_or_replans() {
     apply(
         &mut retry,
         &event(
-            8,
+            9,
             MissionEvent::DecisionRecorded {
                 attention_id: attention_id.into(),
                 action: DecisionAction::Retry,
@@ -1241,7 +1261,7 @@ fn failed_required_judgment_recovery_retries_or_replans() {
     apply(
         &mut repair,
         &event(
-            8,
+            9,
             MissionEvent::DecisionRecorded {
                 attention_id: attention_id.into(),
                 action: DecisionAction::Repair,
@@ -1263,7 +1283,7 @@ fn failed_required_judgment_recovery_retries_or_replans() {
     apply(
         &mut revise,
         &event(
-            8,
+            9,
             MissionEvent::DecisionRecorded {
                 attention_id: attention_id.into(),
                 action: DecisionAction::Revise,
@@ -1294,7 +1314,7 @@ fn repeated_identical_required_judgment_suppresses_retry() {
     apply(
         &mut state,
         &event(
-            8,
+            9,
             MissionEvent::DecisionRecorded {
                 attention_id: attention_id.into(),
                 action: DecisionAction::Retry,
@@ -1303,12 +1323,12 @@ fn repeated_identical_required_judgment_suppresses_retry() {
             },
         ),
     );
-    let (second_effect, request) = reviewer_request(9, 2, "failed-judgment");
+    let (second_effect, request) = reviewer_request(10, 2, "failed-judgment");
     apply(&mut state, &request);
     apply(
         &mut state,
         &event(
-            10,
+            11,
             MissionEvent::RoleTurnCompleted {
                 effect_id: second_effect.clone(),
                 outcome: Ok(validate_success(
@@ -1321,6 +1341,7 @@ fn repeated_identical_required_judgment_suppresses_retry() {
             },
         ),
     );
+    clean_conversation_resources(&mut state, 12, instance("reviewer"), second_effect.clone());
 
     assert_eq!(
         decision_actions(&state, attention_id),
@@ -1334,7 +1355,7 @@ fn repeated_identical_required_judgment_suppresses_retry() {
     apply(
         &mut state,
         &event(
-            11,
+            13,
             MissionEvent::DecisionRecorded {
                 attention_id: attention_id.into(),
                 action: DecisionAction::Retry,
@@ -1360,7 +1381,7 @@ fn changed_judgment_evidence_offers_a_new_retry() {
     apply(
         &mut state,
         &event(
-            8,
+            9,
             MissionEvent::DecisionRecorded {
                 attention_id: attention_id.into(),
                 action: DecisionAction::Retry,
@@ -1369,14 +1390,14 @@ fn changed_judgment_evidence_offers_a_new_retry() {
             },
         ),
     );
-    let (second_effect, request) = reviewer_request(9, 2, "failed-judgment");
+    let (second_effect, request) = reviewer_request(10, 2, "failed-judgment");
     apply(&mut state, &request);
     apply(
         &mut state,
         &event(
-            10,
+            11,
             MissionEvent::RoleTurnCompleted {
-                effect_id: second_effect,
+                effect_id: second_effect.clone(),
                 outcome: Ok(validate_success_with_report(
                     vec![ValidationItem {
                         item_id: AssertionId::new("A-1").unwrap(),
@@ -1388,6 +1409,7 @@ fn changed_judgment_evidence_offers_a_new_retry() {
             },
         ),
     );
+    clean_conversation_resources(&mut state, 12, instance("reviewer"), second_effect);
 
     assert_eq!(
         decision_actions(&state, attention_id),
@@ -1406,7 +1428,7 @@ fn changed_judgment_identity_offers_a_new_retry() {
     apply(
         &mut state,
         &event(
-            8,
+            9,
             MissionEvent::DecisionRecorded {
                 attention_id: attention_id.into(),
                 action: DecisionAction::Retry,
@@ -1415,14 +1437,14 @@ fn changed_judgment_identity_offers_a_new_retry() {
             },
         ),
     );
-    let (second_effect, request) = reviewer_request(9, 2, "changed-judgment-prompt");
+    let (second_effect, request) = reviewer_request(10, 2, "changed-judgment-prompt");
     apply(&mut state, &request);
     apply(
         &mut state,
         &event(
-            10,
+            11,
             MissionEvent::RoleTurnCompleted {
-                effect_id: second_effect,
+                effect_id: second_effect.clone(),
                 outcome: Ok(validate_success(
                     vec![ValidationItem {
                         item_id: AssertionId::new("A-1").unwrap(),
@@ -1433,6 +1455,7 @@ fn changed_judgment_identity_offers_a_new_retry() {
             },
         ),
     );
+    clean_conversation_resources(&mut state, 12, instance("reviewer"), second_effect);
     assert_eq!(
         decision_actions(&state, attention_id),
         [
@@ -1581,6 +1604,7 @@ fn queued_continuation_uses_the_roles_running_serial_task() {
         ConversationState {
             role_instance: instance("engineer"),
             lifecycle: ConversationLifecycle::AwaitingLead,
+            disposable_resource_owner: None,
             queued: vec![QueuedMessage {
                 sequence_no: 6,
                 body: "continue".into(),
