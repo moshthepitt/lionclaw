@@ -1,6 +1,6 @@
 //! The mission type is pinned by content digest at start and verified on every
-//! engine open. A mutated role or oracle (the fake-green vector) must refuse to
-//! advance the mission, not run against a changed instrument of judgment.
+//! engine open. A mutated role or playbook must refuse to advance the mission,
+//! not run against changed mission instructions.
 
 mod common;
 
@@ -16,7 +16,6 @@ use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectC
 
 fn write_minimal_type(root: &Path) {
     std::fs::create_dir_all(root.join("roles")).unwrap();
-    std::fs::create_dir_all(root.join("oracles")).unwrap();
     std::fs::write(
         root.join("mission.toml"),
         "[mission-type]\nname = \"digest-test\"\nstop = \"verified\"\nimage = \"img\"\n\
@@ -35,21 +34,14 @@ fn write_minimal_type(root: &Path) {
     )
     .unwrap();
     std::fs::write(root.join("playbook.md"), "# Digest test\n").unwrap();
-    let oracle = root.join("oracles/cargo-test");
-    std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
 }
 
-/// The pin is only meaningful because the digest is computed over the role and
-/// oracle *content*: prove editing either file changes it (the equality check in
+/// The pin is only meaningful because the digest is computed over the loaded
+/// content: prove editing a role or playbook changes it (the equality check in
 /// `opening_a_mission_whose_type_digest_changed_is_refused` below is otherwise
 /// vacuous if `compute_digest` ignored content).
 #[test]
-fn the_digest_tracks_role_and_oracle_content() {
+fn the_digest_tracks_role_and_playbook_content() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("digest-test");
     write_minimal_type(&root);
@@ -76,10 +68,8 @@ fn the_digest_tracks_role_and_oracle_content() {
     .unwrap();
     assert_eq!(base, digest(), "restoring the role restores the digest");
 
-    // Editing an oracle's bytes changes the digest — the fake-green vector the
-    // pin exists to close.
-    std::fs::write(root.join("oracles/cargo-test"), "#!/bin/sh\nexit 1\n").unwrap();
-    assert_ne!(base, digest(), "a mutated oracle must change the digest");
+    std::fs::write(root.join("playbook.md"), "# Changed digest test\n").unwrap();
+    assert_ne!(base, digest(), "a mutated playbook must change the digest");
 }
 
 #[test]

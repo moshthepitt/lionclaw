@@ -1,5 +1,0 @@
-#!/bin/sh
-# Fetch the locked dependency graph into the declared output directory. The
-# engine keys this result by Cargo.lock, this program, and the pinned image.
-set -eu
-CARGO_HOME="$LIONCLAW_OUTPUT" cargo fetch --locked

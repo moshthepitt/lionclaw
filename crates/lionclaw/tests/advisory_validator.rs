@@ -403,6 +403,7 @@ async fn skill_added_reopens_only_receipts_judged_with_that_skill() {
         .unwrap();
 
     let plan = two_reviewer_plan_with_oracle_obligation();
+    let oracles = common::oracle_specs(&plan);
     let mut team = common::team(1, Some(&plan), false);
     team.roles
         .get_mut(&RoleInstanceId::new("reviewer").unwrap())
@@ -432,6 +433,7 @@ async fn skill_added_reopens_only_receipts_judged_with_that_skill() {
                     assertion_supersessions: Vec::new(),
                     plan,
                 }),
+                oracles: Some(oracles),
             },
         )
         .await
@@ -718,6 +720,7 @@ async fn replacement_validator_requires_new_receipt_and_retains_prior_evidence()
             MissionProposal {
                 plan: None,
                 team: Some(next_team),
+                oracles: None,
             },
         )
         .await

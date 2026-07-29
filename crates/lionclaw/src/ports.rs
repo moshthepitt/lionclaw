@@ -7,7 +7,6 @@
 //! authoritative verdicts exist only on the oracle path, structurally.
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -16,7 +15,7 @@ use tokio::sync::watch;
 
 use crate::mission_type::{PreparedInput, SkillPackage};
 use crate::model::{
-    ConfinementResources, EffectId, EffectResource, Handoff, MissionId, OracleName,
+    CommandOracle, ConfinementResources, EffectId, EffectResource, Handoff, MissionId, OracleName,
     PreparedInputRef, RoleInstance, RuntimeConfigurationEvidence, RuntimeUsage, TaskCandidateRef,
     TaskId,
 };
@@ -112,20 +111,15 @@ pub struct OracleRunRequest {
     pub mission_id: MissionId,
     pub effect_id: EffectId,
     pub oracle: OracleName,
-    /// Resolved oracle executable (engine resolves from the mission type; the
-    /// runner stays domain-blind — it never sees which assertions it judges).
-    pub oracle_path: PathBuf,
+    pub spec_digest: String,
+    /// Complete structured command resolved from mission state.
+    pub command: CommandOracle,
     pub judged_sha: String,
     /// Resolved immutable environment digest this effect is authorized under.
     pub environment_digest: String,
     pub workspace_dir: PathBuf,
     pub state_dir: PathBuf,
     pub prepared_inputs: Vec<PreparedInput>,
-    /// Domain policy from the pinned mission type.
-    pub environment: BTreeMap<String, String>,
-    pub devices: BTreeSet<String>,
-    /// Per-oracle resource overrides declared by the pinned mission type.
-    pub resources: ConfinementResources,
     pub resource_ceilings: ConfinementResources,
     pub deadline_ms: i64,
     pub control: watch::Receiver<ExecutionControl>,

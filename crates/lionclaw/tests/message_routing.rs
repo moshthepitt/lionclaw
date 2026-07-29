@@ -301,6 +301,7 @@ async fn production_cli_routes_atomically_only_to_explicit_live_conversations() 
             &mission,
             MissionProposal {
                 team: Some(replacement_team),
+                oracles: Some(common::oracle_specs(&replacement_plan)),
                 plan: Some(PlanProposal {
                     base_revision: 1,
                     requirement_changes: vec![],

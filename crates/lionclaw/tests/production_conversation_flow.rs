@@ -1,6 +1,8 @@
 //! The Slice 4 production conversation proof.  Only the native agent and
 //! oracle transports are scripted; every boundary around them is production.
 
+mod common;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
@@ -1159,6 +1161,7 @@ fn team_for_plan(revision: u32, plan: &Plan) -> TeamRevision {
 }
 
 fn mission_proposal(base_revision: u32, plan: Plan) -> MissionProposal {
+    let oracles = common::oracle_specs(&plan);
     MissionProposal {
         team: Some(team_for_plan(base_revision.saturating_add(1), &plan)),
         plan: Some(PlanProposal {
@@ -1167,6 +1170,7 @@ fn mission_proposal(base_revision: u32, plan: Plan) -> MissionProposal {
             assertion_supersessions: Vec::new(),
             plan,
         }),
+        oracles: Some(oracles),
     }
 }
 
@@ -1443,7 +1447,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (34, 69));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (35, 70));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -3235,7 +3239,6 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 
 fn materialize_mission_type(root: &Path) {
     std::fs::create_dir_all(root.join("roles")).unwrap();
-    std::fs::create_dir_all(root.join("oracles")).unwrap();
     std::fs::write(root.join("playbook.md"), "Production flow fixture.\n").unwrap();
     std::fs::write(
         root.join("mission.toml"),
@@ -3284,11 +3287,6 @@ auto-continue-proof = true
             format!("---\noutput: {output}\nruntime: codex\n---\nProduction proof role.\n"),
         )
         .unwrap();
-    }
-    for name in ["build-release", "cargo-clippy", "cargo-test", "fmt-check"] {
-        let oracle = root.join("oracles").join(name);
-        std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
 

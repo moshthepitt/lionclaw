@@ -9,7 +9,6 @@
 //! ├─ roles/<name>.md         # frontmatter (output, network, secrets, runtime) + prompt
 //! ├─ skills/<name>/SKILL.md   # optional role skills and their resources
 //! ├─ inputs/<name>            # optional prepared-input program
-//! └─ oracles/<name>          # executable; exit 0 = pass
 //! ```
 
 mod bounded_tree;
@@ -39,8 +38,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::model::{
-    validate_environment_entry, AuthorityCeilings, ConfinementResources, InputName, OracleName,
-    StopBar, TeamRevision,
+    validate_environment_entry, AuthorityCeilings, ConfinementResources, InputName, StopBar,
+    TeamRevision,
 };
 
 /// Aggregate program and declared-key content admitted to one prepared-input
@@ -91,10 +90,10 @@ pub struct PreparedInput {
 pub struct MissionTypeDefinition {
     pub name: String,
     pub stop: StopBar,
-    /// The confinement image every role and oracle runs in (from `mission.toml`).
+    /// The confinement image every role and command oracle runs in.
     pub image: String,
-    /// Domain-owned environment shared by roles and oracles. Kernel-owned
-    /// execution coordinates cannot be overridden here.
+    /// Domain-owned environment shared by roles. A command oracle declares
+    /// its complete bounded environment in the mission proposal.
     pub environment: BTreeMap<String, String>,
     pub default_team: TeamRevision,
     pub ceilings: AuthorityCeilings,
@@ -106,9 +105,6 @@ pub struct MissionTypeDefinition {
     pub playbook: Option<String>,
     pub skills: BTreeMap<String, SkillPackage>,
     pub inputs: BTreeMap<InputName, PreparedInput>,
-    pub oracles: BTreeMap<OracleName, PathBuf>,
-    pub oracle_resources: BTreeMap<OracleName, ConfinementResources>,
-    pub oracle_devices: BTreeMap<OracleName, std::collections::BTreeSet<String>>,
 }
 
 /// One validated mission-type closure sealed to its content identity.
@@ -231,26 +227,6 @@ impl MissionType {
         self.resource_ceilings
             .validate()
             .map_err(|detail| anyhow::anyhow!("resource ceilings are invalid: {detail}"))?;
-        for (oracle, resources) in &self.oracle_resources {
-            if !self.oracles.contains_key(oracle) {
-                anyhow::bail!("oracle resources name undeclared oracle '{oracle}'");
-            }
-            resources
-                .within(&self.resource_ceilings)
-                .map_err(|detail| {
-                    anyhow::anyhow!(
-                        "oracle '{oracle}' requests resources outside mission ceilings: {detail}"
-                    )
-                })?;
-        }
-        for (oracle, devices) in &self.oracle_devices {
-            if !self.oracles.contains_key(oracle) {
-                anyhow::bail!("oracle devices name undeclared oracle '{oracle}'");
-            }
-            if !devices.is_subset(&self.ceilings.devices) {
-                anyhow::bail!("oracle '{oracle}' requests devices outside mission ceilings");
-            }
-        }
         if self.requires_gap_review && self.default_team.gap_review_assignment.is_none() {
             anyhow::bail!("[team] requires-gap-review needs a gap-review assignment");
         }
@@ -263,7 +239,6 @@ impl MissionType {
     pub fn mission_config(&self) -> crate::model::MissionConfig {
         crate::model::MissionConfig {
             stop: self.stop,
-            oracles: self.oracles.keys().cloned().collect(),
             skills: self
                 .skills
                 .values()
@@ -280,8 +255,6 @@ impl MissionType {
                 .collect(),
             ceilings: self.ceilings.clone(),
             resource_ceilings: self.resource_ceilings.clone(),
-            oracle_resources: self.oracle_resources.clone(),
-            oracle_devices: self.oracle_devices.clone(),
             requires_gap_review: self.requires_gap_review,
             recovery: self.recovery.clone(),
             execution: self.execution.clone(),

@@ -78,6 +78,18 @@ proposal = {
         },
     },
     "team": team,
+    "oracles": {
+        "cargo-test": {
+            "type": "command",
+            "argv": ["cargo", "test", "--locked"],
+            "cwd": ".",
+            "environment": {
+                "CARGO_HOME": "/scratch/cargo",
+                "CARGO_TARGET_DIR": "/scratch/target",
+            },
+            "timeout_secs": 900,
+        },
+    },
 }
 json.dump(proposal, open(sys.argv[2], "w"))
 PY

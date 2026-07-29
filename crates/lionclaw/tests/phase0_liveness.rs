@@ -175,6 +175,30 @@ fn assert_decisions_change_authority(state: &lionclaw::model::MissionState) -> b
             } else {
                 vec![]
             };
+            let proposal_runtime_identities = if action == DecisionAction::Approve {
+                state
+                    .proposal
+                    .as_ref()
+                    .and_then(|proposal| proposal.team.as_ref())
+                    .map(|team| {
+                        team.roles
+                            .iter()
+                            .map(|(role_id, role)| {
+                                (
+                                    role_id.clone(),
+                                    lionclaw::model::RuntimeInstrumentIdentity {
+                                        runtime: role.runtime.clone(),
+                                        model: None,
+                                        mode: None,
+                                    },
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Default::default()
+            };
             let mut changed = state.clone();
             apply(
                 &mut changed,
@@ -185,6 +209,7 @@ fn assert_decisions_change_authority(state: &lionclaw::model::MissionState) -> b
                         action: action.clone(),
                         justification: "liveness probe".to_string(),
                         requirement_changes,
+                        proposal_runtime_identities,
                     },
                 ),
             );

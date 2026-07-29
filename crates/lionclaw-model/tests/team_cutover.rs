@@ -1,17 +1,17 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use lionclaw_model::{
     apply, fold, AdvisoryStatus, Assertion, AssertionId, AssertionState, AuthorityCeilings,
-    AuthorityGrants, Choice, ConfinementResources, ConversationLifecycle, ConversationState,
-    DecisionAction, DeliveryMarker, EffectId, EventEnvelope, ExecutionPolicy, Handoff,
-    MissionConfig, MissionEvent, MissionGuidance, MissionId, MissionProposal, MissionState,
-    MissionTypeRef, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, QueuedMessage,
-    RecoveryConfig, Requirement, RequirementDisposition, RequirementId, RequirementKind,
-    RoleAttemptDisposition, RoleInstance, RoleInstanceId, RoleInstrumentIdentity,
-    RolePromptTemplate, RoleTurnSuccess, RuntimeConfigurationEvidence, RuntimeInstrumentIdentity,
-    StopBar, Task, TaskId, TaskRoleAssignment, TaskRuntimeState, TaskStatus, TeamRevision,
-    TerminalState, TypedFailure, ValidationItem, VersionStamps, WorkspacePreparation,
-    SCHEMA_VERSION,
+    AuthorityGrants, Choice, CommandOracle, ConfinementResources, ConversationLifecycle,
+    ConversationState, DecisionAction, DeliveryMarker, EffectId, EventEnvelope, ExecutionPolicy,
+    Handoff, MissionConfig, MissionEvent, MissionGuidance, MissionId, MissionProposal,
+    MissionState, MissionTypeRef, OracleName, OracleSpec, OutputSemantics, PayloadRef, Plan,
+    PlanProposal, QueuedMessage, RecoveryConfig, Requirement, RequirementDisposition,
+    RequirementId, RequirementKind, RoleAttemptDisposition, RoleInstance, RoleInstanceId,
+    RoleInstrumentIdentity, RolePromptTemplate, RoleTurnSuccess, RuntimeConfigurationEvidence,
+    RuntimeInstrumentIdentity, StopBar, Task, TaskId, TaskRoleAssignment, TaskRuntimeState,
+    TaskStatus, TeamRevision, TerminalState, TypedFailure, ValidationItem, VersionStamps,
+    WorkspacePreparation, WorkspaceRelativeDir, SCHEMA_VERSION,
 };
 
 const BASE_ENVIRONMENT_DIGEST: &str = "image";
@@ -88,6 +88,25 @@ fn team_event(team: TeamRevision) -> MissionEvent {
         team,
         runtime_identities,
     }
+}
+
+fn command_oracles(names: &[&str]) -> BTreeMap<OracleName, OracleSpec> {
+    names
+        .iter()
+        .map(|name| {
+            (
+                OracleName::new(*name).unwrap(),
+                OracleSpec::Command(CommandOracle {
+                    argv: vec!["true".to_string()],
+                    cwd: WorkspaceRelativeDir::new(".").unwrap(),
+                    environment: BTreeMap::new(),
+                    timeout_secs: 60,
+                    grants: AuthorityGrants::default(),
+                    resources: ConfinementResources::default(),
+                }),
+            )
+        })
+        .collect()
 }
 
 fn role_instrument_from_prefix(
@@ -251,6 +270,7 @@ fn role_resource_overrides_are_bounded_by_mission_resource_ceilings() {
     let proposal = MissionProposal {
         plan: None,
         team: Some(proposed),
+        oracles: None,
     };
     let error = lionclaw_model::validate_mission_proposal(&state, &proposal)
         .expect_err("over-ceiling role resources must reject the team proposal");
@@ -306,12 +326,9 @@ fn over_ceiling_team_configured_event_is_ignored_during_replay() {
 fn sunset_wire_shapes_have_no_planning_or_role_bridges() {
     let config = MissionConfig {
         stop: StopBar::Verified,
-        oracles: BTreeSet::from([OracleName::new("cargo-test").expect("oracle")]),
         skills: BTreeMap::new(),
         ceilings: AuthorityCeilings::default(),
         resource_ceilings: Default::default(),
-        oracle_resources: Default::default(),
-        oracle_devices: Default::default(),
         requires_gap_review: true,
         recovery: RecoveryConfig::default(),
         execution: ExecutionPolicy::default(),
@@ -464,7 +481,6 @@ fn team(revision: u32, assigned: bool) -> TeamRevision {
 fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
     let config = MissionConfig {
         stop: StopBar::Verified,
-        oracles: BTreeSet::from([OracleName::new("test").unwrap()]),
         skills: BTreeMap::new(),
         ceilings: AuthorityCeilings {
             writes: true,
@@ -500,6 +516,7 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
                         plan: plan(),
                     }),
                     team: Some(accepted_team.clone()),
+                    oracles: Some(command_oracles(&["test"])),
                 }),
                 proposal_hash: "proposal".into(),
             },
@@ -511,17 +528,14 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
                 action: DecisionAction::Approve,
                 justification: "ratified".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: runtime_identities(&accepted_team),
             },
         ),
-        event(5, team_event(accepted_team)),
     ])
     .expect("accepted mission plan");
     let left = AssertionId::new("A-LEFT").unwrap();
     let right = AssertionId::new("A-RIGHT").unwrap();
-    state.config.oracles = BTreeSet::from([
-        OracleName::new("left").unwrap(),
-        OracleName::new("right").unwrap(),
-    ]);
+    state.oracles = command_oracles(&["left", "right"]);
     state.config.execution.effect_capacity = 1;
     state.tasks.clear();
     state.plan = Some(two_oracle_plan());
@@ -622,15 +636,12 @@ fn clean_conversation_resources(
 fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
     let config = MissionConfig {
         stop: StopBar::Verified,
-        oracles: BTreeSet::from([OracleName::new("test").unwrap()]),
         skills: BTreeMap::new(),
         ceilings: AuthorityCeilings {
             writes: true,
             ..Default::default()
         },
         resource_ceilings: Default::default(),
-        oracle_resources: Default::default(),
-        oracle_devices: Default::default(),
         requires_gap_review: false,
         recovery: RecoveryConfig::default(),
         execution: ExecutionPolicy::default(),
@@ -643,6 +654,7 @@ fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
             plan: plan(),
         }),
         team: Some(team(1, true)),
+        oracles: Some(command_oracles(&["test"])),
     };
     let state = fold([
         event(
@@ -674,9 +686,9 @@ fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
                 action: DecisionAction::Approve,
                 justification: "ratified".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: runtime_identities(proposal.team.as_ref().unwrap()),
             },
         ),
-        event(5, team_event(proposal.team.unwrap())),
     ])
     .unwrap();
 
@@ -720,7 +732,6 @@ fn a_skipped_team_revision_is_ignored_during_replay() {
 fn role_completion_cannot_override_the_team_owned_output_contract() {
     let config = MissionConfig {
         stop: StopBar::Verified,
-        oracles: BTreeSet::from([OracleName::new("test").unwrap()]),
         ceilings: AuthorityCeilings {
             writes: true,
             ..Default::default()
@@ -764,6 +775,7 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
                         plan: plan(),
                     }),
                     team: Some(accepted_team.clone()),
+                    oracles: Some(command_oracles(&["test"])),
                 }),
                 proposal_hash: "proposal".into(),
             },
@@ -775,9 +787,9 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
                 action: DecisionAction::Approve,
                 justification: "ratified".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: runtime_identities(&accepted_team),
             },
         ),
-        event(5, team_event(accepted_team)),
     ];
     let instrument_identity = role_instrument_from_prefix(&events, &instance("engineer"), 1);
     events.push(event(
@@ -877,6 +889,7 @@ fn accepted_advisory_state() -> MissionState {
                         plan: advisory_plan,
                     }),
                     team: Some(accepted_team.clone()),
+                    oracles: None,
                 }),
                 proposal_hash: "proposal".into(),
             },
@@ -888,9 +901,9 @@ fn accepted_advisory_state() -> MissionState {
                 action: DecisionAction::Approve,
                 justification: "ratified".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: runtime_identities(&accepted_team),
             },
         ),
-        event(5, team_event(accepted_team)),
     ])
     .unwrap()
 }
@@ -1212,6 +1225,7 @@ fn failed_required_judgment_parks_and_rejects_below_bar_finish() {
                 action: DecisionAction::Accept,
                 justification: "forged proof waiver".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: BTreeMap::new(),
             },
         ),
     );
@@ -1247,6 +1261,7 @@ fn failed_required_judgment_recovery_retries_or_replans() {
                 action: DecisionAction::Retry,
                 justification: "rerun the failed required judgment".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: BTreeMap::new(),
             },
         ),
     );
@@ -1267,6 +1282,7 @@ fn failed_required_judgment_recovery_retries_or_replans() {
                 action: DecisionAction::Repair,
                 justification: "repair the work using the failed judgment".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: BTreeMap::new(),
             },
         ),
     );
@@ -1289,6 +1305,7 @@ fn failed_required_judgment_recovery_retries_or_replans() {
                 action: DecisionAction::Revise,
                 justification: "revise the work using the failed judgment".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: BTreeMap::new(),
             },
         ),
     );
@@ -1320,6 +1337,7 @@ fn repeated_identical_required_judgment_suppresses_retry() {
                 action: DecisionAction::Retry,
                 justification: "one manual retry".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: BTreeMap::new(),
             },
         ),
     );
@@ -1361,6 +1379,7 @@ fn repeated_identical_required_judgment_suppresses_retry() {
                 action: DecisionAction::Retry,
                 justification: "forged repeated retry".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: BTreeMap::new(),
             },
         ),
     );
@@ -1387,6 +1406,7 @@ fn changed_judgment_evidence_offers_a_new_retry() {
                 action: DecisionAction::Retry,
                 justification: "retry after the first report".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: BTreeMap::new(),
             },
         ),
     );
@@ -1434,6 +1454,7 @@ fn changed_judgment_identity_offers_a_new_retry() {
                 action: DecisionAction::Retry,
                 justification: "retry with a changed prompt".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: BTreeMap::new(),
             },
         ),
     );
@@ -1553,11 +1574,61 @@ fn permanent_taskless_role_failure_parks_until_an_explicit_retry() {
                 action: DecisionAction::Retry,
                 justification: "retry after correcting the runtime".into(),
                 requirement_changes: Vec::new(),
+                proposal_runtime_identities: BTreeMap::new(),
             },
         ),
     );
     assert!(has_role_dispatch(&state));
     assert!(!state.parked_effects.contains_key(&effect_id));
+}
+
+#[test]
+fn taskless_role_failure_cannot_continue_after_team_cutover() {
+    let mut state = accepted_advisory_state();
+    state
+        .tasks
+        .get_mut(&TaskId::new("implement").unwrap())
+        .unwrap()
+        .status = TaskStatus::Cleared;
+    let (effect_id, request) = reviewer_request(6, 1, "failure-before-cutover");
+    apply(&mut state, &request);
+    apply(
+        &mut state,
+        &event(
+            7,
+            MissionEvent::RoleTurnCompleted {
+                effect_id: effect_id.clone(),
+                outcome: Err(TypedFailure::permanent("judge.failed", "fault injected")),
+            },
+        ),
+    );
+    assert!(state.parked_effect_is_continuable(&effect_id));
+
+    let mut replacement = state.team.clone().unwrap();
+    replacement.revision += 1;
+    apply(
+        &mut state,
+        &event(
+            8,
+            MissionEvent::TeamConfigured {
+                runtime_identities: runtime_identities(&replacement),
+                team: replacement,
+            },
+        ),
+    );
+
+    assert!(!state.parked_effect_is_continuable(&effect_id));
+    assert!(!lionclaw_model::next(&state)
+        .choices
+        .iter()
+        .any(|choice| matches!(
+            choice,
+            Choice::Continue {
+                effect_id: candidate,
+                ..
+            } if candidate == &effect_id
+        )));
+    assert!(has_role_dispatch(&state));
 }
 
 #[test]

@@ -496,7 +496,6 @@ pub(crate) struct OracleEffectDirs {
     root: PathBuf,
     scratch: PathBuf,
     work: PathBuf,
-    program: PathBuf,
 }
 
 impl OracleEffectDirs {
@@ -504,14 +503,13 @@ impl OracleEffectDirs {
         Self {
             scratch: root.join("scratch"),
             work: root.join("work"),
-            program: root.join("oracle"),
             state_dir,
             root,
         }
     }
 
     pub(crate) fn prepare(&self) -> std::io::Result<()> {
-        ensure_dirs_beneath(&self.state_dir, [&self.scratch, &self.program])
+        ensure_dirs_beneath(&self.state_dir, [&self.scratch])
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -524,10 +522,6 @@ impl OracleEffectDirs {
 
     pub(crate) fn work(&self) -> &Path {
         &self.work
-    }
-
-    pub(crate) fn program(&self) -> &Path {
-        &self.program
     }
 }
 

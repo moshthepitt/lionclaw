@@ -61,7 +61,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn materialized_bundle_preserves_files_and_executable_bits() {
+    fn materialized_bundle_preserves_declared_files() {
         let bundle = BundledMissionTypes::materialize().unwrap();
         let mut mission_types = std::fs::read_dir(bundle.root())
             .unwrap()
@@ -76,13 +76,7 @@ mod tests {
         let metric_root = bundle.root().join("metric-driven");
         assert!(metric_root.join("mission.toml").is_file());
 
-        let oracle = std::fs::metadata(root.join("oracles/cargo-test")).unwrap();
-        let metric_oracle = std::fs::metadata(metric_root.join("oracles/metric-scalar")).unwrap();
-        let input = std::fs::metadata(root.join("inputs/cargo-home")).unwrap();
         let playbook = std::fs::metadata(root.join("playbook.md")).unwrap();
-        assert_ne!(oracle.permissions().mode() & 0o111, 0);
-        assert_ne!(metric_oracle.permissions().mode() & 0o111, 0);
-        assert_ne!(input.permissions().mode() & 0o111, 0);
         assert_eq!(playbook.permissions().mode() & 0o111, 0);
     }
 }

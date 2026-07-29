@@ -123,7 +123,7 @@ id_type!(
 id_type!(
     OracleName,
     validate_component_name,
-    "Mission-type oracle name."
+    "Mission-local oracle name."
 );
 id_type!(
     InputName,
@@ -184,6 +184,7 @@ impl EffectId {
     pub fn for_oracle_request(
         mission_id: &MissionId,
         oracle: &OracleName,
+        spec_digest: &str,
         judged_sha: &str,
         attempt_no: u32,
     ) -> Self {
@@ -191,6 +192,7 @@ impl EffectId {
             "oracle",
             mission_id.as_str(),
             oracle.as_str(),
+            spec_digest,
             judged_sha,
             &attempt_no.to_string(),
         ])

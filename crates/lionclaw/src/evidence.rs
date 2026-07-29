@@ -18,8 +18,9 @@ pub fn render_authoritative_receipt(
 ) -> String {
     let (stdout, stderr) = verdict.evidence();
     format!(
-        "effect: {effect_id}\nsource: oracle {}\nassertions: {}\nattempt: {}\njudged artifact: {}\nenvironment: {}\nexit code: {}\nsignal: {}\nstdout:\n{}\nstderr:\n{}",
+        "effect: {effect_id}\nsource: oracle {}\nspec: {}\nassertions: {}\nattempt: {}\njudged artifact: {}\nenvironment: {}\nexit code: {}\nsignal: {}\nstdout:\n{}\nstderr:\n{}",
         verdict.oracle(),
+        verdict.spec_digest(),
         verdict
             .assertion_ids()
             .iter()
@@ -47,6 +48,7 @@ pub fn authoritative_receipt_json(
     serde_json::json!({
         "effect_id": effect_id,
         "oracle": verdict.oracle(),
+        "spec_digest": verdict.spec_digest(),
         "assertion_ids": verdict.assertion_ids(),
         "attempt_no": verdict.attempt_no(),
         "judged_sha": verdict.judged_sha(),

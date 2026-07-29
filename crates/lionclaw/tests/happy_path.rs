@@ -573,10 +573,6 @@ async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mission_type = test_mission_type();
     mission_type.edit_for_testing(|definition| {
-        definition.oracles.insert(
-            OracleName::new("lint").unwrap(),
-            "/nonexistent-mission-type/oracles/lint".into(),
-        );
         definition.execution.auto_continue_candidate = false;
         definition.execution.auto_continue_proof = false;
     });
@@ -853,11 +849,13 @@ async fn replayed_oracle_attempt_cannot_replace_authoritative_receipt() {
     let assertion_ids = vec![AssertionId::new("TESTS-PASS").unwrap()];
     let judged_sha = replayed.deliverable_head().to_string();
     let environment_digest = replayed.environment_digest().to_string();
+    let spec_digest = replayed.oracles[&oracle].digest();
     let request = next_envelope(
         &replayed,
         MissionEvent::OracleRunRequested {
             assertion_ids: assertion_ids.clone(),
             oracle: oracle.clone(),
+            spec_digest: spec_digest.clone(),
             judged_sha: judged_sha.clone(),
             environment_digest,
             attempt_no: 1,
@@ -873,6 +871,7 @@ async fn replayed_oracle_attempt_cannot_replace_authoritative_receipt() {
         MissionEvent::OracleRunCompleted {
             assertion_ids,
             oracle: oracle.clone(),
+            spec_digest: spec_digest.clone(),
             judged_sha,
             attempt_no: 1,
             effect_id: receipt_id.clone(),
@@ -894,7 +893,7 @@ async fn replayed_oracle_attempt_cannot_replace_authoritative_receipt() {
         .values()
         .all(|assertion| assertion.last_authoritative_receipt.is_none()));
     assert_eq!(common::finish_choice(&replayed), None);
-    assert_eq!(replayed.oracle_attempts[&oracle], 1);
+    assert_eq!(replayed.oracle_attempts[&oracle][&spec_digest], 1);
 }
 
 #[tokio::test]
@@ -1163,6 +1162,7 @@ async fn mixed_failures_are_fail_closed_and_preserve_every_feedback() {
             action: DecisionAction::Accept,
             justification: "forged oracle runtime waiver".into(),
             requirement_changes: Vec::new(),
+            proposal_runtime_identities: BTreeMap::new(),
         },
     );
     apply(&mut forged, &forged_event);
@@ -1230,13 +1230,7 @@ async fn mixed_failures_are_fail_closed_and_preserve_every_feedback() {
 }
 
 fn plan_with_lint_oracle() -> (lionclaw::mission_type::MissionType, lionclaw::model::Plan) {
-    let mut mission_type = test_mission_type();
-    mission_type.edit_for_testing(|definition| {
-        definition.oracles.insert(
-            OracleName::new("lint").unwrap(),
-            "/nonexistent-mission-type/oracles/lint".into(),
-        );
-    });
+    let mission_type = test_mission_type();
     let mut plan = simple_plan();
     plan.requirements
         .push(covered_requirement("LINT-GREEN", "LINT-PASS"));

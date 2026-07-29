@@ -38,8 +38,8 @@ fn moat_refuses_over_privileged_judge_mission_type() {
     );
 }
 
-/// Scenario 4 — the fold-level honesty cap: a mission type with a reviewer and
-/// no oracles finishes internally-consistent even when the reviewer passes
+/// Scenario 4 — the fold-level honesty cap: a mission with a reviewer and no
+/// command proof finishes internally-consistent even when the reviewer passes
 /// everything. Never verified — an agent-only verdict can't mint authority.
 /// (Its bar is `attested`, so the advisory plan is valid; a `verified`
 /// type would reject the oracle-less plan when proposed — see
@@ -52,7 +52,6 @@ async fn advisory_only_mission_type_never_verifies() {
     )
     .expect("advisory-only mission type loads");
     assert_eq!(mission_type.stop, StopBar::Attested);
-    assert!(mission_type.oracles.is_empty(), "fixture has no oracles");
     let proposed_team = mission_type.default_team.clone();
 
     let dir = tempfile::tempdir().expect("tempdir");

@@ -3,12 +3,12 @@
 use alloc::collections::btree_map::Entry;
 
 use super::event::{ControlAction, EventEnvelope, Handoff, MissionEvent};
-use super::ids::{AssertionId, RoleInstanceId, TaskId};
+use super::ids::{RoleInstanceId, TaskId};
 use super::state::{
     ActiveDelivery, AppliedResult, AssertionState, ConversationLifecycle, ConversationState,
     DeliveryMarker, InflightEffect, MissionState, ParkedEffect, PlanningInput, PlanningRefinement,
-    ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, RoleAttemptDisposition, SettledHandoff,
-    TaskAttemptOutcome, TaskRoleAssignment, TaskRuntimeState, TaskStatus, TerminalState,
+    RoleAttemptDisposition, SettledHandoff, TaskAttemptOutcome, TaskRoleAssignment,
+    TaskRuntimeState, TaskStatus, TerminalState,
 };
 use super::verdict::{
     proof_readiness, AuthoritativeVerdict, ProofFailure, ProofReadiness, ProofSource,
@@ -16,9 +16,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 69 prevents direct administrative mutation while a proposal awaits
-/// its exact approve-or-revise decision.
-pub const REDUCER_VERSION: u32 = 69;
+/// Reducer 70 promotes a validated plan, team, and complete oracle map as one
+/// prospective mission shape and binds proof state to oracle-spec digests.
+pub const REDUCER_VERSION: u32 = 70;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -67,6 +67,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
             refinement: None,
         },
         proposal: None,
+        oracles: BTreeMap::new(),
         current_sha: base_sha.clone(),
         oracle_attempts: BTreeMap::new(),
         inflight: BTreeMap::new(),
@@ -79,12 +80,10 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         reached_deadlines: BTreeMap::new(),
         parked_effects: BTreeMap::new(),
         cleanup_failure: None,
-        proposal_approved: false,
         revision: 0,
         acknowledged_gates: BTreeSet::new(),
         flagged_tasks: BTreeSet::new(),
         oracle_failures: BTreeMap::new(),
-        gap_review: Default::default(),
         head: envelope.sequence_no,
     })
 }
@@ -129,7 +128,6 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }) && valid_proposal(state, proposal)
             {
                 state.proposal = Some((**proposal).clone());
-                state.proposal_approved = false;
             }
         }
         MissionEvent::RoleTurnRequested { .. } => apply_role_request(state, envelope),
@@ -144,6 +142,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         MissionEvent::OracleRunRequested {
             assertion_ids,
             oracle,
+            spec_digest,
             judged_sha,
             environment_digest,
             attempt_no,
@@ -151,59 +150,65 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             requested_at_ms,
             deadline_ms,
         } => {
+            let spec = state
+                .oracles
+                .get(oracle)
+                .filter(|spec| spec.digest() == *spec_digest);
+            let not_before_ms = state
+                .oracle_failures
+                .get(oracle)
+                .filter(|failure| failure.is_transient())
+                .and_then(TypedFailure::next_eligible_at_ms)
+                .unwrap_or(*requested_at_ms)
+                .max(*requested_at_ms);
             let canonical = effect_id
                 == &super::EffectId::for_oracle_request(
                     &state.mission_id,
                     oracle,
+                    spec_digest,
                     judged_sha,
                     *attempt_no,
                 )
+                && spec.is_some()
                 && judged_sha == state.deliverable_head()
                 && environment_digest == state.environment_digest()
                 && state.next_oracle_attempt(oracle) == Some(*attempt_no)
                 && !assertion_ids.is_empty()
                 && assertion_ids == &state.owed_assertions_for_oracle(oracle)
-                && !state.authoritative_receipts.contains_key(effect_id);
+                && !state.authoritative_receipts.contains_key(effect_id)
+                && spec
+                    .and_then(|spec| {
+                        super::resolve_execution_deadline_ms(
+                            not_before_ms,
+                            spec.as_command().timeout_secs,
+                        )
+                        .ok()
+                    })
+                    == Some(*deadline_ms);
             if canonical && !state.inflight.contains_key(effect_id) {
-                state.oracle_attempts.insert(oracle.clone(), *attempt_no);
+                state
+                    .oracle_attempts
+                    .entry(oracle.clone())
+                    .or_default()
+                    .insert(spec_digest.clone(), *attempt_no);
                 state.inflight.insert(
                     effect_id.clone(),
                     InflightEffect::OracleRun {
                         assertion_ids: assertion_ids.clone(),
                         oracle: oracle.clone(),
+                        spec_digest: spec_digest.clone(),
                         judged_sha: judged_sha.clone(),
                         environment_digest: environment_digest.clone(),
                         attempt_no: *attempt_no,
                         requested_at_ms: *requested_at_ms,
-                        not_before_ms: state
-                            .oracle_failures
-                            .get(oracle)
-                            .filter(|failure| failure.is_transient())
-                            .and_then(TypedFailure::next_eligible_at_ms)
-                            .unwrap_or(*requested_at_ms)
-                            .max(*requested_at_ms),
+                        not_before_ms,
                         deadline_ms: *deadline_ms,
                         requested_seq: seq,
                     },
                 );
             }
         }
-        MissionEvent::OracleRunCompleted {
-            assertion_ids,
-            oracle,
-            judged_sha,
-            attempt_no,
-            effect_id,
-            outcome,
-        } => apply_oracle_outcome(
-            state,
-            assertion_ids,
-            oracle,
-            judged_sha,
-            *attempt_no,
-            effect_id,
-            outcome,
-        ),
+        event @ MissionEvent::OracleRunCompleted { .. } => apply_oracle_outcome(state, event),
         MissionEvent::ControlRequested {
             effect_id,
             action,
@@ -291,12 +296,14 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             action,
             justification,
             requirement_changes,
+            proposal_runtime_identities,
         } => apply_decision(
             state,
             attention_id,
             action,
             justification,
             requirement_changes,
+            proposal_runtime_identities,
         ),
     }
     if state
@@ -399,13 +406,7 @@ fn apply_team(
         .team
         .as_ref()
         .map_or(0, |current| current.revision.saturating_add(1));
-    let plan = state
-        .proposal
-        .as_ref()
-        .filter(|proposal| state.proposal_approved && proposal.team.as_ref() == Some(team))
-        .and_then(|proposal| proposal.plan.as_ref())
-        .map(|proposal| &proposal.plan)
-        .or(state.plan.as_ref());
+    let plan = state.plan.as_ref();
     if !super::next(state)
         .choices
         .contains(&super::Choice::ConfigureTeam { revision: expected })
@@ -421,10 +422,20 @@ fn apply_team(
                 .is_err()
         })
         || !runtime_identities_match_team(team, runtime_identities)
-        || plan.is_some_and(|plan| !super::validate_plan(plan, team, &state.config).is_empty())
+        || plan.is_some_and(|plan| {
+            !super::validate_plan(plan, team, &state.oracles, &state.config).is_empty()
+        })
     {
         return;
     }
+    replace_team(state, team, runtime_identities);
+}
+
+fn replace_team(
+    state: &mut MissionState,
+    team: &super::TeamRevision,
+    runtime_identities: &BTreeMap<RoleInstanceId, super::RuntimeInstrumentIdentity>,
+) {
     if let Some(previous) = &state.team {
         for id in previous.roles.keys() {
             if !team.roles.contains_key(id) {
@@ -439,15 +450,6 @@ fn apply_team(
         .runtime_identity_history
         .insert(team.revision, runtime_identities.clone());
     state.team = Some(team.clone());
-    if state.proposal_approved
-        && state
-            .proposal
-            .as_ref()
-            .and_then(|proposal| proposal.team.as_ref())
-            == Some(team)
-    {
-        promote_proposal_plan(state);
-    }
 }
 
 fn runtime_identities_match_team(
@@ -849,7 +851,6 @@ fn apply_success_handoff(
             if let Some(proposal) = proposal {
                 if valid_proposal(state, proposal) {
                     state.proposal = Some((**proposal).clone());
-                    state.proposal_approved = false;
                 }
             }
             if let Some(conversation) = state.conversations.get_mut(&request.role_instance) {
@@ -876,12 +877,37 @@ fn apply_success_handoff(
             }
             retire_role_conversation(state, &request.role_instance);
         }
-        (super::OutputSemantics::EmitsGapVerdict, Some(Handoff::Review { .. })) => {
-            state.gap_review.attempts = request.attempt_no;
-            state.gap_review.consecutive_failures = 0;
-            state.gap_review.outcome = Some(ReviewOutcome::Verdict {
-                effect_id: effect_id.clone(),
-            });
+        (super::OutputSemantics::EmitsGapVerdict, Some(Handoff::Review { passed, gaps, .. })) => {
+            let obsolete: Vec<_> = state
+                .parked_effects
+                .iter()
+                .filter_map(|(parked_id, parked)| {
+                    matches!(
+                        parked,
+                        ParkedEffect::RoleTurn {
+                            role_instance,
+                            task_id: None,
+                        } if role_instance == &request.role_instance
+                    )
+                    .then_some(parked_id.clone())
+                })
+                .collect();
+            for parked_id in obsolete {
+                state.parked_effects.remove(&parked_id);
+            }
+            if !passed
+                || gaps
+                    .iter()
+                    .any(|gap| gap.severity == super::GapSeverity::Blocking)
+            {
+                state.parked_effects.insert(
+                    effect_id.clone(),
+                    ParkedEffect::RoleTurn {
+                        role_instance: request.role_instance.clone(),
+                        task_id: None,
+                    },
+                );
+            }
             retire_role_conversation(state, &request.role_instance);
         }
         (super::OutputSemantics::ProducesReport, Some(Handoff::Work { .. })) => {
@@ -919,19 +945,6 @@ fn settle_role_failure(
                 effect_id: effect_id.clone(),
             });
         }
-    }
-    let output = state
-        .team_history
-        .get(&request.team_revision)
-        .and_then(|team| team.role(&request.role_instance))
-        .map(|role| role.output);
-    if output == Some(super::OutputSemantics::EmitsGapVerdict) {
-        state.gap_review.attempts = request.attempt_no;
-        state.gap_review.consecutive_failures =
-            state.gap_review.consecutive_failures.saturating_add(1);
-        state.gap_review.outcome = Some(ReviewOutcome::Failed {
-            effect_id: effect_id.clone(),
-        });
     }
     state.parked_effects.insert(
         effect_id.clone(),
@@ -1043,18 +1056,23 @@ fn settle_unavailable_delivery(state: &mut MissionState, role_instance: &RoleIns
     }
 }
 
-fn apply_oracle_outcome(
-    state: &mut MissionState,
-    assertion_ids: &[AssertionId],
-    oracle: &super::OracleName,
-    judged_sha: &str,
-    attempt_no: u32,
-    effect_id: &super::EffectId,
-    outcome: &Result<super::OracleRunSuccess, TypedFailure>,
-) {
+fn apply_oracle_outcome(state: &mut MissionState, event: &MissionEvent) {
+    let MissionEvent::OracleRunCompleted {
+        assertion_ids,
+        oracle,
+        spec_digest,
+        judged_sha,
+        attempt_no,
+        effect_id,
+        outcome,
+    } = event
+    else {
+        unreachable!("oracle outcome fold only receives completion events");
+    };
     let Some(InflightEffect::OracleRun {
         assertion_ids: expected_assertions,
         oracle: expected_oracle,
+        spec_digest: expected_spec_digest,
         judged_sha: expected_sha,
         environment_digest,
         attempt_no: expected_attempt,
@@ -1065,8 +1083,9 @@ fn apply_oracle_outcome(
     };
     if expected_assertions != assertion_ids
         || *expected_oracle != *oracle
+        || expected_spec_digest != spec_digest
         || expected_sha != judged_sha
-        || *expected_attempt != attempt_no
+        || *expected_attempt != *attempt_no
     {
         return;
     }
@@ -1088,9 +1107,10 @@ fn apply_oracle_outcome(
             let verdict = AuthoritativeVerdict::from_oracle_success(
                 assertion_ids.to_vec(),
                 oracle.clone(),
+                spec_digest.to_string(),
                 judged_sha.to_string(),
                 environment_digest,
-                attempt_no,
+                *attempt_no,
                 success,
             );
             let Entry::Vacant(receipt) = state.authoritative_receipts.entry(effect_id.clone())
@@ -1208,15 +1228,17 @@ fn apply_decision(
     action: &super::DecisionAction,
     justification: &str,
     requirement_changes: &[super::RequirementId],
+    proposal_runtime_identities: &BTreeMap<RoleInstanceId, super::RuntimeInstrumentIdentity>,
 ) {
     if super::validate_decision(state, decision_id, action, justification).is_err() {
         return;
     }
 
     if decision_id == "mission" && action == &super::DecisionAction::Revise {
+        if !proposal_runtime_identities.is_empty() {
+            return;
+        }
         state.proposal = None;
-        state.proposal_approved = false;
-        state.gap_review.accepted = None;
         state.planning_input.refinement =
             Some(PlanningRefinement::Guidance(justification.to_string()));
         ready_planning_conversation(state);
@@ -1235,23 +1257,15 @@ fn apply_decision(
                 if expected != requirement_changes {
                     return;
                 }
-                state.proposal_approved = true;
-                state.planning_input.latest_rejected_proposal = None;
-                state.planning_input.refinement = None;
-                if state
-                    .proposal
-                    .as_ref()
-                    .is_some_and(|proposal| proposal.team.is_none())
-                {
-                    promote_proposal_plan(state);
-                }
+                accept_mission_proposal(state, proposal_runtime_identities);
             }
             super::DecisionAction::Revise => {
+                if !proposal_runtime_identities.is_empty() {
+                    return;
+                }
                 state.planning_input.latest_rejected_proposal = state.proposal.take();
                 state.planning_input.refinement =
                     Some(PlanningRefinement::Guidance(justification.to_string()));
-                state.proposal_approved = false;
-                state.gap_review.accepted = None;
                 ready_planning_conversation(state);
             }
             super::DecisionAction::Retry
@@ -1261,25 +1275,7 @@ fn apply_decision(
         return;
     }
 
-    if matches!(
-        decision_id,
-        "gap_review_gaps:mission" | "gap_review_failed:mission"
-    ) {
-        match action {
-            super::DecisionAction::Retry => {
-                if let Some(outcome) = state.gap_review.outcome.take() {
-                    state.parked_effects.remove(outcome.effect_id());
-                }
-                state.gap_review.accepted = None;
-            }
-            super::DecisionAction::Revise => {
-                revise_from_failure(state, decision_id, justification);
-            }
-            super::DecisionAction::Accept => {
-                accept_gap_review(state, decision_id, justification);
-            }
-            super::DecisionAction::Approve | super::DecisionAction::Repair => {}
-        }
+    if !proposal_runtime_identities.is_empty() {
         return;
     }
 
@@ -1434,34 +1430,58 @@ fn apply_proof_recovery(
     action: &super::DecisionAction,
     justification: &str,
 ) {
+    let feedback = proof_failure_feedback(state, failure, justification);
     clear_failed_proof(state, failure);
     if action != &super::DecisionAction::Repair {
         return;
     }
 
-    let feedback = proof_failure_feedback(state, failure, justification);
     let repair_base = state.deliverable_head().to_string();
-    let mut repaired_tasks = Vec::new();
-    if let Some(plan) = &state.plan {
-        for task in plan.tasks.iter().filter(|task| {
-            task.targets
-                .iter()
-                .any(|target| failure.assertion_ids().contains(target))
-        }) {
-            repaired_tasks.push(task.id.clone());
-            if let Some(runtime) = state.tasks.get_mut(&task.id) {
-                runtime.status = TaskStatus::Pending;
-                runtime.consecutive_failures = 0;
-                runtime.candidate_sha = None;
-                runtime.pending_base_sha = Some(repair_base.clone());
-                runtime.feedback.push(feedback.clone());
+    let repaired_tasks: Vec<_> = state.plan.as_ref().map_or_else(Vec::new, |plan| {
+        if matches!(
+            failure,
+            ProofFailure::Receipt {
+                source: ProofSource::Review { .. },
+                ..
             }
+        ) {
+            deliverable_sink(plan).into_iter().collect()
+        } else {
+            plan.tasks
+                .iter()
+                .filter(|task| {
+                    task.targets
+                        .iter()
+                        .any(|target| failure.assertion_ids().contains(target))
+                })
+                .map(|task| task.id.clone())
+                .collect()
+        }
+    });
+    for task_id in &repaired_tasks {
+        if let Some(runtime) = state.tasks.get_mut(task_id) {
+            runtime.status = TaskStatus::Pending;
+            runtime.consecutive_failures = 0;
+            runtime.candidate_sha = None;
+            runtime.pending_base_sha = Some(repair_base.clone());
+            runtime.feedback.push(feedback.clone());
         }
     }
     for task_id in repaired_tasks {
         mark_downstream_stale(state, &task_id);
     }
-    state.gap_review = Default::default();
+}
+
+fn deliverable_sink(plan: &super::Plan) -> Option<TaskId> {
+    let depended_on: BTreeSet<_> = plan
+        .tasks
+        .iter()
+        .flat_map(|task| task.depends_on.iter())
+        .collect();
+    plan.tasks
+        .iter()
+        .find(|task| !depended_on.contains(&task.id))
+        .map(|task| task.id.clone())
 }
 
 fn revise_from_failure(state: &mut MissionState, decision_id: &str, justification: &str) {
@@ -1479,8 +1499,6 @@ fn revise_from_failure(state: &mut MissionState, decision_id: &str, justificatio
         }
     }
     state.proposal = None;
-    state.proposal_approved = false;
-    state.gap_review.accepted = None;
     state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(feedback));
     ready_planning_conversation(state);
 }
@@ -1539,22 +1557,7 @@ fn decision_feedback(
             justification: justification.to_string(),
         });
     }
-    let effect_id = match decision_id {
-        "gap_review_gaps:mission" => state.gap_review.outcome.as_ref()?.effect_id().clone(),
-        "gap_review_failed:mission" => state.gap_review.outcome.as_ref()?.effect_id().clone(),
-        _ => return None,
-    };
-    Some(super::FailureFeedback {
-        summary: if decision_id == "gap_review_gaps:mission" {
-            "Gap review found blocking gaps.".to_string()
-        } else {
-            "Gap review failed to run.".to_string()
-        },
-        evidence: super::DecisionEvidence::RoleAttempts {
-            effect_ids: vec![effect_id],
-        },
-        justification: justification.to_string(),
-    })
+    None
 }
 
 fn proof_failure_feedback(
@@ -1581,6 +1584,15 @@ fn proof_failure_feedback(
                 effect_ids: vec![effect_id.clone()],
             },
         ),
+        ProofFailure::Receipt {
+            source: ProofSource::Review { role_instance },
+            effect_id,
+        } => (
+            format!("Required review by '{role_instance}' found blocking gaps or failed to run."),
+            super::DecisionEvidence::RoleAttempts {
+                effect_ids: vec![effect_id.clone()],
+            },
+        ),
         ProofFailure::StopBar { finish, .. } => (
             format!(
                 "Settled proof class '{}' is below the declared stop bar '{}'.",
@@ -1597,34 +1609,18 @@ fn proof_failure_feedback(
     }
 }
 
-fn accept_gap_review(state: &mut MissionState, decision_id: &str, justification: &str) {
-    let freshness = state
-        .gap_review_receipt()
-        .map(|receipt| match &receipt.source {
-            super::RoleEffectSource::Turn { request, .. } => request.freshness(),
-        });
-    let kind = if decision_id == "gap_review_gaps:mission" {
-        ReviewAcceptanceKind::AcknowledgedGaps
-    } else {
-        if let Some(outcome) = state.gap_review.outcome.take() {
-            state.parked_effects.remove(outcome.effect_id());
-        }
-        state.gap_review.consecutive_failures = 0;
-        ReviewAcceptanceKind::Waived
-    };
-    if let Some(freshness) = freshness {
-        state.gap_review.accepted = Some(ReviewAcceptance {
-            kind,
-            freshness,
-            justification: justification.to_string(),
-        });
-    }
-}
-
 fn clear_failed_proof(state: &mut MissionState, failure: &ProofFailure) {
     let ProofFailure::Receipt { source, effect_id } = failure else {
         return;
     };
+    if let ProofSource::Review { role_instance } = source {
+        state.parked_effects.remove(effect_id);
+        if let Some(conversation) = state.conversations.get_mut(role_instance) {
+            conversation.lifecycle = ConversationLifecycle::Ready;
+            conversation.active_delivery = None;
+        }
+        return;
+    }
     for assertion_id in source.assertion_ids() {
         let Some(assertion) = state.contract.get_mut(assertion_id) else {
             continue;
@@ -1641,25 +1637,47 @@ fn clear_failed_proof(state: &mut MissionState, failure: &ProofFailure) {
                 assertion.last_advisory.remove(role_instance);
             }
             ProofSource::Command { .. } | ProofSource::Judgment { .. } => {}
+            ProofSource::Review { .. } => unreachable!("review handled above"),
         }
     }
 }
 
-fn promote_proposal_plan(state: &mut MissionState) {
+fn accept_mission_proposal(
+    state: &mut MissionState,
+    runtime_identities: &BTreeMap<RoleInstanceId, super::RuntimeInstrumentIdentity>,
+) {
     let Some(proposal) = state.proposal.clone() else {
         return;
     };
-    let Some(plan_proposal) = proposal.plan else {
-        state.proposal = None;
-        state.proposal_approved = false;
-        return;
-    };
-    let Some(team) = state.team.as_ref() else {
-        return;
-    };
-    if !super::validate_plan(&plan_proposal.plan, team, &state.config).is_empty() {
+    if super::validate_mission_proposal(state, &proposal).is_err() {
         return;
     }
+    match &proposal.team {
+        Some(team) if !runtime_identities_match_team(team, runtime_identities) => return,
+        None if !runtime_identities.is_empty() => return,
+        Some(_) | None => {}
+    }
+
+    state.planning_input.latest_rejected_proposal = None;
+    state.planning_input.refinement = None;
+    if let Some(team) = &proposal.team {
+        replace_team(state, team, runtime_identities);
+    }
+    if let Some(plan_proposal) = proposal.plan {
+        promote_plan(state, plan_proposal, proposal.oracles);
+    } else {
+        state.proposal = None;
+    }
+}
+
+fn promote_plan(
+    state: &mut MissionState,
+    plan_proposal: super::PlanProposal,
+    oracles: Option<BTreeMap<super::OracleName, super::OracleSpec>>,
+) {
+    let Some(_team) = state.team.as_ref() else {
+        return;
+    };
     let prior_deliverable = state.deliverable_head().to_string();
     let supersessions: BTreeMap<_, _> = plan_proposal
         .assertion_supersessions
@@ -1685,6 +1703,11 @@ fn promote_proposal_plan(state: &mut MissionState) {
     }
     state.revision = state.revision.saturating_add(1);
     state.plan = Some(plan_proposal.plan.clone());
+    if let Some(oracles) = oracles {
+        state.oracles = oracles;
+    }
+    state.parked_effects.clear();
+    state.oracle_failures.clear();
     state.contract = plan_proposal
         .plan
         .assertions
@@ -1717,7 +1740,6 @@ fn promote_proposal_plan(state: &mut MissionState) {
         }
     }
     state.proposal = None;
-    state.proposal_approved = false;
     recompute_current_sha(state);
 }
 
@@ -1764,7 +1786,6 @@ fn mark_downstream_stale(state: &mut MissionState, changed_task: &TaskId) {
             }
         }
     }
-    state.gap_review = Default::default();
     recompute_current_sha(state);
 }
 

@@ -411,6 +411,7 @@ async fn run_preparation_program(
                 },
             ],
         },
+        working_dir: checkout.to_path_buf(),
         judged_roots: &judged_roots,
         environment: preparation_environment(),
         resources: Default::default(),

@@ -20,6 +20,7 @@ pub struct AuthoritativeVerdict {
     passed: bool,
     assertion_ids: Vec<AssertionId>,
     oracle: OracleName,
+    spec_digest: String,
     judged_sha: String,
     environment_digest: String,
     attempt_no: u32,
@@ -35,6 +36,7 @@ impl AuthoritativeVerdict {
     pub(crate) fn from_oracle_success(
         assertion_ids: Vec<AssertionId>,
         oracle: OracleName,
+        spec_digest: String,
         judged_sha: String,
         environment_digest: String,
         attempt_no: u32,
@@ -44,6 +46,7 @@ impl AuthoritativeVerdict {
             passed: success.exit_code == 0 && success.exit_signal.is_none(),
             assertion_ids,
             oracle,
+            spec_digest,
             judged_sha,
             environment_digest,
             attempt_no,
@@ -67,6 +70,10 @@ impl AuthoritativeVerdict {
         &self.oracle
     }
 
+    pub fn spec_digest(&self) -> &str {
+        &self.spec_digest
+    }
+
     pub fn judged_sha(&self) -> &str {
         &self.judged_sha
     }
@@ -85,6 +92,10 @@ impl AuthoritativeVerdict {
     pub fn is_fresh_at(&self, state: &MissionState) -> bool {
         self.judged_sha == state.deliverable_head()
             && self.environment_digest == state.environment_digest()
+            && state
+                .oracles
+                .get(&self.oracle)
+                .is_some_and(|spec| spec.digest() == self.spec_digest)
     }
 
     pub fn exit_code(&self) -> i32 {
@@ -106,6 +117,7 @@ impl AuthoritativeVerdict {
     fn same_identity(&self, other: &Self) -> bool {
         self.assertion_ids == other.assertion_ids
             && self.oracle == other.oracle
+            && self.spec_digest == other.spec_digest
             && self.judged_sha == other.judged_sha
             && self.environment_digest == other.environment_digest
             && self.prepared_inputs == other.prepared_inputs
@@ -129,6 +141,9 @@ pub(crate) enum ProofSource {
         role_instance: RoleInstanceId,
         assertion_ids: Vec<AssertionId>,
     },
+    Review {
+        role_instance: RoleInstanceId,
+    },
 }
 
 impl ProofSource {
@@ -137,6 +152,7 @@ impl ProofSource {
             Self::Command { assertion_ids, .. } | Self::Judgment { assertion_ids, .. } => {
                 assertion_ids
             }
+            Self::Review { .. } => &[],
         }
     }
 }
@@ -178,6 +194,10 @@ impl ProofFailure {
                 source: ProofSource::Judgment { .. },
                 effect_id,
             } => judgment_retry_available(state, effect_id),
+            Self::Receipt {
+                source: ProofSource::Review { .. },
+                ..
+            } => true,
             Self::StopBar { .. } => false,
         }
     }
@@ -372,13 +392,79 @@ pub(crate) fn proof_readiness(state: &MissionState) -> ProofReadiness {
     } else {
         FinishClass::Unverified
     };
-    if state.config.stop.satisfied_by(finish) {
-        ProofReadiness::Satisfied(finish)
-    } else {
-        ProofReadiness::Failed(vec![ProofFailure::StopBar {
+    if !state.config.stop.satisfied_by(finish) {
+        return ProofReadiness::Failed(vec![ProofFailure::StopBar {
             finish,
             assertion_ids: state.contract.keys().cloned().collect(),
-        }])
+        }]);
+    }
+    review_readiness(state, finish)
+}
+
+fn review_readiness(state: &MissionState, finish: FinishClass) -> ProofReadiness {
+    if !state.config.requires_gap_review {
+        return ProofReadiness::Satisfied(finish);
+    }
+    let Some(role_instance) = state
+        .team
+        .as_ref()
+        .and_then(|team| team.gap_review_assignment.clone())
+    else {
+        return ProofReadiness::Pending(Vec::new());
+    };
+    let source = ProofSource::Review {
+        role_instance: role_instance.clone(),
+    };
+    let Some(receipt) = state.latest_taskless_assignment_receipt(&role_instance, &[]) else {
+        return ProofReadiness::Pending(vec![source]);
+    };
+    if !state.role_attempt_is_fresh(receipt) {
+        return ProofReadiness::Pending(vec![source]);
+    }
+    match &receipt.disposition {
+        super::RoleAttemptDisposition::Succeeded {
+            handoff: Some(handoff),
+            ..
+        } => {
+            let super::SettledHandoff::Review { passed, gaps } = handoff.as_ref() else {
+                return ProofReadiness::Pending(vec![source]);
+            };
+            let blocking = !passed
+                || gaps
+                    .iter()
+                    .any(|gap| gap.severity == super::GapSeverity::Blocking);
+            if !blocking {
+                ProofReadiness::Satisfied(finish)
+            } else if state.parked_effects.contains_key(&receipt.effect_id) {
+                ProofReadiness::Failed(vec![ProofFailure::Receipt {
+                    source,
+                    effect_id: receipt.effect_id.clone(),
+                }])
+            } else {
+                ProofReadiness::Pending(vec![source])
+            }
+        }
+        super::RoleAttemptDisposition::Failed { failure } => {
+            let consecutive = state
+                .taskless_assignment_failure(&role_instance, &[])
+                .map(|(_, _, consecutive)| consecutive)
+                .unwrap_or_default();
+            if failure.automatically_retryable() && consecutive < state.config.recovery.max_attempts
+            {
+                ProofReadiness::Pending(vec![source])
+            } else {
+                ProofReadiness::Failed(vec![ProofFailure::Receipt {
+                    source,
+                    effect_id: receipt.effect_id.clone(),
+                }])
+            }
+        }
+        super::RoleAttemptDisposition::Active | super::RoleAttemptDisposition::Retired => {
+            ProofReadiness::Pending(vec![source])
+        }
+        super::RoleAttemptDisposition::Succeeded { handoff: None, .. } => {
+            ProofReadiness::Pending(vec![source])
+        }
     }
 }
 

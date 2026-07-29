@@ -8,10 +8,11 @@ use std::sync::Arc;
 use lionclaw::engine::{Engine, EngineServices, MissionView};
 use lionclaw::mission_type::{MissionType, MissionTypeDefinition};
 use lionclaw::model::{
-    Assertion, AssertionId, AuthorityCeilings, AuthorityGrants, Choice, FinishClass, MissionId,
-    MissionProposal, OracleName, OutputSemantics, Plan, PlanProposal, Requirement,
-    RequirementDisposition, RequirementId, RequirementKind, RoleInstance, RoleInstanceId,
-    RuntimeInstrumentIdentity, StopBar, Task, TeamRevision,
+    Assertion, AssertionId, AuthorityCeilings, AuthorityGrants, Choice, CommandOracle,
+    ConfinementResources, FinishClass, MissionId, MissionProposal, OracleName, OracleSpec,
+    OutputSemantics, Plan, PlanProposal, Requirement, RequirementDisposition, RequirementId,
+    RequirementKind, RoleInstance, RoleInstanceId, RuntimeInstrumentIdentity, StopBar, Task,
+    TeamRevision, WorkspaceRelativeDir,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
@@ -263,7 +264,6 @@ pub fn team(revision: u32, plan: Option<&Plan>, gap_review: bool) -> TeamRevisio
 }
 
 fn mission_type(requires_gap_review: bool) -> MissionType {
-    let cargo_test = OracleName::new("cargo-test").expect("oracle name");
     MissionType::for_testing(MissionTypeDefinition {
         name: "software-dev-test".to_string(),
         stop: StopBar::Verified,
@@ -275,7 +275,6 @@ fn mission_type(requires_gap_review: bool) -> MissionType {
             ..Default::default()
         },
         resource_ceilings: Default::default(),
-        oracle_resources: Default::default(),
         requires_gap_review,
         recovery: Default::default(),
         execution: lionclaw::model::ExecutionPolicy {
@@ -286,11 +285,6 @@ fn mission_type(requires_gap_review: bool) -> MissionType {
         playbook: None,
         skills: BTreeMap::new(),
         inputs: BTreeMap::new(),
-        oracles: BTreeMap::from([(
-            cargo_test,
-            "/nonexistent-mission-type/oracles/cargo-test".into(),
-        )]),
-        oracle_devices: Default::default(),
     })
 }
 
@@ -359,7 +353,28 @@ pub fn reviewer_checkable_requirement(id: &str, assertion: &str) -> Requirement 
     }
 }
 
+pub fn oracle_specs(plan: &Plan) -> BTreeMap<OracleName, OracleSpec> {
+    plan.assertions
+        .iter()
+        .filter_map(|assertion| assertion.oracle.clone())
+        .map(|oracle| {
+            (
+                oracle,
+                OracleSpec::Command(CommandOracle {
+                    argv: vec!["true".to_string()],
+                    cwd: WorkspaceRelativeDir::new(".").unwrap(),
+                    environment: BTreeMap::new(),
+                    timeout_secs: 60,
+                    grants: AuthorityGrants::default(),
+                    resources: ConfinementResources::default(),
+                }),
+            )
+        })
+        .collect()
+}
+
 pub fn proposal(base_revision: u32, plan: Plan) -> MissionProposal {
+    let oracles = oracle_specs(&plan);
     MissionProposal {
         team: Some(team(base_revision.saturating_add(1), Some(&plan), false)),
         plan: Some(PlanProposal {
@@ -368,10 +383,30 @@ pub fn proposal(base_revision: u32, plan: Plan) -> MissionProposal {
             assertion_supersessions: vec![],
             plan,
         }),
+        oracles: Some(oracles),
     }
 }
 
+pub fn proposal_with_oracle_timeout(
+    base_revision: u32,
+    plan: Plan,
+    timeout_secs: u64,
+) -> MissionProposal {
+    let mut proposal = proposal(base_revision, plan);
+    for spec in proposal
+        .oracles
+        .as_mut()
+        .expect("test proposal declares its complete oracle map")
+        .values_mut()
+    {
+        let OracleSpec::Command(command) = spec;
+        command.timeout_secs = timeout_secs;
+    }
+    proposal
+}
+
 pub fn review_proposal(base_revision: u32, plan: Plan) -> MissionProposal {
+    let oracles = oracle_specs(&plan);
     MissionProposal {
         team: Some(team(base_revision.saturating_add(1), Some(&plan), true)),
         plan: Some(PlanProposal {
@@ -380,6 +415,7 @@ pub fn review_proposal(base_revision: u32, plan: Plan) -> MissionProposal {
             assertion_supersessions: vec![],
             plan,
         }),
+        oracles: Some(oracles),
     }
 }
 
@@ -404,6 +440,7 @@ pub fn proposal_with_team(
             )
         })
         .collect();
+    let oracles = oracle_specs(&plan);
     MissionProposal {
         team: Some(next_team),
         plan: Some(PlanProposal {
@@ -412,10 +449,12 @@ pub fn proposal_with_team(
             assertion_supersessions: vec![],
             plan,
         }),
+        oracles: Some(oracles),
     }
 }
 
 pub fn proposal_from_plan(plan: PlanProposal, gap_review: bool) -> MissionProposal {
+    let oracles = oracle_specs(&plan.plan);
     MissionProposal {
         team: Some(team(
             plan.base_revision.saturating_add(1),
@@ -423,6 +462,7 @@ pub fn proposal_from_plan(plan: PlanProposal, gap_review: bool) -> MissionPropos
             gap_review,
         )),
         plan: Some(plan),
+        oracles: Some(oracles),
     }
 }
 

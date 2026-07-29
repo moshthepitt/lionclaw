@@ -22,8 +22,6 @@ use crate::runner::{
 };
 use crate::workspace;
 
-const ORACLE_MOUNT_TARGET: &str = "/mission/oracle";
-
 pub struct OciOracleRunner {
     profile: MissionRuntimeProfile,
     repo_lock: Arc<Mutex<()>>,
@@ -99,6 +97,13 @@ impl OracleRunner for OciOracleRunner {
         if let Some(failure) = control_failure(&request.control.borrow().clone()) {
             return Err(failure);
         }
+        let actual_digest = crate::model::OracleSpec::Command(request.command.clone()).digest();
+        if actual_digest != request.spec_digest {
+            return Err(TypedFailure::permanent(
+                "oracle.spec_mismatch",
+                "resolved command does not match the recorded oracle spec digest",
+            ));
+        }
         let dirs = MissionDirs::new(&request.state_dir, &request.mission_id)
             .effect(&request.effect_id)
             .oracle();
@@ -119,14 +124,6 @@ impl OracleRunner for OciOracleRunner {
                     .await
                     .map_err(|e| fail(format!("failed to create judged checkout: {e}")))?;
             }
-
-            // Copy the oracle executable into its own read-only mount.
-            let oracle_dir = dirs.program().to_path_buf();
-            let oracle_dest = oracle_dir.join(request.oracle.as_str());
-            tokio::fs::copy(&request.oracle_path, &oracle_dest)
-                .await
-                .map_err(|e| fail(format!("failed to stage oracle executable: {e}")))?;
-            workspace::make_executable(&oracle_dest).map_err(|e| fail(e.to_string()))?;
 
             // Preparation may use its declaration's explicit network policy,
             // but only publishes an immutable cache directory. The oracle
@@ -152,22 +149,35 @@ impl OracleRunner for OciOracleRunner {
                 .map_err(|error| fail(format!("failed to prepare mission inputs: {error:#}")))?
             };
 
-            let authority =
-                oracle_authority_with_devices(request.oracle.as_str(), request.devices.clone());
-            let mut extras = vec![
-                MountSpec {
-                    source: oracle_dir.clone(),
-                    target: ORACLE_MOUNT_TARGET.to_string(),
-                    access: MountAccess::ReadOnly,
-                },
-                MountSpec {
-                    source: dirs.scratch().to_path_buf(),
-                    target: SCRATCH_MOUNT_TARGET.to_string(),
-                    access: MountAccess::ReadWrite,
-                },
-            ];
+            let authority = oracle_authority_with_devices(
+                request.oracle.as_str(),
+                request.command.grants.devices.clone(),
+            );
+            let mut extras = vec![MountSpec {
+                source: dirs.scratch().to_path_buf(),
+                target: SCRATCH_MOUNT_TARGET.to_string(),
+                access: MountAccess::ReadWrite,
+            }];
             extras.extend(prepared.mounts);
-            let environment = oracle_environment(&request.environment, prepared.environment);
+            let environment =
+                oracle_environment(&request.command.environment, prepared.environment);
+            let working_dir = if request.command.cwd.as_str() == "." {
+                checkout.clone()
+            } else {
+                checkout.join(request.command.cwd.as_str())
+            };
+            let metadata = tokio::fs::metadata(&working_dir).await.map_err(|error| {
+                fail(format!(
+                    "oracle working directory '{}' is unavailable: {error}",
+                    request.command.cwd.as_str()
+                ))
+            })?;
+            if !metadata.is_dir() {
+                return Err(fail(format!(
+                    "oracle working directory '{}' is not a directory",
+                    request.command.cwd.as_str()
+                )));
+            }
             let judged_roots = [crate::authority::canonical_or_lexical(&checkout)];
             let compiled = compile_role_plan(RolePlanRequest {
                 authority: &authority,
@@ -177,20 +187,15 @@ impl OracleRunner for OciOracleRunner {
                     workspace: checkout.clone(),
                     extras,
                 },
+                working_dir,
                 judged_roots: &judged_roots,
                 environment,
-                resources: request.resources.clone(),
+                resources: request.command.resources.clone(),
                 resource_ceilings: &request.resource_ceilings,
             })
             .map_err(|e| fail(format!("oracle plan refused to compile (moat): {e}")))?;
 
-            let program = RuntimeProgramSpec {
-                executable: format!("{ORACLE_MOUNT_TARGET}/{}", request.oracle),
-                args: Vec::new(),
-                environment: Vec::new(),
-                stdin: String::new(),
-                auth: None,
-            };
+            let program = command_program(&request.command)?;
             let mut executor = MissionProgramExecutor::new(
                 compiled.plan().clone(),
                 None,
@@ -228,22 +233,38 @@ fn oracle_environment(
     declared: &std::collections::BTreeMap<String, String>,
     prepared_input: Vec<(String, String)>,
 ) -> Vec<(String, String)> {
-    crate::mission_type::execution_environment(
-        [
-            ("HOME".to_string(), SCRATCH_MOUNT_TARGET.to_string()),
-            ("TMPDIR".to_string(), "/tmp".to_string()),
-            ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
-        ],
-        declared,
-        prepared_input,
-    )
+    let mut environment = declared.clone();
+    environment.extend(prepared_input);
+    environment.extend([
+        ("HOME".to_string(), SCRATCH_MOUNT_TARGET.to_string()),
+        ("TMPDIR".to_string(), "/tmp".to_string()),
+        ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+    ]);
+    environment.into_iter().collect()
+}
+
+fn command_program(
+    command: &crate::model::CommandOracle,
+) -> Result<RuntimeProgramSpec, TypedFailure> {
+    let Some((executable, args)) = command.argv.split_first() else {
+        return Err(fail("oracle argv is empty"));
+    };
+    Ok(RuntimeProgramSpec {
+        executable: executable.clone(),
+        args: args.to_vec(),
+        environment: Vec::new(),
+        stdin: String::new(),
+        auth: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::RuntimeProfiles;
-    use crate::model::{EffectId, MissionId, OracleName};
+    use crate::model::{
+        AuthorityGrants, CommandOracle, EffectId, MissionId, OracleName, WorkspaceRelativeDir,
+    };
     use std::collections::BTreeMap;
 
     #[test]
@@ -258,6 +279,29 @@ mod tests {
         assert_eq!(environment["HOME"], "/scratch");
         assert_eq!(environment["BUILD_OUTPUT"], "/scratch/build");
         assert_eq!(environment["TOOL_HOME"], "/inputs/tool");
+    }
+
+    #[test]
+    fn shell_syntax_is_a_literal_argument() {
+        let program = command_program(&CommandOracle {
+            argv: vec![
+                "printf".into(),
+                "$(touch /workspace/escaped)".into(),
+                "a; echo b".into(),
+            ],
+            cwd: WorkspaceRelativeDir::new(".").unwrap(),
+            environment: BTreeMap::new(),
+            timeout_secs: 30,
+            grants: AuthorityGrants::default(),
+            resources: Default::default(),
+        })
+        .unwrap();
+
+        assert_eq!(program.executable, "printf");
+        assert_eq!(
+            program.args,
+            vec!["$(touch /workspace/escaped)", "a; echo b"]
+        );
     }
 
     #[tokio::test]
@@ -278,15 +322,20 @@ mod tests {
                 mission_id: MissionId::parse("m123456789abc").unwrap(),
                 effect_id: EffectId::for_parts(&["oracle", "pre-start-stop"]),
                 oracle: OracleName::new("checks").unwrap(),
-                oracle_path: temp.path().join("must-not-be-read"),
+                spec_digest: "spec".to_string(),
+                command: CommandOracle {
+                    argv: vec!["true".into()],
+                    cwd: WorkspaceRelativeDir::new(".").unwrap(),
+                    environment: BTreeMap::new(),
+                    timeout_secs: 30,
+                    grants: AuthorityGrants::default(),
+                    resources: Default::default(),
+                },
                 judged_sha: "must-not-be-resolved".into(),
                 environment_digest: "sha256:oracle-test".into(),
                 workspace_dir: temp.path().join("must-not-be-cloned"),
                 state_dir: temp.path().join("state"),
                 prepared_inputs: Vec::new(),
-                environment: Default::default(),
-                devices: Default::default(),
-                resources: Default::default(),
                 resource_ceilings: Default::default(),
                 deadline_ms: 10,
                 control,

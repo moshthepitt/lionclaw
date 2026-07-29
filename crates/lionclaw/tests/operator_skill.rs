@@ -32,9 +32,11 @@ fn required_proof_failure_is_never_taught_as_acceptance() {
     assert!(SKILL.contains(
         "Required proof failure can\n   never be accepted: a failed-proof target never exposes `accept`."
     ));
-    assert!(
-        SKILL.contains("Preserve\n   any listed terminal-review `accept` decision for the human")
-    );
+    assert!(SKILL.contains(
+        "A failed or\n   blocking gap review is ordinary required proof and exposes retry, repair, or\n   revise instead."
+    ));
+    assert!(!SKILL.contains("terminal-review `accept`"));
+    assert!(!SKILL.contains("waived at review"));
     assert!(!SKILL.contains("acceptance below the\n   mission's proof bar"));
     assert!(!SKILL.contains("accepted below bar"));
 }

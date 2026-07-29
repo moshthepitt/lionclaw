@@ -22,9 +22,9 @@ hunting, beyond "the tests pass":
 Build and run the product to check behavior: compile it, run its binary, or
 test-drive its API from a small probe program you write under /scratch, and
 exercise the objective's scenarios end to end. Prefer locked, reproducible
-commands (e.g. `cargo build --locked`, `cargo test --locked`) whose output
-you can quote as evidence. Build output belongs in /scratch (the environment
-already points cargo there).
+commands supplied by the repository whose output you can quote as evidence.
+The judged workspace is read-only; direct build output and temporary probes
+to /scratch.
 
 Stay within the objective: this is a review of whether the product does what
 was asked, not a general code audit. Style preferences, architecture taste,

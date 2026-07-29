@@ -11,8 +11,8 @@ use common::{
     HEAD_SHA,
 };
 use lionclaw::model::{
-    apply, fold, ControlAction, DecisionAction, EffectId, MissionEvent, MissionId, PayloadRef,
-    RoleInstanceId, TaskId,
+    apply, fold, next, ControlAction, DecisionAction, EffectId, MissionEvent, MissionId,
+    PayloadRef, RoleInstanceId, TaskId,
 };
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -28,6 +28,7 @@ async fn assert_fold_litmus(h: &TestHarness, mission_id: &MissionId) {
     let once = fold(events.clone()).expect("fold");
     let twice = fold(events.clone()).expect("fold");
     assert_eq!(once, twice);
+    assert_eq!(next(&once), next(&twice));
 
     // Incremental consistency: fold(prefix) + apply(tail) == fold(all).
     for split in 1..events.len() {
@@ -36,12 +37,14 @@ async fn assert_fold_litmus(h: &TestHarness, mission_id: &MissionId) {
             apply(&mut prefix, envelope);
         }
         assert_eq!(prefix, once, "split at {split} diverged");
+        assert_eq!(next(&prefix), next(&once), "next diverged at split {split}");
     }
 
     // Serde roundtrip (snapshot readiness): state == decode(encode(state)).
     let encoded = serde_json::to_string(&once).expect("encode");
     let decoded = serde_json::from_str(&encoded).expect("decode");
     assert_eq!(once, decoded);
+    assert_eq!(next(&once), next(&decoded));
 
     // A finished mission has no unfinished requests.
     assert!(once.inflight.is_empty());
@@ -54,19 +57,21 @@ async fn assert_fold_litmus(h: &TestHarness, mission_id: &MissionId) {
         .await
         .expect("rebuild cursors");
     assert_eq!(rebuilt, once, "state diverged after cursor rebuild");
+    assert_eq!(next(&rebuilt), next(&once));
 }
 
 fn assert_every_prefix_is_deterministic(events: &[lionclaw::model::EventEnvelope]) {
     for end in 1..=events.len() {
         let prefix = &events[..end];
         let expected = fold(prefix.to_vec()).expect("prefix fold");
-        assert_eq!(fold(prefix.to_vec()).expect("repeat fold"), expected);
+        let repeated = fold(prefix.to_vec()).expect("repeat fold");
+        assert_eq!(repeated, expected);
+        assert_eq!(next(&repeated), next(&expected));
         let json = serde_json::to_string(&expected).expect("encode prefix state");
-        assert_eq!(
-            serde_json::from_str::<lionclaw::model::MissionState>(&json)
-                .expect("decode prefix state"),
-            expected
-        );
+        let decoded = serde_json::from_str::<lionclaw::model::MissionState>(&json)
+            .expect("decode prefix state");
+        assert_eq!(decoded, expected);
+        assert_eq!(next(&decoded), next(&expected));
         for split in 1..end {
             let mut incremental = fold(prefix[..split].to_vec()).expect("incremental prefix");
             for event in &prefix[split..] {
@@ -75,6 +80,11 @@ fn assert_every_prefix_is_deterministic(events: &[lionclaw::model::EventEnvelope
             assert_eq!(
                 incremental, expected,
                 "prefix ending at {end} diverged at split {split}"
+            );
+            assert_eq!(
+                next(&incremental),
+                next(&expected),
+                "next for prefix ending at {end} diverged at split {split}"
             );
         }
     }
@@ -105,15 +115,14 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
 }
 
 #[tokio::test]
-async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
-    // The richest review log: request → blocking verdict → park →
-    // acknowledge → Done. Catches a missing #[serde(default)] on any new
-    // state field the moment it exists.
+async fn a_clean_review_mission_satisfies_the_fold_litmus() {
+    // Review request → clean verdict → Done. Catches a missing
+    // #[serde(default)] on any new state field the moment it exists.
     let dir = tempfile::tempdir().expect("tempdir");
     let h = harness_with_type(
         dir.path(),
         review_mission_type(),
-        review_runner(vec![(false, vec![blocking_gap()])]),
+        review_runner(vec![(true, vec![])]),
         MockOracleRunner::exiting(0),
     )
     .await;
@@ -127,23 +136,7 @@ async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
-    h.engine
-        .advance(&mission_id)
-        .await
-        .expect("advance to park");
-    h.engine
-        .decide(
-            &mission_id,
-            "gap_review_gaps:mission",
-            DecisionAction::Accept,
-            "acceptable",
-        )
-        .await
-        .expect("decide");
-    h.engine
-        .advance(&mission_id)
-        .await
-        .expect("advance to done");
+    common::advance_to_finished(&h.engine, &mission_id).await;
 
     assert_fold_litmus(&h, &mission_id).await;
 }
@@ -537,7 +530,7 @@ async fn failure_driven_replanning_survives_every_prefix_and_snapshot_rebuild() 
     h.engine
         .decide(
             &mission_id,
-            "gap_review_gaps:mission",
+            "proof_failed:review:gap-reviewer",
             DecisionAction::Revise,
             "repair what the reviewer observed",
         )

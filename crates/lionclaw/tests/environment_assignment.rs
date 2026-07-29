@@ -332,7 +332,14 @@ async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle(
         &prompt_hash,
     );
     let oracle = OracleName::new("cargo-test").unwrap();
-    let oracle_effect = EffectId::for_oracle_request(&mission_id, &oracle, HEAD_SHA, 1);
+    let oracle_spec_digest = image_a_state.oracles[&oracle].digest();
+    let oracle_deadline_ms = lionclaw::model::resolve_execution_deadline_ms(
+        22,
+        image_a_state.oracles[&oracle].as_command().timeout_secs,
+    )
+    .unwrap();
+    let oracle_effect =
+        EffectId::for_oracle_request(&mission_id, &oracle, &oracle_spec_digest, HEAD_SHA, 1);
     common::fault_append_events(
         dir.path(),
         &mission_id,
@@ -387,16 +394,18 @@ async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle(
             NewEvent::new(MissionEvent::OracleRunRequested {
                 assertion_ids: vec![assertion_id.clone()],
                 oracle: oracle.clone(),
+                spec_digest: oracle_spec_digest.clone(),
                 judged_sha: HEAD_SHA.to_string(),
                 environment_digest: image_a_state.environment_digest().to_string(),
                 attempt_no: 1,
                 effect_id: oracle_effect.clone(),
                 requested_at_ms: 22,
-                deadline_ms: 30_000,
+                deadline_ms: oracle_deadline_ms,
             }),
             NewEvent::new(MissionEvent::OracleRunCompleted {
                 assertion_ids: vec![assertion_id.clone()],
                 oracle: oracle.clone(),
+                spec_digest: oracle_spec_digest,
                 judged_sha: HEAD_SHA.to_string(),
                 attempt_no: 1,
                 effect_id: oracle_effect,

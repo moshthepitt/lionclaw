@@ -1,6 +1,0 @@
-#!/bin/sh
-# Authoritative oracle: clippy must be clean (warnings are errors) at the
-# judged commit. Read-only /workspace, writable /scratch for build output.
-set -e
-cd /workspace
-exec cargo clippy --locked --all-targets -- -D warnings

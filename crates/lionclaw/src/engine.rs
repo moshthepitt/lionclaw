@@ -641,6 +641,7 @@ impl Engine {
         let proposal = MissionProposal {
             plan: None,
             team: Some(team.clone()),
+            oracles: None,
         };
         validate_mission_proposal(&state, &proposal)
             .map_err(|error| anyhow::anyhow!("team revision rejected: {error}"))?;
@@ -720,21 +721,21 @@ impl Engine {
         let state = self.load_state(mission_id).await?;
         crate::model::validate_decision(&state, attention_id, &action, justification)?;
         let requirement_changes = decision_requirement_changes(&state, attention_id, &action);
-        let mut events = vec![NewEvent::new(MissionEvent::DecisionRecorded {
+        let proposal_runtime_identities = if action == crate::model::DecisionAction::Approve {
+            approved_team_proposal(&state, attention_id)
+                .map(|team| self.resolve_team_runtime_identities(&team))
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        let events = vec![NewEvent::new(MissionEvent::DecisionRecorded {
             attention_id: attention_id.to_string(),
             action: action.clone(),
             justification: justification.to_string(),
             requirement_changes,
+            proposal_runtime_identities,
         })];
-        if action == crate::model::DecisionAction::Approve {
-            if let Some(team) = approved_team_proposal(&state, attention_id) {
-                let runtime_identities = self.resolve_team_runtime_identities(&team)?;
-                events.push(NewEvent::new(MissionEvent::TeamConfigured {
-                    team,
-                    runtime_identities,
-                }));
-            }
-        }
         self.store
             .append(mission_id, state.head, &events, self.clock.now_ms())
             .await?;
@@ -1701,6 +1702,7 @@ impl Engine {
         let InflightEffect::OracleRun {
             assertion_ids,
             oracle,
+            spec_digest,
             judged_sha,
             environment_digest,
             attempt_no,
@@ -1714,42 +1716,36 @@ impl Engine {
             NewEvent::new(MissionEvent::OracleRunCompleted {
                 assertion_ids: assertion_ids.to_vec(),
                 oracle: oracle.clone(),
+                spec_digest: spec_digest.clone(),
                 judged_sha: judged_sha.to_string(),
                 attempt_no,
                 effect_id: effect_id.clone(),
                 outcome,
             })
         };
-        let Some(oracle_path) = self.mission_type.oracles.get(oracle) else {
+        let Some(spec) = state
+            .oracles
+            .get(oracle)
+            .filter(|spec| spec.digest() == *spec_digest)
+        else {
             return Ok(completed(Err(TypedFailure::permanent(
-                "oracle.missing",
-                format!("oracle '{oracle}' is no longer provided by the mission type"),
+                "oracle.spec_stale",
+                format!("oracle '{oracle}' no longer matches the recorded command spec"),
             ))));
         };
+        let command = spec.as_command().clone();
         let request = OracleRunRequest {
             mission_id: state.mission_id.clone(),
             effect_id: effect_id.clone(),
             oracle: oracle.clone(),
-            oracle_path: oracle_path.clone(),
+            spec_digest: spec_digest.clone(),
+            prepared_inputs: prepared_inputs_for_grants(&command.grants, &self.mission_type.inputs),
+            command,
             judged_sha: judged_sha.to_string(),
             environment_digest: environment_digest.clone(),
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
-            prepared_inputs: self.mission_type.inputs.values().cloned().collect(),
-            environment: self.mission_type.environment.clone(),
-            devices: self
-                .mission_type
-                .oracle_devices
-                .get(oracle)
-                .cloned()
-                .unwrap_or_default(),
-            resources: self
-                .mission_type
-                .oracle_resources
-                .get(oracle)
-                .cloned()
-                .unwrap_or_default(),
-            resource_ceilings: self.mission_type.resource_ceilings.clone(),
+            resource_ceilings: state.config.resource_ceilings.clone(),
             deadline_ms: effect.deadline_ms(),
             control,
         };
@@ -1919,7 +1915,7 @@ impl Engine {
     }
 
     /// Assemble a planning role's prompt. Threads the mission type's playbook
-    /// and execution-role/oracle inventories through a separate assembler.
+    /// and the current mission shape through a separate assembler.
     fn assemble_planning_request(
         &self,
         state: &MissionState,
@@ -1931,12 +1927,6 @@ impl Engine {
         let mut task_feedback = Vec::new();
         task_feedback.extend_from_slice(dialogue);
         let planning_input = self.resolve_planning_prompt_input(state)?;
-        let oracle_inventory: Vec<String> = self
-            .mission_type
-            .oracles
-            .keys()
-            .map(|o| o.as_str().to_string())
-            .collect();
         let prompt = render(TurnContext::Planning(
             role,
             PlanningPromptContext {
@@ -1949,8 +1939,10 @@ impl Engine {
                     .team
                     .as_ref()
                     .context("planning dispatch without a team")?,
-                resource_ceilings: &self.mission_type.resource_ceilings,
-                oracle_inventory: &oracle_inventory,
+                resource_ceilings: &state.config.resource_ceilings,
+                authority_ceilings: &state.config.ceilings,
+                current_oracles: &state.oracles,
+                max_oracle_timeout_secs: state.config.execution.max_task_time_secs,
                 task_body: &intent.body,
                 upstream_reports: &upstream_reports,
                 guidance: state
@@ -2249,9 +2241,20 @@ impl Engine {
         let requests: Vec<(EffectId, NewEvent)> = intents
             .into_iter()
             .map(|intent| {
+                let Some(spec) = state
+                    .oracles
+                    .get(&intent.oracle)
+                    .filter(|spec| spec.digest() == intent.spec_digest)
+                else {
+                    bail!(
+                        "oracle '{}' dispatch no longer matches mission state",
+                        intent.oracle
+                    );
+                };
                 let effect_id = EffectId::for_oracle_request(
                     &state.mission_id,
                     &intent.oracle,
+                    &intent.spec_digest,
                     &intent.judged_sha,
                     intent.attempt_no,
                 );
@@ -2263,6 +2266,7 @@ impl Engine {
                     NewEvent::new(MissionEvent::OracleRunRequested {
                         assertion_ids: intent.assertion_ids,
                         oracle: intent.oracle,
+                        spec_digest: intent.spec_digest,
                         judged_sha: intent.judged_sha,
                         environment_digest: state.environment_digest().to_string(),
                         attempt_no: intent.attempt_no,
@@ -2270,7 +2274,7 @@ impl Engine {
                         requested_at_ms,
                         deadline_ms: resolved_deadline(
                             not_before_ms,
-                            state.config.execution.default_timeout_secs,
+                            spec.as_command().timeout_secs,
                         )?,
                     }),
                 ))
@@ -2389,7 +2393,17 @@ fn granted_prepared_inputs(
         crate::mission_type::PreparedInput,
     >,
 ) -> Vec<crate::mission_type::PreparedInput> {
-    role.grants
+    prepared_inputs_for_grants(&role.grants, available)
+}
+
+fn prepared_inputs_for_grants(
+    grants: &crate::model::AuthorityGrants,
+    available: &std::collections::BTreeMap<
+        crate::model::InputName,
+        crate::mission_type::PreparedInput,
+    >,
+) -> Vec<crate::mission_type::PreparedInput> {
+    grants
         .inputs
         .iter()
         .filter_map(|name| available.get(name).cloned())
@@ -2483,12 +2497,14 @@ fn failed_outcome(
         InflightEffect::OracleRun {
             assertion_ids,
             oracle,
+            spec_digest,
             judged_sha,
             attempt_no,
             ..
         } => MissionEvent::OracleRunCompleted {
             assertion_ids: assertion_ids.clone(),
             oracle: oracle.clone(),
+            spec_digest: spec_digest.clone(),
             judged_sha: judged_sha.clone(),
             attempt_no: *attempt_no,
             effect_id: effect_id.clone(),
@@ -2615,6 +2631,7 @@ pub async fn record_decision(
         action: action.clone(),
         justification: justification.to_string(),
         requirement_changes,
+        proposal_runtime_identities: BTreeMap::new(),
     });
     let events = vec![decision];
     store

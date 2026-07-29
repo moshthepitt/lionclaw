@@ -479,6 +479,7 @@ async fn judge_turn_batches_run_concurrently_after_work_settles() {
             &mission_id,
             MissionProposal {
                 team: Some(judged_team(1, &plan)),
+                oracles: Some(common::oracle_specs(&plan)),
                 plan: Some(PlanProposal {
                     base_revision: 0,
                     requirement_changes: vec![],
@@ -801,10 +802,6 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
                     writes: true,
                     ..Default::default()
                 },
-                oracles: BTreeSet::from([
-                    OracleName::new("cargo-left").unwrap(),
-                    OracleName::new("cargo-test").unwrap(),
-                ]),
                 ..Default::default()
             },
         },
@@ -820,6 +817,7 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
         MissionEvent::ProposalRecorded {
             proposal: Box::new(MissionProposal {
                 team: Some(team.clone()),
+                oracles: Some(common::oracle_specs(&plan)),
                 plan: Some(PlanProposal {
                     base_revision: 0,
                     requirement_changes: vec![],
@@ -838,9 +836,9 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
             action: DecisionAction::Approve,
             justification: "approve".to_string(),
             requirement_changes: vec![],
+            proposal_runtime_identities: team_runtime_identities(&team),
         },
     ));
-    prefix.push(envelope(&mission_id, 5, team_event(team)));
     let prefix_state = lionclaw::model::fold(prefix.clone()).expect("prefix fold");
     let left_request = role_request(&prefix_state, 6, LEFT, "left-writer", 1, &base, vec![]);
     let right_request = role_request(&prefix_state, 7, RIGHT, "right-writer", 1, &base, vec![]);
@@ -997,7 +995,6 @@ fn mission_type() -> MissionType {
             ..Default::default()
         },
         resource_ceilings: Default::default(),
-        oracle_resources: Default::default(),
         requires_gap_review: false,
         recovery: Default::default(),
         execution: ExecutionPolicy {
@@ -1009,17 +1006,6 @@ fn mission_type() -> MissionType {
         playbook: None,
         skills: BTreeMap::new(),
         inputs: BTreeMap::new(),
-        oracles: BTreeMap::from([
-            (
-                OracleName::new("cargo-left").expect("oracle name"),
-                "/nonexistent-left".into(),
-            ),
-            (
-                OracleName::new("cargo-test").expect("oracle name"),
-                "/nonexistent".into(),
-            ),
-        ]),
-        oracle_devices: Default::default(),
     })
 }
 
@@ -1035,7 +1021,6 @@ fn judged_mission_type() -> MissionType {
             ..Default::default()
         },
         resource_ceilings: Default::default(),
-        oracle_resources: Default::default(),
         requires_gap_review: false,
         recovery: Default::default(),
         execution: ExecutionPolicy {
@@ -1047,8 +1032,6 @@ fn judged_mission_type() -> MissionType {
         playbook: None,
         skills: BTreeMap::new(),
         inputs: BTreeMap::new(),
-        oracles: BTreeMap::new(),
-        oracle_devices: Default::default(),
     })
 }
 
@@ -1259,6 +1242,7 @@ async fn start_parallel_mission(engine: &Engine, repo: &Path) -> lionclaw::model
             &mission_id,
             MissionProposal {
                 team: Some(assigned_team(1, &plan)),
+                oracles: Some(common::oracle_specs(&plan)),
                 plan: Some(PlanProposal {
                     base_revision: 0,
                     requirement_changes: vec![],
@@ -1431,8 +1415,17 @@ fn envelope(
 }
 
 fn team_event(team: TeamRevision) -> MissionEvent {
-    let runtime_identities = team
-        .roles
+    let runtime_identities = team_runtime_identities(&team);
+    MissionEvent::TeamConfigured {
+        team,
+        runtime_identities,
+    }
+}
+
+fn team_runtime_identities(
+    team: &TeamRevision,
+) -> BTreeMap<RoleInstanceId, RuntimeInstrumentIdentity> {
+    team.roles
         .iter()
         .map(|(id, role)| {
             (
@@ -1444,11 +1437,7 @@ fn team_event(team: TeamRevision) -> MissionEvent {
                 },
             )
         })
-        .collect();
-    MissionEvent::TeamConfigured {
-        team,
-        runtime_identities,
-    }
+        .collect()
 }
 
 fn role_request(

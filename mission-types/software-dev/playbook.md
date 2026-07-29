@@ -68,9 +68,10 @@ records the resolved image id before any later effect can run under it.
 The engine does not know your domain. You choose, per assertion, whether it
 is proven by:
 
-- an **oracle** (`cargo-test`, `cargo-clippy`, `fmt-check`, `build-release`) —
-  an engine-run command, exit 0 = pass, the strong authoritative check; every
-  contract assertion binds one; and, optionally,
+- a **command oracle** — a structured executable and argument vector with a
+  workspace-relative directory, bounded environment, timeout, authority, and
+  resources; exit 0 is the strong authoritative check, and every contract
+  assertion binds one. The executable must not be a shell; and, optionally,
 - a **judgment panel** — assigned role instances layered on top of the oracle
   for depth a command cannot capture (was the change made honestly?).
 
@@ -119,8 +120,7 @@ construction.
 ## Dependency installs and resources
 
 If an effect needs language-level dependency installs, put them in
-workspace-local or scratch-local prefixes (`venv`, `npm --prefix`,
-`CARGO_HOME`/`CARGO_TARGET_DIR` under `/scratch`) so retries and preserved
-workspaces remain reproducible. Do not treat install policy or tmpfs resource
-overrides as a way to change the runtime image or widen network, secrets,
-device, input, or write authority.
+workspace-local or scratch-local prefixes so retries and preserved workspaces
+remain reproducible. Do not treat install policy or tmpfs resource overrides
+as a way to change the runtime image or widen network, secrets, device, input,
+or write authority.

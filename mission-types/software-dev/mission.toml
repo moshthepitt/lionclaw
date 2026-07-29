@@ -1,10 +1,9 @@
 [mission-type]
 name = "software-dev"
 stop = "verified"
-# The confinement image every role and oracle runs in. Must carry this
+# The confinement image every role and command oracle runs in. Must carry this
 # domain's toolchain (here: the pinned Rust toolchain + agent CLIs).
 image = "localhost/lionclaw-runtime-dev:v1"
-environment = { CARGO_HOME = "/scratch/cargo", CARGO_TARGET_DIR = "/scratch/target" }
 
 [team]
 planning-assignment = "strategist"
@@ -15,13 +14,9 @@ requires-gap-review = true
 network = true
 install = true
 writes = true
-inputs = ["cargo-home"]
 
 [resource-ceilings]
 tmpfs = ["/tmp:rw,size=2g"]
-
-[oracle-resources.cargo-test]
-tmpfs = ["/tmp:rw,size=1536m"]
 
 [recovery]
 max-attempts = 3
@@ -33,9 +28,3 @@ extension-step-secs = 600
 effect-capacity = 4
 auto-continue-candidate = false
 auto-continue-proof = false
-
-[[inputs]]
-name = "cargo-home"
-network = true
-key-files = ["Cargo.lock"]
-environment = { CARGO_HOME = "/inputs/cargo-home" }

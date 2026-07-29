@@ -718,6 +718,7 @@ impl RoleRunner for OciRoleRunner {
                 workspace: workspace_source.clone(),
                 extras,
             },
+            working_dir: workspace_source.clone(),
             judged_roots: &judged_roots,
             environment,
             resources: request.role.resources.clone(),

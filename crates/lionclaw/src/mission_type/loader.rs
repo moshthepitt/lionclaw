@@ -1,14 +1,14 @@
-//! Fail-closed mission-type loading. A mission type is a directory of prose; every role
-//! compiles through the moat at load time, every oracle is a real executable,
-//! or the mission type does not load and the mission never starts.
+//! Fail-closed mission-type loading. A mission type is a directory of prose;
+//! every role compiles through the moat at load time or the mission type does
+//! not load and the mission never starts.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
 use crate::model::{
-    AuthorityGrants, ConfinementResources, InputName, OracleName, OutputSemantics, RoleInstance,
-    RoleInstanceId, StopBar, TeamRevision,
+    AuthorityGrants, InputName, OutputSemantics, RoleInstance, RoleInstanceId, StopBar,
+    TeamRevision,
 };
 
 use super::bounded_tree::{BoundedTree, ControlTextBudget};
@@ -17,9 +17,7 @@ use super::frontmatter::{parse_role_file, RoleFrontmatter};
 use super::manifest::{is_path_safe_name, ManifestFile, ManifestInput};
 use super::prepared_input::{validate_prepared_inputs, PreparedInputContractError};
 use super::skills::load_skills;
-use super::{
-    has_shebang, is_executable, MissionType, MissionTypeDefinition, PreparedInput, SkillPackage,
-};
+use super::{MissionType, MissionTypeDefinition, PreparedInput, SkillPackage};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MissionTypeError {
@@ -38,8 +36,6 @@ pub enum MissionTypeError {
         #[source]
         violation: MoatViolation,
     },
-    #[error("oracle '{oracle}' is invalid: {detail}")]
-    Oracle { oracle: String, detail: String },
     #[error("prepared input '{input}' is invalid: {detail}")]
     Input { input: String, detail: String },
     #[error("skill '{skill}' is invalid: {detail}")]
@@ -101,9 +97,6 @@ pub(crate) fn load_materialized_mission_type(
     };
     let skills = load_skills(root, &tree, &mut text_budget)?;
     let inputs = load_inputs(root, manifest.inputs)?;
-    let oracles = load_oracles(&root.join("oracles"))?;
-    let oracle_resources = load_oracle_resources(manifest.oracle_resources, &oracles)?;
-    let oracle_devices = load_oracle_devices(manifest.oracle_devices, &oracles)?;
     let roles = load_roles(
         root,
         &tree,
@@ -147,9 +140,6 @@ pub(crate) fn load_materialized_mission_type(
         playbook: Some(playbook),
         skills,
         inputs,
-        oracles,
-        oracle_resources,
-        oracle_devices,
     };
     let mission_type = MissionType::from_loaded(definition, digest);
     mission_type
@@ -315,101 +305,6 @@ fn load_roles(
     Ok(roles)
 }
 
-fn load_oracles(dir: &Path) -> Result<BTreeMap<OracleName, PathBuf>, MissionTypeError> {
-    let mut oracles = BTreeMap::new();
-    if !dir.exists() {
-        return Ok(oracles);
-    }
-    for entry in read_dir(dir)? {
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| MissionTypeError::Io {
-            path: path.clone(),
-            source: e,
-        })?;
-        // No symlinks out of the mission type: an oracle must be a regular file.
-        if !file_type.is_file() {
-            return Err(MissionTypeError::Oracle {
-                oracle: path.display().to_string(),
-                detail: "must be a regular file (no symlinks)".to_string(),
-            });
-        }
-        let stem =
-            path.file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| MissionTypeError::Oracle {
-                    oracle: path.display().to_string(),
-                    detail: "non-utf8 filename".to_string(),
-                })?;
-        let name = OracleName::new(stem).map_err(|e| MissionTypeError::Oracle {
-            oracle: stem.to_string(),
-            detail: e.to_string(),
-        })?;
-        if !is_executable(&path) {
-            return Err(MissionTypeError::Oracle {
-                oracle: stem.to_string(),
-                detail: "must be executable".to_string(),
-            });
-        }
-        if !has_shebang(&path) {
-            return Err(MissionTypeError::Oracle {
-                oracle: stem.to_string(),
-                detail: "must start with a #! shebang".to_string(),
-            });
-        }
-        oracles.insert(name, path);
-    }
-    Ok(oracles)
-}
-
-fn load_oracle_resources(
-    declared: BTreeMap<String, ConfinementResources>,
-    oracles: &BTreeMap<OracleName, PathBuf>,
-) -> Result<BTreeMap<OracleName, ConfinementResources>, MissionTypeError> {
-    let mut resources = BTreeMap::new();
-    for (raw_name, declared_resources) in declared {
-        let name = OracleName::new(&raw_name).map_err(|error| MissionTypeError::Oracle {
-            oracle: raw_name.clone(),
-            detail: error.to_string(),
-        })?;
-        if !oracles.contains_key(&name) {
-            return Err(MissionTypeError::Oracle {
-                oracle: raw_name,
-                detail: "resources declared for missing oracle".to_string(),
-            });
-        }
-        resources.insert(name, declared_resources);
-    }
-    Ok(resources)
-}
-
-fn load_oracle_devices(
-    declared: BTreeMap<String, Vec<String>>,
-    oracles: &BTreeMap<OracleName, PathBuf>,
-) -> Result<BTreeMap<OracleName, BTreeSet<String>>, MissionTypeError> {
-    let mut devices = BTreeMap::new();
-    for (raw_name, declared_devices) in declared {
-        let name = OracleName::new(&raw_name).map_err(|error| MissionTypeError::Oracle {
-            oracle: raw_name.clone(),
-            detail: error.to_string(),
-        })?;
-        if !oracles.contains_key(&name) {
-            return Err(MissionTypeError::Oracle {
-                oracle: raw_name.clone(),
-                detail: "devices declared for missing oracle".to_string(),
-            });
-        }
-        let declared_devices = declared_devices.into_iter().collect::<BTreeSet<_>>();
-        if declared_devices.is_empty() {
-            return Err(MissionTypeError::Oracle {
-                oracle: raw_name,
-                detail: "device declaration must not be empty".to_string(),
-            });
-        }
-        devices.insert(name, declared_devices);
-    }
-    Ok(devices)
-}
-
 fn read(
     tree: &BoundedTree,
     relative: &Path,
@@ -421,7 +316,7 @@ fn read(
 }
 
 /// A content digest over everything the loader consumes: manifest, optional
-/// lock/playbook, roles, oracles, and each resolved skill package recursively.
+/// lock/playbook, roles, inputs, and each resolved skill package recursively.
 /// Entries contribute logical path, bytes, and executable bit. Verified on
 /// every engine open, so mutated mission behavior is caught.
 fn compute_digest(tree: &BoundedTree) -> Result<String, MissionTypeError> {

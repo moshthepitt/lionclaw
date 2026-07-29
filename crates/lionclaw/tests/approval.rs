@@ -5,6 +5,7 @@
 mod common;
 
 use lionclaw::model::TerminalState;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use common::{
@@ -12,7 +13,9 @@ use common::{
 };
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::model::{
-    Choice, DecisionAction, FinishClass, MissionEvent, MissionProposal, MissionSkill,
+    AuthorityGrants, Choice, CommandOracle, ConfinementResources, DecisionAction, FinishClass,
+    MissionEvent, MissionProposal, MissionSkill, OracleName, OracleSpec, PlanProposal,
+    WorkspaceRelativeDir,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, NoopEffectCleaner};
@@ -64,6 +67,7 @@ async fn terminal_mission_rejects_every_administrative_mutation_without_appendin
                     team.revision += 1;
                     team
                 }),
+                oracles: None,
             },
         )
         .await
@@ -155,6 +159,162 @@ async fn pending_joint_proposal_blocks_direct_team_mutation_then_promotes_atomic
     assert_eq!(approved.team, Some(proposed_team));
     assert!(approved.plan.is_some());
     assert!(approved.proposal.is_none());
+}
+
+#[tokio::test]
+async fn invalid_command_oracles_append_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = gated_engine(dir.path()).await;
+    let mission_id = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "reject invalid oracles",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    let before = engine.load_state(&mission_id).await.expect("before");
+    let base_command = CommandOracle {
+        argv: vec!["cargo".to_string(), "test".to_string()],
+        cwd: WorkspaceRelativeDir::new(".").unwrap(),
+        environment: BTreeMap::new(),
+        timeout_secs: 60,
+        grants: AuthorityGrants::default(),
+        resources: ConfinementResources::default(),
+    };
+    let mut invalid = Vec::new();
+
+    let mut reserved_environment = base_command.clone();
+    reserved_environment
+        .environment
+        .insert("HOME".to_string(), "/tmp/forged-home".to_string());
+    invalid.push(("reserved environment", reserved_environment));
+
+    let mut excessive_timeout = base_command.clone();
+    excessive_timeout.timeout_secs = before.config.execution.max_task_time_secs + 1;
+    invalid.push(("excessive timeout", excessive_timeout));
+
+    let mut secrets = base_command.clone();
+    secrets.grants.secrets = true;
+    invalid.push(("secret access", secrets));
+
+    let mut writes = base_command.clone();
+    writes.grants.writes = true;
+    invalid.push(("workspace writes", writes));
+
+    let mut resources = base_command;
+    resources
+        .resources
+        .tmpfs
+        .push("/tmp:rw,size=1m".to_string());
+    invalid.push(("excessive resources", resources));
+
+    let shell = CommandOracle {
+        argv: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf injected".to_string(),
+        ],
+        cwd: WorkspaceRelativeDir::new(".").unwrap(),
+        environment: BTreeMap::new(),
+        timeout_secs: 60,
+        grants: AuthorityGrants::default(),
+        resources: ConfinementResources::default(),
+    };
+    invalid.push(("shell executable", shell));
+
+    for (case, command) in invalid {
+        let mut candidate = proposal(0, simple_plan());
+        candidate.oracles = Some(BTreeMap::from([(
+            OracleName::new("cargo-test").unwrap(),
+            OracleSpec::Command(command),
+        )]));
+        let error = engine
+            .propose_plan(&mission_id, candidate)
+            .await
+            .expect_err(case);
+        assert!(
+            error.to_string().contains("invalid_oracle"),
+            "{case} reached the wrong rejection: {error}"
+        );
+        let after = engine
+            .load_state(&mission_id)
+            .await
+            .expect("after rejection");
+        assert_eq!(after.head, before.head, "{case} appended an event");
+        assert_eq!(after.proposal, before.proposal);
+    }
+
+    let mut serialized = serde_json::to_value(proposal(0, simple_plan())).unwrap();
+    serialized["oracles"]["cargo-test"]["cwd"] = serde_json::json!("../outside");
+    assert!(
+        serde_json::from_value::<MissionProposal>(serialized).is_err(),
+        "an invalid cwd reached the typed engine boundary"
+    );
+    let after = engine
+        .load_state(&mission_id)
+        .await
+        .expect("after invalid cwd");
+    assert_eq!(after.head, before.head, "invalid cwd appended an event");
+}
+
+#[tokio::test]
+async fn stale_oracle_replacement_appends_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = gated_engine(dir.path()).await;
+    let mission_id = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "reject stale oracle replacement",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    let accepted_plan = simple_plan();
+    engine
+        .propose_plan(&mission_id, proposal(0, accepted_plan.clone()))
+        .await
+        .expect("initial proposal");
+    common::approve_plan(&engine, &mission_id).await;
+    let before = engine.load_state(&mission_id).await.expect("accepted");
+
+    let stale = MissionProposal {
+        plan: Some(PlanProposal {
+            base_revision: 0,
+            requirement_changes: Vec::new(),
+            assertion_supersessions: Vec::new(),
+            plan: accepted_plan,
+        }),
+        team: None,
+        oracles: Some(BTreeMap::from([(
+            OracleName::new("cargo-test").unwrap(),
+            OracleSpec::Command(CommandOracle {
+                argv: vec![
+                    "cargo".to_string(),
+                    "test".to_string(),
+                    "--all-targets".to_string(),
+                ],
+                cwd: WorkspaceRelativeDir::new(".").unwrap(),
+                environment: BTreeMap::new(),
+                timeout_secs: 60,
+                grants: AuthorityGrants::default(),
+                resources: ConfinementResources::default(),
+            }),
+        )])),
+    };
+    let error = engine
+        .propose_plan(&mission_id, stale)
+        .await
+        .expect_err("stale oracle proposal");
+    assert!(error.to_string().contains("current revision is 1"));
+
+    let after = engine
+        .load_state(&mission_id)
+        .await
+        .expect("after rejection");
+    assert_eq!(after.head, before.head);
+    assert_eq!(after.oracles, before.oracles);
+    assert_eq!(after.proposal, before.proposal);
 }
 
 #[tokio::test]

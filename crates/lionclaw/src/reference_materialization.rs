@@ -474,6 +474,7 @@ mod tests {
                 MissionEvent::OracleRunCompleted {
                     assertion_ids: vec![],
                     oracle: crate::model::OracleName::new("forged-oracle").unwrap(),
+                    spec_digest: "forged-spec".into(),
                     judged_sha: "unrequested".into(),
                     attempt_no: 1,
                     effect_id: effect_id.clone(),

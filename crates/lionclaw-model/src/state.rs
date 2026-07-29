@@ -3,14 +3,14 @@
 //! rebuilt state equality. Wall-clock time never enters this type.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
+use super::digest::CanonicalDigest;
 use super::event::{
     EffectResource, EnvironmentAssignment, MissionConfig, MissionTypeRef, PayloadRef,
     PreparedInputRef, RoleInstrumentIdentity, RoleProofFreshness, RuntimeConfigurationEvidence,
     RuntimeInstrumentIdentity, SkillInstrumentIdentity, TaskCandidateRef,
 };
-use super::ids::{lowercase_hex, AssertionId, MissionId, OracleName, RoleInstanceId, TaskId};
+use super::ids::{AssertionId, MissionId, OracleName, RoleInstanceId, TaskId};
 use super::plan::{Assertion, OutputSemantics, Plan};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
 use crate::prelude::*;
@@ -684,76 +684,6 @@ pub struct SupersededAssertion {
     pub superseded_at_revision: u32,
 }
 
-/// The gap-review ledger: fold-owned and advisory-only. All-default means no
-/// review has run.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct GapReviewState {
-    /// Dispatch counter (mirrors `oracle_attempts`): folded from
-    /// The assigned gap role's request attempt; the next dispatch and its
-    /// effect ID ride on it, so a retry re-rolls under a fresh identity.
-    #[serde(default)]
-    pub attempts: u32,
-    /// Failures since the last completed review or explicit recovery decision.
-    #[serde(default)]
-    pub consecutive_failures: u32,
-    /// The last attempt's result. A fresh verdict and a pending failure
-    /// cannot coexist: a failure only follows a dispatch, and dispatch only
-    /// happens without a fresh verdict (history lives in the event log).
-    #[serde(default)]
-    pub outcome: Option<ReviewOutcome>,
-    /// The one human-acceptance fact ("accept closure despite the review").
-    #[serde(default)]
-    pub accepted: Option<ReviewAcceptance>,
-}
-
-impl GapReviewState {
-    /// The acceptance, if it still holds in the current state — the ONE
-    /// freshness-law site the fold's derivations and the CLI's summaries all
-    /// share, so they can never disagree about whether the mission may close.
-    pub fn fresh_acceptance(&self, state: &MissionState) -> Option<&ReviewAcceptance> {
-        self.accepted.as_ref().filter(|a| a.is_fresh_at(state))
-    }
-
-    /// Whether a fresh waiver stands in the current state (closure permitted
-    /// without a verdict).
-    pub fn waived_at(&self, state: &MissionState) -> bool {
-        self.fresh_acceptance(state)
-            .is_some_and(|a| a.kind == ReviewAcceptanceKind::Waived)
-    }
-
-    /// Whether this verdict's blocking gaps were acknowledged (the
-    /// acknowledgment is keyed to the verdict's own sha and environment).
-    pub fn acknowledges_sha(&self, state: &MissionState, judged_sha: &str) -> bool {
-        self.accepted.as_ref().is_some_and(|a| {
-            a.kind == ReviewAcceptanceKind::AcknowledgedGaps
-                && a.freshness.judged_sha == judged_sha
-                && a.is_fresh_at(state)
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum ReviewOutcome {
-    Verdict {
-        effect_id: super::EffectId,
-    },
-    /// The reviewer failed to run or hand off a verdict (infrastructure),
-    /// until a decision clears it. Prevents a broken reviewer from
-    /// re-requesting forever (mirrors `oracle_failures`).
-    Failed {
-        effect_id: super::EffectId,
-    },
-}
-
-impl ReviewOutcome {
-    pub const fn effect_id(&self) -> &super::EffectId {
-        match self {
-            Self::Verdict { effect_id } | Self::Failed { effect_id } => effect_id,
-        }
-    }
-}
-
 /// Exact failed effect generation that may be reopened by `continue`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -780,51 +710,6 @@ pub enum ReferenceRecipientPolicy {
     },
     Mixed,
     Invalid,
-}
-
-/// How a human accepted closure despite the review: `accept` on a gap park
-/// acknowledges the blocking verdict, while `accept` on a failure park waives
-/// the review outright. One value, so waived-and-acknowledged is unrepresentable;
-/// the receipt distinguishes the kinds and cites why it was accepted.
-///
-/// Both kinds are keyed to the proof freshness they were granted at: a later
-/// artifact commit, environment change, or role instrument change stales the
-/// acceptance and re-opens the review, so neither an acknowledgment nor a
-/// waiver is ever inherited by work the human never saw or by a different
-/// judging instrument.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewAcceptance {
-    pub kind: ReviewAcceptanceKind,
-    /// The exact proof conditions the human accepted or waived.
-    pub freshness: RoleProofFreshness,
-    pub justification: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewAcceptanceKind {
-    /// A blocking verdict the human closed over; its gaps stay on record.
-    AcknowledgedGaps,
-    /// The review failed to run and the human closed without a verdict.
-    Waived,
-}
-
-impl ReviewAcceptance {
-    /// Same freshness law as judged receipts: an acceptance holds only under
-    /// the exact role proof conditions it was granted at.
-    pub fn is_fresh_at(&self, state: &MissionState) -> bool {
-        self.freshness.is_fresh_at(state)
-    }
-}
-
-impl ReviewAcceptanceKind {
-    /// The stable snake_case name (matches the serde repr).
-    pub const fn slug(self) -> &'static str {
-        match self {
-            Self::AcknowledgedGaps => "acknowledged_gaps",
-            Self::Waived => "waived",
-        }
-    }
 }
 
 /// A `…Requested` event without a recorded outcome. The active driver executes
@@ -862,6 +747,7 @@ pub enum InflightEffect {
     OracleRun {
         assertion_ids: Vec<AssertionId>,
         oracle: OracleName,
+        spec_digest: String,
         judged_sha: String,
         environment_digest: String,
         attempt_no: u32,
@@ -1036,6 +922,7 @@ impl InflightEffect {
             MissionEvent::OracleRunRequested {
                 assertion_ids,
                 oracle,
+                spec_digest,
                 judged_sha,
                 environment_digest,
                 attempt_no,
@@ -1047,6 +934,7 @@ impl InflightEffect {
                 Self::OracleRun {
                     assertion_ids: assertion_ids.clone(),
                     oracle: oracle.clone(),
+                    spec_digest: spec_digest.clone(),
                     judged_sha: judged_sha.clone(),
                     environment_digest: environment_digest.clone(),
                     attempt_no: *attempt_no,
@@ -1110,11 +998,15 @@ pub struct MissionState {
     pub planning_input: PlanningInput,
     /// Complete plan proposal awaiting approval or automatic promotion.
     pub proposal: Option<super::MissionProposal>,
+    /// Current mission-local command oracle set.
+    pub oracles: BTreeMap<OracleName, super::OracleSpec>,
     /// Latest recorded artifact head (starts at `base_sha`). Oracle verdicts
     /// are fresh only when judged at this commit.
     pub current_sha: String,
     /// Per-oracle dispatch counter (attempt numbering).
-    pub oracle_attempts: BTreeMap<OracleName, u32>,
+    /// Dispatch counters scoped by oracle name and canonical spec digest.
+    /// Retaining prior digests prevents effect-id reuse if a spec is restored.
+    pub oracle_attempts: BTreeMap<OracleName, BTreeMap<String, u32>>,
     pub inflight: BTreeMap<super::EffectId, InflightEffect>,
     /// One append-only, fold-owned receipt for every role effect. Mutable task,
     /// advisory, review, attention, and feedback state retains only effect IDs
@@ -1144,10 +1036,6 @@ pub struct MissionState {
     /// effect's outcome is durably recorded.
     #[serde(default)]
     pub cleanup_failure: Option<EffectCleanupFailure>,
-    /// The pending proposal was approved (the durable approval gate was answered).
-    /// Cleared on every new proposal when the gate is on, so approval of
-    /// one plan revision never authorizes the next (ADR 0006).
-    pub proposal_approved: bool,
     /// Plan revision: the initial proposal promotes to 1, each later proposal
     /// to the next. Used for the proposal staleness guard (`base_revision`) and
     /// status display; the initial `MissionCreated` state (no plan) is 0.
@@ -1163,33 +1051,27 @@ pub struct MissionState {
     /// nonzero exit) → mapped to the failure detail, until a decision clears
     /// them. Prevents a broken oracle from re-requesting forever.
     pub oracle_failures: BTreeMap<OracleName, TypedFailure>,
-    /// Terminal-review runtime (config-gated; default-empty for every
-    /// pre-feature mission and snapshot).
-    #[serde(default)]
-    pub gap_review: GapReviewState,
     /// Sequence number of the last folded event (optimistic-concurrency head).
     pub head: u64,
 }
 
 fn role_instrument_digest(role: &super::RoleInstance) -> String {
-    let mut digest = Sha256::new();
-    feed_str(&mut digest, "schema", "lionclaw.role-instrument.v1");
-    feed_str(&mut digest, "output", output_slug(role.output));
-    feed_str(&mut digest, "instructions", &role.instructions);
-    feed_map(&mut digest, "environment", role.environment.iter());
-    feed_bool(&mut digest, "grants.secrets", role.grants.secrets);
-    feed_bool(&mut digest, "grants.network", role.grants.network);
-    feed_bool(&mut digest, "grants.install", role.grants.install);
-    feed_bool(&mut digest, "grants.writes", role.grants.writes);
-    feed_set(&mut digest, "grants.devices", role.grants.devices.iter());
-    feed_set(
-        &mut digest,
+    let mut digest = CanonicalDigest::new("lionclaw.role-instrument.v1");
+    digest.str("output", output_slug(role.output));
+    digest.str("instructions", &role.instructions);
+    digest.map("environment", role.environment.iter());
+    digest.bool("grants.secrets", role.grants.secrets);
+    digest.bool("grants.network", role.grants.network);
+    digest.bool("grants.install", role.grants.install);
+    digest.bool("grants.writes", role.grants.writes);
+    digest.set("grants.devices", role.grants.devices.iter());
+    digest.set(
         "grants.inputs",
         role.grants.inputs.iter().map(ToString::to_string),
     );
-    feed_set(&mut digest, "resources.tmpfs", role.resources.tmpfs.iter());
-    feed_option_u64(&mut digest, "deadline_secs", role.deadline_secs);
-    lowercase_hex(&digest.finalize())
+    digest.set("resources.tmpfs", role.resources.tmpfs.iter());
+    digest.option_u64("deadline_secs", role.deadline_secs);
+    digest.finish()
 }
 
 fn output_slug(output: OutputSemantics) -> &'static str {
@@ -1199,46 +1081,6 @@ fn output_slug(output: OutputSemantics) -> &'static str {
         OutputSemantics::EmitsVerdict => "emits-verdict",
         OutputSemantics::EmitsGapVerdict => "emits-gap-verdict",
         OutputSemantics::ProposesPlan => "proposes-plan",
-    }
-}
-
-fn feed_str(digest: &mut Sha256, label: &str, value: &str) {
-    digest.update((label.len() as u64).to_be_bytes());
-    digest.update(label.as_bytes());
-    digest.update((value.len() as u64).to_be_bytes());
-    digest.update(value.as_bytes());
-}
-
-fn feed_bool(digest: &mut Sha256, label: &str, value: bool) {
-    feed_str(digest, label, if value { "true" } else { "false" });
-}
-
-fn feed_option_u64(digest: &mut Sha256, label: &str, value: Option<u64>) {
-    match value {
-        Some(value) => feed_str(digest, label, &value.to_string()),
-        None => feed_str(digest, label, ""),
-    }
-}
-
-fn feed_map<'a, I>(digest: &mut Sha256, label: &str, entries: I)
-where
-    I: Iterator<Item = (&'a String, &'a String)>,
-{
-    feed_str(digest, label, "map");
-    for (key, value) in entries {
-        feed_str(digest, "key", key);
-        feed_str(digest, "value", value);
-    }
-}
-
-fn feed_set<'a, I, S>(digest: &mut Sha256, label: &str, entries: I)
-where
-    I: Iterator<Item = S>,
-    S: AsRef<str> + 'a,
-{
-    feed_str(digest, label, "set");
-    for entry in entries {
-        feed_str(digest, "item", entry.as_ref());
     }
 }
 
@@ -1289,10 +1131,30 @@ impl MissionState {
             })
         });
         let current_review = self
-            .gap_review
-            .outcome
+            .team
             .as_ref()
-            .is_some_and(|outcome| outcome.effect_id() == effect_id);
+            .and_then(|team| team.gap_review_assignment.as_ref())
+            .and_then(|role| self.latest_taskless_assignment_receipt(role, &[]))
+            .is_some_and(|latest| {
+                if &latest.effect_id != effect_id {
+                    return false;
+                }
+                if !self.role_attempt_is_fresh(latest) {
+                    return false;
+                }
+                let clean_review = matches!(
+                    &latest.disposition,
+                    RoleAttemptDisposition::Succeeded {
+                        handoff: Some(handoff),
+                        ..
+                    } if matches!(
+                        handoff.as_ref(),
+                        SettledHandoff::Review { passed: true, gaps }
+                            if !gaps.iter().any(|gap| gap.severity == super::GapSeverity::Blocking)
+                    )
+                );
+                clean_review || self.parked_effects.contains_key(effect_id)
+            });
         let current_feedback = self
             .planning_input
             .refinement
@@ -1373,10 +1235,7 @@ impl MissionState {
         effect_id: &super::EffectId,
     ) -> Option<(&RoleAttemptReceipt, bool)> {
         let receipt = self.role_attempt_receipts.get(effect_id)?;
-        let RoleEffectSource::Turn {
-            request,
-            plan_revision,
-        } = &receipt.source;
+        let RoleEffectSource::Turn { request, .. } = &receipt.source;
         if &request.role_instance != validator
             || !request.assertion_ids.contains(assertion_id)
             || request.task_id.is_some()
@@ -1386,8 +1245,7 @@ impl MissionState {
         let current_team = self.team.as_ref()?;
         let role = current_team.role(&request.role_instance)?;
         if role.output != super::OutputSemantics::EmitsVerdict
-            || *plan_revision != self.revision
-            || !request.is_fresh_at(self)
+            || !self.role_attempt_is_fresh(receipt)
             || !self
                 .team
                 .as_ref()
@@ -1435,7 +1293,7 @@ impl MissionState {
         }
     }
 
-    fn taskless_assignment_receipts<'a>(
+    pub(crate) fn taskless_assignment_receipts<'a>(
         &'a self,
         role_instance: &RoleInstanceId,
         assertion_ids: &[AssertionId],
@@ -1461,6 +1319,24 @@ impl MissionState {
             RoleEffectSource::Turn { request, .. } => request.attempt_no,
         });
         receipts
+    }
+
+    pub fn latest_taskless_assignment_receipt(
+        &self,
+        role_instance: &RoleInstanceId,
+        assertion_ids: &[AssertionId],
+    ) -> Option<&RoleAttemptReceipt> {
+        self.taskless_assignment_receipts(role_instance, assertion_ids)
+            .into_iter()
+            .last()
+    }
+
+    pub fn role_attempt_is_fresh(&self, receipt: &RoleAttemptReceipt) -> bool {
+        let RoleEffectSource::Turn {
+            request,
+            plan_revision,
+        } = &receipt.source;
+        *plan_revision == self.revision && request.is_fresh_at(self)
     }
 
     pub(crate) fn taskless_assignment_failure(
@@ -1493,13 +1369,6 @@ impl MissionState {
             .is_none_or(|(_, failure, consecutive)| {
                 failure.automatically_retryable() && consecutive < self.config.recovery.max_attempts
             })
-    }
-
-    pub fn gap_review_receipt(&self) -> Option<&RoleAttemptReceipt> {
-        self.gap_review
-            .outcome
-            .as_ref()
-            .and_then(|outcome| self.role_attempt_receipts.get(outcome.effect_id()))
     }
 
     /// Closed role contract shared by request folding, dispatch, and live
@@ -1906,7 +1775,7 @@ impl MissionState {
             && self
                 .parked_effects
                 .get(effect_id)
-                .is_some_and(|effect| self.parked_effect_remains_continuable(effect))
+                .is_some_and(|effect| self.parked_effect_remains_continuable(effect_id, effect))
     }
 
     pub fn parked_workspace_recreation(&self, effect_id: &super::EffectId) -> Option<TaskId> {
@@ -1959,7 +1828,11 @@ impl MissionState {
             && self.parked_continue_is_legal(effect_id, mode)
     }
 
-    pub(crate) fn parked_effect_remains_continuable(&self, effect: &ParkedEffect) -> bool {
+    pub(crate) fn parked_effect_remains_continuable(
+        &self,
+        effect_id: &super::EffectId,
+        effect: &ParkedEffect,
+    ) -> bool {
         match effect {
             ParkedEffect::RoleTurn {
                 role_instance,
@@ -1973,7 +1846,22 @@ impl MissionState {
                         .get(task_id)
                         .is_some_and(|task| task.status == TaskStatus::Failed)
                 }
-                None => self.conversation_is_messageable(role_instance),
+                None => {
+                    self.conversation_is_messageable(role_instance)
+                        && self
+                            .role_attempt_receipts
+                            .get(effect_id)
+                            .is_some_and(|receipt| {
+                                matches!(
+                                    &receipt.source,
+                                    RoleEffectSource::Turn { request, .. }
+                                        if request.task_id.is_none()
+                                            && self.team.as_ref().is_some_and(|team| {
+                                                request.team_revision == team.revision
+                                            })
+                                ) && self.role_attempt_is_fresh(receipt)
+                            })
+                }
             },
             ParkedEffect::OracleRun { oracle } => self.oracle_failures.contains_key(oracle),
         }
@@ -1994,20 +1882,26 @@ impl MissionState {
     }
 
     pub(crate) fn oracle_automatic_retry_remaining(&self, oracle: &OracleName) -> bool {
+        let Some(spec_digest) = self.oracles.get(oracle).map(super::OracleSpec::digest) else {
+            return false;
+        };
         self.oracle_failures
             .get(oracle)
             .is_some_and(TypedFailure::is_transient)
             && self
                 .oracle_attempts
                 .get(oracle)
+                .and_then(|attempts| attempts.get(&spec_digest))
                 .copied()
                 .unwrap_or_default()
                 < self.config.recovery.max_attempts
     }
 
     pub(crate) fn next_oracle_attempt(&self, oracle: &OracleName) -> Option<u32> {
+        let spec_digest = self.oracles.get(oracle)?.digest();
         self.oracle_attempts
             .get(oracle)
+            .and_then(|attempts| attempts.get(&spec_digest))
             .copied()
             .unwrap_or_default()
             .checked_add(1)

@@ -16,10 +16,7 @@ use lionclaw::ports::{CapturedArtifact, RoleTurnOutcome};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 fn write_cli_test_mission_type(root: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-
     std::fs::create_dir_all(root.join("roles")).expect("roles");
-    std::fs::create_dir_all(root.join("oracles")).expect("oracles");
     std::fs::write(
         root.join("playbook.md"),
         "Conversation resource lifecycle fixture.\n",
@@ -64,10 +61,6 @@ install = true
         "---\noutput: emits-verdict\nruntime: codex\n---\nReview the change.\n",
     )
     .expect("reviewer role");
-    let oracle = root.join("oracles/cargo-test");
-    std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").expect("oracle");
-    std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o755))
-        .expect("oracle permissions");
 }
 
 fn task_work(role_root: &std::path::Path) -> PathBuf {

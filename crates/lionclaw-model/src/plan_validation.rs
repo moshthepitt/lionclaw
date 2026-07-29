@@ -12,7 +12,7 @@
 use super::ids::TaskId;
 use super::plan::{OutputSemantics, Plan, PlanProposal, RequirementDisposition};
 use super::state::MissionState;
-use super::{MissionConfig, MissionProposal, StopBar, TeamRevision};
+use super::{MissionConfig, MissionProposal, OracleName, OracleSpec, StopBar, TeamRevision};
 use crate::prelude::*;
 
 /// Maximum direct fan-in for one task. Role reports are independently bounded
@@ -37,6 +37,7 @@ fn err(code: &'static str, detail: impl Into<String>) -> PlanValidationError {
 pub fn validate_plan(
     plan: &Plan,
     team: &TeamRevision,
+    oracles: &BTreeMap<OracleName, OracleSpec>,
     config: &MissionConfig,
 ) -> Vec<PlanValidationError> {
     // Group 0: emptiness (zenith empty_contract / empty_task_list).
@@ -68,7 +69,7 @@ pub fn validate_plan(
         return errors;
     }
     // Group 3: work shape plus team/oracle resolution.
-    let errors = check_shape(plan, team, config);
+    let errors = check_shape(plan, team, oracles, config);
     if !errors.is_empty() {
         return errors;
     }
@@ -219,6 +220,8 @@ pub enum ProposalError {
     },
     #[error("proposal is immaterial (it leaves the plan unchanged)")]
     Immaterial,
+    #[error("oracle change requires a plan proposal")]
+    OracleChangeRequiresPlan,
     #[error("task '{task}' changes an existing task; retained task ids are immutable")]
     TaskChanged { task: String },
     #[error("new task '{task}' reuses a retired task id")]
@@ -253,14 +256,14 @@ pub fn validate_plan_proposal(
     state: &MissionState,
     proposal: &PlanProposal,
 ) -> Result<(), ProposalError> {
-    validate_plan_transition(state, proposal)?;
+    validate_plan_transition(state, proposal, false)?;
     let Some(team) = state.team.as_ref() else {
         return Err(ProposalError::Invalid(vec![err(
             "missing_team",
             "mission has no accepted team revision",
         )]));
     };
-    let errors = validate_plan(&proposal.plan, team, &state.config);
+    let errors = validate_plan(&proposal.plan, team, &state.oracles, &state.config);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -272,8 +275,19 @@ pub fn validate_mission_proposal(
     state: &MissionState,
     proposal: &MissionProposal,
 ) -> Result<(), ProposalError> {
+    let oracle_change = proposal
+        .oracles
+        .as_ref()
+        .is_some_and(|oracles| oracles != &state.oracles);
     if proposal.plan.is_none() && proposal.team.is_none() {
-        return Err(ProposalError::Immaterial);
+        return if oracle_change {
+            Err(ProposalError::OracleChangeRequiresPlan)
+        } else {
+            Err(ProposalError::Immaterial)
+        };
+    }
+    if oracle_change && proposal.plan.is_none() {
+        return Err(ProposalError::OracleChangeRequiresPlan);
     }
     if let Some(team) = &proposal.team {
         let expected = state
@@ -299,7 +313,28 @@ pub fn validate_mission_proposal(
         }
     }
     if let Some(plan) = &proposal.plan {
-        validate_plan_transition(state, plan)?;
+        validate_plan_transition(state, plan, oracle_change)?;
+    }
+    let oracles = proposal.oracles.as_ref().unwrap_or(&state.oracles);
+    let oracle_errors = oracles
+        .iter()
+        .filter_map(|(name, spec)| {
+            spec.validate(
+                &state.config.ceilings,
+                &state.config.resource_ceilings,
+                &state.config.execution,
+            )
+            .err()
+            .map(|error| {
+                err(
+                    "invalid_oracle",
+                    format!("oracle '{name}' is invalid: {error}"),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if !oracle_errors.is_empty() {
+        return Err(ProposalError::Invalid(oracle_errors));
     }
     let team = proposal
         .team
@@ -317,7 +352,7 @@ pub fn validate_mission_proposal(
         .map(|candidate| &candidate.plan)
         .or(state.plan.as_ref());
     if let Some(plan) = plan {
-        let errors = validate_plan(plan, team, &state.config);
+        let errors = validate_plan(plan, team, oracles, &state.config);
         if !errors.is_empty() {
             return Err(ProposalError::Invalid(errors));
         }
@@ -330,6 +365,7 @@ pub fn validate_mission_proposal(
 fn validate_plan_transition(
     state: &MissionState,
     proposal: &PlanProposal,
+    allow_unchanged_plan: bool,
 ) -> Result<(), ProposalError> {
     if proposal.base_revision != state.revision {
         return Err(ProposalError::Stale {
@@ -360,7 +396,7 @@ fn validate_plan_transition(
         }
         return Ok(());
     };
-    if proposal.plan == *current {
+    if proposal.plan == *current && !allow_unchanged_plan {
         return Err(ProposalError::Immaterial);
     }
 
@@ -661,6 +697,7 @@ fn check_unique_ids(plan: &Plan) -> Vec<PlanValidationError> {
 fn check_shape(
     plan: &Plan,
     team: &TeamRevision,
+    oracles: &BTreeMap<OracleName, OracleSpec>,
     config: &MissionConfig,
 ) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
@@ -696,11 +733,11 @@ fn check_shape(
     }
     for assertion in &plan.assertions {
         if let Some(oracle) = &assertion.oracle {
-            if !config.oracles.contains(oracle) {
+            if !oracles.contains_key(oracle) {
                 errors.push(err(
                     "unknown_oracle",
                     format!(
-                        "assertion '{}' binds oracle '{oracle}' which the mission type does not provide",
+                        "assertion '{}' binds oracle '{oracle}' which the mission does not define",
                         assertion.id
                     ),
                 ));

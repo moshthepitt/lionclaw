@@ -730,7 +730,7 @@ pub async fn remove_dir(dir: &Path) -> Result<()> {
     }
 }
 
-/// `chmod 0o755` — used to keep staged oracle executables executable.
+/// `chmod 0o755` for staged mission programs.
 #[cfg(unix)]
 pub fn make_executable(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;

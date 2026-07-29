@@ -169,7 +169,13 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
         .all(|assertion| assertion.last_authoritative_receipt.is_none()));
 
     let oracle = OracleName::new("cargo-test").unwrap();
-    let effect = EffectId::for_oracle_request(&id, &oracle, HEAD_SHA, 1);
+    let spec_digest = ready.oracles[&oracle].digest();
+    let deadline_ms = lionclaw::model::resolve_execution_deadline_ms(
+        0,
+        ready.oracles[&oracle].as_command().timeout_secs,
+    )
+    .unwrap();
+    let effect = EffectId::for_oracle_request(&id, &oracle, &spec_digest, HEAD_SHA, 1);
     fault_append_events(
         dir.path(),
         &id,
@@ -177,12 +183,13 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
         &[NewEvent::new(MissionEvent::OracleRunRequested {
             assertion_ids: vec![lionclaw::model::AssertionId::new("TESTS-PASS").unwrap()],
             oracle: oracle.clone(),
+            spec_digest,
             judged_sha: HEAD_SHA.to_string(),
             environment_digest: ready.environment_digest().to_string(),
             attempt_no: 1,
             effect_id: effect.clone(),
             requested_at_ms: 0,
-            deadline_ms: 100_000,
+            deadline_ms,
         })],
         1,
     )

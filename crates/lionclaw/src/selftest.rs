@@ -1,14 +1,15 @@
 //! `lionclaw mission self-test`: drive the real stack (real store + fold +
 //! loop + real podman confinement + real engine-run oracle) and assert the
-//! four Slice-1 invariants, complete plan revision, gap-review closure,
-//! native read-only skill mounting, and prepared inputs (eight checks). Hermetic and
-//! model-auth-free — the *oracle*
+//! four Slice-1 invariants, complete plan revision, gap-review recovery,
+//! native read-only skill mounting, prepared inputs, and dynamic command
+//! portability (nine checks). Hermetic and model-auth-free — the *oracle*
 //! decides every outcome, so no agent turn (and no model credentials) is
 //! required. The agentic multi-run eval stays in `scripts/mission-eval.sh`.
 //!
 //! Exit codes: 0 all green · 1 a check failed · 2 podman/image unavailable
 //! (the runtime checks were skipped — never green-washed).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,16 +26,16 @@ use crate::config::RuntimeProfiles;
 use crate::engine::{Engine, EngineServices, ProposeError};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
-    Assertion, AssertionId, Choice, DecisionAction, EffectId, FinishClass, Gap, GapSeverity,
-    Handoff, MissionEvent, MissionId, MissionProposal, OracleName, PayloadRef, Plan, PlanProposal,
-    ProposalError, Requirement, RequirementDisposition, RequirementId, RequirementKind,
-    ReviewAcceptanceKind, RoleInstanceId, Task, TaskId, TaskStatus, TeamRevision, TerminalState,
-    ValidationItem,
+    Assertion, AssertionId, AuthorityGrants, Choice, CommandOracle, DecisionAction, EffectId,
+    FinishClass, Gap, GapSeverity, Handoff, MissionEvent, MissionId, MissionProposal, OracleName,
+    OracleSpec, PayloadRef, Plan, PlanProposal, ProposalError, Requirement, RequirementDisposition,
+    RequirementId, RequirementKind, RoleEffectSource, RoleInstanceId, Task, TaskId, TaskStatus,
+    TeamRevision, TerminalState, ValidationItem, WorkspaceRelativeDir,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
-    EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, OracleOutcome, OracleRunRequest,
-    OracleRunner, RoleRunner, RoleTurnOutcome, RoleTurnRequest, SystemClock,
+    EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, OracleOutcome,
+    OracleRunRequest, OracleRunner, RoleRunner, RoleTurnOutcome, RoleTurnRequest, SystemClock,
 };
 use crate::resources::MissionDirs;
 use crate::runner::MissionProgramExecutor;
@@ -244,6 +245,9 @@ fn runtime_checks() -> Vec<(&'static str, RuntimeCheck)> {
         ("prepared-input-feeds-network-off-oracle", || {
             Box::pin(check_prepared_input())
         }),
+        ("dynamic-oracles-run-rust-python-js-without-shell", || {
+            Box::pin(check_dynamic_oracle_languages())
+        }),
     ]
 }
 
@@ -355,7 +359,6 @@ const BROKEN_LIB: &str = include_str!("../tests/fixtures/eval/interval-bug/src/l
 fn manifest_toml(name: &str) -> String {
     format!(
         "[mission-type]\nname = \"{name}\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n\
-         environment = {{ CARGO_HOME = \"/scratch/cargo\", CARGO_TARGET_DIR = \"/scratch/target\" }}\n\
          \n[team]\nplanning-assignment = \"strategist\"\nrequires-gap-review = false\n\
          \n[ceilings]\nwrites = true\nnetwork = true\ninstall = true\n\
          \n[execution]\ndefault-timeout-secs = 1800\nmax-task-time-secs = 1800\n\
@@ -383,11 +386,18 @@ runtime: codex
 ---
 Self-test reviewer.
 ";
-const CARGO_TEST_ORACLE: &str = "#!/bin/sh\nset -e\ncd /workspace\nexec cargo test --locked\n";
-const PREPARED_CARGO_TEST_ORACLE: &str =
-    "#!/bin/sh\nset -e\ntest \"$(cat /inputs/fixture/sentinel)\" = prepared\ntest -f /inputs/fixture/vendor/representative/Cargo.toml\ntest -f /inputs/fixture/vendor/representative/src/lib.rs\ngrep -q \"name = 'representative'\" /inputs/fixture/vendor/representative/Cargo.toml\ngrep -q \"pub fn retained\" /inputs/fixture/vendor/representative/src/lib.rs\ncd /workspace\nexec cargo test --locked\n";
 const PREPARE_FIXTURE_INPUT: &str =
     "#!/bin/sh\nset -e\nmkdir -p \"$LIONCLAW_OUTPUT/vendor/representative/src\"\nprintf prepared > \"$LIONCLAW_OUTPUT/sentinel\"\nprintf \"[package]\\nname = 'representative'\\nversion = '1.0.0'\\n\" > \"$LIONCLAW_OUTPUT/vendor/representative/Cargo.toml\"\nprintf \"pub fn retained() {}\\n\" > \"$LIONCLAW_OUTPUT/vendor/representative/src/lib.rs\"\n";
+const PREPARED_INPUT_ORACLE_PROGRAM: &str = concat!(
+    "from pathlib import Path; import subprocess; ",
+    "root = Path('/inputs/fixture'); ",
+    "assert (root / 'sentinel').read_text() == 'prepared'; ",
+    "assert \"name = 'representative'\" in ",
+    "(root / 'vendor/representative/Cargo.toml').read_text(); ",
+    "assert 'pub fn retained' in ",
+    "(root / 'vendor/representative/src/lib.rs').read_text(); ",
+    "subprocess.run(['cargo', 'test', '--locked'], check=True)"
+);
 
 // A verdict role that illegally requests secrets — the loader must refuse it.
 // (A judge can't be declared *writable* in a mission type — workspace access is
@@ -402,18 +412,14 @@ secrets: true
 A verdict role illegally requesting secrets — the loader must refuse it.
 ";
 
-/// Write a mission-type dir: mission.toml + roles/implementer.md + oracles/cargo-test.
+/// Write a mission-type dir with the self-test roles and policy.
 fn materialize_sw_mission_type(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("roles"))?;
-    std::fs::create_dir_all(root.join("oracles"))?;
     std::fs::write(root.join("mission.toml"), manifest_toml("selftest"))?;
     std::fs::write(root.join("playbook.md"), "# Self-test\n")?;
     std::fs::write(root.join("roles/implementer.md"), IMPLEMENTER_ROLE)?;
     std::fs::write(root.join("roles/strategist.md"), STRATEGIST_ROLE)?;
     std::fs::write(root.join("roles/reviewer.md"), REVIEWER_ROLE)?;
-    let oracle = root.join("oracles/cargo-test");
-    std::fs::write(&oracle, CARGO_TEST_ORACLE)?;
-    workspace::make_executable(&oracle)?;
     Ok(())
 }
 
@@ -433,9 +439,6 @@ fn materialize_input_mission_type(root: &Path) -> Result<()> {
     let input = root.join("inputs/fixture");
     std::fs::write(&input, PREPARE_FIXTURE_INPUT)?;
     workspace::make_executable(&input)?;
-    let oracle = root.join("oracles/cargo-test");
-    std::fs::write(&oracle, PREPARED_CARGO_TEST_ORACLE)?;
-    workspace::make_executable(&oracle)?;
     Ok(())
 }
 
@@ -460,6 +463,21 @@ async fn materialize_repo(root: &Path, cargo_toml: &str, lib_rs: &str) -> Result
         .current_dir(root)
         .output()
         .await;
+    commit_fixture(root).await
+}
+
+async fn materialize_files_repo(root: &Path, files: &[(&str, &str)]) -> Result<String> {
+    for (relative, contents) in files {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, contents)?;
+    }
+    commit_fixture(root).await
+}
+
+async fn commit_fixture(root: &Path) -> Result<String> {
     git(root, &["init", "-q"]).await?;
     git(root, &["add", "-A"]).await?;
     git(
@@ -544,6 +562,44 @@ async fn proposal(
         .iter()
         .map(|assertion| (assertion.id.clone(), vec![reviewer.clone()]))
         .collect();
+    let uses_fixture = state
+        .config
+        .ceilings
+        .inputs
+        .contains(&crate::model::InputName::new("fixture")?);
+    let argv = if uses_fixture {
+        vec![
+            "python3".to_string(),
+            "-c".to_string(),
+            PREPARED_INPUT_ORACLE_PROGRAM.to_string(),
+        ]
+    } else {
+        vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "--locked".to_string(),
+        ]
+    };
+    let oracles = BTreeMap::from([(
+        OracleName::new("cargo-test")?,
+        OracleSpec::Command(CommandOracle {
+            argv,
+            cwd: WorkspaceRelativeDir::new(".")?,
+            environment: BTreeMap::from([
+                ("CARGO_HOME".to_string(), "/scratch/cargo".to_string()),
+                (
+                    "CARGO_TARGET_DIR".to_string(),
+                    "/scratch/target".to_string(),
+                ),
+            ]),
+            timeout_secs: 1800,
+            grants: AuthorityGrants {
+                inputs: state.config.ceilings.inputs.clone(),
+                ..Default::default()
+            },
+            resources: Default::default(),
+        }),
+    )]);
     Ok(MissionProposal {
         plan: Some(PlanProposal {
             base_revision,
@@ -552,6 +608,7 @@ async fn proposal(
             plan,
         }),
         team: Some(team),
+        oracles: Some(oracles),
     })
 }
 
@@ -684,6 +741,7 @@ async fn run_confined_sh(
             workspace: workspace_source.to_path_buf(),
             extras: Vec::new(),
         },
+        working_dir: workspace_source.to_path_buf(),
         judged_roots,
         environment: vec![("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string())],
         resources: Default::default(),
@@ -869,6 +927,148 @@ async fn check_prepared_input() -> Result<()> {
     Ok(())
 }
 
+async fn check_dynamic_oracle_languages() -> Result<()> {
+    run_dynamic_oracle_fixture(
+        "rust",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"oracle-rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "Cargo.lock",
+                "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"oracle-rust\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn add(left: i32, right: i32) -> i32 { left + right }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() { assert_eq!(super::add(2, 3), 5); }\n}\n",
+            ),
+        ],
+        &["cargo", "test", "--locked", "--offline"],
+        ".",
+        BTreeMap::from([
+            ("CARGO_HOME".to_string(), "/scratch/cargo".to_string()),
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                "/scratch/target".to_string(),
+            ),
+        ]),
+        None,
+    )
+    .await?;
+    run_dynamic_oracle_fixture(
+        "python",
+        &[(
+            "python/test_math.py",
+            "import unittest\n\nclass MathTest(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(2 + 3, 5)\n",
+        )],
+        &["python3", "-m", "unittest", "discover", "-v"],
+        "python",
+        BTreeMap::from([("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string())]),
+        None,
+    )
+    .await?;
+    run_dynamic_oracle_fixture(
+        "javascript",
+        &[
+            (
+                "javascript/package.json",
+                "{\"name\":\"oracle-javascript\",\"private\":true,\"scripts\":{\"test\":\"node --test\"}}\n",
+            ),
+            (
+                "javascript/add.test.js",
+                "const test = require('node:test');\nconst assert = require('node:assert/strict');\ntest('adds', () => assert.equal(2 + 3, 5));\n",
+            ),
+        ],
+        &["npm", "test", "--silent"],
+        "javascript",
+        BTreeMap::from([
+            ("npm_config_cache".to_string(), "/scratch/npm".to_string()),
+            ("npm_config_update_notifier".to_string(), "false".to_string()),
+        ]),
+        None,
+    )
+    .await?;
+    run_dynamic_oracle_fixture(
+        "literal-shell-syntax",
+        &[("sentinel.txt", "unchanged\n")],
+        &["printf", "%s", "$(printf injected); echo shell"],
+        ".",
+        BTreeMap::new(),
+        Some("$(printf injected); echo shell"),
+    )
+    .await
+}
+
+async fn run_dynamic_oracle_fixture(
+    name: &str,
+    files: &[(&str, &str)],
+    argv: &[&str],
+    cwd: &str,
+    environment: BTreeMap<String, String>,
+    expected_stdout: Option<&str>,
+) -> Result<()> {
+    let repo = tempfile::tempdir().context("oracle fixture repo")?;
+    let state = tempfile::tempdir().context("oracle fixture state")?;
+    let judged_sha = materialize_files_repo(repo.path(), files).await?;
+    let mut profile = RuntimeProfiles::built_in()?.get("codex")?;
+    profile.confinement.oci_mut().image = Some(RUNTIME_IMAGE.to_string());
+    let runner = OciOracleRunner::new(profile);
+    let command = CommandOracle {
+        argv: argv
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect(),
+        cwd: WorkspaceRelativeDir::new(cwd)?,
+        environment,
+        timeout_secs: 120,
+        grants: AuthorityGrants::default(),
+        resources: Default::default(),
+    };
+    let spec_digest = OracleSpec::Command(command.clone()).digest();
+    let mission_id = MissionId::for_creation(
+        &repo.path().to_string_lossy(),
+        &format!("dynamic oracle {name}"),
+        1,
+    );
+    let effect_id = EffectId::for_parts(&["selftest", "dynamic-oracle", name]);
+    let (_control_tx, control) = tokio::sync::watch::channel(ExecutionControl::RunUntil(i64::MAX));
+    let outcome = runner
+        .run(OracleRunRequest {
+            mission_id,
+            effect_id,
+            oracle: OracleName::new(name)?,
+            spec_digest,
+            command,
+            judged_sha,
+            environment_digest: RUNTIME_IMAGE.to_string(),
+            workspace_dir: repo.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            prepared_inputs: Vec::new(),
+            resource_ceilings: Default::default(),
+            deadline_ms: i64::MAX,
+            control,
+        })
+        .await
+        .map_err(|failure| anyhow::anyhow!("{name} oracle infrastructure failure: {failure}"))?;
+    if outcome.exit_code != 0 {
+        anyhow::bail!(
+            "{name} oracle exited {}: {}",
+            outcome.exit_code,
+            String::from_utf8_lossy(&outcome.stderr).trim()
+        );
+    }
+    if let Some(expected) = expected_stdout {
+        let actual = String::from_utf8_lossy(&outcome.stdout);
+        if actual != expected {
+            anyhow::bail!(
+                "{name} oracle evaluated shell syntax: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
     let outcome = advance_through_ready_checkpoints(engine, id).await?;
     let state = engine.load_state(id).await?;
@@ -1039,14 +1239,10 @@ async fn check_replanning() -> Result<()> {
     }
 }
 
-/// (6) Gap review gates closure: a mission type declaring a closing
-/// review does not close on a blocking verdict — it parks for a human, and
-/// only an explicit `accept` (acknowledge) lets it finish, with the
-/// acknowledgment on record. Also: the loader refuses `stop = "attested"`
-/// without the declaration (that bar is *defined* by the review). Pure — no
-/// agent turn, no oracle run — so it always runs.
+/// (6) A blocking gap review is an ordinary proof failure. It offers the
+/// shared retry/repair/revise recovery paths, never acceptance, and repair
+/// reopens the deliverable sink with the review receipt as evidence.
 async fn check_gap_review() -> Result<()> {
-    // Closure gate: blocking verdict → park → acknowledge → done.
     let type_dir = tempfile::tempdir().context("tempdir")?;
     materialize_sw_mission_type(type_dir.path())?;
     let manifest = manifest_toml("selftest").replace(
@@ -1093,46 +1289,55 @@ async fn check_gap_review() -> Result<()> {
     engine.advance(&mission_id).await?;
     let parked = engine.load_state(&mission_id).await?;
     let parked_next = crate::model::next(&parked);
-    if !parked_next.choices.iter().any(|choice| {
-        matches!(
-            choice,
-            Choice::Decide { id, .. } if id == "gap_review_gaps:mission"
-        )
-    }) {
-        anyhow::bail!("park is not the gap-review gaps item");
+    let decision_id = "proof_failed:review:gap-reviewer";
+    let actions: Vec<_> = parked_next
+        .choices
+        .iter()
+        .filter_map(|choice| match choice {
+            Choice::Decide { id, action } if id == decision_id => Some(action.clone()),
+            _ => None,
+        })
+        .collect();
+    let expected = vec![
+        DecisionAction::Retry,
+        DecisionAction::Repair,
+        DecisionAction::Revise,
+    ];
+    if actions != expected {
+        anyhow::bail!("blocking review recovery choices were {actions:?}, expected {expected:?}");
     }
+    let review_effect = parked
+        .role_attempt_receipts
+        .values()
+        .filter_map(|receipt| {
+            let RoleEffectSource::Turn { request, .. } = &receipt.source;
+            (request.role_instance.as_str() == "gap-reviewer" && request.task_id.is_none())
+                .then_some((request.attempt_no, receipt.effect_id.clone()))
+        })
+        .max_by_key(|(attempt_no, _)| *attempt_no)
+        .map(|(_, effect_id)| effect_id)
+        .context("blocking review receipt")?;
 
     engine
         .decide(
             &mission_id,
-            "gap_review_gaps:mission",
-            DecisionAction::Accept,
-            "self-test acknowledges the gap",
+            decision_id,
+            DecisionAction::Repair,
+            "repair the blocking gap",
         )
         .await?;
-    advance_through_ready_checkpoints(&engine, &mission_id).await?;
-    let done = engine.load_state(&mission_id).await?;
-    if !matches!(
-        done.terminal,
-        Some(TerminalState::Done {
-            finish: FinishClass::Verified
-        })
-    ) {
-        anyhow::bail!(
-            "acknowledged mission did not close verified: {:?}",
-            done.terminal
-        );
+    let repaired = engine.load_state(&mission_id).await?;
+    let sink = &repaired.tasks[&TaskId::new("build")?];
+    if sink.status != TaskStatus::Pending
+        || sink.pending_base_sha.as_deref() != Some(repaired.deliverable_head())
+        || !sink
+            .feedback
+            .iter()
+            .any(|feedback| feedback.evidence.role_attempts().contains(&review_effect))
+    {
+        anyhow::bail!("review repair did not reopen the deliverable sink with receipt evidence");
     }
-    match &done.gap_review.accepted {
-        Some(a)
-            if a.kind == ReviewAcceptanceKind::AcknowledgedGaps
-                && a.freshness.judged_sha == base
-                && a.freshness.environment_digest == done.environment_digest() =>
-        {
-            Ok(())
-        }
-        other => anyhow::bail!("acknowledgment not on record at the judged sha: {other:?}"),
-    }
+    Ok(())
 }
 
 /// (4) A read-only role gets complete Git inspection while writes to both the
@@ -1229,6 +1434,7 @@ async fn check_runtime_skill_mount() -> Result<()> {
             workspace: workspace.path().to_path_buf(),
             extras,
         },
+        working_dir: workspace.path().to_path_buf(),
         judged_roots: &judged_roots,
         environment: vec![(
             "HOME".to_string(),

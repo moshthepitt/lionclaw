@@ -8,8 +8,8 @@ use std::sync::{
 
 use async_trait::async_trait;
 use common::{
-    approve_plan, covered_requirement, initialize_repository, proposal, simple_plan,
-    test_mission_type, BASE_SHA, HEAD_SHA,
+    approve_plan, covered_requirement, initialize_repository, proposal,
+    proposal_with_oracle_timeout, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{record_control, record_message, Engine, EngineServices, MessageCommand};
 use lionclaw::model::{
@@ -872,16 +872,7 @@ async fn abort_cancels_an_active_oracle_while_the_driver_drains_its_batch() {
     let store = MissionStore::open(dir.path()).await.unwrap();
     let blocked_started = Arc::new(Notify::new());
     let abort_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut mission_type = test_mission_type();
-    mission_type.edit_for_testing(|definition| {
-        definition.oracles.clear();
-        for name in ["oracle-a", "oracle-b"] {
-            definition.oracles.insert(
-                OracleName::new(name).unwrap(),
-                format!("/nonexistent-mission-type/oracles/{name}").into(),
-            );
-        }
-    });
+    let mission_type = test_mission_type();
     let engine = Arc::new(Engine::new(
         store.clone(),
         mission_type,
@@ -1129,10 +1120,12 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
                 )
                 .await
                 .unwrap();
-            engine
-                .propose_plan(&mission_id, proposal(0, simple_plan()))
-                .await
-                .unwrap();
+            let candidate = if deadline_race {
+                proposal_with_oracle_timeout(0, simple_plan(), 1)
+            } else {
+                proposal(0, simple_plan())
+            };
+            engine.propose_plan(&mission_id, candidate).await.unwrap();
             approve_plan(&engine, &mission_id).await;
 
             let driver = tokio::spawn({
@@ -1447,7 +1440,10 @@ async fn deadline_is_durably_linearized_before_one_adapter_cancellation() {
         .await
         .unwrap();
     engine
-        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .propose_plan(
+            &mission_id,
+            proposal_with_oracle_timeout(0, simple_plan(), 1),
+        )
         .await
         .unwrap();
     approve_plan(&engine, &mission_id).await;
@@ -1523,7 +1519,10 @@ async fn finite_policy_budget_extends_before_the_initial_deadline() {
         .await
         .unwrap();
     engine
-        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .propose_plan(
+            &mission_id,
+            proposal_with_oracle_timeout(0, simple_plan(), 1),
+        )
         .await
         .unwrap();
     approve_plan(&engine, &mission_id).await;

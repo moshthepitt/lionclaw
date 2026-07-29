@@ -42,11 +42,10 @@ binary separately from its skill instructions.
 7. Use `mission decide` only for an exact decision target and action listed in
    `next.choices`.
    Non-revise actions require `--justification`. Required proof failure can
-   never be accepted: a failed-proof target never exposes `accept`. Preserve
-   any listed terminal-review `accept` decision for the human unless the
-   initiating request explicitly delegates that decision. Routine retry,
-   repair, and evidence-led replanning may be driven autonomously when the
-   listed action is supported by the evidence.
+   never be accepted: a failed-proof target never exposes `accept`. A failed or
+   blocking gap review is ordinary required proof and exposes retry, repair, or
+   revise instead. Routine recovery and evidence-led replanning may be driven
+   autonomously when the listed action is supported by the evidence.
    `mission abort --reason <reason>` is independently legal for every
    nonterminal mission and never accepts or verifies work.
 8. A concurrent observer may use `mission status --watch` and can target the
@@ -58,7 +57,8 @@ binary separately from its skill instructions.
 9. When `next.choices` exposes `finish`, run `lionclaw mission finish --reason
    <reason>`. A green mission never finishes automatically. Then read
    `lionclaw mission report` and state clearly what was verified, attested,
-   accepted with review gaps, waived at review, or left unresolved.
+   or left unresolved, including any review evidence that still blocks
+   completion.
 
 Use `lionclaw --help`, subcommand `--help`, or the bundled `lionclaw(1)` manual
 for the command contract. Mission-specific behavior belongs to the selected

@@ -10,7 +10,8 @@ Treat claimed metric improvements as unproven unless the measurement command,
 baseline, and final value are inspectable from the workspace or recorded
 evidence.
 
-For `metric-scalar` oracle-backed assertions, check that the assertion text is
-limited to the pinned scalar condition represented by `metric.txt`,
-`metric.expected`, and `metric.operator`; broader improvement claims require
-reviewer-checkable proof.
+For command-oracle-backed assertions, check that the structured command tests
+the whole assertion against a project-owned measurement source. An exit status
+from a command that only reads a worker-authored claim is not independent
+evidence. Broader improvement or quality claims require reviewer-checkable
+proof.

@@ -8,8 +8,7 @@ use serde::Serialize;
 
 use super::ids::{AssertionId, EffectId, OracleName, RoleInstanceId, TaskId};
 use super::state::{
-    ConversationLifecycle, DeliveryMarker, InflightEffect, MissionState, ReviewOutcome,
-    RoleAttemptReceipt, SettledHandoff, TaskStatus, TerminalState,
+    ConversationLifecycle, DeliveryMarker, InflightEffect, MissionState, TaskStatus, TerminalState,
 };
 use super::verdict::{proof_readiness, FinishClass, ProofFailure, ProofReadiness, ProofSource};
 use crate::prelude::*;
@@ -53,6 +52,7 @@ pub struct RoleDispatchIntent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OracleDispatchIntent {
     pub oracle: OracleName,
+    pub spec_digest: String,
     pub assertion_ids: Vec<AssertionId>,
     pub judged_sha: String,
     pub attempt_no: u32,
@@ -168,12 +168,6 @@ pub fn next(state: &MissionState) -> Next {
     let failures = failure_choices(state);
     if !failures.is_empty() {
         choices.extend(failures);
-        return complete_nonterminal(state, Vec::new(), choices);
-    }
-
-    let review = gap_review_choices(state);
-    if !review.is_empty() {
-        choices.extend(review);
         return complete_nonterminal(state, Vec::new(), choices);
     }
 
@@ -358,7 +352,7 @@ fn proposal_choices(state: &MissionState) -> Vec<Choice> {
 }
 
 fn proposal_awaits_decision(state: &MissionState) -> bool {
-    state.proposal.is_some() && !state.proposal_approved
+    state.proposal.is_some()
 }
 
 pub(crate) fn task_failure_id(task_id: &TaskId) -> String {
@@ -399,6 +393,10 @@ pub(crate) fn proof_failure_id(failure: &ProofFailure) -> String {
                 .map_or_else(|| role_instance.to_string(), ToString::to_string);
             format!("proof_failed:judgment:{role_instance}:{anchor}")
         }
+        ProofFailure::Receipt {
+            source: ProofSource::Review { role_instance },
+            ..
+        } => format!("proof_failed:review:{role_instance}"),
         ProofFailure::StopBar { .. } => "proof_failed:mission".to_string(),
     }
 }
@@ -477,85 +475,12 @@ fn failure_choices(state: &MissionState) -> Vec<Choice> {
     choices
 }
 
-fn gap_review_choices(state: &MissionState) -> Vec<Choice> {
-    let mut choices = Vec::new();
-    if state.config.requires_gap_review {
-        match &state.gap_review.outcome {
-            Some(ReviewOutcome::Failed { effect_id })
-                if state
-                    .role_attempt_receipts
-                    .get(effect_id)
-                    .and_then(RoleAttemptReceipt::failure)
-                    .is_some_and(|failure| !failure.automatically_retryable())
-                    || state.gap_review.consecutive_failures
-                        >= state.config.recovery.max_attempts =>
-            {
-                push_decisions(
-                    &mut choices,
-                    "gap_review_failed:mission".to_string(),
-                    [
-                        super::DecisionAction::Retry,
-                        super::DecisionAction::Revise,
-                        super::DecisionAction::Accept,
-                    ],
-                );
-            }
-            Some(ReviewOutcome::Verdict { effect_id }) => {
-                let blocking = state
-                    .role_attempt_receipts
-                    .get(effect_id)
-                    .and_then(
-                        |receipt| match (&receipt.source, receipt.settled_handoff()) {
-                            (
-                                super::RoleEffectSource::Turn { request, .. },
-                                Some(SettledHandoff::Review { passed, gaps }),
-                            ) if request.is_fresh_at(state) => Some(
-                                !passed
-                                    || gaps
-                                        .iter()
-                                        .any(|gap| gap.severity == super::GapSeverity::Blocking),
-                            ),
-                            _ => None,
-                        },
-                    )
-                    .unwrap_or(false);
-                let work_settled = state
-                    .tasks
-                    .values()
-                    .filter(|task| task.status != TaskStatus::Superseded)
-                    .all(|task| task.status == TaskStatus::Cleared)
-                    && state.inflight.is_empty()
-                    && matches!(proof_readiness(state), ProofReadiness::Satisfied(_));
-                if blocking
-                    && work_settled
-                    && !state
-                        .gap_review
-                        .acknowledges_sha(state, state.deliverable_head())
-                {
-                    push_decisions(
-                        &mut choices,
-                        "gap_review_gaps:mission".to_string(),
-                        [
-                            super::DecisionAction::Retry,
-                            super::DecisionAction::Revise,
-                            super::DecisionAction::Accept,
-                        ],
-                    );
-                }
-            }
-            Some(ReviewOutcome::Failed { .. }) | None => {}
-        }
-    }
-    choices
-}
-
 fn finish_class(state: &MissionState) -> Option<FinishClass> {
     if state.terminal.is_some()
         || state.plan.is_none()
         || !state.inflight.is_empty()
         || !proposal_choices(state).is_empty()
         || !failure_choices(state).is_empty()
-        || gap_review_outstanding(state)
     {
         return None;
     }
@@ -571,46 +496,6 @@ fn finish_class(state: &MissionState) -> Option<FinishClass> {
         ProofReadiness::Satisfied(finish) => Some(finish),
         ProofReadiness::Pending(_) | ProofReadiness::Failed(_) => None,
     }
-}
-
-fn gap_review_outstanding(state: &MissionState) -> bool {
-    if !state.config.requires_gap_review {
-        return false;
-    }
-    if state.gap_review.waived_at(state)
-        || state
-            .gap_review
-            .acknowledges_sha(state, state.deliverable_head())
-    {
-        return false;
-    }
-    let Some(team) = state.team.as_ref() else {
-        return true;
-    };
-    let Some(role_id) = team.gap_review_assignment.as_ref() else {
-        return true;
-    };
-    let Some(ReviewOutcome::Verdict { effect_id }) = &state.gap_review.outcome else {
-        return true;
-    };
-    state
-        .role_attempt_receipts
-        .get(effect_id)
-        .and_then(
-            |receipt| match (&receipt.source, receipt.settled_handoff()) {
-                (
-                    super::RoleEffectSource::Turn { request, .. },
-                    Some(SettledHandoff::Review { passed, gaps }),
-                ) if &request.role_instance == role_id && request.is_fresh_at(state) => Some(
-                    *passed
-                        && gaps
-                            .iter()
-                            .all(|gap| gap.severity != super::GapSeverity::Blocking),
-                ),
-                _ => None,
-            },
-        )
-        != Some(true)
 }
 
 fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
@@ -776,9 +661,9 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
         return intents;
     }
 
-    let Some(team) = state.team.as_ref() else {
+    if state.team.is_none() {
         return intents;
-    };
+    }
     let pending_proof = match proof_readiness(state) {
         ProofReadiness::Pending(sources) => sources,
         ProofReadiness::Failed(_) => return intents,
@@ -787,24 +672,33 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
     let proof_pending = !pending_proof.is_empty();
     let mut reserved_judges = reserved_roles;
     for source in &pending_proof {
-        let ProofSource::Judgment {
-            role_instance,
-            assertion_ids,
-        } = source
-        else {
-            continue;
+        let (role_instance, assertion_ids, body, dispatchable) = match source {
+            ProofSource::Judgment {
+                role_instance,
+                assertion_ids,
+            } => (
+                role_instance,
+                assertion_ids.clone(),
+                "Judge the assigned assertions.".to_string(),
+                state.taskless_assignment_dispatchable(role_instance, assertion_ids),
+            ),
+            ProofSource::Review { role_instance } => (
+                role_instance,
+                Vec::new(),
+                "Review the delivered product against the objective.".to_string(),
+                state.taskless_assignment_dispatchable(role_instance, &[]),
+            ),
+            ProofSource::Command { .. } => continue,
         };
-        if reserved_judges.contains(role_instance)
-            || !state.taskless_assignment_dispatchable(role_instance, assertion_ids)
-        {
+        if reserved_judges.contains(role_instance) || !dispatchable {
             continue;
         }
         if let Some(intent) = role_intent(
             state,
             role_instance,
             None,
-            "Judge the assigned assertions.".to_string(),
-            assertion_ids.clone(),
+            body,
+            assertion_ids,
             state.deliverable_head().to_string(),
             Vec::new(),
         ) {
@@ -838,6 +732,7 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
     for intent in by_oracle.into_iter().filter_map(|(oracle, assertion_ids)| {
         Some(OracleDispatchIntent {
             attempt_no: state.next_oracle_attempt(&oracle)?,
+            spec_digest: state.oracles.get(&oracle)?.digest(),
             oracle,
             assertion_ids,
             judged_sha: state.deliverable_head().to_string(),
@@ -847,36 +742,6 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
     }
     if !intents.is_empty() || proof_pending {
         return intents;
-    }
-
-    if gap_review_outstanding(state) {
-        let retryable = match &state.gap_review.outcome {
-            Some(ReviewOutcome::Failed { effect_id }) => state
-                .role_attempt_receipts
-                .get(effect_id)
-                .and_then(super::RoleAttemptReceipt::failure)
-                .is_some_and(|failure| {
-                    failure.automatically_retryable()
-                        && state.gap_review.consecutive_failures
-                            < state.config.recovery.max_attempts
-                }),
-            Some(ReviewOutcome::Verdict { .. }) | None => true,
-        };
-        if retryable {
-            if let Some(role_id) = &team.gap_review_assignment {
-                if let Some(intent) = role_intent(
-                    state,
-                    role_id,
-                    None,
-                    "Review the delivered product against the objective.".to_string(),
-                    Vec::new(),
-                    state.deliverable_head().to_string(),
-                    Vec::new(),
-                ) {
-                    intents.push(EffectIntent::DispatchRole(intent));
-                }
-            }
-        }
     }
 
     intents

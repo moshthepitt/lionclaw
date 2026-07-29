@@ -23,10 +23,12 @@ mod prelude {
 }
 
 pub mod decision;
+mod digest;
 pub mod event;
 pub mod failure;
 pub mod fold;
 pub mod ids;
+pub mod oracle;
 pub mod plan;
 pub mod plan_validation;
 pub mod state;
@@ -58,6 +60,11 @@ pub use ids::{
     short_hex, AssertionId, EffectId, IdError, InputName, MissionId, OracleName, RequirementId,
     RoleInstanceId, TaskId,
 };
+pub use oracle::{
+    CommandOracle, OracleSpec, OracleSpecError, WorkspaceRelativeDir, MAX_ORACLE_ARGV_BYTES,
+    MAX_ORACLE_ARG_BYTES, MAX_ORACLE_ARG_COUNT, MAX_ORACLE_CWD_BYTES, MAX_ORACLE_ENVIRONMENT_BYTES,
+    MAX_ORACLE_ENVIRONMENT_ENTRIES,
+};
 pub use plan::{
     Assertion, AssertionSupersession, OutputSemantics, Plan, PlanProposal, Requirement,
     RequirementDisposition, RequirementKind, RoleResourceLifetime, Task,
@@ -69,9 +76,8 @@ pub use plan_validation::{
 pub use state::{
     resolve_role_assignment, resolve_task_assignment, AdvisoryStatus, AppliedResult,
     AssertionState, ConversationLifecycle, ConversationState, DecisionEvidence, DeliveryMarker,
-    DurableCancellation, EffectCleanupFailure, FailureFeedback, GapReviewState, InflightEffect,
-    MissionState, ParkedEffect, PlanningInput, PlanningRefinement, QueuedMessage,
-    ReferenceRecipientPolicy, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
+    DurableCancellation, EffectCleanupFailure, FailureFeedback, InflightEffect, MissionState,
+    ParkedEffect, PlanningInput, PlanningRefinement, QueuedMessage, ReferenceRecipientPolicy,
     RoleAssignment, RoleAssignmentContext, RoleAttemptAuthority, RoleAttemptDisposition,
     RoleAttemptEvidenceUse, RoleAttemptGeneration, RoleAttemptReceipt, RoleEffectSource,
     RoleTurnProvenance, SettledHandoff, SupersededAssertion, TaskAttemptOutcome,

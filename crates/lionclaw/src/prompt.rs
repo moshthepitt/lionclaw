@@ -5,8 +5,8 @@
 //! roles see the contract and the artifact, not the worker's story.
 
 use crate::model::{
-    Assertion, ConfinementResources, MissionProposal, OutputSemantics, Plan, RoleInstance,
-    TaskCandidateRef, TeamRevision,
+    Assertion, AuthorityCeilings, ConfinementResources, MissionProposal, OracleName, OracleSpec,
+    OutputSemantics, Plan, RoleInstance, TaskCandidateRef, TeamRevision,
 };
 
 pub struct ExecutionContext<'a> {
@@ -132,8 +132,12 @@ pub struct PlanningPromptContext<'a> {
     pub team: &'a TeamRevision,
     /// Resource ceilings the next team revision must stay within.
     pub resource_ceilings: &'a ConfinementResources,
-    /// The oracles the author may bind assertions to.
-    pub oracle_inventory: &'a [String],
+    /// Authority ceilings shared by proposed roles and command oracles.
+    pub authority_ceilings: &'a AuthorityCeilings,
+    /// The accepted oracle set. A proposal may retain it or replace it
+    /// completely alongside a plan revision.
+    pub current_oracles: &'a std::collections::BTreeMap<OracleName, OracleSpec>,
+    pub max_oracle_timeout_secs: u64,
     pub task_body: &'a str,
     /// Reports supplied to this planning turn by the lead.
     pub upstream_reports: &'a [String],
@@ -208,14 +212,19 @@ fn render_planning(role: &RoleInstance, ctx: &PlanningPromptContext<'_>) -> Stri
         &serde_json::to_string_pretty(ctx.resource_ceilings).expect("resource ceilings serialize"),
     );
     prompt.push_str("\n```\n");
-    if !ctx.oracle_inventory.is_empty() {
-        prompt.push_str("\n\n## Available oracles\n\n");
-        prompt
-            .push_str("Bind an assertion to one of these to make it authoritatively checkable:\n");
-        for oracle in ctx.oracle_inventory {
-            prompt.push_str(&format!("- {oracle}\n"));
-        }
-    }
+    prompt.push_str("\n\n## Current command oracles\n\n");
+    prompt.push_str("Return one complete `oracles` map alongside every plan revision. Preserve a current oracle by reproducing its exact spec. Add or replace checks using structured argv only: the first item is a non-shell executable and every later item is one literal argument. Shell syntax is data and is never evaluated. `cwd` is `.` or a clean workspace-relative directory. Command oracles are read-only proof: they can never request secrets, network, installs, or writes. Inputs, devices, environment, timeouts, and tmpfs resources must stay within the immutable ceilings below.\n\n");
+    prompt.push_str("Current accepted oracle set:\n\n```json\n");
+    prompt.push_str(&serde_json::to_string_pretty(ctx.current_oracles).expect("oracles serialize"));
+    prompt.push_str("\n```\n\nAuthority ceilings:\n\n```json\n");
+    prompt.push_str(
+        &serde_json::to_string_pretty(ctx.authority_ceilings)
+            .expect("authority ceilings serialize"),
+    );
+    prompt.push_str(&format!(
+        "\n```\n\nMaximum oracle timeout: {} seconds.\n",
+        ctx.max_oracle_timeout_secs
+    ));
     if !ctx.task_body.is_empty() {
         prompt.push_str("\n\n## Task\n\n");
         prompt.push_str(ctx.task_body);
@@ -457,13 +466,15 @@ A proposal separates outcomes from proof:
   contribution and real ordering between tasks
 - the complete team revision owns role contracts, task assignments, independent
   judgment panels, and the optional gap-review assignment
+- the complete oracle map owns every repository command used as proof
 
 Rules the engine enforces (an invalid proposal is rejected):
 - assertion ids match ^[A-Z][A-Z0-9-]+$ ; task ids match ^[A-Za-z][A-Za-z0-9_-]*$
 - requirement ids follow the assertion-id format; every assertion covers at
   least one requirement
 - each assertion is covered by exactly one task (via its `targets`)
-- an assertion an oracle can check should bind that oracle by name; under a
+- an assertion an oracle can check should bind a command oracle from the same
+  proposal by name; under a
   `verified` mission type every proof-bearing requirement must be
   `confined_provable` and every named assertion must bind an oracle
 - the DAG is acyclic and every dependency resolves
@@ -472,10 +483,13 @@ Rules the engine enforces (an invalid proposal is rejected):
   independent judgment assignments
 - role instances carry their complete output semantics, runtime, instructions,
   skills, environment, authority grants, and optional deadline
+- command oracles use structured argv with a non-shell executable and clean
+  workspace-relative cwd, stay read-only and secret-free, and remain within the displayed timeout,
+  authority, input, device, and resource ceilings
 
-Use exact role-instance ids and oracle names from the inventories. Preserve
-contracts from the current team unless the mission requires a deliberate
-change. Angle-bracketed values below are placeholders.
+Choose stable oracle names that describe the proof they run. Preserve contracts
+and command specs from the current mission unless the objective requires a
+deliberate change. Angle-bracketed values below are placeholders.
 
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:
    {\"schema\": \"lionclaw.mission.plan-handoff.v2\",
@@ -490,7 +504,8 @@ When you are finished you MUST write /mission/handoff/handoff.json exactly like:
                      \"requirements\": [{\"id\": \"OBJECTIVE-MET\", \"kind\": \"capability\",
                        \"prose\": \"...\", \"disposition\": {\"type\": \"confined_provable\",
                        \"assertion_ids\": [\"OUTCOME-HOLDS\"]}}],
-                     \"assertions\": [{\"id\": \"OUTCOME-HOLDS\", \"prose\": \"...\"}],
+                     \"assertions\": [{\"id\": \"OUTCOME-HOLDS\", \"prose\": \"...\",
+                                      \"oracle\": \"outcome-check\"}],
                      \"tasks\": [{\"id\": \"change\", \"body\": \"...\",
                                  \"targets\": [\"OUTCOME-HOLDS\"],
                                  \"depends_on\": []}]}},
@@ -502,7 +517,12 @@ When you are finished you MUST write /mission/handoff/handoff.json exactly like:
                 \"planning_assignment\": \"<planning-role-id>\",
                 \"task_assignments\": {\"change\": \"<artifact-role-id>\"},
                 \"judgment_assignments\": {\"OUTCOME-HOLDS\": [\"<judge-role-id>\"]},
-                \"gap_review_assignment\": \"<gap-review-role-id>\"}}
+                \"gap_review_assignment\": \"<gap-review-role-id>\"},
+      \"oracles\": {\"outcome-check\": {\"type\": \"command\",
+                  \"argv\": [\"<executable>\", \"<literal-argument>\"],
+                  \"cwd\": \".\", \"environment\": {},
+                  \"timeout_secs\": <seconds-within-the-ceiling>,
+                  \"grants\": {}, \"resources\": {}}}
     },
     \"request_attention\": false}";
 
@@ -579,7 +599,9 @@ mod team_prompt_tests {
                 playbook: None,
                 team: &team,
                 resource_ceilings: &resource_ceilings,
-                oracle_inventory: &[],
+                authority_ceilings: &AuthorityCeilings::default(),
+                current_oracles: &BTreeMap::new(),
+                max_oracle_timeout_secs: 3600,
                 task_body: "plan it",
                 upstream_reports: &[],
                 guidance,
@@ -611,6 +633,9 @@ mod team_prompt_tests {
         assert!(planning.contains("\"tmpfs\": ["));
         assert!(planning.contains("/tmp:rw,size=2g"));
         assert!(planning.contains("\"resources\": {"));
+        assert!(planning.contains("\"oracles\": {\"outcome-check\""));
+        assert!(planning.contains("structured argv"));
+        assert!(planning.contains("Maximum oracle timeout: 3600 seconds"));
         assert!(!planning.contains("\"kind\": \"work\""));
         assert!(!judgment.contains(guidance));
         assert!(!gap_review.contains(guidance));

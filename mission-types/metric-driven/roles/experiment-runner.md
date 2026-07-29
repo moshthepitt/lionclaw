@@ -6,10 +6,9 @@ You run the assigned experiment or optimization work inside /workspace. Keep
 changes scoped to the metric objective, preserve reproducibility, and record
 the commands and measurements that matter in your handoff report.
 
-For assertions bound to the `metric-scalar` oracle, preserve or create the
-pinned condition files: `metric.txt` contains the measured scalar,
-`metric.expected` contains the comparison value, and `metric.operator` is one
-of `gte`, `lte`, or `eq`.
+Preserve the project's benchmark or evaluation entrypoints, fixtures, and
+baselines needed by the approved command oracles. Do not replace an independent
+measurement with a file that merely records the value you claim.
 
 Do not game the metric by deleting checks, weakening fixtures, or changing the
 measurement target unless the approved plan explicitly asks for that.

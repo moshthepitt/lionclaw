@@ -42,11 +42,6 @@ fn software_dev_mission_type_loads() {
     .expect("software-dev mission type loads");
     assert_eq!(mission_type.name, "software-dev");
     assert_eq!(mission_type.stop, StopBar::Verified);
-    assert_eq!(mission_type.environment["CARGO_HOME"], "/scratch/cargo");
-    assert_eq!(
-        mission_type.environment["CARGO_TARGET_DIR"],
-        "/scratch/target"
-    );
     assert!(
         mission_type
             .default_team
@@ -55,20 +50,9 @@ fn software_dev_mission_type_loads() {
             .all(|role| role.runtime == "codex"),
         "bundled roles pin their team-owned runtime"
     );
-    assert!(mission_type
-        .oracles
-        .contains_key(&lionclaw::model::OracleName::new("cargo-test").expect("name")));
     assert_eq!(
         mission_type.resource_ceilings.tmpfs,
         ["/tmp:rw,size=2g".to_string()]
-    );
-    assert_eq!(
-        mission_type
-            .oracle_resources
-            .get(&lionclaw::model::OracleName::new("cargo-test").expect("name"))
-            .expect("cargo-test resource override")
-            .tmpfs,
-        ["/tmp:rw,size=1536m".to_string()]
     );
     let planner = &mission_type.default_team.planning_assignment;
     assert_eq!(planner.as_str(), "strategist");
@@ -87,9 +71,6 @@ fn metric_driven_mission_type_loads() {
     .expect("metric-driven mission type loads");
     assert_eq!(mission_type.name, "metric-driven");
     assert_eq!(mission_type.stop, StopBar::Attested);
-    assert!(mission_type
-        .oracles
-        .contains_key(&lionclaw::model::OracleName::new("metric-scalar").expect("name")));
     assert!(mission_type.ceilings.devices.contains("/dev/dri"));
     let planner = &mission_type.default_team.planning_assignment;
     assert_eq!(planner.as_str(), "metric-planner");
@@ -101,13 +82,9 @@ fn metric_driven_mission_type_loads() {
 }
 
 #[test]
-fn mission_type_loads_role_and_oracle_resource_declarations_within_ceiling() {
+fn mission_type_loads_role_resource_declarations_within_ceiling() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_minimal_bundle(dir.path());
-    std::fs::create_dir(dir.path().join("oracles")).unwrap();
-    let oracle = dir.path().join("oracles/check");
-    std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
-    make_executable(&oracle);
     std::fs::write(
         dir.path().join("mission.toml"),
         r#"[mission-type]
@@ -120,9 +97,6 @@ planning-assignment = "worker"
 
 [resource-ceilings]
 tmpfs = ["/tmp:rw,size=2g"]
-
-[oracle-resources.check]
-tmpfs = ["/tmp:rw,size=1g"]
 "#,
     )
     .unwrap();
@@ -139,14 +113,6 @@ tmpfs = ["/tmp:rw,size=1g"]
         .get(&RoleInstanceId::new("worker").unwrap())
         .expect("worker role");
     assert_eq!(worker.resources.tmpfs, ["/tmp:rw,size=1g".to_string()]);
-    assert_eq!(
-        mission_type
-            .oracle_resources
-            .get(&lionclaw::model::OracleName::new("check").unwrap())
-            .unwrap()
-            .tmpfs,
-        ["/tmp:rw,size=1g".to_string()]
-    );
 }
 
 #[test]
@@ -180,84 +146,6 @@ tmpfs = ["/tmp:rw,size=1g"]
         error.to_string().contains("outside mission ceilings"),
         "got {error:?}"
     );
-}
-
-#[test]
-fn mission_type_rejects_oracle_device_declaration_above_ceiling() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write_minimal_bundle(dir.path());
-    std::fs::create_dir(dir.path().join("oracles")).unwrap();
-    let oracle = dir.path().join("oracles/gpu-check");
-    std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
-    make_executable(&oracle);
-    std::fs::write(
-        dir.path().join("mission.toml"),
-        r#"[mission-type]
-name = "bounded"
-stop = "verified"
-image = "img"
-
-[team]
-planning-assignment = "worker"
-
-[oracle-devices]
-gpu-check = ["/dev/dri"]
-"#,
-    )
-    .unwrap();
-
-    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
-        .expect_err("over-ceiling oracle devices must fail closed");
-    assert!(
-        error.to_string().contains("outside mission ceilings"),
-        "got {error:?}"
-    );
-}
-
-#[test]
-fn mission_type_loads_oracle_device_declaration_within_ceiling() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write_minimal_bundle(dir.path());
-    std::fs::create_dir(dir.path().join("oracles")).unwrap();
-    let oracle = dir.path().join("oracles/gpu-check");
-    std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
-    make_executable(&oracle);
-    std::fs::write(
-        dir.path().join("mission.toml"),
-        r#"[mission-type]
-name = "bounded"
-stop = "verified"
-image = "img"
-
-[team]
-planning-assignment = "worker"
-
-[ceilings]
-devices = ["/dev/dri"]
-
-[oracle-devices]
-gpu-check = ["/dev/dri"]
-"#,
-    )
-    .unwrap();
-
-    let mission_type =
-        load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("mission type loads");
-    assert_eq!(
-        mission_type
-            .oracle_devices
-            .get(&lionclaw::model::OracleName::new("gpu-check").unwrap())
-            .unwrap(),
-        &std::collections::BTreeSet::from(["/dev/dri".to_string()])
-    );
-}
-
-fn make_executable(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = std::fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions).unwrap();
 }
 
 #[test]
@@ -703,7 +591,7 @@ fn a_planning_dag_naming_an_execution_role_fails_to_load() {
 
 // ---- Loader fail-closed guards (each with a failing-first fault injection) ----
 
-fn write_oracle(path: &std::path::Path, contents: &str, executable: bool) {
+fn write_program(path: &std::path::Path, contents: &str, executable: bool) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, contents).unwrap();
     // Set the mode explicitly — `fs::write` preserves an existing file's bits.
@@ -711,10 +599,9 @@ fn write_oracle(path: &std::path::Path, contents: &str, executable: bool) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// A minimal, loadable mission type: one artifact role + one valid oracle.
+/// A minimal, loadable mission type with one planning role.
 fn write_valid_type(root: &std::path::Path) {
     std::fs::create_dir_all(root.join("roles")).unwrap();
-    std::fs::create_dir_all(root.join("oracles")).unwrap();
     std::fs::write(
         root.join("mission.toml"),
         "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"implementer\"\n",
@@ -726,11 +613,6 @@ fn write_valid_type(root: &std::path::Path) {
     )
     .unwrap();
     std::fs::write(root.join("playbook.md"), "# Guarded\n").unwrap();
-    write_oracle(
-        &root.join("oracles/cargo-test"),
-        "#!/bin/sh\nexit 0\n",
-        true,
-    );
 }
 
 fn load_err(root: &std::path::Path) -> MissionTypeError {
@@ -763,7 +645,7 @@ fn an_invalid_execution_policy_refuses_to_load() {
 
 fn add_input_program(root: &std::path::Path, name: &str) {
     std::fs::create_dir_all(root.join("inputs")).unwrap();
-    write_oracle(
+    write_program(
         &root.join("inputs").join(name),
         "#!/bin/sh\ncp /workspace/Cargo.lock /output/Cargo.lock\n",
         true,
@@ -830,9 +712,8 @@ fn loaded_runtime_files_survive_removal_of_the_source_bundle() {
     let mission_type =
         load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("valid bundle");
     let input = &mission_type.inputs[&lionclaw::model::InputName::new("cargo-home").unwrap()];
-    let oracle = &mission_type.oracles[&lionclaw::model::OracleName::new("cargo-test").unwrap()];
     let skill = &mission_type.skills["rust"].root;
-    for path in [&input.program, oracle, skill] {
+    for path in [&input.program, skill] {
         assert!(!path.starts_with(dir.path()));
     }
 
@@ -840,7 +721,6 @@ fn loaded_runtime_files_survive_removal_of_the_source_bundle() {
     assert!(std::fs::read_to_string(&input.program)
         .unwrap()
         .starts_with("#!"));
-    assert!(std::fs::read_to_string(oracle).unwrap().starts_with("#!"));
     assert!(std::fs::read_to_string(skill.join("SKILL.md"))
         .unwrap()
         .contains("Owned source"));
@@ -888,42 +768,6 @@ fn prepared_inputs_require_explicit_authority_and_safe_keys() {
         .unwrap();
         assert!(load_mission_type(dir.path(), &AuthorityCeiling::default()).is_err());
     }
-}
-
-#[test]
-fn a_non_executable_oracle_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    write_valid_type(dir.path());
-    write_oracle(
-        &dir.path().join("oracles/cargo-test"),
-        "#!/bin/sh\nexit 0\n",
-        false,
-    );
-    assert!(
-        matches!(&load_err(dir.path()), MissionTypeError::Oracle { detail, .. } if detail.contains("executable")),
-    );
-}
-
-#[test]
-fn an_oracle_without_a_shebang_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    write_valid_type(dir.path());
-    write_oracle(&dir.path().join("oracles/cargo-test"), "exit 0\n", true);
-    assert!(
-        matches!(&load_err(dir.path()), MissionTypeError::Oracle { detail, .. } if detail.contains("shebang")),
-    );
-}
-
-#[test]
-fn a_symlinked_oracle_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    write_valid_type(dir.path());
-    let oracle = dir.path().join("oracles/cargo-test");
-    std::fs::remove_file(&oracle).unwrap();
-    std::os::unix::fs::symlink("/bin/sh", &oracle).unwrap();
-    assert!(
-        matches!(&load_err(dir.path()), MissionTypeError::Manifest(detail) if detail.contains("symlink")),
-    );
 }
 
 #[test]

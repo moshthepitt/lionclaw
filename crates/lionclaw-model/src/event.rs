@@ -21,9 +21,9 @@ use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailureEvidence};
 
-/// Version 34 records successful cleanup of one exact conversation resource
-/// generation so `next` owns terminal and nonterminal cleanup retries.
-pub const SCHEMA_VERSION: u32 = 34;
+/// Version 35 records mission-local command-oracle specifications and binds
+/// every request and outcome to the canonical digest of the executed spec.
+pub const SCHEMA_VERSION: u32 = 35;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -219,9 +219,10 @@ impl StopBar {
 }
 
 /// The mission type a mission was created against, pinned by content digest.
-/// The digest is verified on every engine open, so the instrument of judgment
-/// (roles, oracles) cannot be swapped after the mission starts. Plain data —
-/// the shell computes the digest (`mission_type::load_mission_type`).
+/// The digest is verified on every engine open, so its method, role defaults,
+/// and immutable authority ceilings cannot be swapped after the mission
+/// starts. Plain data — the shell computes the digest
+/// (`mission_type::load_mission_type`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionTypeRef {
     pub name: String,
@@ -232,16 +233,11 @@ pub struct MissionTypeRef {
 #[serde(deny_unknown_fields)]
 pub struct MissionConfig {
     pub stop: StopBar,
-    pub oracles: BTreeSet<OracleName>,
     pub skills: BTreeMap<String, MissionSkill>,
     #[serde(default)]
     pub ceilings: super::AuthorityCeilings,
     #[serde(default, skip_serializing_if = "super::ConfinementResources::is_empty")]
     pub resource_ceilings: super::ConfinementResources,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub oracle_resources: BTreeMap<OracleName, super::ConfinementResources>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub oracle_devices: BTreeMap<OracleName, BTreeSet<String>>,
     #[serde(default)]
     pub requires_gap_review: bool,
     #[serde(default)]
@@ -254,12 +250,9 @@ impl Default for MissionConfig {
     fn default() -> Self {
         Self {
             stop: StopBar::Verified,
-            oracles: BTreeSet::new(),
             skills: BTreeMap::new(),
             ceilings: super::AuthorityCeilings::default(),
             resource_ceilings: super::ConfinementResources::default(),
-            oracle_resources: BTreeMap::new(),
-            oracle_devices: BTreeMap::new(),
             requires_gap_review: false,
             recovery: RecoveryConfig::default(),
             execution: ExecutionPolicy::default(),
@@ -374,7 +367,7 @@ pub enum Handoff {
     },
     /// The engine-owned gap review's contract-blind product verdict.
     /// Separate from `Validate` so per-assertion items and objective-level
-    /// gaps cannot be accepted on the wrong path and silently discarded.
+    /// gaps cannot cross proof paths and silently lose their meaning.
     Review {
         done: bool,
         report: PayloadRef,
@@ -589,6 +582,8 @@ pub struct MissionProposal {
     pub plan: Option<PlanProposal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<super::TeamRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracles: Option<BTreeMap<OracleName, super::OracleSpec>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -698,6 +693,7 @@ pub enum MissionEvent {
     OracleRunRequested {
         assertion_ids: Vec<AssertionId>,
         oracle: OracleName,
+        spec_digest: String,
         judged_sha: String,
         /// Resolved immutable environment digest at dispatch time.
         environment_digest: String,
@@ -709,6 +705,7 @@ pub enum MissionEvent {
     OracleRunCompleted {
         assertion_ids: Vec<AssertionId>,
         oracle: OracleName,
+        spec_digest: String,
         judged_sha: String,
         attempt_no: u32,
         effect_id: super::EffectId,
@@ -756,6 +753,10 @@ pub enum MissionEvent {
         /// Covered requirements explicitly changed by plan approval.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         requirement_changes: Vec<super::RequirementId>,
+        /// Runtime identities resolved by the engine for an atomically accepted
+        /// proposed team. Empty for every other decision.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        proposal_runtime_identities: BTreeMap<RoleInstanceId, RuntimeInstrumentIdentity>,
     },
 }
 

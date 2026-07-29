@@ -64,6 +64,11 @@ pub enum MoatViolation {
     SecretsForJudge { role: String },
     #[error("mount target '{target}' shadows a reserved mission target")]
     ReservedTargetShadowed { target: String },
+    #[error("working directory '{working_dir}' is outside workspace '{workspace}'")]
+    WorkingDirectoryOutsideWorkspace {
+        working_dir: PathBuf,
+        workspace: PathBuf,
+    },
     #[error("invalid tmpfs entry '{entry}': {detail}")]
     InvalidTmpfs { entry: String, detail: String },
     #[error("resource override for '{role}' is invalid: {detail}")]
@@ -226,6 +231,8 @@ pub struct RolePlanRequest<'a> {
     pub runtime_id: String,
     pub confinement: ConfinementConfig,
     pub mounts: MissionMounts,
+    /// Host path projected into the workspace mount as the process cwd.
+    pub working_dir: PathBuf,
     /// Canonical roots of the tree(s) any verdict from this node is about.
     pub judged_roots: &'a [PathBuf],
     pub environment: Vec<(String, String)>,
@@ -250,6 +257,14 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
     let authority = request.authority;
     let role = authority.role_name.clone();
     let mut confinement = request.confinement;
+    let workspace_source = canonical_or_lexical(&request.mounts.workspace);
+    let working_dir = canonical_or_lexical(&request.working_dir);
+    if !working_dir.starts_with(&workspace_source) {
+        return Err(MoatViolation::WorkingDirectoryOutsideWorkspace {
+            working_dir,
+            workspace: workspace_source,
+        });
+    }
 
     apply_resource_overrides(
         &mut confinement,
@@ -358,7 +373,7 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
             WorkspaceAccess::ReadWrite => MountAccess::ReadWrite,
         },
     };
-    let working_dir = workspace.source.to_string_lossy().into_owned();
+    let working_dir = working_dir.to_string_lossy().into_owned();
     let mut mounts = vec![workspace];
     mounts.extend(request.mounts.extras);
     mounts.extend(confinement.oci().additional_mounts.clone());
@@ -515,6 +530,7 @@ mod team_authority_tests {
                 workspace: "/tmp/work".into(),
                 extras: Vec::new(),
             },
+            working_dir: "/tmp/work".into(),
             judged_roots: &["/tmp/work".into()],
             environment: Vec::new(),
             resources: ConfinementResources::default(),
@@ -541,6 +557,7 @@ mod team_authority_tests {
                 workspace: "/tmp/work".into(),
                 extras: Vec::new(),
             },
+            working_dir: "/tmp/work".into(),
             judged_roots: &["/tmp/work".into()],
             environment: Vec::new(),
             resources: ConfinementResources::default(),
@@ -600,6 +617,7 @@ mod team_authority_tests {
                 workspace: "/tmp/work".into(),
                 extras: Vec::new(),
             },
+            working_dir: "/tmp/work".into(),
             judged_roots: &["/tmp/work".into()],
             environment: Vec::new(),
             resources: ConfinementResources {
@@ -630,6 +648,7 @@ mod team_authority_tests {
                 workspace: "/tmp/work".into(),
                 extras: Vec::new(),
             },
+            working_dir: "/tmp/work".into(),
             judged_roots: &["/tmp/work".into()],
             environment: Vec::new(),
             resources: ConfinementResources::default(),
@@ -658,6 +677,7 @@ mod team_authority_tests {
                 workspace: "/tmp/work".into(),
                 extras: Vec::new(),
             },
+            working_dir: "/tmp/work".into(),
             judged_roots: &["/tmp/work".into()],
             environment: Vec::new(),
             resources: ConfinementResources {
@@ -685,6 +705,7 @@ mod team_authority_tests {
                 workspace: "/tmp/work".into(),
                 extras: Vec::new(),
             },
+            working_dir: "/tmp/work".into(),
             judged_roots: &["/tmp/work".into()],
             environment: Vec::new(),
             resources: ConfinementResources {
@@ -712,6 +733,7 @@ mod team_authority_tests {
                 workspace: "/tmp/work".into(),
                 extras: Vec::new(),
             },
+            working_dir: "/tmp/work".into(),
             judged_roots: &["/tmp/work".into()],
             environment: Vec::new(),
             resources: ConfinementResources {

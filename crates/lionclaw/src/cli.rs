@@ -351,7 +351,7 @@ pub struct MissionSkillAddArgs {
 pub enum TypeCommand {
     /// List installed mission types.
     List(TypeListArgs),
-    /// Show one mission type (roles, oracles, stop bar, playbook).
+    /// Show one mission type (roles, stop bar, playbook).
     Show(TypeShowArgs),
     /// Validate a mission type directory (loader + moat) without installing it.
     Check(TypeCheckArgs),
@@ -498,7 +498,7 @@ pub struct PlanProposeArgs {
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
     pub repo: Option<PathBuf>,
-    /// Proposal JSON ({ "base_revision": N, "plan": {...} }); `-` reads stdin.
+    /// Complete mission proposal JSON (plan, team, and optional oracle map); `-` reads stdin.
     #[arg(long = "file")]
     pub file: PathBuf,
 }
@@ -1771,6 +1771,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             Some(serde_json::json!({
                 "effect_id": effect_id,
                 "oracle": v.oracle().as_str(),
+                "spec_digest": v.spec_digest(),
                 "passed": v.passed(),
                 "exit_code": v.exit_code(),
                 "exit_signal": v.exit_signal(),
@@ -1845,6 +1846,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "image_id": state.image_id,
                 "environment": environment_json(state),
                 "team": state.team,
+                "oracles": oracle_specs_json(state),
                 "stop_bar": state.config.stop.slug(),
                 "base_sha": state.base_sha,
                 "current_sha": state.deliverable_head(),
@@ -2802,38 +2804,7 @@ async fn cmd_advance(
     reconcile_disposable_conversation_resources_if_idle(&store, &mission_id).await?;
     let engine = build_engine_for_mission(store, &repo, &mission_id, transports).await?;
     let view = load_mission_view(engine.store(), &mission_id).await?;
-    let state = &view.state;
     print_mission_view(&view, engine.store(), args.json).await?;
-    // Closing over acknowledged review gaps (or a waived review) was an
-    // explicit, justified human decision — exit SUCCESS, but say so. The
-    // summary already applies the freshness law, so a stale verdict from a
-    // superseded head never triggers a false note here.
-    if matches!(state.terminal, Some(TerminalState::Done { .. })) {
-        let summary = review_summary(state, engine.store().blobs());
-        let blocking = summary["gaps"]["blocking"].as_u64().unwrap_or(0);
-        let total = blocking
-            + summary["gaps"]["major"].as_u64().unwrap_or(0)
-            + summary["gaps"]["minor"].as_u64().unwrap_or(0);
-        if summary["verdict"] == serde_json::json!("gaps")
-            && summary["acknowledged"].as_bool() == Some(true)
-        {
-            // Zero blocking gaps under a "gaps" verdict = the reviewer's
-            // fail bit; the note must never read as "0 gaps waved through".
-            if blocking == 0 {
-                eprintln!(
-                    "note: closed over a review that FAILED the product \
-                     ({total} gap(s) recorded), acknowledged by a human; see 'mission report'"
-                );
-            } else {
-                eprintln!(
-                    "note: closed with {blocking} blocking gap(s) acknowledged by a human \
-                     ({total} recorded in total); see 'mission report'"
-                );
-            }
-        } else if summary["verdict"] == serde_json::json!("waived") {
-            eprintln!("note: closed with the gap review waived; see 'mission report'");
-        }
-    }
     Ok(std::process::ExitCode::SUCCESS)
 }
 
@@ -3330,12 +3301,9 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
                         "environment": input.environment,
                     })
                 }).collect::<Vec<_>>(),
-                "oracles": mt.oracles.keys().map(|o| o.as_str()).collect::<Vec<_>>(),
                 "team": mt.default_team,
                 "ceilings": mt.ceilings,
                 "resource_ceilings": mt.resource_ceilings,
-                "oracle_resources": mt.oracle_resources,
-                "oracle_devices": mt.oracle_devices,
                 "playbook": mt.playbook,
             })
         );
@@ -3380,34 +3348,11 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!(
-        "  oracles: {}",
-        mt.oracles
-            .keys()
-            .map(|o| o.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
     if !mt.resource_ceilings.tmpfs.is_empty() {
         println!(
             "  tmpfs ceilings: {}",
             mt.resource_ceilings.tmpfs.join(", ")
         );
-    }
-    if !mt.oracle_resources.is_empty() {
-        println!("  oracle resources:");
-        for (oracle, resources) in &mt.oracle_resources {
-            println!("    {oracle}: tmpfs={}", resources.tmpfs.join(","));
-        }
-    }
-    if !mt.oracle_devices.is_empty() {
-        println!("  oracle devices:");
-        for (oracle, devices) in &mt.oracle_devices {
-            println!(
-                "    {oracle}: {}",
-                devices.iter().cloned().collect::<Vec<_>>().join(",")
-            );
-        }
     }
     if let Some(playbook) = &mt.playbook {
         println!("\n--- playbook ---\n{playbook}");
@@ -3590,6 +3535,24 @@ fn environment_json(state: &crate::model::MissionState) -> serde_json::Value {
     })
 }
 
+fn oracle_specs_json(state: &crate::model::MissionState) -> serde_json::Value {
+    serde_json::Value::Object(
+        state
+            .oracles
+            .iter()
+            .map(|(name, spec)| {
+                (
+                    name.to_string(),
+                    serde_json::json!({
+                        "spec_digest": spec.digest(),
+                        "spec": spec,
+                    }),
+                )
+            })
+            .collect(),
+    )
+}
+
 fn print_environment(state: &crate::model::MissionState, indent: &str) {
     println!("{indent}environment: {}", state.image_id);
     if let Some(active) = state.environment_history.last() {
@@ -3621,6 +3584,7 @@ fn active_effects_json(state: &crate::model::MissionState) -> Vec<serde_json::Va
             }),
             crate::model::InflightEffect::OracleRun {
                 oracle,
+                spec_digest,
                 assertion_ids,
                 deadline_ms,
                 ..
@@ -3628,6 +3592,7 @@ fn active_effects_json(state: &crate::model::MissionState) -> Vec<serde_json::Va
                 "effect_id": effect_id.as_str(),
                 "kind": "oracle_run",
                 "oracle": oracle.as_str(),
+                "spec_digest": spec_digest,
                 "assertion_ids": assertion_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
                 "deadline_ms": deadline_ms,
             }),
@@ -3649,6 +3614,7 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         "revision": state.revision,
         "team_revision": state.team.as_ref().map(|team| team.revision),
         "environment": environment_json(state),
+        "oracles": oracle_specs_json(state),
         "current_sha": state.deliverable_head(),
         "deliverable_head": state.deliverable_head(),
         "objective": state.objective,
@@ -3664,7 +3630,9 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
             )
         }).collect::<Result<Vec<_>>>()?,
         "planning_input": planning_input_json(state, blobs)?,
+        "active_effects": active_effects_json(state),
         "contract": state.contract.iter().map(|(id, assertion)| {
+            let authoritative = state.authoritative_verdict(assertion);
             serde_json::json!({
                 "id": id.as_str(),
                 "advisory": state.advisory_status(id).slug(),
@@ -3675,9 +3643,10 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
                     blobs,
                     true,
                 ),
-                "authoritative_pass": state
-                    .authoritative_verdict(assertion)
+                "authoritative_pass": authoritative
                     .map(crate::model::AuthoritativeVerdict::passed),
+                "authoritative_spec_digest": authoritative
+                    .map(crate::model::AuthoritativeVerdict::spec_digest),
             })
         }).collect::<Vec<_>>(),
         "superseded_assertions": superseded_assertions_json(state, blobs),
@@ -4203,18 +4172,14 @@ fn print_non_task_failures(blobs: &BlobStore, state: &crate::model::MissionState
     for (oracle, failure) in &state.oracle_failures {
         print_typed_failure(failure, &format!("  oracle {oracle} failure: "));
     }
-    if let Some(crate::model::ReviewOutcome::Failed { effect_id }) = &state.gap_review.outcome {
-        if let Some(receipt) = state.role_attempt_receipts.get(effect_id) {
-            if let Some(failure) = receipt.failure() {
-                print_typed_failure(failure, "  gap review failure: ");
-            }
+    if let Some(receipt) = latest_gap_review_receipt(state) {
+        if let Some(failure) = receipt.failure() {
+            print_typed_failure(failure, "  gap review failure: ");
             println!("  gap review receipt:");
             for line in crate::evidence::render_role_attempt_receipt(blobs, state, receipt).lines()
             {
                 println!("    {line}");
             }
-        } else {
-            println!("  gap review failure receipt unavailable: {effect_id}");
         }
     }
 }
@@ -4223,30 +4188,30 @@ fn gap_review_receipt_json(
     state: &crate::model::MissionState,
     blobs: &BlobStore,
 ) -> serde_json::Value {
-    state
-        .gap_review
-        .outcome
-        .as_ref()
-        .map_or(serde_json::Value::Null, |outcome| {
-            crate::evidence::role_attempt_reference_json(blobs, state, outcome.effect_id())
-        })
+    latest_gap_review_receipt(state).map_or(serde_json::Value::Null, |receipt| {
+        crate::evidence::role_attempt_reference_json(blobs, state, &receipt.effect_id)
+    })
 }
 
 fn print_gap_review_receipt(blobs: &BlobStore, state: &crate::model::MissionState, indent: &str) {
-    if let Some(outcome) = state.gap_review.outcome.as_ref() {
+    if let Some(receipt) = latest_gap_review_receipt(state) {
         println!("{indent}gap review receipt:");
         for line in
-            crate::evidence::render_role_attempt_reference(blobs, state, outcome.effect_id())
-                .lines()
+            crate::evidence::render_role_attempt_reference(blobs, state, &receipt.effect_id).lines()
         {
             println!("{indent}  {line}");
         }
     }
 }
 
-/// The gap-review summary — ONE source of truth behind the advance
-/// banner, `status`, `report`, and every `--json` output. `Null` when the
-/// mission declares no review.
+fn latest_gap_review_receipt(
+    state: &crate::model::MissionState,
+) -> Option<&crate::model::RoleAttemptReceipt> {
+    let team = state.team.as_ref()?;
+    let role_instance = team.gap_review_assignment.as_ref()?;
+    state.latest_taskless_assignment_receipt(role_instance, &[])
+}
+
 fn gap_review_verdict(
     state: &crate::model::MissionState,
 ) -> Option<(
@@ -4256,11 +4221,7 @@ fn gap_review_verdict(
     bool,
     &[crate::model::Gap],
 )> {
-    let crate::model::ReviewOutcome::Verdict { effect_id } = state.gap_review.outcome.as_ref()?
-    else {
-        return None;
-    };
-    let receipt = state.role_attempt_receipts.get(effect_id)?;
+    let receipt = latest_gap_review_receipt(state)?;
     let crate::model::RoleEffectSource::Turn { request, .. } = &receipt.source;
     let role = state
         .team_history
@@ -4275,20 +4236,17 @@ fn gap_review_verdict(
     Some((
         receipt,
         request.base_sha.as_str(),
-        request.is_fresh_at(state),
+        state.role_attempt_is_fresh(receipt),
         *passed,
         gaps,
     ))
 }
 
 fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serde_json::Value {
-    use crate::model::{GapSeverity, ReviewOutcome};
+    use crate::model::GapSeverity;
     if !state.config.requires_gap_review {
         return serde_json::Value::Null;
     }
-    let tr = &state.gap_review;
-    // A terminal mission owes nothing: a successful finish requires a settled
-    // review, while an abort ends every remaining obligation.
     let done = state.is_terminal();
     let proof_failed = crate::model::next(state).choices.iter().any(|choice| {
         matches!(
@@ -4297,16 +4255,23 @@ fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serd
                 if id.starts_with("oracle_failed:") || id.starts_with("proof_failed:")
         )
     });
-    let waived = tr.waived_at(state);
-    let (verdict, judged_sha, fresh, counts, acknowledged) =
-        if let Some((_, judged_sha, is_fresh, passed, gaps)) = gap_review_verdict(state) {
+    let latest = latest_gap_review_receipt(state);
+    let attempts = latest.map_or(0, |receipt| {
+        let crate::model::RoleEffectSource::Turn { request, .. } = &receipt.source;
+        request.attempt_no
+    });
+    let (verdict, judged_sha, fresh, counts) =
+        if let Some((receipt, judged_sha, is_fresh, passed, gaps)) = gap_review_verdict(state) {
             let count =
                 |severity: GapSeverity| gaps.iter().filter(|gap| gap.severity == severity).count();
             let blocking = !passed || gaps.iter().any(|gap| gap.severity == GapSeverity::Blocking);
+            let active = state.parked_effects.contains_key(&receipt.effect_id);
             let kind = if !is_fresh && done {
                 "skipped"
-            } else if blocking {
+            } else if blocking && active {
                 "gaps"
+            } else if blocking || !is_fresh {
+                "owed"
             } else {
                 "clean"
             };
@@ -4319,16 +4284,17 @@ fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serd
                     "major": count(GapSeverity::Major),
                     "minor": count(GapSeverity::Minor),
                 })),
-                tr.acknowledges_sha(state, judged_sha),
             )
         } else {
-            match &tr.outcome {
-                Some(ReviewOutcome::Verdict { .. }) | Some(ReviewOutcome::Failed { .. }) => {
-                    ("failed", None, None, None, false)
+            match latest {
+                Some(receipt)
+                    if receipt.failure().is_some()
+                        && state.parked_effects.contains_key(&receipt.effect_id) =>
+                {
+                    ("failed", None, None, None)
                 }
-                None if waived => ("waived", None, None, None, false),
-                None if done || proof_failed => ("skipped", None, None, None, false),
-                None => ("owed", None, None, None, false),
+                _ if done || proof_failed => ("skipped", None, None, None),
+                _ => ("owed", None, None, None),
             }
         };
     serde_json::json!({
@@ -4339,15 +4305,12 @@ fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serd
         "judged_sha": judged_sha,
         "fresh": fresh,
         "gaps": counts,
-        "acknowledged": acknowledged,
-        "waived": waived,
-        "attempts": tr.attempts,
-        "failure_receipt": match &tr.outcome {
-            Some(ReviewOutcome::Failed { effect_id }) => {
-                crate::evidence::role_attempt_reference_json(blobs, state, effect_id)
-            }
-            _ => serde_json::Value::Null,
-        },
+        "attempts": attempts,
+        "failure_receipt": latest
+            .filter(|receipt| receipt.failure().is_some())
+            .map_or(serde_json::Value::Null, |receipt| {
+                crate::evidence::role_attempt_reference_json(blobs, state, &receipt.effect_id)
+            }),
     })
 }
 
@@ -4363,18 +4326,13 @@ fn review_line(state: &crate::model::MissionState, blobs: &BlobStore) -> Option<
         .map(short_hex)
         .unwrap_or_default();
     let stale = if summary["fresh"] == serde_json::json!(false) {
-        " [STALE - not at the current commit/environment]"
+        " [STALE - not at the current mission shape]"
     } else {
         ""
     };
     let blocking = summary["gaps"]["blocking"].as_u64().unwrap_or(0);
     let major = summary["gaps"]["major"].as_u64().unwrap_or(0);
     let minor = summary["gaps"]["minor"].as_u64().unwrap_or(0);
-    let acknowledged = if summary["acknowledged"].as_bool().unwrap_or(false) {
-        " — acknowledged by a human"
-    } else {
-        ""
-    };
     Some(match summary["verdict"].as_str().unwrap_or("owed") {
         "clean" => format!("review: clean (judged {sha}){stale}"),
         // A "gaps" verdict without a single blocking gap means the park came
@@ -4382,18 +4340,17 @@ fn review_line(state: &crate::model::MissionState, blobs: &BlobStore) -> Option<
         // on a parked mission.
         "gaps" if blocking == 0 => format!(
             "review: FAILED the product ({} gap(s) recorded) — see its report \
-             (judged {sha}){stale}{acknowledged}",
+             (judged {sha}){stale}",
             major + minor,
         ),
         "gaps" => format!(
             "review: {blocking} blocking, {major} major, {minor} minor gap(s) \
-             (judged {sha}){stale}{acknowledged}",
+             (judged {sha}){stale}",
         ),
         "failed" if state.is_terminal() => {
             "review: FAILED to run before the mission ended".to_string()
         }
-        "failed" => "review: FAILED to run — retry, accept, or abort".to_string(),
-        "waived" => "review: WAIVED after a failure — no verdict was recorded".to_string(),
+        "failed" => "review: FAILED to run — retry, repair, revise, or abort".to_string(),
         "skipped" if matches!(state.terminal, Some(TerminalState::Aborted { .. })) => {
             "review: none — the mission was aborted before a review settled".to_string()
         }

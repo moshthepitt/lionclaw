@@ -17,9 +17,9 @@ use common::{
 use lionclaw::engine::MissionView;
 use lionclaw::model::{
     BlobRef, Choice, DecisionAction, EffectId, EnvironmentPreflight, FinishClass, Gap, GapSeverity,
-    Handoff, MissionEvent, MissionState, OutputSemantics, PayloadRef, ReviewAcceptanceKind,
-    RoleAttemptReceipt, RoleEffectSource, RolePromptTemplate, RoleResourceLifetime, SettledHandoff,
-    Task, WorkspacePreparation,
+    Handoff, MissionEvent, MissionState, OutputSemantics, PayloadRef, RoleAttemptReceipt,
+    RoleEffectSource, RolePromptTemplate, RoleResourceLifetime, SettledHandoff, Task,
+    WorkspacePreparation,
 };
 use lionclaw::ports::{CapturedArtifact, RoleTurnOutcome, RoleTurnRequest};
 use lionclaw::testing::{review_verdict, MockOracleRunner, MockRoleRunner};
@@ -55,8 +55,24 @@ fn assert_terminal(view: &MissionView) {
 }
 
 fn gap_review_receipt(state: &MissionState) -> &RoleAttemptReceipt {
+    let team = state.team.as_ref().expect("active team");
+    let role_instance = team
+        .gap_review_assignment
+        .as_ref()
+        .expect("assigned gap reviewer");
     state
-        .gap_review_receipt()
+        .role_attempt_receipts
+        .values()
+        .filter_map(|receipt| {
+            let RoleEffectSource::Turn { request, .. } = &receipt.source;
+            (request.role_instance == *role_instance
+                && request.team_revision == team.revision
+                && request.task_id.is_none()
+                && request.assertion_ids.is_empty())
+            .then_some((request.attempt_no, receipt))
+        })
+        .max_by_key(|(attempt_no, _)| *attempt_no)
+        .map(|(_, receipt)| receipt)
         .expect("fold-authoritative gap-review receipt")
 }
 
@@ -142,12 +158,12 @@ async fn reopen_failed_review(h: &common::TestHarness, mission_id: &lionclaw::mo
     let parked = h.engine.advance(mission_id).await.expect("initial advance");
     assert!(common::has_decision(
         &parked.state,
-        "gap_review_failed:mission"
+        "proof_failed:review:gap-reviewer"
     ));
     h.engine
         .decide(
             mission_id,
-            "gap_review_failed:mission",
+            "proof_failed:review:gap-reviewer",
             DecisionAction::Retry,
             "retry after the failed review",
         )
@@ -460,7 +476,7 @@ async fn gap_review_uses_the_shared_role_output_boundary() {
         let view = h.engine.advance(&mission_id).await.expect("advance");
         assert!(common::has_decision(
             &view.state,
-            "gap_review_failed:mission"
+            "proof_failed:review:gap-reviewer"
         ));
         let failure = gap_review_failure(&view.state);
         assert_eq!(failure.evidence().code.as_deref(), Some(expected_code));
@@ -566,44 +582,38 @@ async fn gap_review_receives_its_declared_skill_packages() {
 }
 
 #[tokio::test]
-async fn blocking_gaps_park_then_accept_closes_with_acknowledged_gaps() {
+async fn blocking_gaps_offer_retry_repair_revise_but_never_accept() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (h, mission_id) = started(&dir, review_runner(vec![(false, vec![blocking_gap()])])).await;
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
     assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0], "gap_review_gaps:mission");
-
-    h.engine
-        .decide(
-            &mission_id,
-            "gap_review_gaps:mission",
-            DecisionAction::Accept,
-            "gap is acceptable for this release",
-        )
-        .await
-        .expect("decide");
-    let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
-    assert_terminal(&outcome);
-    let state = h.engine.load_state(&mission_id).await.expect("state");
-    let accepted = state
-        .gap_review
-        .accepted
-        .as_ref()
-        .expect("acceptance recorded");
-    assert_eq!(accepted.kind, ReviewAcceptanceKind::AcknowledgedGaps);
-    assert_eq!(accepted.freshness.judged_sha, HEAD_SHA);
+    let decision_id = "proof_failed:review:gap-reviewer";
+    assert_eq!(attention[0], decision_id);
+    let actions = outcome
+        .next
+        .choices
+        .iter()
+        .filter_map(|choice| match choice {
+            Choice::Decide { id, action } if id == decision_id => Some(action.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        accepted.freshness.environment_digest,
-        state.environment_digest()
+        actions,
+        vec![
+            DecisionAction::Retry,
+            DecisionAction::Repair,
+            DecisionAction::Revise,
+        ]
     );
-    // The receipt preserves the exact reason without claiming a caller actor.
-    assert_eq!(accepted.justification, "gap is acceptable for this release");
+    assert!(!actions.contains(&DecisionAction::Accept));
+    assert_eq!(common::finish_choice(&outcome.state), None);
 }
 
 #[tokio::test]
-async fn accepted_blocking_gap_review_reopens_after_environment_change() {
+async fn retried_blocking_review_reopens_after_environment_change() {
     let dir = tempfile::tempdir().expect("tempdir");
     let image_b = format!("sha256:{}", digest('b'));
     let (h, mission_id) = started(
@@ -618,54 +628,36 @@ async fn accepted_blocking_gap_review_reopens_after_environment_change() {
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
     assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0], "gap_review_gaps:mission");
+    assert_eq!(attention[0], "proof_failed:review:gap-reviewer");
     let image_a = outcome.state.environment_digest().to_string();
+    let (first_receipt, _, _, _) = gap_review_verdict(&outcome.state);
+    let RoleEffectSource::Turn { request, .. } = &first_receipt.source;
+    assert_eq!(request.environment_digest, image_a);
 
     h.engine
         .decide(
             &mission_id,
-            "gap_review_gaps:mission",
-            DecisionAction::Accept,
-            "gap accepted only for image A",
+            "proof_failed:review:gap-reviewer",
+            DecisionAction::Retry,
+            "retry under the next environment",
         )
         .await
-        .expect("accept gaps under image A");
-    let accepted = h.engine.load_state(&mission_id).await.expect("accepted");
-    let acceptance = accepted
-        .gap_review
-        .accepted
-        .as_ref()
-        .expect("acceptance recorded");
-    assert_eq!(acceptance.kind, ReviewAcceptanceKind::AcknowledgedGaps);
-    assert_eq!(acceptance.freshness.judged_sha, HEAD_SHA);
-    assert_eq!(acceptance.freshness.environment_digest, image_a);
-    assert!(acceptance.is_fresh_at(&accepted));
-    assert_eq!(
-        common::finish_choice(&accepted),
-        Some(FinishClass::Verified)
-    );
+        .expect("retry gaps");
+    let retried = h.engine.load_state(&mission_id).await.expect("retried");
 
     fault_append_events(
         dir.path(),
         &mission_id,
-        accepted.head,
+        retried.head,
         &[lionclaw::store::NewEvent::new(environment_event(
             &image_b,
-            accepted.team.as_ref().map(|team| team.revision),
+            retried.team.as_ref().map(|team| team.revision),
         ))],
         10,
     )
     .await;
     let stale = h.engine.load_state(&mission_id).await.expect("stale");
-    let stale_acceptance = stale
-        .gap_review
-        .accepted
-        .as_ref()
-        .expect("historical acceptance remains inspectable");
     assert_eq!(stale.environment_digest(), image_b);
-    assert_eq!(stale_acceptance.freshness.environment_digest, image_a);
-    assert!(!stale_acceptance.is_fresh_at(&stale));
-    assert!(stale.gap_review.fresh_acceptance(&stale).is_none());
     assert_eq!(common::finish_choice(&stale), None);
 
     let reopened = h
@@ -675,7 +667,7 @@ async fn accepted_blocking_gap_review_reopens_after_environment_change() {
         .expect("re-open gap review");
     let attention = parked(&reopened);
     assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0], "gap_review_gaps:mission");
+    assert_eq!(attention[0], "proof_failed:review:gap-reviewer");
     assert_eq!(
         review_calls(&h, &mission_id).await.len(),
         2,
@@ -696,7 +688,7 @@ async fn revising_terminal_gaps_carries_the_review_report_into_planning() {
     h.engine
         .decide(
             &mission_id,
-            "gap_review_gaps:mission",
+            "proof_failed:review:gap-reviewer",
             DecisionAction::Revise,
             "repair the observed behavior",
         )
@@ -764,9 +756,10 @@ async fn a_revision_resumes_work_and_re_reviews_at_the_new_head() {
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     assert!(common::has_decision(
         &outcome.state,
-        "gap_review_gaps:mission"
+        "proof_failed:review:gap-reviewer"
     ));
     let first_head = outcome.state.current_sha.clone();
+    let first_review = gap_review_receipt(&outcome.state).effect_id.clone();
 
     // Remediation is a complete next plan; the park auto-clears.
     let mut next = simple_plan();
@@ -781,6 +774,15 @@ async fn a_revision_resumes_work_and_re_reviews_at_the_new_head() {
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
+    let revised = h.engine.load_state(&mission_id).await.expect("revised");
+    assert_eq!(
+        revised.current_sha, first_head,
+        "plan promotion itself does not change the judged artifact"
+    );
+    assert!(
+        !revised.role_attempt_is_fresh(&revised.role_attempt_receipts[&first_review]),
+        "a prior review is stale under the next plan revision even at the same artifact"
+    );
     let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
     assert_terminal(&outcome);
 
@@ -827,12 +829,12 @@ async fn a_failed_review_parks_then_retry_re_rolls() {
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
-    assert_eq!(attention[0], "gap_review_failed:mission");
+    assert_eq!(attention[0], "proof_failed:review:gap-reviewer");
 
     h.engine
         .decide(
             &mission_id,
-            "gap_review_failed:mission",
+            "proof_failed:review:gap-reviewer",
             DecisionAction::Retry,
             "transient timeout",
         )
@@ -874,7 +876,7 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
-    assert_eq!(attention[0], "gap_review_failed:mission");
+    assert_eq!(attention[0], "proof_failed:review:gap-reviewer");
     let failure = gap_review_failure(&outcome.state);
     assert!(failure.evidence().detail.contains("nonce does not match"));
     let final_response = gap_review_receipt(&outcome.state)
@@ -1016,12 +1018,7 @@ async fn a_attested_bar_mission_type_without_a_review_is_refused_at_creation() {
 }
 
 #[tokio::test]
-async fn a_stale_waiver_reopens_the_review_after_new_work() {
-    // Regression (QA round 1): a waiver is granted at a head, never
-    // inherited. The live sequence: park on a review failure, propose
-    // remediation in WHILE parked, waive the failure — the revised work then
-    // moves the head, the waiver goes stale, and the review re-dispatches at
-    // the new head instead of the mission closing reviewless.
+async fn repairing_a_failed_review_reopens_the_sink_with_receipt_evidence() {
     let dir = tempfile::tempdir().expect("tempdir");
     let work_heads = Mutex::new(vec![HEAD_SHA.to_string(), "second-worker-commit".into()]);
     let reviews = Mutex::new(0usize);
@@ -1052,49 +1049,47 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
     }));
     let (h, mission_id) = started_with_recovery(&dir, runner, 1).await;
 
-    // Park on the review failure; propose follow-up work while parked.
     let initial = h.engine.advance(&mission_id).await.expect("advance");
-    let waived_head = initial.state.current_sha.clone();
-    let mut next = simple_plan();
-    next.tasks = vec![Task {
-        id: "more".parse_task(),
-        body: "Follow-up work proposed while parked.".to_string(),
-        targets: vec![lionclaw::model::AssertionId::new("TESTS-PASS").unwrap()],
-        depends_on: vec![],
-    }];
-    h.engine
-        .propose_plan(&mission_id, review_proposal(1, next))
-        .await
-        .expect("propose");
-    approve_plan(&h.engine, &mission_id).await;
-    // Waive the failure at the CURRENT head; the pending work resumes.
+    let initial_head = initial.state.current_sha.clone();
+    let review_effect = gap_review_receipt(&initial.state).effect_id.clone();
     h.engine
         .decide(
             &mission_id,
-            "gap_review_failed:mission",
-            DecisionAction::Accept,
-            "reviewer infra is down today",
+            "proof_failed:review:gap-reviewer",
+            DecisionAction::Repair,
+            "repair using the failed review evidence",
         )
         .await
-        .expect("waive");
+        .expect("repair");
+
+    let repaired = h.engine.load_state(&mission_id).await.expect("repaired");
+    let sink = &repaired.tasks[&"fix".parse_task()];
+    assert_eq!(sink.status, lionclaw::model::TaskStatus::Pending);
+    assert_eq!(
+        sink.pending_base_sha.as_deref(),
+        Some(initial_head.as_str())
+    );
+    assert!(sink.feedback.iter().any(|feedback| {
+        feedback.justification == "repair using the failed review evidence"
+            && feedback.evidence.role_attempts().contains(&review_effect)
+    }));
+    assert!(repaired.role_attempt_receipts.contains_key(&review_effect));
 
     let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
     assert_terminal(&outcome);
-    // The revised work moved the head, staling the waiver: a second review
-    // ran at the new head and its verdict is on record.
     assert_eq!(
         review_calls(&h, &mission_id).await.len(),
         2,
-        "the stale waiver must re-review"
+        "repair must re-review the repaired deliverable"
     );
     let state = h.engine.load_state(&mission_id).await.expect("state");
     let (_, judged_sha, _, _) = gap_review_verdict(&state);
     assert_eq!(judged_sha, state.current_sha);
-    assert_ne!(state.current_sha, waived_head);
+    assert_ne!(state.current_sha, initial_head);
     assert!(
-        lionclaw::workspace::is_ancestor(dir.path(), &waived_head, &state.current_sha)
+        lionclaw::workspace::is_ancestor(dir.path(), &initial_head, &state.current_sha)
             .await
-            .expect("post-waiver work descends from the waived deliverable")
+            .expect("repair descends from the reviewed deliverable")
     );
 }
 
@@ -1129,7 +1124,7 @@ async fn a_mission_type_naming_an_unknown_or_non_verdict_reviewer_is_refused_at_
 #[tokio::test]
 async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
     // Regression (QA round 3): done=false means "the review itself did not
-    // complete" — an infra park to retry/waive, never a sealed verdict and
+    // complete" — an ordinary proof failure, never a sealed verdict and
     // never a gaps park.
     let dir = tempfile::tempdir().expect("tempdir");
     let runner = MockRoleRunner::new(Box::new(move |request| {
@@ -1157,7 +1152,7 @@ async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
     let (h, mission_id) = started(&dir, runner).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
-    assert_eq!(attention[0], "gap_review_failed:mission");
+    assert_eq!(attention[0], "proof_failed:review:gap-reviewer");
     let failure = gap_review_failure(&outcome.state);
     assert!(failure.evidence().detail.contains("did not complete"));
 }
@@ -1190,7 +1185,7 @@ async fn an_ordinary_validator_handoff_cannot_seal_the_gap_review() {
     let (h, mission_id) = started(&dir, runner).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
-    assert_eq!(attention[0], "gap_review_failed:mission");
+    assert_eq!(attention[0], "proof_failed:review:gap-reviewer");
     let failure = gap_review_failure(&outcome.state);
     assert_eq!(failure.evidence().code.as_deref(), Some("handoff.schema"));
 }
