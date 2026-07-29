@@ -8,14 +8,14 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use common::{approve_plan, covered_requirement, initialize_repository, ParseTask, BASE_SHA};
-use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
+use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::{MissionType, MissionTypeDefinition};
 use lionclaw::model::{
-    Assertion, AssertionId, AuthorityCeilings, AuthorityGrants, DecisionAction, EffectId,
+    Assertion, AssertionId, AuthorityCeilings, AuthorityGrants, Choice, DecisionAction, EffectId,
     EventEnvelope, ExecutionPolicy, FinishClass, Handoff, MissionConfig, MissionEvent,
-    MissionPhase, MissionProposal, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal,
-    RoleInstance, RoleInstanceId, RolePromptTemplate, RuntimeInstrumentIdentity, StopBar, Task,
-    TaskCandidateRef, TeamRevision, VersionStamps, WorkspacePreparation, SCHEMA_VERSION,
+    MissionProposal, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, RoleInstance,
+    RoleInstanceId, RolePromptTemplate, RuntimeInstrumentIdentity, StopBar, Task, TaskCandidateRef,
+    TeamRevision, VersionStamps, WorkspacePreparation, SCHEMA_VERSION,
 };
 use lionclaw::ports::{
     OracleOutcome, OracleRunRequest, OracleRunner, RoleRunner, RoleTurnOutcome, RoleTurnRequest,
@@ -385,14 +385,9 @@ async fn parallel_writers_run_concurrently_and_integrate_at_the_deliverable_head
     .await;
     let mission_id = start_parallel_mission(&h.engine, dir.path()).await;
 
-    let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
-    assert_eq!(
-        outcome.state.phase,
-        MissionPhase::Done {
-            finish: FinishClass::Verified
-        }
-    );
+    let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
+    assert!(outcome.state.is_terminal());
+    assert_eq!(outcome.state.finish(), Some(FinishClass::Verified));
     assert_writer_overlap(&h.runner_log);
     assert_distinct_workspaces(&h.runner_log);
     let refs = h
@@ -433,14 +428,24 @@ async fn oracle_batches_run_concurrently_after_writer_fan_in() {
     );
     let mission_id = start_parallel_mission(&engine, dir.path()).await;
 
-    let done = tokio::time::timeout(
+    let ready = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         engine.advance(&mission_id),
     )
     .await
     .expect("oracle batch did not run concurrently")
     .expect("advance");
-    assert_eq!(done.disposition, MissionDisposition::Terminal);
+    assert!(ready
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Finish { .. })));
+    engine
+        .finish(&mission_id, "proof bar satisfied")
+        .await
+        .expect("finish");
+    let done = engine.advance(&mission_id).await.expect("terminal");
+    assert!(done.state.is_terminal());
     assert_eq!(oracle.calls.lock().expect("lock").len(), 2);
 }
 
@@ -486,14 +491,24 @@ async fn judge_turn_batches_run_concurrently_after_work_settles() {
         .expect("propose");
     approve_plan(&engine, &mission_id).await;
 
-    let done = tokio::time::timeout(
+    let ready = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         engine.advance(&mission_id),
     )
     .await
     .expect("judge batch did not run concurrently")
     .expect("advance");
-    assert_eq!(done.disposition, MissionDisposition::Terminal);
+    assert!(ready
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Finish { .. })));
+    engine
+        .finish(&mission_id, "proof bar satisfied")
+        .await
+        .expect("finish");
+    let done = engine.advance(&mission_id).await.expect("terminal");
+    assert!(done.state.is_terminal());
     assert_eq!(runner.calls.lock().expect("lock").len(), 2);
 }
 
@@ -509,7 +524,10 @@ async fn repairing_a_non_sink_task_reowes_integration_and_proof_at_the_new_head(
     let mission_id = start_parallel_mission(&h.engine, dir.path()).await;
 
     let parked = h.engine.advance(&mission_id).await.expect("first advance");
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert!(common::has_decision(
+        &parked.state,
+        "proof_failed:oracle:cargo-left"
+    ));
     let first_head = parked.state.deliverable_head().to_string();
     h.engine
         .decide(
@@ -521,8 +539,8 @@ async fn repairing_a_non_sink_task_reowes_integration_and_proof_at_the_new_head(
         .await
         .expect("repair");
 
-    let done = h.engine.advance(&mission_id).await.expect("repair advance");
-    assert_eq!(done.disposition, MissionDisposition::Terminal);
+    let done = common::advance_to_finished(&h.engine, &mission_id).await;
+    assert!(done.state.is_terminal());
     let final_head = done.state.deliverable_head().to_string();
     assert_ne!(final_head, first_head);
     let calls = h.runner_log.calls.lock().expect("lock").clone();
@@ -561,15 +579,7 @@ async fn integration_merge_conflicts_park_the_sink_task() {
     let mission_id = start_parallel_mission(&h.engine, dir.path()).await;
 
     let parked = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
-    assert!(
-        parked
-            .state
-            .open_attention
-            .contains_key("node_failed:merge"),
-        "expected merge task failure, got {:?}",
-        parked.state.open_attention
-    );
+    assert!(common::has_decision(&parked.state, "node_failed:merge"));
     let merge = parked
         .state
         .tasks
@@ -600,7 +610,7 @@ async fn integration_candidate_missing_a_dependency_is_rejected_before_proof() {
     let mission_id = start_parallel_mission(&h.engine, dir.path()).await;
 
     let parked = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert!(common::has_decision(&parked.state, "node_failed:merge"));
     let merge = parked
         .state
         .tasks
@@ -632,12 +642,13 @@ async fn accepting_a_failed_fan_in_without_a_candidate_does_not_fabricate_a_head
     let mission_id = start_parallel_mission(&h.engine, dir.path()).await;
 
     let parked = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
-    assert!(parked
-        .state
-        .open_attention
-        .contains_key("node_failed:merge"));
-    h.engine
+    assert!(common::has_decision(&parked.state, "node_failed:merge"));
+    assert!(
+        !common::decision_actions(&parked.state, "node_failed:merge")
+            .contains(&DecisionAction::Accept)
+    );
+    let error = h
+        .engine
         .decide(
             &mission_id,
             "node_failed:merge",
@@ -645,9 +656,10 @@ async fn accepting_a_failed_fan_in_without_a_candidate_does_not_fabricate_a_head
             "accepting a failed fan-in must not invent a merge",
         )
         .await
-        .expect("record decision");
+        .expect_err("an artifactless failure must not advertise accept");
+    assert!(error.to_string().contains("not valid"));
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    assert!(state.open_attention.contains_key("node_failed:merge"));
+    assert!(common::has_decision(&state, "node_failed:merge"));
     let merge = state.tasks.get(&MERGE.parse_task()).expect("merge task");
     assert_eq!(merge.status, lionclaw::model::TaskStatus::Failed);
     assert!(merge.candidate_sha.is_none());
@@ -695,7 +707,10 @@ async fn serial_single_writer_repair_flow_keeps_slice8_projection() {
     approve_plan(&engine, &mission_id).await;
 
     let parked = engine.advance(&mission_id).await.expect("first advance");
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert!(common::has_decision(
+        &parked.state,
+        "proof_failed:oracle:cargo-test"
+    ));
     let first_head = parked.state.deliverable_head().to_string();
     engine
         .decide(
@@ -706,8 +721,8 @@ async fn serial_single_writer_repair_flow_keeps_slice8_projection() {
         )
         .await
         .expect("repair");
-    let done = engine.advance(&mission_id).await.expect("second advance");
-    assert_eq!(done.disposition, MissionDisposition::Terminal);
+    let done = common::advance_to_finished(&engine, &mission_id).await;
+    assert!(done.state.is_terminal());
     let calls = runner.calls.lock().expect("lock").clone();
     assert_eq!(
         calls,

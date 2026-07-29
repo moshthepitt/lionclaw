@@ -12,9 +12,9 @@ use common::{advisory_plan, approve_plan, proposal, ParseTask, BASE_SHA, HEAD_SH
 use lionclaw::engine::Engine;
 use lionclaw::mission_type::SkillSource;
 use lionclaw::model::{
-    AdvisoryStatus, Assertion, AssertionId, DecisionAction, FinishClass, Handoff, MissionPhase,
-    MissionProposal, MissionSkill, OutputSemantics, PayloadRef, Plan, RoleAttemptDisposition,
-    RoleEffectSource, RoleInstanceId, RuntimeInstrumentIdentity, Task, ValidationItem,
+    AdvisoryStatus, Assertion, AssertionId, DecisionAction, FinishClass, Handoff, MissionProposal,
+    MissionSkill, OutputSemantics, PayloadRef, Plan, RoleAttemptDisposition, RoleEffectSource,
+    RoleInstanceId, RuntimeInstrumentIdentity, Task, ValidationItem,
 };
 use lionclaw::ports::{CapturedArtifact, RoleTurnOutcome, RoleTurnRequest};
 use lionclaw::store::NewEvent;
@@ -88,7 +88,13 @@ async fn run(reviewer_passes: bool) -> lionclaw::model::MissionState {
         .await
         .unwrap();
     approve_plan(&harness.engine, &id).await;
-    harness.engine.advance(&id).await.unwrap().state
+    if reviewer_passes {
+        common::advance_to_finished(&harness.engine, &id)
+            .await
+            .state
+    } else {
+        harness.engine.advance(&id).await.unwrap().state
+    }
 }
 
 fn runtime_identities(codex_model: &str) -> BTreeMap<String, RuntimeInstrumentIdentity> {
@@ -199,15 +205,7 @@ fn validate_outcome(request: &RoleTurnRequest, report: &str) -> RoleTurnOutcome 
 }
 
 fn oracle_attention_id(state: &lionclaw::model::MissionState) -> String {
-    state
-        .open_attention
-        .values()
-        .find(|item| {
-            item.kind == lionclaw::model::AttentionKind::ProofFailed && item.oracle.is_some()
-        })
-        .expect("oracle verdict attention")
-        .id
-        .clone()
+    common::decision_id_with_prefix(state, "proof_failed:oracle:")
 }
 
 fn write_skill_package(root: &Path, name: &str, description: &str, body: &str) {
@@ -252,12 +250,7 @@ async fn advisory_pass_is_attested_never_verified() {
     let state = run(true).await;
     let assertion = lionclaw::model::AssertionId::new("STYLE-OK").unwrap();
     assert_eq!(state.advisory_status(&assertion), AdvisoryStatus::Passed);
-    assert_eq!(
-        state.phase,
-        MissionPhase::Done {
-            finish: FinishClass::Attested
-        }
-    );
+    assert_eq!(state.finish(), Some(FinishClass::Attested));
 }
 
 #[tokio::test]
@@ -510,13 +503,15 @@ async fn advisory_fail_parks_for_generic_recovery() {
     let state = run(false).await;
     let assertion = lionclaw::model::AssertionId::new("STYLE-OK").unwrap();
     assert_eq!(state.advisory_status(&assertion), AdvisoryStatus::Failed);
-    assert_eq!(state.phase, MissionPhase::AttentionNeeded);
-    assert_eq!(lionclaw::model::ready_to_finish(&state), None);
-    let attention = &state.open_attention["proof_failed:judgment:reviewer:STYLE-OK"];
-    assert_eq!(attention.kind, lionclaw::model::AttentionKind::ProofFailed);
-    assert_eq!(attention.assertion_ids, [assertion]);
-    let actions = lionclaw::engine::MissionView::from_state(state, false).next_actions();
-    assert_eq!(actions, ["mission decide", "mission abort"]);
+    assert_eq!(
+        common::decision_actions(&state, "proof_failed:judgment:reviewer:STYLE-OK"),
+        [
+            DecisionAction::Retry,
+            DecisionAction::Repair,
+            DecisionAction::Revise
+        ]
+    );
+    assert_eq!(common::finish_choice(&state), None);
 }
 
 #[tokio::test]
@@ -589,7 +584,7 @@ async fn read_only_validator_artifacts_are_rejected_before_the_fold() {
     approve_plan(&harness.engine, &id).await;
     let state = harness.engine.advance(&id).await.unwrap().state;
     assert_eq!(state.current_sha, HEAD_SHA);
-    assert!(matches!(state.phase, MissionPhase::AttentionNeeded));
+    assert!(!common::decision_ids(&state).is_empty());
     assert!(harness
         .engine
         .store()
@@ -735,15 +730,7 @@ async fn replacement_validator_requires_new_receipt_and_retains_prior_evidence()
         Some(&original_receipt)
     );
 
-    let oracle_attention = pending
-        .open_attention
-        .values()
-        .find(|item| {
-            item.kind == lionclaw::model::AttentionKind::ProofFailed && item.oracle.is_some()
-        })
-        .unwrap()
-        .id
-        .clone();
+    let oracle_attention = common::decision_id_with_prefix(&pending, "proof_failed:oracle:");
     harness
         .engine
         .decide(

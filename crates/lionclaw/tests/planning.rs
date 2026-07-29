@@ -2,14 +2,15 @@
 
 mod common;
 
+use lionclaw::model::TerminalState;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use common::{approve_plan, simple_plan, BASE_SHA, HEAD_SHA};
-use lionclaw::engine::{Engine, MissionDisposition};
+use common::{advance_to_finished, approve_plan, simple_plan, BASE_SHA, HEAD_SHA};
+use lionclaw::engine::Engine;
 use lionclaw::model::{
-    AttentionKind, DecisionAction, Handoff, MissionPhase, MissionProposal, OutputSemantics,
-    PayloadRef, PlanningRefinement, RoleAttemptDisposition, ValidationItem,
+    Choice, DecisionAction, EffectIntent, Handoff, MissionProposal, OutputSemantics, PayloadRef,
+    PlanningRefinement, RoleAttemptDisposition, ValidationItem,
 };
 use lionclaw::ports::{CapturedArtifact, RoleTurnOutcome, RoleTurnRequest};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -123,18 +124,14 @@ async fn create(engine: &Engine, dir: &std::path::Path) -> lionclaw::model::Miss
 
 async fn proposal_attention(engine: &Engine, id: &lionclaw::model::MissionId) -> String {
     let state = engine.load_state(id).await.unwrap();
-    state
-        .open_attention
-        .values()
-        .find(|item| item.kind == AttentionKind::PlanProposal)
-        .unwrap_or_else(|| {
-            panic!(
-                "plan proposal attention: phase={:?} attention={:?} proposal={:?} receipts={:?}",
-                state.phase, state.open_attention, state.proposal, state.role_attempt_receipts
-            )
-        })
-        .id
-        .clone()
+    assert_eq!(
+        common::decision_actions(&state, "plan_proposal:mission"),
+        [DecisionAction::Approve, DecisionAction::Revise],
+        "proposal={:?} receipts={:?}",
+        state.proposal,
+        state.role_attempt_receipts
+    );
+    "plan_proposal:mission".to_string()
 }
 
 #[tokio::test]
@@ -143,7 +140,7 @@ async fn mission_creation_persists_the_pinned_planning_contract() {
     let (engine, _) = engine(dir.path(), vec![candidate("a")], false).await;
     let id = create(&engine, dir.path()).await;
     let state = engine.load_state(&id).await.unwrap();
-    let team = state.team.expect("revision-zero team");
+    let team = state.team.as_ref().expect("revision-zero team");
     assert_eq!(team.revision, 0);
     assert_eq!(team.planning_assignment.as_str(), "strategist");
     assert_eq!(
@@ -151,7 +148,10 @@ async fn mission_creation_persists_the_pinned_planning_contract() {
         OutputSemantics::ProposesPlan
     );
     assert!(state.plan.is_none());
-    assert_eq!(state.phase, MissionPhase::Planning);
+    assert!(lionclaw::model::next(&state)
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, EffectIntent::DispatchRole(_))));
 }
 
 #[tokio::test]
@@ -160,11 +160,11 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
     let (engine, _) = engine(dir.path(), vec![candidate("fix")], false).await;
     let id = create(&engine, dir.path()).await;
     let parked = engine.advance(&id).await.unwrap();
-    assert_eq!(parked.disposition, MissionDisposition::AwaitingLead);
     assert!(parked.state.plan.is_none());
+    assert!(common::has_decision(&parked.state, "plan_proposal:mission"));
     approve_plan(&engine, &id).await;
-    let finished = engine.advance(&id).await.unwrap();
-    assert_eq!(finished.disposition, MissionDisposition::Terminal);
+    let finished = advance_to_finished(&engine, &id).await;
+    assert!(finished.state.is_terminal());
     assert_eq!(finished.state.revision, 1);
     assert!(finished
         .state
@@ -193,7 +193,10 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
         .await
         .unwrap();
     let state = engine.load_state(&id).await.unwrap();
-    assert_eq!(state.phase, MissionPhase::Planning);
+    assert!(lionclaw::model::next(&state)
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, EffectIntent::DispatchRole(_))));
     assert_eq!(
         state.planning_input.refinement,
         Some(PlanningRefinement::Guidance("not good enough".to_string()))
@@ -235,15 +238,18 @@ async fn replanning_prompt_combines_the_accepted_plan_rejected_candidate_and_gui
     approve_plan(&engine, &id).await;
     let failed = engine.advance(&id).await.unwrap();
     let node = failed
-        .state
-        .open_attention
-        .values()
-        .find(|item| item.kind == AttentionKind::NodeFailed)
-        .unwrap();
+        .next
+        .choices
+        .iter()
+        .find_map(|choice| match choice {
+            Choice::Decide { id, .. } if id.starts_with("node_failed:") => Some(id.clone()),
+            _ => None,
+        })
+        .expect("failed work is explicitly decidable");
     engine
         .decide(
             &id,
-            &node.id,
+            &node,
             DecisionAction::Revise,
             "replace the implementation approach",
         )
@@ -405,8 +411,8 @@ async fn aborting_a_plan_proposal_uses_the_universal_abort_fact() {
     engine.abort(&id, "stop exactly here").await.unwrap();
     let state = engine.load_state(&id).await.unwrap();
     assert!(matches!(
-        state.phase,
-        MissionPhase::Aborted { ref reason } if reason == "stop exactly here"
+        state.terminal,
+        Some(TerminalState::Aborted { ref reason }) if reason == "stop exactly here"
     ));
     assert!(engine
         .store()
@@ -435,23 +441,25 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
     let id = create(&harness.engine, dir.path()).await;
     let failed = harness.engine.advance(&id).await.unwrap();
     let node = failed
-        .state
-        .open_attention
-        .values()
-        .find(|item| item.kind == AttentionKind::NodeFailed)
-        .expect("failed planner parks");
+        .next
+        .choices
+        .iter()
+        .find_map(|choice| match choice {
+            Choice::Decide { id, .. } if id.starts_with("node_failed:") => Some(id.clone()),
+            _ => None,
+        })
+        .expect("failed planner parks with an explicit decision");
     let calls = harness.role_runner.calls.lock().unwrap().len();
     harness
         .engine
-        .decide(&id, &node.id, DecisionAction::Retry, "try again")
+        .decide(&id, &node, DecisionAction::Retry, "try again")
         .await
         .unwrap();
     let failed_again = harness.engine.advance(&id).await.unwrap();
-    assert!(failed_again
-        .state
-        .open_attention
-        .values()
-        .any(|item| item.kind == AttentionKind::NodeFailed));
+    assert!(failed_again.next.choices.iter().any(|choice| matches!(
+        choice,
+        Choice::Decide { id, .. } if id.starts_with("node_failed:")
+    )));
     assert_eq!(harness.role_runner.calls.lock().unwrap().len(), calls + 1);
 }
 
@@ -464,11 +472,10 @@ async fn a_bad_author_proposal_fails_the_node_and_seeds_nothing() {
     let (engine, _) = engine(dir.path(), vec![bad], false).await;
     let id = create(&engine, dir.path()).await;
     let failed = engine.advance(&id).await.unwrap();
-    assert!(failed
-        .state
-        .open_attention
-        .values()
-        .any(|item| item.kind == AttentionKind::NodeFailed));
+    assert!(failed.next.choices.iter().any(|choice| matches!(
+        choice,
+        Choice::Decide { id, .. } if id.starts_with("node_failed:")
+    )));
     assert!(failed.state.plan.is_none());
     assert!(failed.state.contract.is_empty());
     assert_eq!(failed.state.revision, 0);

@@ -30,10 +30,10 @@ fn delegated_ratification_uses_the_same_unbounded_revision_loop() {
 #[test]
 fn required_proof_failure_is_never_taught_as_acceptance() {
     assert!(SKILL.contains(
-        "Required proof failure can\n   never be accepted: a `ProofFailed` item never exposes `Accept`."
+        "Required proof failure can\n   never be accepted: a failed-proof target never exposes `accept`."
     ));
     assert!(
-        SKILL.contains("Preserve any\n   listed terminal-review `Accept` decision for the human")
+        SKILL.contains("Preserve\n   any listed terminal-review `accept` decision for the human")
     );
     assert!(!SKILL.contains("acceptance below the\n   mission's proof bar"));
     assert!(!SKILL.contains("accepted below bar"));
@@ -50,4 +50,7 @@ fn the_skill_uses_wait_as_the_one_blocking_surface_and_documents_controls() {
     assert!(SKILL
         .contains("`mission extend`, `mission stop`, or, after it\n   parks, `mission continue`"));
     assert!(SKILL.contains("Ctrl-C detaches an observer; it does not stop\n   the driver."));
+    assert!(SKILL.contains(
+        "When `next.choices` exposes `finish`, run `lionclaw mission finish --reason\n   <reason>`. A green mission never finishes automatically."
+    ));
 }

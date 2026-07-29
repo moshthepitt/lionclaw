@@ -15,7 +15,7 @@ use crate::authority::AuthorityCeiling;
 use crate::config::{MissionRuntimeProfile, RuntimeProfiles};
 use crate::engine::{
     load_mission_view, reconcile_disposable_conversation_resources_if_idle, record_control, Engine,
-    EngineServices, MissionDisposition, MissionView,
+    EngineServices, MissionView,
 };
 use crate::mission_type::{
     add_mission_skill, add_skill, install_mission_type, load_materialized_mission_type,
@@ -23,9 +23,9 @@ use crate::mission_type::{
     MissionType, MissionTypeLocator, SkillSource,
 };
 use crate::model::{
-    fold, short_hex, AuthorityGrants, ControlAction, DecisionAction, EffectId,
-    EnvironmentPreflight, FinishClass, InputName, MissionGuidance, MissionId, MissionPhase,
-    MissionSkill, OutputSemantics, RequirementDisposition, RoleInstance, RoleInstanceId, TaskId,
+    fold, short_hex, AuthorityGrants, Choice, ControlAction, DecisionAction, EffectId,
+    EnvironmentPreflight, FinishClass, InputName, MissionGuidance, MissionId, MissionSkill,
+    OutputSemantics, RequirementDisposition, RoleInstance, RoleInstanceId, TaskId, TerminalState,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, OracleRunner, SystemClock};
@@ -157,7 +157,7 @@ pub enum MissionCommand {
     Driver(DriverArgs),
     #[command(hide = true)]
     DriverStderr(DriverStderrArgs),
-    /// Show a mission's state (contract, phase, finish grade).
+    /// Show a mission's state (contract, workflow state, finish grade).
     Status(StatusArgs),
     /// Print restart-safe lead guidance derived from folded state.
     Guide(GuideArgs),
@@ -183,7 +183,7 @@ pub enum MissionCommand {
     /// Add mission-local skills without mutating the mission type.
     #[command(subcommand)]
     Skill(MissionSkillCommand),
-    /// Resolve an open attention item.
+    /// Select an advertised workflow decision.
     Decide(DecideArgs),
     /// Finish a mission whose proof bar is satisfied.
     Finish(FinishArgs),
@@ -449,7 +449,7 @@ pub struct PlanShowArgs {
 #[derive(Args)]
 pub struct DecideArgs {
     pub mission_id: String,
-    /// The attention item id (see `mission status`/`inbox`).
+    /// The decision target id from `next.choices`.
     pub item: String,
     /// One of: approve | retry | repair | revise | accept.
     pub action: String,
@@ -1044,7 +1044,7 @@ async fn resolve_mission_id(store: &MissionStore, explicit: Option<&str>) -> Res
         let Some(state) = fold(store.load(&mission_id).await?) else {
             continue;
         };
-        if !state.phase.is_terminal() {
+        if !state.is_terminal() {
             live.push(mission_id.clone());
         }
         all.push(mission_id);
@@ -1177,13 +1177,7 @@ async fn cmd_inbox(args: InboxArgs) -> Result<()> {
     let mut pending = Vec::new();
     for mission_id in store.list_missions().await? {
         let view = load_mission_view(&store, &mission_id).await?;
-        if matches!(
-            view.disposition,
-            MissionDisposition::AwaitingPlan
-                | MissionDisposition::AwaitingLead
-                | MissionDisposition::Parked
-                | MissionDisposition::CleanupBlocked
-        ) {
+        if inbox_includes(&view) {
             pending.push(view);
         }
     }
@@ -1199,10 +1193,59 @@ async fn cmd_inbox(args: InboxArgs) -> Result<()> {
         for view in &pending {
             print_mission_view(view, &store, false).await?;
             println!("  objective: {}", view.state.objective);
-            println!("  next: {}", view.next_actions().join(" | "));
+            println!("  next: {}", next_commands(view).join(" | "));
         }
     }
     Ok(())
+}
+
+fn inbox_includes(view: &MissionView) -> bool {
+    view.state.cleanup_failure.is_some()
+        || (view.state.is_terminal() && !view.next.effects.is_empty())
+        || finish_is_advertised(view)
+        || view.next.choices.iter().any(|choice| {
+            matches!(
+                choice,
+                Choice::Decide { .. } | Choice::SendMessage { .. } | Choice::Continue { .. }
+            )
+        })
+}
+
+fn finish_is_advertised(view: &MissionView) -> bool {
+    view.next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Finish { .. }))
+}
+
+fn next_commands(view: &MissionView) -> Vec<&'static str> {
+    let mut commands = Vec::new();
+    if !view.next.effects.is_empty() {
+        commands.push("mission advance");
+    }
+    for choice in &view.next.choices {
+        let command = match choice {
+            Choice::Decide { .. } => "mission decide",
+            Choice::SendMessage { .. } => "mission send",
+            Choice::Stop { .. } => "mission stop",
+            Choice::ExtendDeadline { .. } => "mission extend",
+            Choice::Continue {
+                mode: crate::model::ContinueMode::Preserve,
+                ..
+            } => "mission continue",
+            Choice::Continue {
+                mode: crate::model::ContinueMode::RecreateWorkspace,
+                ..
+            } => "mission continue --recreate",
+            Choice::Finish { .. } => "mission finish",
+            Choice::Abort => "mission abort",
+            Choice::Apply { .. } => "mission apply",
+        };
+        if !commands.contains(&command) {
+            commands.push(command);
+        }
+    }
+    commands
 }
 
 async fn cmd_plan(command: PlanCommand, transports: &MissionTransports) -> Result<()> {
@@ -1613,11 +1656,23 @@ async fn cmd_apply(args: ApplyArgs) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let state = store.require_state(&mission_id).await?;
-    if !matches!(state.phase, MissionPhase::Done { .. }) {
-        bail!("mission {mission_id} did not complete; retained work is not accepted for apply");
-    }
-    let branch = apply_target(&mission_id, &state.base_sha, state.deliverable_head())?;
-    workspace::create_branch(&repo, &branch, state.deliverable_head(), args.force)
+    let apply_choice = crate::model::next(&state)
+        .choices
+        .into_iter()
+        .find_map(|choice| match choice {
+            Choice::Apply { branch, sha } => Some((branch, sha)),
+            _ => None,
+        })
+        .with_context(|| {
+            format!("mission {mission_id} has no completed, unapplied result to apply")
+        })?;
+    let (branch, sha) = apply_choice;
+    let branch = if branch.is_empty() {
+        apply_target(&mission_id, &state.base_sha, state.deliverable_head())?
+    } else {
+        branch
+    };
+    workspace::create_branch(&repo, &branch, &sha, args.force)
         .await
         .with_context(|| {
             format!("could not create branch '{branch}' (already exists? use --force)")
@@ -1628,7 +1683,7 @@ async fn cmd_apply(args: ApplyArgs) -> Result<()> {
             state.head,
             &[NewEvent::new(crate::model::MissionEvent::ResultApplied {
                 branch: branch.clone(),
-                sha: state.deliverable_head().to_string(),
+                sha: sha.clone(),
                 reason: "mission apply created the result branch".into(),
             })],
             SystemClock.now_ms(),
@@ -1641,7 +1696,7 @@ async fn cmd_apply(args: ApplyArgs) -> Result<()> {
         })?;
     println!(
         "applied mission {mission_id} → branch {branch} ({})",
-        short_hex(state.deliverable_head())
+        short_hex(&sha)
     );
     Ok(())
 }
@@ -1654,7 +1709,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     let workspace_observations =
         crate::activity::task_workspace_observations(store.lionclaw_dir(), state).await;
 
-    let finish = state.phase.finish();
+    let finish = state.finish();
     // Per-assertion evidence: the oracle that judged it, its exit code, the
     // commit it judged, whether that verdict is fresh at the final head, and a
     // short excerpt of its output.
@@ -1755,8 +1810,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "current_sha": state.deliverable_head(),
                 "deliverable_head": state.deliverable_head(),
                 "finish": finish.map(|f| f.slug()),
-                "disposition": view.disposition.slug(),
-                "next_actions": view.next_actions(),
+                "next": view.next,
                 "tasks": state.tasks.iter().map(|(id, task)| {
                     task_runtime_json(
                         state,
@@ -1786,9 +1840,6 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "acknowledged_gates": state.acknowledged_gates.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
                 "oracle_failures": state.oracle_failures,
                 "gap_review": review,
-                "attention": state.open_attention.values().map(|item| {
-                    attention_json(store.blobs(), state, item)
-                }).collect::<Result<Vec<_>>>()?,
                 "cleanup_failure": cleanup_failure_json(state),
             })
         );
@@ -1819,17 +1870,12 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         Some(FinishClass::Unverified) => {
             println!("  finish:  UNVERIFIED — not proven at the final commit")
         }
-        None => println!(
-            "  finish:  (not finished; phase {})",
-            phase_slug(&state.phase)
-        ),
+        None => println!("  finish:  (not finished)"),
     }
     println!("  bar:     {:?}", state.config.stop);
-    println!(
-        "  state:   {} ({})",
-        phase_slug(&state.phase),
-        view.disposition.slug()
-    );
+    if let Some(terminal) = &state.terminal {
+        println!("  terminal: {}", terminal.display_slug());
+    }
     for (task_id, task) in &state.tasks {
         print_task_outcome(
             store.blobs(),
@@ -1994,14 +2040,8 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 .join(", ")
         );
     }
-    if !state.open_attention.is_empty() {
-        println!("\n  attention:");
-        for item in state.open_attention.values() {
-            print_attention(store.blobs(), state, item, "    ")?;
-        }
-    }
-    if !matches!(view.disposition, MissionDisposition::Terminal) {
-        println!("\n  next: {}", view.next_actions().join(" | "));
+    if state.terminal.is_none() {
+        println!("\n  next: {}", next_commands(&view).join(" | "));
     }
     if args.patch && state.deliverable_head() != state.base_sha {
         let diff = workspace::diff(&repo, &state.base_sha, state.deliverable_head()).await?;
@@ -2071,7 +2111,7 @@ async fn cmd_environment_use(
         bail!("mission {mission_id} has a running driver; retry after it parks or finishes");
     };
     let state = store.require_state(&mission_id).await?;
-    if state.phase.is_terminal() {
+    if state.is_terminal() {
         bail!("mission {mission_id} is terminal; environment assignment is closed");
     }
     if !state.inflight.is_empty() {
@@ -2662,17 +2702,13 @@ async fn cmd_advance(
     let initial = load_mission_view(&store, &mission_id).await?;
     let mut child = None;
     let mut startup = None;
-    if matches!(
-        initial.disposition,
-        MissionDisposition::Ready | MissionDisposition::CleanupBlocked
-    ) {
+    if !initial.driver_running && !initial.next.effects.is_empty() {
         let mission_dirs = store.mission_dirs(&mission_id);
         let handshake = mission_dirs.root().join(format!(
             "driver-{}-{}.ready",
             std::process::id(),
             SystemClock.now_ms()
         ));
-        crate::activity::clear_driver_run_evidence(&mission_dirs)?;
         let mut command = std::process::Command::new(std::env::current_exe()?);
         command
             .arg("mission")
@@ -2707,10 +2743,7 @@ async fn cmd_advance(
             if startup == Some(DriverStartup::LostRace) {
                 wait_for_existing_driver(&store, &mission_id).await?;
             }
-        } else if matches!(
-            initial.disposition,
-            MissionDisposition::Running | MissionDisposition::Terminal
-        ) {
+        } else if initial.driver_running || initial.state.is_terminal() {
             wait_for_existing_driver(&store, &mission_id).await?;
         }
     }
@@ -2726,7 +2759,7 @@ async fn cmd_advance(
     // explicit, justified human decision — exit SUCCESS, but say so. The
     // summary already applies the freshness law, so a stale verdict from a
     // superseded head never triggers a false note here.
-    if matches!(state.phase, MissionPhase::Done { .. }) {
+    if matches!(state.terminal, Some(TerminalState::Done { .. })) {
         let summary = review_summary(state, engine.store().blobs());
         let blocking = summary["gaps"]["blocking"].as_u64().unwrap_or(0);
         let total = blocking
@@ -2762,7 +2795,6 @@ async fn cmd_driver(
     let mission_id = MissionId::parse(&args.mission_id)?;
     let store = MissionStore::open(&args.repo).await?;
     let mission_dirs = store.mission_dirs(&mission_id);
-    crate::activity::clear_driver_error(&mission_dirs)?;
     let result = async {
         let engine = build_engine_for_mission(store, &args.repo, &mission_id, transports).await?;
         engine
@@ -2803,10 +2835,13 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
         let workspace_observations =
             crate::activity::task_workspace_observations(store.lionclaw_dir(), state).await;
         println!(
-            "mission {mission_id}: {} (revision {}, {})",
-            phase_slug(&state.phase),
+            "mission {mission_id}: revision {}{}",
             state.revision,
-            view.disposition.slug(),
+            state
+                .terminal
+                .as_ref()
+                .map(|terminal| format!(", {}", terminal.display_slug()))
+                .unwrap_or_default(),
         );
         println!("objective: {}", state.objective);
         print_environment(state, "");
@@ -2843,7 +2878,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
         print_superseded_assertions(state, store.blobs(), "  ");
         print_task_workspace_observations(state, "  ", &workspace_observations);
         print_workspace_control_state(state, "  ");
-        if view.disposition == MissionDisposition::Running {
+        if view.driver_running {
             print_activity(&store, state)?;
         }
         if let Some(error) = crate::activity::driver_error(&store.mission_dirs(&mission_id)) {
@@ -2859,10 +2894,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
             );
         }
         print_planning_input(store.blobs(), state, "")?;
-        for item in state.open_attention.values() {
-            print_attention(store.blobs(), state, item, "  ")?;
-        }
-        println!("next: {}", view.next_actions().join(" | "));
+        println!("next: {}", next_commands(&view).join(" | "));
     }
     Ok(())
 }
@@ -2871,8 +2903,8 @@ async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) 
     let mut previous = Vec::new();
     loop {
         let view = load_mission_view(store, mission_id).await?;
-        let Some(activity) = running_activity(store, &view.state, view.disposition) else {
-            if view.disposition != MissionDisposition::Running {
+        let Some(activity) = running_activity(store, &view.state, view.driver_running) else {
+            if !view.driver_running {
                 return Ok(());
             }
             tokio::select! {
@@ -2919,7 +2951,7 @@ async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) 
 
 async fn status_json(view: &MissionView, store: &MissionStore) -> Result<serde_json::Value> {
     let mut value = mission_view_json(view, store).await?;
-    value["activity"] = running_activity(store, &view.state, view.disposition)
+    value["activity"] = running_activity(store, &view.state, view.driver_running)
         .and_then(|activity| serde_json::to_value(activity).ok())
         .unwrap_or(serde_json::Value::Null);
     value["driver_error"] =
@@ -2931,9 +2963,9 @@ async fn status_json(view: &MissionView, store: &MissionStore) -> Result<serde_j
 fn running_activity(
     store: &MissionStore,
     state: &crate::model::MissionState,
-    disposition: MissionDisposition,
+    driver_running: bool,
 ) -> Option<crate::activity::ActivityProjection> {
-    (disposition == MissionDisposition::Running)
+    driver_running
         .then(|| crate::activity::load_validated(&store.mission_dirs(&state.mission_id), state))
         .flatten()
 }
@@ -3340,63 +3372,59 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
     if json {
         println!("{}", mission_view_json(view, store).await?);
     } else {
-        match view.disposition {
-            MissionDisposition::AwaitingPlan => {
-                println!("mission {mission_id}: awaiting a plan");
-                print_planning_input(blobs, state, "  ")?;
-            }
-            MissionDisposition::Parked => {
-                let workspace_observations =
-                    crate::activity::task_workspace_observations(store.lionclaw_dir(), state).await;
+        if view.driver_running && state.terminal.is_none() {
+            println!("mission {mission_id}: running under another driver");
+        } else if let Some(failure) = &state.cleanup_failure {
+            println!(
+                "mission {mission_id}: cleanup blocked for effect {} ({:?})",
+                failure.effect_id, failure.resource
+            );
+            println!("  {}", failure.failure.detail());
+        } else if let Some(terminal) = &state.terminal {
+            if state.inflight.is_empty() {
+                println!("mission {mission_id}: {}", terminal.display_slug());
+            } else {
                 println!(
-                    "mission {mission_id}: parked ({} attention item(s))",
-                    state.open_attention.len()
+                    "mission {mission_id}: {} with {} inherited effect(s) awaiting cleanup",
+                    terminal.display_slug(),
+                    state.inflight.len()
                 );
-                for item in state.open_attention.values() {
-                    print_attention(blobs, state, item, "  ")?;
-                }
-                print_conversations(state, store, "  ")?;
-                print_task_workspace_observations(state, "  ", &workspace_observations);
-            }
-            MissionDisposition::Running => {
-                println!("mission {mission_id}: running under another driver")
-            }
-            MissionDisposition::AwaitingLead => {
-                println!("mission {mission_id}: awaiting lead feedback");
-                print_conversations(state, store, "  ")?;
-            }
-            MissionDisposition::CleanupBlocked => {
-                if let Some(failure) = &state.cleanup_failure {
-                    println!(
-                        "mission {mission_id}: cleanup blocked for effect {} ({:?})",
-                        failure.effect_id, failure.resource
-                    );
-                    println!("  {}", failure.failure.detail());
-                } else {
-                    println!(
-                        "mission {mission_id}: {} with {} inherited effect(s) awaiting cleanup",
-                        phase_slug(&state.phase),
-                        state.inflight.len()
-                    );
-                    for effect_id in state.inflight.keys() {
-                        println!("  effect {effect_id}: no live driver; recovery required");
-                    }
+                for effect_id in state.inflight.keys() {
+                    println!("  effect {effect_id}: no live driver; recovery required");
                 }
             }
-            MissionDisposition::Terminal => {
-                println!("mission {mission_id}: {}", phase_slug(&state.phase));
-                if let Some(line) = review_line(state, blobs) {
-                    println!("  {line}");
-                }
+            if let Some(line) = review_line(state, blobs) {
+                println!("  {line}");
             }
-            MissionDisposition::Ready => println!("mission {mission_id}: ready to advance"),
+        } else if finish_is_advertised(view) {
+            println!("mission {mission_id}: ready to finish");
+        } else if view
+            .next
+            .choices
+            .iter()
+            .any(|choice| matches!(choice, Choice::Decide { .. }))
+        {
+            println!("mission {mission_id}: awaiting a decision");
+        } else if view.next.effects.is_empty()
+            && view
+                .next
+                .choices
+                .iter()
+                .any(|choice| matches!(choice, Choice::SendMessage { .. }))
+        {
+            println!("mission {mission_id}: awaiting lead feedback");
+        } else if !view.next.effects.is_empty() {
+            println!("mission {mission_id}: ready to advance");
+        } else {
+            println!("mission {mission_id}: awaiting an operator choice");
         }
+        print_conversations(state, store, "  ")?;
         for (task_id, task) in &state.tasks {
             print_task_outcome(blobs, state, task_id, task, &format!("  task {task_id}"));
         }
         print_non_task_failures(blobs, state);
         print_role_attempt_receipts(blobs, state, "  ");
-        if matches!(view.disposition, MissionDisposition::Terminal) {
+        if state.is_terminal() {
             print_gap_review_receipt(blobs, state, "  ");
         }
         print_workspace_control_state(state, "  ");
@@ -3450,25 +3478,22 @@ async fn guide_json(view: &MissionView, store: &MissionStore) -> Result<serde_js
     Ok(serde_json::json!({
         "mission_id": state.mission_id.as_str(),
         "objective": state.objective,
-        "phase": phase_slug(&state.phase),
-        "finish": state.phase.finish().map(|finish| finish.slug()),
-        "disposition": view.disposition.slug(),
+        "terminal": state.terminal,
+        "finish": state.finish().map(|finish| finish.slug()),
+        "driver_running": view.driver_running,
+        "next": view.next,
         "stop_bar": state.config.stop.slug(),
         "revision": state.revision,
         "team_revision": state.team.as_ref().map(|team| team.revision),
         "current_sha": state.deliverable_head(),
         "deliverable_head": state.deliverable_head(),
         "environment": environment_json(state),
-        "next_actions": view.next_actions(),
         "operator_loop": [
             "mission guide",
             "mission status --json",
         ],
         "active_effects": active_effects_json(state),
         "parked_effects": parked_effect_views(state),
-        "attention": state.open_attention.values().map(|item| {
-            attention_json(store.blobs(), state, item)
-        }).collect::<Result<Vec<_>>>()?,
         "conversations": conversation_views(state, store)?,
     }))
 }
@@ -3477,11 +3502,9 @@ async fn print_guide(view: &MissionView, store: &MissionStore) -> Result<()> {
     let state = &view.state;
     println!("mission {} guide", state.mission_id);
     println!("objective: {}", state.objective);
-    println!(
-        "state: {} ({})",
-        phase_slug(&state.phase),
-        view.disposition.slug()
-    );
+    if let Some(terminal) = &state.terminal {
+        println!("terminal: {}", terminal.display_slug());
+    }
     println!("commit: {}", short_hex(state.deliverable_head()));
     print_environment(state, "");
     if !state.inflight.is_empty() {
@@ -3501,14 +3524,8 @@ async fn print_guide(view: &MissionView, store: &MissionStore) -> Result<()> {
             println!("  {effect_id}: {:?}", parked);
         }
     }
-    if !state.open_attention.is_empty() {
-        println!("attention:");
-        for item in state.open_attention.values() {
-            println!("  {} [{}] {}", item.id, item.kind.slug(), item.report);
-        }
-    }
     print_conversations(state, store, "  ")?;
-    println!("next: {}", view.next_actions().join(" | "));
+    println!("next: {}", next_commands(view).join(" | "));
     Ok(())
 }
 
@@ -3572,10 +3589,10 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         crate::activity::task_workspace_observations(store.lionclaw_dir(), state).await;
     Ok(serde_json::json!({
         "mission_id": state.mission_id.as_str(),
-        "phase": phase_slug(&state.phase),
-        "finish": state.phase.finish().map(|finish| finish.slug()),
-        "disposition": view.disposition.slug(),
-        "next_actions": view.next_actions(),
+        "terminal": state.terminal,
+        "finish": state.finish().map(|finish| finish.slug()),
+        "driver_running": view.driver_running,
+        "next": view.next,
         "revision": state.revision,
         "team_revision": state.team.as_ref().map(|team| team.revision),
         "environment": environment_json(state),
@@ -3611,9 +3628,6 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
             })
         }).collect::<Vec<_>>(),
         "superseded_assertions": superseded_assertions_json(state, blobs),
-        "attention": state.open_attention.values().map(|item| {
-            attention_json(blobs, state, item)
-        }).collect::<Result<Vec<_>>>()?,
         "cleanup_failure": cleanup_failure_json(state),
         "oracle_failures": state.oracle_failures,
         "parked_effects": parked_effect_views(state),
@@ -3951,7 +3965,6 @@ fn conversation_views(
                 "presented_messages": conversation.active_delivery.as_ref().map(|delivery| &delivery.presented_messages),
                 "invalid_handoff_reworks": conversation.invalid_handoff_reworks,
                 "runtime_resume_mode": resume_mode,
-                "legal_actions": state.conversation_legal_actions(id),
                 "retained_workspace_archives": state.retained_workspace_archives
                     .iter()
                     .filter(|(task_id, _)| state.team.as_ref()
@@ -3971,7 +3984,7 @@ fn print_conversations(
 ) -> Result<()> {
     for conversation in conversation_views(state, store)? {
         println!(
-            "{indent}conversation {}: lifecycle={} queued={} delivery_through={} resume={} legal_actions={}",
+            "{indent}conversation {}: lifecycle={} queued={} delivery_through={} resume={}",
             conversation["id"].as_str().unwrap_or("?"),
             conversation["lifecycle"].as_str().unwrap_or("?"),
             conversation["queued_messages"]
@@ -3979,14 +3992,6 @@ fn print_conversations(
                 .map_or(0, Vec::len),
             conversation["consumed_through"],
             conversation["runtime_resume_mode"].as_str().unwrap_or("?"),
-            conversation["legal_actions"]
-                .as_array()
-                .map(|actions| actions
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join("|"))
-                .unwrap_or_default()
         );
         if let Some(response) = conversation["final_response"].as_str() {
             println!("{indent}  final response: {response}");
@@ -4186,55 +4191,6 @@ fn print_gap_review_receipt(blobs: &BlobStore, state: &crate::model::MissionStat
     }
 }
 
-fn attention_json(
-    blobs: &BlobStore,
-    state: &crate::model::MissionState,
-    item: &crate::model::AttentionItem,
-) -> Result<serde_json::Value> {
-    Ok(serde_json::json!({
-        "id": item.id,
-        "kind": item.kind.slug(),
-        "report": item.report,
-        "assertion_ids": item.assertion_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
-        "actions": crate::model::decision::legal_actions(state, item)
-            .iter()
-            .map(crate::model::DecisionAction::slug)
-            .collect::<Vec<_>>(),
-        "evidence": crate::evidence::decision_evidence_json(blobs, state, &item.evidence)?,
-    }))
-}
-
-fn print_attention(
-    blobs: &BlobStore,
-    state: &crate::model::MissionState,
-    item: &crate::model::AttentionItem,
-    indent: &str,
-) -> Result<()> {
-    println!("{indent}[{}] {}", item.id, item.report);
-    let actions = crate::model::decision::legal_actions(state, item)
-        .iter()
-        .map(crate::model::DecisionAction::slug)
-        .collect::<Vec<_>>()
-        .join(" | ");
-    println!("{indent}  actions: {actions}");
-    let evidence = crate::evidence::render_decision_evidence(blobs, state, &item.evidence)?;
-    if !evidence.is_empty() {
-        for line in evidence.lines() {
-            println!("{indent}  {line}");
-        }
-    }
-    Ok(())
-}
-
-/// The mission phase as a slug, carrying the finish grade for `Done`
-/// (`done:verified`). The variant slugs live on the enums (one source).
-fn phase_slug(phase: &MissionPhase) -> String {
-    match phase {
-        MissionPhase::Done { finish } => format!("done:{}", finish.slug()),
-        other => other.slug().to_string(),
-    }
-}
-
 /// The gap-review summary — ONE source of truth behind the advance
 /// banner, `status`, `report`, and every `--json` output. `Null` when the
 /// mission declares no review.
@@ -4273,18 +4229,19 @@ fn gap_review_verdict(
 }
 
 fn review_summary(state: &crate::model::MissionState, blobs: &BlobStore) -> serde_json::Value {
-    use crate::model::{AttentionKind, GapSeverity, ReviewOutcome};
+    use crate::model::{GapSeverity, ReviewOutcome};
     if !state.config.requires_gap_review {
         return serde_json::Value::Null;
     }
     let tr = &state.gap_review;
     // A terminal mission owes nothing: a successful finish requires a settled
     // review, while an abort ends every remaining obligation.
-    let done = state.phase.is_terminal();
-    let proof_failed = state.open_attention.values().any(|item| {
+    let done = state.is_terminal();
+    let proof_failed = crate::model::next(state).choices.iter().any(|choice| {
         matches!(
-            item.kind,
-            AttentionKind::OracleFailed | AttentionKind::ProofFailed
+            choice,
+            Choice::Decide { id, .. }
+                if id.starts_with("oracle_failed:") || id.starts_with("proof_failed:")
         )
     });
     let waived = tr.waived_at(state);
@@ -4379,12 +4336,12 @@ fn review_line(state: &crate::model::MissionState, blobs: &BlobStore) -> Option<
             "review: {blocking} blocking, {major} major, {minor} minor gap(s) \
              (judged {sha}){stale}{acknowledged}",
         ),
-        "failed" if state.phase.is_terminal() => {
+        "failed" if state.is_terminal() => {
             "review: FAILED to run before the mission ended".to_string()
         }
         "failed" => "review: FAILED to run — retry, accept, or abort".to_string(),
         "waived" => "review: WAIVED after a failure — no verdict was recorded".to_string(),
-        "skipped" if matches!(state.phase, MissionPhase::Aborted { .. }) => {
+        "skipped" if matches!(state.terminal, Some(TerminalState::Aborted { .. })) => {
             "review: none — the mission was aborted before a review settled".to_string()
         }
         "skipped" => "review: deferred — required proof is not settled".to_string(),

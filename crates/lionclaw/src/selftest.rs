@@ -22,13 +22,13 @@ use crate::authority::{
     MissionMounts, RolePlanRequest,
 };
 use crate::config::RuntimeProfiles;
-use crate::engine::{Engine, EngineServices, MissionDisposition, ProposeError};
+use crate::engine::{Engine, EngineServices, ProposeError};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
-    Assertion, AssertionId, DecisionAction, EffectId, FinishClass, Gap, GapSeverity, Handoff,
-    MissionEvent, MissionId, MissionPhase, MissionProposal, OracleName, PayloadRef, Plan,
-    PlanProposal, ProposalError, Requirement, RequirementDisposition, RequirementId,
-    RequirementKind, ReviewAcceptanceKind, RoleInstanceId, Task, TaskId, TaskStatus, TeamRevision,
+    Assertion, AssertionId, Choice, DecisionAction, EffectId, FinishClass, Gap, GapSeverity,
+    Handoff, MissionEvent, MissionId, MissionProposal, OracleName, PayloadRef, Plan, PlanProposal,
+    ProposalError, Requirement, RequirementDisposition, RequirementId, RequirementKind,
+    ReviewAcceptanceKind, RoleInstanceId, Task, TaskId, TaskStatus, TeamRevision, TerminalState,
     ValidationItem,
 };
 use crate::oracle::OciOracleRunner;
@@ -872,10 +872,10 @@ async fn check_prepared_input() -> Result<()> {
 async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
     let outcome = advance_through_ready_checkpoints(engine, id).await?;
     let state = engine.load_state(id).await?;
-    match state.phase {
-        MissionPhase::Done {
+    match state.terminal {
+        Some(TerminalState::Done {
             finish: FinishClass::Verified,
-        } => Ok(()),
+        }) => Ok(()),
         other => anyhow::bail!("expected verified finish, got {other:?} (outcome {outcome:?})"),
     }
 }
@@ -886,7 +886,16 @@ async fn advance_through_ready_checkpoints(
 ) -> Result<crate::engine::MissionView> {
     for _ in 0..16 {
         let outcome = engine.advance(id).await?;
-        if outcome.disposition != MissionDisposition::Ready {
+        if outcome
+            .next
+            .choices
+            .iter()
+            .any(|choice| matches!(choice, Choice::Finish { .. }))
+        {
+            engine.finish(id, "self-test proof bar satisfied").await?;
+            return engine.advance(id).await;
+        }
+        if outcome.next.effects.is_empty() {
             return Ok(outcome);
         }
     }
@@ -932,10 +941,13 @@ async fn check_oracle_honesty() -> Result<()> {
     if verdict.passed() {
         anyhow::bail!("the genuinely broken tree received an authoritative pass");
     }
-    if outcome.disposition != MissionDisposition::Parked
-        || !state
-            .open_attention
-            .contains_key("proof_failed:oracle:cargo-test")
+    if !outcome.next.effects.is_empty()
+        || !outcome.next.choices.iter().any(|choice| {
+            matches!(
+                choice,
+                Choice::Decide { id, .. } if id == "proof_failed:oracle:cargo-test"
+            )
+        })
     {
         anyhow::bail!("failing oracle did not park on its repair path: {outcome:?}");
     }
@@ -1080,16 +1092,13 @@ async fn check_gap_review() -> Result<()> {
 
     engine.advance(&mission_id).await?;
     let parked = engine.load_state(&mission_id).await?;
-    if !matches!(parked.phase, MissionPhase::AttentionNeeded) {
-        anyhow::bail!(
-            "a blocking review verdict did not park the mission (phase {:?})",
-            parked.phase,
-        );
-    }
-    if !parked
-        .open_attention
-        .contains_key("gap_review_gaps:mission")
-    {
+    let parked_next = crate::model::next(&parked);
+    if !parked_next.choices.iter().any(|choice| {
+        matches!(
+            choice,
+            Choice::Decide { id, .. } if id == "gap_review_gaps:mission"
+        )
+    }) {
         anyhow::bail!("park is not the gap-review gaps item");
     }
 
@@ -1101,17 +1110,17 @@ async fn check_gap_review() -> Result<()> {
             "self-test acknowledges the gap",
         )
         .await?;
-    engine.advance(&mission_id).await?;
+    advance_through_ready_checkpoints(&engine, &mission_id).await?;
     let done = engine.load_state(&mission_id).await?;
     if !matches!(
-        done.phase,
-        MissionPhase::Done {
+        done.terminal,
+        Some(TerminalState::Done {
             finish: FinishClass::Verified
-        }
+        })
     ) {
         anyhow::bail!(
             "acknowledged mission did not close verified: {:?}",
-            done.phase
+            done.terminal
         );
     }
     match &done.gap_review.accepted {

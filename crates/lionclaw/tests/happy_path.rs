@@ -13,14 +13,13 @@ use common::{
     approve_plan, covered_requirement, harness, proposal, review_runner, simple_plan,
     test_mission_type, BASE_SHA, HEAD_SHA,
 };
-use lionclaw::engine::MissionDisposition;
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::PreparedInput;
 use lionclaw::model::{
-    apply, Assertion, AssertionId, DecisionAction, EventEnvelope, FinishClass, InputName,
-    MissionEvent, MissionPhase, OracleName, OutputSemantics, RoleInstanceId, RuntimeUsage,
-    RuntimeUsageCost, RuntimeUsageCostScope, RuntimeUsageDetails, TaskStatus, VersionStamps,
-    SCHEMA_VERSION,
+    apply, Assertion, AssertionId, Choice, DecisionAction, EffectIntent, EventEnvelope,
+    FinishClass, InputName, MissionEvent, OracleName, OutputSemantics, RoleInstanceId,
+    RuntimeUsage, RuntimeUsageCost, RuntimeUsageCostScope, RuntimeUsageDetails, TaskStatus,
+    VersionStamps, SCHEMA_VERSION,
 };
 use lionclaw::testing::{MockClock, NoopEffectCleaner};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -103,7 +102,12 @@ async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_complet
     approve_plan(&h.engine, &mission_id).await;
 
     let checkpoint = h.engine.advance(&mission_id).await.unwrap();
-    assert_eq!(checkpoint.disposition, MissionDisposition::AwaitingLead);
+    assert!(checkpoint.next.effects.is_empty());
+    assert!(checkpoint
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::SendMessage { .. })));
     let (role_instance, conversation) = checkpoint.state.conversations.iter().next().unwrap();
     assert_eq!(
         conversation.final_response,
@@ -155,14 +159,9 @@ async fn question_checkpoint_resumes_after_cli_feedback_and_restart_then_complet
             Arc::new(MockClock::default()),
         ),
     );
-    let outcome = restarted.advance(&mission_id).await.unwrap();
-    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
-    assert_eq!(
-        outcome.state.phase,
-        MissionPhase::Done {
-            finish: FinishClass::Verified
-        }
-    );
+    let outcome = common::advance_to_finished(&restarted, &mission_id).await;
+    assert!(outcome.state.is_terminal());
+    assert_eq!(outcome.state.finish(), Some(FinishClass::Verified));
     let resumed = outcome.state.conversations.get(&role_instance).unwrap();
     assert_eq!(resumed.role_instance, role_instance);
     let task = outcome.state.tasks.values().next().unwrap();
@@ -248,14 +247,9 @@ async fn passing_oracle_yields_verified_finish() {
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
-    let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
-    assert_eq!(
-        outcome.state.phase,
-        MissionPhase::Done {
-            finish: FinishClass::Verified
-        }
-    );
+    let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
+    assert!(outcome.state.is_terminal());
+    assert_eq!(outcome.state.finish(), Some(FinishClass::Verified));
 
     let state = h.engine.load_state(&mission_id).await.expect("state");
     assert_eq!(state.current_sha, HEAD_SHA);
@@ -620,7 +614,11 @@ async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
     approve_plan(&h.engine, &mission_id).await;
 
     let checkpoint = h.engine.advance(&mission_id).await.unwrap();
-    assert_eq!(checkpoint.disposition, MissionDisposition::Ready);
+    assert!(checkpoint
+        .next
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, EffectIntent::DispatchOracle(_))));
     assert!(checkpoint.state.inflight.is_empty());
     assert!(checkpoint
         .state
@@ -629,7 +627,11 @@ async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
         .all(|assertion| assertion.last_authoritative_receipt.is_none()));
 
     let checkpoint = h.engine.advance(&mission_id).await.unwrap();
-    assert_eq!(checkpoint.disposition, MissionDisposition::Ready);
+    assert!(checkpoint
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Finish { .. })));
     assert_eq!(
         checkpoint
             .state
@@ -641,13 +643,12 @@ async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
     );
     assert!(checkpoint.state.inflight.is_empty());
 
-    let checkpoint = h.engine.advance(&mission_id).await.unwrap();
-    assert_eq!(
-        checkpoint.disposition,
-        MissionDisposition::Terminal,
-        "phase={:?} attention={:?} contract={:?}",
-        checkpoint.state.phase,
-        checkpoint.state.open_attention,
+    let checkpoint = common::advance_to_finished(&h.engine, &mission_id).await;
+    assert!(
+        checkpoint.state.is_terminal(),
+        "state={:?} next={:?} contract={:?}",
+        checkpoint.state.terminal,
+        checkpoint.next,
         checkpoint.state.contract
     );
     assert!(checkpoint.state.inflight.is_empty());
@@ -728,14 +729,9 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
 
-    let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
-    assert!(matches!(
-        outcome.state.phase,
-        MissionPhase::Done {
-            finish: FinishClass::Verified
-        }
-    ));
+    let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
+    assert!(outcome.state.is_terminal());
+    assert_eq!(outcome.state.finish(), Some(FinishClass::Verified));
     let state = h.engine.load_state(&mission_id).await.expect("state");
     assert_eq!(state.current_sha, BASE_SHA);
     assert_eq!(
@@ -768,16 +764,11 @@ async fn failing_required_oracle_cannot_be_accepted() {
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(outcome.disposition, MissionDisposition::Parked);
-    let attention: Vec<_> = outcome.state.open_attention.values().collect();
-    assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0].id, "proof_failed:oracle:cargo-test");
-    assert_eq!(attention[0].assertion_ids[0].as_str(), "TESTS-PASS");
-    assert!(matches!(
-        &attention[0].evidence,
-        lionclaw::model::DecisionEvidence::AuthoritativeReceipts { effect_ids }
-            if effect_ids.len() == 1
-    ));
+    assert_eq!(
+        common::decision_ids(&outcome.state),
+        ["proof_failed:oracle:cargo-test"]
+    );
+    assert_eq!(outcome.state.authoritative_receipts.len(), 1);
     let state = h.engine.load_state(&mission_id).await.expect("state");
     let verdict = state
         .contract
@@ -807,11 +798,11 @@ async fn failing_required_oracle_cannot_be_accepted() {
         .load_state(&mission_id)
         .await
         .expect("parked state");
-    assert_eq!(parked.phase, MissionPhase::AttentionNeeded);
-    assert_eq!(lionclaw::model::ready_to_finish(&parked), None);
-    assert!(parked
-        .open_attention
-        .contains_key("proof_failed:oracle:cargo-test"));
+    assert!(common::has_decision(
+        &parked,
+        "proof_failed:oracle:cargo-test"
+    ));
+    assert_eq!(common::finish_choice(&parked), None);
 }
 
 #[tokio::test]
@@ -902,7 +893,7 @@ async fn replayed_oracle_attempt_cannot_replace_authoritative_receipt() {
         .contract
         .values()
         .all(|assertion| assertion.last_authoritative_receipt.is_none()));
-    assert_eq!(lionclaw::model::ready_to_finish(&replayed), None);
+    assert_eq!(common::finish_choice(&replayed), None);
     assert_eq!(replayed.oracle_attempts[&oracle], 1);
 }
 
@@ -949,7 +940,7 @@ async fn command_retry_is_reoffered_only_for_a_changed_outcome() {
     let first = h.engine.advance(&mission_id).await.expect("first failure");
     let attention_id = "proof_failed:oracle:cargo-test";
     assert_eq!(
-        lionclaw::model::legal_actions(&first.state, &first.state.open_attention[attention_id]),
+        common::decision_actions(&first.state, attention_id),
         [
             DecisionAction::Retry,
             DecisionAction::Repair,
@@ -973,7 +964,7 @@ async fn command_retry_is_reoffered_only_for_a_changed_outcome() {
         .await
         .expect("changed failure");
     assert_eq!(
-        lionclaw::model::legal_actions(&changed.state, &changed.state.open_attention[attention_id]),
+        common::decision_actions(&changed.state, attention_id),
         [
             DecisionAction::Retry,
             DecisionAction::Repair,
@@ -997,10 +988,7 @@ async fn command_retry_is_reoffered_only_for_a_changed_outcome() {
         .await
         .expect("repeated failure");
     assert_eq!(
-        lionclaw::model::legal_actions(
-            &repeated.state,
-            &repeated.state.open_attention[attention_id]
-        ),
+        common::decision_actions(&repeated.state, attention_id),
         [DecisionAction::Repair, DecisionAction::Revise]
     );
     assert_eq!(repeated.state.authoritative_receipts.len(), 3);
@@ -1042,37 +1030,34 @@ async fn revising_one_of_multiple_proof_failures_replans_with_every_receipt() {
     approve_plan(&h.engine, &mission_id).await;
 
     let failed = h.engine.advance(&mission_id).await.expect("failed proofs");
-    let failed_attention = failed
-        .state
-        .open_attention
-        .values()
-        .filter(|item| item.kind == lionclaw::model::AttentionKind::ProofFailed)
+    let failed_attention = common::decision_ids(&failed.state)
+        .into_iter()
+        .filter(|id| id.starts_with("proof_failed:"))
         .collect::<Vec<_>>();
     assert_eq!(failed_attention.len(), 2);
     assert_eq!(failed.state.authoritative_receipts.len(), 2);
-    let expected_receipts = failed_attention
-        .iter()
-        .map(|item| {
-            item.evidence
-                .authoritative_receipts()
-                .first()
-                .expect("command failure receipt")
-                .clone()
-        })
-        .collect::<Vec<_>>();
+    let expected_receipts = failed
+        .state
+        .authoritative_receipts
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
 
     h.engine
         .decide(
             &mission_id,
-            &failed_attention[0].id,
+            &failed_attention[0],
             DecisionAction::Revise,
             "revise for every failed proof",
         )
         .await
         .expect("revise");
     let replanning = h.engine.load_state(&mission_id).await.expect("state");
-    assert_eq!(replanning.phase, MissionPhase::Planning);
-    assert!(replanning.open_attention.is_empty());
+    assert!(lionclaw::model::next(&replanning)
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, EffectIntent::DispatchRole(_))));
+    assert!(common::decision_ids(&replanning).is_empty());
     assert_eq!(replanning.authoritative_receipts.len(), 2);
     let Some(lionclaw::model::PlanningRefinement::FailureEvidence(feedback)) =
         &replanning.planning_input.refinement
@@ -1087,14 +1072,9 @@ async fn revising_one_of_multiple_proof_failures_replans_with_every_receipt() {
         .iter()
         .flat_map(|item| item.evidence.authoritative_receipts().iter().cloned())
         .collect::<Vec<_>>();
-    assert_eq!(replanning_receipts, expected_receipts);
     assert_eq!(
         replanning_receipts.into_iter().collect::<BTreeSet<_>>(),
-        replanning
-            .authoritative_receipts
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>()
+        expected_receipts
     );
     let rendered =
         lionclaw::evidence::render_feedbacks(h.engine.store().blobs(), &replanning, feedback)
@@ -1146,14 +1126,11 @@ async fn mixed_failures_are_fail_closed_and_preserve_every_feedback() {
     approve_plan(&h.engine, &mission_id).await;
 
     let failed = h.engine.advance(&mission_id).await.expect("mixed failures");
-    assert!(failed
-        .state
-        .open_attention
-        .contains_key("proof_failed:oracle:cargo-test"));
-    assert!(failed
-        .state
-        .open_attention
-        .contains_key("oracle_failed:lint"));
+    assert!(common::has_decision(
+        &failed.state,
+        "proof_failed:oracle:cargo-test"
+    ));
+    assert!(common::has_decision(&failed.state, "oracle_failed:lint"));
 
     let error = h
         .engine
@@ -1174,7 +1151,7 @@ async fn mixed_failures_are_fail_closed_and_preserve_every_feedback() {
         .load_state(&mission_id)
         .await
         .expect("rejected state");
-    assert!(rejected.open_attention.contains_key("oracle_failed:lint"));
+    assert!(common::has_decision(&rejected, "oracle_failed:lint"));
     let lint = OracleName::new("lint").unwrap();
     assert_eq!(rejected.oracle_failures[&lint], lint_failure);
 
@@ -1189,8 +1166,7 @@ async fn mixed_failures_are_fail_closed_and_preserve_every_feedback() {
         },
     );
     apply(&mut forged, &forged_event);
-    assert_eq!(forged.phase, MissionPhase::AttentionNeeded);
-    assert!(forged.open_attention.contains_key("oracle_failed:lint"));
+    assert!(common::has_decision(&forged, "oracle_failed:lint"));
     assert_eq!(forged.oracle_failures[&lint], lint_failure);
 
     h.engine
@@ -1213,8 +1189,11 @@ async fn mixed_failures_are_fail_closed_and_preserve_every_feedback() {
         .expect("revise oracle failure");
 
     let replanning = h.engine.load_state(&mission_id).await.expect("state");
-    assert_eq!(replanning.phase, MissionPhase::Planning);
-    assert!(replanning.open_attention.is_empty());
+    assert!(lionclaw::model::next(&replanning)
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, EffectIntent::DispatchRole(_))));
+    assert!(common::decision_ids(&replanning).is_empty());
     assert!(replanning.oracle_failures.is_empty());
     assert_eq!(replanning.authoritative_receipts.len(), 1);
     let Some(lionclaw::model::PlanningRefinement::FailureEvidence(feedback)) =
@@ -1323,9 +1302,7 @@ async fn worker_reporting_not_done_parks_with_attention() {
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(outcome.disposition, MissionDisposition::Parked);
-    let attention: Vec<_> = outcome.state.open_attention.values().collect();
-    assert_eq!(attention.len(), 1);
+    assert_eq!(common::decision_ids(&outcome.state).len(), 1);
     // Parked means parked: no oracle ever ran.
     assert!(h.oracle_runner.calls.lock().expect("lock").is_empty());
 }
@@ -1375,7 +1352,7 @@ async fn role_runner_cannot_inject_a_durable_blob_reference() {
     approve_plan(&h.engine, &mission_id).await;
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    assert!(common::has_decision(&outcome.state, "node_failed:fix"));
     assert_eq!(outcome.state.current_sha, BASE_SHA);
     let task_id = outcome.state.tasks.keys().next().unwrap();
     let failure = outcome.state.task_last_failure(task_id).unwrap();
@@ -1429,7 +1406,7 @@ async fn role_runner_oversized_report_is_a_durable_invalid_output() {
     approve_plan(&h.engine, &mission_id).await;
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    assert!(common::has_decision(&outcome.state, "node_failed:fix"));
     assert_eq!(outcome.state.current_sha, BASE_SHA);
     let task_id = outcome.state.tasks.keys().next().unwrap();
     let failure = outcome.state.task_last_failure(task_id).unwrap();

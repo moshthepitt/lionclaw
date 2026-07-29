@@ -249,7 +249,7 @@ async fn accepted_commit_object_fault_settles_once_and_does_not_block_later_mess
 }
 
 async fn prove_commit_object_fault_settles_once(fault: CommitObjectFault) {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (33, 66));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (33, 67));
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let h = checkpoint_harness(dir.path(), prompts.clone()).await;
@@ -531,7 +531,7 @@ async fn oversized_authoritative_receipt_is_rejected_with_exact_typed_truth() {
     for _ in 0..8 {
         h.engine.advance(&mission).await.unwrap();
         let state = h.engine.load_state(&mission).await.unwrap();
-        if !state.authoritative_receipts.is_empty() && !state.open_attention.is_empty() {
+        if !state.authoritative_receipts.is_empty() && !common::decision_ids(&state).is_empty() {
             break;
         }
     }
@@ -557,7 +557,7 @@ async fn oversized_authoritative_receipt_is_rejected_with_exact_typed_truth() {
             )
         });
     assert!(receipt_is_blob_backed);
-    let attention = failed.open_attention.keys().next().unwrap().clone();
+    let attention = common::decision_id_with_prefix(&failed, "proof_failed:");
     h.engine
         .decide(
             &mission,
@@ -657,7 +657,7 @@ async fn prove_receipt_blob_fault_settles_once(fault: ReceiptBlobFault) {
             .require_state(&mission)
             .await
             .unwrap();
-        if !state.authoritative_receipts.is_empty() && !state.open_attention.is_empty() {
+        if !state.authoritative_receipts.is_empty() && !common::decision_ids(&state).is_empty() {
             break;
         }
     }
@@ -669,7 +669,7 @@ async fn prove_receipt_blob_fault_settles_once(fault: ReceiptBlobFault) {
         .next()
         .unwrap_or_else(|| panic!("receipt was not minted: {failed:#?}"))
         .clone();
-    let attention = failed.open_attention.keys().next().unwrap().clone();
+    let attention = common::decision_id_with_prefix(&failed, "proof_failed:");
     h.engine
         .decide(
             &mission,
@@ -1315,7 +1315,7 @@ async fn assert_park_operator_views(
     assert_eq!(missions.len(), 1);
     assert_eq!(missions[0]["mission_id"], mission.as_str());
     let status = cli_json(repo, mission, "status");
-    assert_eq!(missions[0]["next_actions"], status["next_actions"]);
+    assert_eq!(missions[0]["next"], status["next"]);
 }
 
 fn assert_inbox_binding(mission_id: &str, status: &serde_json::Value, inbox: &[serde_json::Value]) {
@@ -1332,25 +1332,16 @@ fn assert_inbox_binding(mission_id: &str, status: &serde_json::Value, inbox: &[s
     if let Some(record) = selected.first() {
         assert_eq!(selected.len(), 1);
         assert_eq!(record["mission_id"], status["mission_id"]);
-        assert_eq!(record["attention"], status["attention"]);
-        assert_eq!(record["next_actions"], status["next_actions"]);
+        assert_eq!(record["next"], status["next"]);
         assert_eq!(record["conversations"], status["conversations"]);
         return;
     }
 
-    assert_eq!(status["attention"], serde_json::json!([]));
-    assert_eq!(status["disposition"], "ready");
-    assert_eq!(
-        status["next_actions"],
-        serde_json::json!(["mission advance", "mission send", "mission abort"])
-    );
-    for conversation in status["conversations"].as_array().unwrap() {
-        assert_eq!(conversation["lifecycle"], "ready");
-        assert_eq!(
-            conversation["legal_actions"],
-            serde_json::json!(["mission advance", "mission send"])
-        );
-    }
+    let choices = status["next"]["choices"].as_array().unwrap();
+    assert!(choices.iter().all(|choice| !matches!(
+        choice["kind"].as_str(),
+        Some("decide" | "send_message" | "continue" | "finish")
+    )));
 }
 
 #[test]
@@ -1358,12 +1349,17 @@ fn assert_inbox_binding(mission_id: &str, status: &serde_json::Value, inbox: &[s
 fn inbox_binding_rejects_omitted_mission_that_awaits_lead_input() {
     let status = serde_json::json!({
         "mission_id": "m-awaiting",
-        "attention": [],
-        "disposition": "awaiting_lead",
-        "next_actions": ["mission send", "mission abort"],
+        "terminal": null,
+        "next": {
+            "effects": [],
+            "choices": [
+                {"kind": "send_message", "role_instance": "implementer"},
+                {"kind": "abort"}
+            ]
+        },
         "conversations": [{
             "lifecycle": "awaiting_lead",
-            "legal_actions": ["mission send"]
+            "queued_messages": []
         }]
     });
     assert_inbox_binding("m-awaiting", &status, &[]);

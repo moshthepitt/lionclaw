@@ -1,5 +1,6 @@
 mod common;
 
+use lionclaw::model::TerminalState;
 use lionclaw_runtime_api::TypedFailure;
 use std::sync::{Arc, Mutex};
 
@@ -7,11 +8,11 @@ use common::{
     approve_plan, covered_requirement, fault_append_events, harness, harness_with_type, proposal,
     review_runner, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
 };
-use lionclaw::engine::{record_control, MissionDisposition};
+use lionclaw::engine::record_control;
 use lionclaw::model::{
-    Assertion, AssertionId, ControlAction, DecisionAction, Handoff, MissionEvent, MissionPhase,
-    OracleName, OutputSemantics, PayloadRef, RoleAttemptDisposition, RoleEffectSource,
-    RoleInstanceId, SettledHandoff,
+    Assertion, AssertionId, ControlAction, DecisionAction, Handoff, MissionEvent, OracleName,
+    OutputSemantics, PayloadRef, RoleAttemptDisposition, RoleEffectSource, RoleInstanceId,
+    SettledHandoff,
 };
 use lionclaw::ports::{CapturedArtifact, OracleOutcome, RoleTurnOutcome};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -205,8 +206,8 @@ async fn invalid_handoff_is_reworked_automatically_with_exact_feedback() {
         .unwrap();
     approve_plan(&h.engine, &id).await;
 
-    let outcome = h.engine.advance(&id).await.unwrap();
-    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
+    let outcome = common::advance_to_finished(&h.engine, &id).await;
+    assert!(outcome.state.is_terminal());
     let prompts = prompts.lock().unwrap();
     assert_eq!(prompts.len(), 2);
     assert!(prompts[1].contains("Required rework"));
@@ -328,8 +329,8 @@ async fn wrong_handoff_type_is_recorded_as_invalid_and_reworked() {
         .unwrap();
     approve_plan(&h.engine, &id).await;
 
-    let outcome = h.engine.advance(&id).await.unwrap();
-    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
+    let outcome = common::advance_to_finished(&h.engine, &id).await;
+    assert!(outcome.state.is_terminal());
     {
         let prompts = prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
@@ -377,10 +378,10 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
         .await
         .unwrap();
     approve_plan(&h.engine, &id).await;
-    assert_eq!(
-        h.engine.advance(&id).await.unwrap().disposition,
-        MissionDisposition::Terminal
-    );
+    assert!(common::advance_to_finished(&h.engine, &id)
+        .await
+        .state
+        .is_terminal());
     assert_eq!(*attempts.lock().unwrap(), 2);
 
     let dir = tempfile::tempdir().unwrap();
@@ -405,9 +406,7 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
         .unwrap();
     approve_plan(&h.engine, &id).await;
     let view = h.engine.advance(&id).await.unwrap();
-    assert_eq!(view.disposition, MissionDisposition::Parked);
-    let attention: Vec<_> = view.state.open_attention.values().collect();
-    assert_eq!(attention[0].id, "node_failed:fix");
+    assert!(common::has_decision(&view.state, "node_failed:fix"));
     assert_eq!(h.role_runner.calls.lock().unwrap().len(), 1);
 }
 
@@ -487,9 +486,12 @@ async fn a_scheduled_transient_retry_can_be_stopped_before_runtime_launch() {
     .unwrap();
 
     let parked = driver.await.unwrap();
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
     assert_eq!(*attempts.lock().unwrap(), 1);
     let task_id = parked.state.tasks.keys().next().unwrap();
+    assert!(common::has_decision(
+        &parked.state,
+        &format!("node_failed:{task_id}")
+    ));
     assert_eq!(
         parked.state.task_last_failure(task_id).unwrap().category(),
         "operator_stopped"
@@ -596,7 +598,12 @@ async fn stopping_one_scheduled_oracle_retry_does_not_interrupt_its_sibling() {
     .unwrap();
 
     let parked = driver.await.unwrap();
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert!(parked.next.effects.is_empty());
+    assert!(parked
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, lionclaw::model::Choice::Decide { .. })));
     let attempts = attempts.lock().unwrap();
     for (oracle, count) in attempts.iter() {
         assert_eq!(
@@ -656,8 +663,8 @@ async fn structured_transient_oracle_failure_uses_the_shared_retry_budget() {
         .unwrap();
     approve_plan(&h.engine, &id).await;
 
-    let view = h.engine.advance(&id).await.unwrap();
-    assert_eq!(view.disposition, MissionDisposition::Terminal);
+    let view = common::advance_to_finished(&h.engine, &id).await;
+    assert!(view.state.is_terminal());
     assert_eq!(*attempts.lock().unwrap(), 2);
     assert!(view.state.oracle_failures.is_empty());
     assert!(view.state.parked_effects.is_empty());
@@ -711,7 +718,10 @@ async fn oracle_repair_reopens_the_owner_with_both_evidence_streams() {
         .unwrap();
     approve_plan(&h.engine, &id).await;
     let failed = h.engine.advance(&id).await.unwrap();
-    assert_eq!(failed.disposition, MissionDisposition::Parked);
+    assert!(common::has_decision(
+        &failed.state,
+        "proof_failed:oracle:cargo-test"
+    ));
     let failed_receipt = failed
         .state
         .authoritative_receipts
@@ -736,9 +746,12 @@ async fn oracle_repair_reopens_the_owner_with_both_evidence_streams() {
         .contract
         .values()
         .all(|assertion| assertion.last_authoritative_receipt.is_none()));
-    let view = h.engine.advance(&id).await.unwrap();
-    assert_eq!(view.disposition, MissionDisposition::Terminal);
-    assert!(matches!(view.state.phase, MissionPhase::Done { .. }));
+    let view = common::advance_to_finished(&h.engine, &id).await;
+    assert!(view.state.is_terminal());
+    assert!(matches!(
+        view.state.terminal,
+        Some(TerminalState::Done { .. })
+    ));
     assert_eq!(view.state.authoritative_receipts.len(), 2);
     assert!(view
         .state

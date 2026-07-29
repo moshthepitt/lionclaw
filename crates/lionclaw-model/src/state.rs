@@ -114,28 +114,14 @@ impl DurableCancellation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "phase", rename_all = "snake_case")]
-pub enum MissionPhase {
-    /// No accepted plan yet: dispatches the team's planning assignment toward
-    /// a joint plan/team proposal.
-    Planning,
-    Running,
-    /// Open attention items — parked at zero compute (durable interrupt).
-    AttentionNeeded,
-    Done {
-        finish: FinishClass,
-    },
-    Aborted {
-        reason: String,
-    },
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TerminalState {
+    Done { finish: FinishClass },
+    Aborted { reason: String },
 }
 
-impl MissionPhase {
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done { .. } | Self::Aborted { .. })
-    }
-
-    /// The finish grade, if this is a `Done` phase.
+impl TerminalState {
+    /// The finish grade, if this is a completed terminal state.
     pub const fn finish(&self) -> Option<FinishClass> {
         match self {
             Self::Done { finish } => Some(*finish),
@@ -143,18 +129,30 @@ impl MissionPhase {
         }
     }
 
-    /// The stable snake_case variant name (matches the serde `phase` tag). The
-    /// `Done`/`Aborted` payloads are not part of the slug — a caller that wants
-    /// the finish grade composes it from [`FinishClass::slug`].
+    /// The stable snake_case terminal variant name. The `Done`/`Aborted`
+    /// payloads are not part of the slug; callers that want the finish grade
+    /// compose it from [`FinishClass::slug`].
     pub const fn slug(&self) -> &'static str {
         match self {
-            Self::Planning => "planning",
-            Self::Running => "running",
-            Self::AttentionNeeded => "attention_needed",
             Self::Done { .. } => "done",
             Self::Aborted { .. } => "aborted",
         }
     }
+
+    pub fn display_slug(&self) -> String {
+        match self {
+            Self::Done { finish } => format!("done:{}", finish.slug()),
+            Self::Aborted { .. } => "aborted".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppliedResult {
+    pub branch: String,
+    pub sha: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -825,69 +823,6 @@ impl ReviewAcceptanceKind {
     }
 }
 
-/// A gap reviewer's verdict. Plain public data — deliberately NOT an
-/// `AuthoritativeVerdict` (private-field mint, `verdict.rs`): this verdict
-/// is advisory, mints nothing, and gates closure only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttentionKind {
-    NodeFailed,
-    NodeAttention,
-    /// An oracle failed to *run* (infrastructure), distinct from a nonzero
-    /// exit (which is a valid verdict).
-    OracleFailed,
-    /// Fresh required command or judged proof returned a non-passing verdict.
-    ProofFailed,
-    GateFailed,
-    GateCheckpoint,
-    /// A complete plan proposal awaits approval before promotion.
-    PlanProposal,
-    /// The gap review's blocking verdict awaits a human (revise to
-    /// remediate / retry to re-run / accept to acknowledge-and-close /
-    /// abort). Raised only when the mission would otherwise close, so
-    /// remediation work auto-clears it.
-    GapReviewGaps,
-    /// The gap reviewer failed to run or hand off a verdict
-    /// (infrastructure), distinct from a verdict with gaps.
-    GapReviewFailed,
-}
-
-impl AttentionKind {
-    /// The stable snake_case name (matches the serde repr). Used both to derive
-    /// the durable attention-item id in the fold and to render it in the CLI, so
-    /// the id a user reads is exactly the id they pass back to `decide`.
-    pub const fn slug(self) -> &'static str {
-        match self {
-            Self::NodeFailed => "node_failed",
-            Self::NodeAttention => "node_attention",
-            Self::OracleFailed => "oracle_failed",
-            Self::ProofFailed => "proof_failed",
-            Self::GateFailed => "gate_failed",
-            Self::GateCheckpoint => "gate_checkpoint",
-            Self::PlanProposal => "plan_proposal",
-            Self::GapReviewGaps => "gap_review_gaps",
-            Self::GapReviewFailed => "gap_review_failed",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttentionItem {
-    /// Stable across refolds: `{kind}:{anchor}` where the anchor is the task,
-    /// oracle, or "mission".
-    pub id: String,
-    pub kind: AttentionKind,
-    /// The task this item is about, if any.
-    pub task_id: Option<TaskId>,
-    /// The oracle this item is about, if any (oracle infra failures).
-    #[serde(default)]
-    pub oracle: Option<OracleName>,
-    #[serde(default)]
-    pub assertion_ids: Vec<AssertionId>,
-    pub evidence: DecisionEvidence,
-    pub report: String,
-}
-
 /// A `…Requested` event without a recorded outcome. The active driver executes
 /// it; a later driver cleans and marks it interrupted rather than replaying it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1157,7 +1092,10 @@ pub struct MissionState {
         BTreeMap<u32, BTreeMap<RoleInstanceId, RuntimeInstrumentIdentity>>,
     #[serde(default)]
     pub skills: BTreeMap<String, super::MissionSkill>,
-    pub phase: MissionPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<TerminalState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_result: Option<AppliedResult>,
     pub plan: Option<Plan>,
     pub contract: BTreeMap<AssertionId, AssertionState>,
     #[serde(default)]
@@ -1201,9 +1139,6 @@ pub struct MissionState {
     /// effect's outcome is durably recorded.
     #[serde(default)]
     pub cleanup_failure: Option<EffectCleanupFailure>,
-    /// Derived each fold from failed nodes, gate results, and the
-    /// approval gate, minus anything a decision has resolved.
-    pub open_attention: BTreeMap<String, AttentionItem>,
     /// The pending proposal was approved (the durable approval gate was answered).
     /// Cleared on every new proposal when the gate is on, so approval of
     /// one plan revision never authorizes the next (ADR 0006).
@@ -1366,17 +1301,27 @@ impl MissionState {
                     .iter()
                     .any(|item| item.evidence.role_attempts().contains(effect_id))
             });
-        let current_attention = self
-            .open_attention
-            .values()
-            .any(|item| item.evidence.role_attempts().contains(effect_id));
+        let current_taskless_failure = match &receipt.source {
+            RoleEffectSource::Turn {
+                request,
+                plan_revision,
+            } if request.task_id.is_none()
+                && *plan_revision == self.revision
+                && receipt.failure().is_some()
+                && self.parked_effects.contains_key(effect_id) =>
+            {
+                self.taskless_assignment_failure(&request.role_instance, &request.assertion_ids)
+                    .is_some_and(|(parked_id, _, _)| parked_id == effect_id)
+            }
+            _ => false,
+        };
         let inflight = self.inflight.contains_key(effect_id)
             && receipt.disposition == RoleAttemptDisposition::Active;
         let evidence_use = if current_task
             || current_advisory
             || current_review
             || current_feedback
-            || current_attention
+            || current_taskless_failure
             || inflight
         {
             RoleAttemptEvidenceUse::Current
@@ -1597,6 +1542,14 @@ impl MissionState {
 }
 
 impl MissionState {
+    pub fn is_terminal(&self) -> bool {
+        self.terminal.is_some()
+    }
+
+    pub fn finish(&self) -> Option<FinishClass> {
+        self.terminal.as_ref().and_then(TerminalState::finish)
+    }
+
     pub fn task_workspace_role(
         &self,
         task_id: &TaskId,
@@ -1794,7 +1747,7 @@ impl MissionState {
     }
 
     pub fn conversation_is_messageable(&self, role_instance: &RoleInstanceId) -> bool {
-        !self.phase.is_terminal()
+        !self.is_terminal()
             && self
                 .conversations
                 .get(role_instance)
@@ -1810,24 +1763,6 @@ impl MissionState {
         self.conversation_is_messageable(role_instance)
             && self.conversations[role_instance].queued.len()
                 < crate::MAX_QUEUED_MESSAGES_PER_CONVERSATION
-    }
-
-    pub fn conversation_legal_actions(&self, role_instance: &RoleInstanceId) -> Vec<&'static str> {
-        if !self.conversation_is_messageable(role_instance) {
-            return Vec::new();
-        }
-        let mut actions = match self.conversations[role_instance].lifecycle {
-            ConversationLifecycle::AwaitingLead => Vec::new(),
-            ConversationLifecycle::Running => vec!["mission status"],
-            ConversationLifecycle::Ready | ConversationLifecycle::ReworkingInvalidHandoff => {
-                vec!["mission advance"]
-            }
-            ConversationLifecycle::Completed | ConversationLifecycle::Retired => return Vec::new(),
-        };
-        if self.conversation_accepts_message(role_instance) {
-            actions.push("mission send");
-        }
-        actions
     }
 
     pub fn deliverable_head(&self) -> &str {
@@ -1945,7 +1880,7 @@ impl MissionState {
     }
 
     pub fn durable_cancellation(&self, effect_id: &super::EffectId) -> Option<DurableCancellation> {
-        if let MissionPhase::Aborted { reason } = &self.phase {
+        if let Some(TerminalState::Aborted { reason }) = &self.terminal {
             return Some(DurableCancellation::Aborted {
                 reason: reason.clone(),
             });
@@ -1962,7 +1897,7 @@ impl MissionState {
     }
 
     pub fn parked_effect_is_continuable(&self, effect_id: &super::EffectId) -> bool {
-        !self.phase.is_terminal()
+        !self.is_terminal()
             && self
                 .parked_effects
                 .get(effect_id)

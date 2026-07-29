@@ -4,13 +4,14 @@
 
 mod common;
 
+use lionclaw::model::TerminalState;
 use std::sync::Arc;
 
 use common::{
     initialize_repository, proposal, review_runner, simple_plan, test_mission_type, BASE_SHA,
 };
-use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
-use lionclaw::model::{DecisionAction, FinishClass, MissionEvent, MissionPhase};
+use lionclaw::engine::{Engine, EngineServices};
+use lionclaw::model::{Choice, DecisionAction, FinishClass, MissionEvent};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, NoopEffectCleaner};
 
@@ -45,10 +46,10 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
 
     // Advance parks at the approval gate — no work has run.
     let parked = engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
-    let attention: Vec<_> = parked.state.open_attention.values().collect();
-    assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0].id, "plan_proposal:mission");
+    assert_eq!(
+        common::decision_actions(&parked.state, "plan_proposal:mission"),
+        [DecisionAction::Approve, DecisionAction::Revise]
+    );
 
     // The model contract rejects an empty reason even when the action itself
     // is legal; callers cannot bypass the CLI's required flag.
@@ -78,7 +79,8 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
         .await
         .is_err());
 
-    // Approve, then advance runs the mission to a verified finish.
+    // Approve, then drive to the explicit finish gate without losing the mission
+    // from operator inboxes. `Finish` is a choice, not an automatic phase.
     engine
         .decide(
             &mission_id,
@@ -88,14 +90,73 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
         )
         .await
         .expect("approve");
-    let done = engine.advance(&mission_id).await.expect("advance 2");
-    assert_eq!(done.disposition, MissionDisposition::Terminal);
-    assert!(matches!(
-        done.state.phase,
-        MissionPhase::Done {
-            finish: FinishClass::Verified
-        }
-    ));
+    let ready = engine
+        .advance(&mission_id)
+        .await
+        .expect("advance to finish");
+    assert!(ready
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Finish { .. })));
+    let projected = serde_json::to_value(&ready.next).expect("serialize next");
+    assert_eq!(
+        projected.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["choices", "effects"],
+        "Next must not grow another state or issue projection"
+    );
+    assert!(
+        !projected["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|choice| choice["kind"] == "propose_plan"),
+        "a fully green mission must not restart planning implicitly"
+    );
+    assert!(
+        projected["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|choice| {
+                choice["kind"] == "decide"
+                    && choice["id"] == "mission"
+                    && choice["action"] == "revise"
+            }),
+        "a fully green mission must offer explicit revision"
+    );
+    let inbox = std::process::Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+        .args(["mission", "inbox", "--json", "--repo"])
+        .arg(dir.path())
+        .output()
+        .expect("render finish-ready inbox");
+    assert!(
+        inbox.status.success(),
+        "inbox failed: {}",
+        String::from_utf8_lossy(&inbox.stderr)
+    );
+    let inbox: serde_json::Value = serde_json::from_slice(&inbox.stdout).unwrap();
+    assert_eq!(inbox["missions"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox["missions"][0]["mission_id"], mission_id.as_str());
+    assert_eq!(inbox["missions"][0]["next"], projected);
+    let inbox = std::process::Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+        .args(["mission", "inbox", "--repo"])
+        .arg(dir.path())
+        .output()
+        .expect("render finish-ready human inbox");
+    assert!(
+        inbox.status.success(),
+        "inbox failed: {}",
+        String::from_utf8_lossy(&inbox.stderr)
+    );
+    let inbox = String::from_utf8(inbox.stdout).expect("UTF-8 inbox");
+    assert!(inbox.contains("ready to finish"));
+    assert!(inbox.contains("next: mission finish | mission decide | mission abort"));
+
+    engine.finish(&mission_id, "done").await.expect("finish");
+    let done = engine.advance(&mission_id).await.expect("advance terminal");
+    assert!(done.state.is_terminal());
+    assert_eq!(done.state.finish(), Some(FinishClass::Verified));
 }
 
 #[tokio::test]
@@ -110,8 +171,8 @@ async fn universal_abort_needs_no_attention_and_records_only_the_abort_fact() {
     engine.abort(&mission_id, "stop").await.expect("abort");
     let state = engine.load_state(&mission_id).await.expect("state");
     assert!(matches!(
-        state.phase,
-        MissionPhase::Aborted { ref reason } if reason == "stop"
+        state.terminal,
+        Some(TerminalState::Aborted { ref reason }) if reason == "stop"
     ));
     let events = engine.store().load(&mission_id).await.expect("events");
     assert!(matches!(

@@ -1,20 +1,51 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use lionclaw_model::{
-    apply, fold, ready_to_finish, step, AdvisoryStatus, Assertion, AssertionId, AssertionState,
-    AttentionKind, AuthorityCeilings, AuthorityGrants, ConfinementResources, ConversationLifecycle,
-    ConversationState, DecisionAction, DeliveryMarker, EffectId, EventEnvelope, ExecutionPolicy,
-    Handoff, MissionConfig, MissionEvent, MissionGuidance, MissionId, MissionPhase,
-    MissionProposal, MissionState, MissionTypeRef, OracleName, OutputSemantics, PayloadRef, Plan,
-    PlanProposal, QueuedMessage, RecoveryConfig, Requirement, RequirementDisposition,
-    RequirementId, RequirementKind, RoleAttemptDisposition, RoleInstance, RoleInstanceId,
-    RoleInstrumentIdentity, RolePromptTemplate, RoleTurnSuccess, RuntimeConfigurationEvidence,
-    RuntimeInstrumentIdentity, StepDecision, StopBar, Task, TaskId, TaskRoleAssignment,
-    TaskRuntimeState, TaskStatus, TeamRevision, TypedFailure, ValidationItem, VersionStamps,
-    WorkspacePreparation, SCHEMA_VERSION,
+    apply, fold, AdvisoryStatus, Assertion, AssertionId, AssertionState, AuthorityCeilings,
+    AuthorityGrants, Choice, ConfinementResources, ConversationLifecycle, ConversationState,
+    DecisionAction, DeliveryMarker, EffectId, EventEnvelope, ExecutionPolicy, Handoff,
+    MissionConfig, MissionEvent, MissionGuidance, MissionId, MissionProposal, MissionState,
+    MissionTypeRef, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal, QueuedMessage,
+    RecoveryConfig, Requirement, RequirementDisposition, RequirementId, RequirementKind,
+    RoleAttemptDisposition, RoleInstance, RoleInstanceId, RoleInstrumentIdentity,
+    RolePromptTemplate, RoleTurnSuccess, RuntimeConfigurationEvidence, RuntimeInstrumentIdentity,
+    StopBar, Task, TaskId, TaskRoleAssignment, TaskRuntimeState, TaskStatus, TeamRevision,
+    TerminalState, TypedFailure, ValidationItem, VersionStamps, WorkspacePreparation,
+    SCHEMA_VERSION,
 };
 
 const BASE_ENVIRONMENT_DIGEST: &str = "image";
+
+fn decision_actions(state: &MissionState, id: &str) -> Vec<DecisionAction> {
+    lionclaw_model::next(state)
+        .choices
+        .into_iter()
+        .filter_map(|choice| match choice {
+            lionclaw_model::Choice::Decide {
+                id: choice_id,
+                action,
+            } if choice_id == id => Some(action),
+            _ => None,
+        })
+        .collect()
+}
+
+fn finish_choice(state: &MissionState) -> Option<lionclaw_model::FinishClass> {
+    lionclaw_model::next(state)
+        .choices
+        .into_iter()
+        .find_map(|choice| match choice {
+            Choice::Finish { finish } => Some(finish),
+            _ => None,
+        })
+}
+
+fn has_role_dispatch(state: &MissionState) -> bool {
+    lionclaw_model::next(state)
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, lionclaw_model::EffectIntent::DispatchRole(_)))
+}
 
 fn instance(raw: &str) -> RoleInstanceId {
     RoleInstanceId::new(raw).expect("valid role instance id")
@@ -487,7 +518,6 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
     .expect("accepted mission plan");
     let left = AssertionId::new("A-LEFT").unwrap();
     let right = AssertionId::new("A-RIGHT").unwrap();
-    state.phase = MissionPhase::Running;
     state.config.oracles = BTreeSet::from([
         OracleName::new("left").unwrap(),
         OracleName::new("right").unwrap(),
@@ -545,9 +575,14 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
         2
     );
 
-    let StepDecision::RunOracles(intents) = step(&state) else {
-        panic!("expected oracle dispatch, got {:?}", step(&state))
-    };
+    let intents = lionclaw_model::next(&state)
+        .effects
+        .into_iter()
+        .filter_map(|effect| match effect {
+            lionclaw_model::EffectIntent::DispatchOracle(intent) => Some(intent),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(intents.len(), 1);
 }
 
@@ -937,7 +972,7 @@ fn attested_closure_waits_for_every_assigned_judge() {
         state.advisory_status(&AssertionId::new("A-1").unwrap()),
         AdvisoryStatus::Pending
     );
-    assert_eq!(state.phase, MissionPhase::Running);
+    assert!(has_role_dispatch(&state));
 
     let (effect_id, request) = reviewer_request(7, 1, "judge");
     apply(&mut state, &request);
@@ -958,9 +993,44 @@ fn attested_closure_waits_for_every_assigned_judge() {
         ),
     );
     assert_eq!(
-        ready_to_finish(&state),
+        finish_choice(&state),
         Some(lionclaw_model::FinishClass::Attested)
     );
+
+    let mut queued = state.clone();
+    let message_sequence = queued.head;
+    let conversation = queued
+        .conversations
+        .get_mut(&instance("reviewer"))
+        .expect("reviewer conversation");
+    conversation.lifecycle = ConversationLifecycle::AwaitingLead;
+    conversation.queued.push(QueuedMessage {
+        sequence_no: message_sequence,
+        body: "one more question".into(),
+        references: Vec::new(),
+        marker: DeliveryMarker::Queued,
+    });
+    let projection = lionclaw_model::next(&queued);
+    assert!(projection
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, lionclaw_model::EffectIntent::DispatchRole(_))));
+    assert!(!projection
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Finish { .. })));
+    apply(
+        &mut queued,
+        &event(
+            9,
+            MissionEvent::MissionFinished {
+                finish: lionclaw_model::FinishClass::Attested,
+                reason: "forged while a continuation is owed".into(),
+            },
+        ),
+    );
+    assert_eq!(queued.terminal, None);
+
     apply(
         &mut state,
         &event(
@@ -972,10 +1042,10 @@ fn attested_closure_waits_for_every_assigned_judge() {
         ),
     );
     assert_eq!(
-        state.phase,
-        MissionPhase::Done {
+        state.terminal,
+        Some(TerminalState::Done {
             finish: lionclaw_model::FinishClass::Attested
-        }
+        })
     );
 }
 
@@ -1012,29 +1082,20 @@ fn failed_required_judgment_parks_and_rejects_below_bar_finish() {
     let state = failed_required_judgment_state();
     let assertion_id = AssertionId::new("A-1").unwrap();
     assert_eq!(state.advisory_status(&assertion_id), AdvisoryStatus::Failed);
-    assert_eq!(state.phase, MissionPhase::AttentionNeeded);
-    assert_eq!(ready_to_finish(&state), None);
-    assert_eq!(step(&state), StepDecision::Park);
+    assert_eq!(finish_choice(&state), None);
+    assert!(lionclaw_model::next(&state).effects.is_empty());
 
-    let attention = &state.open_attention["proof_failed:judgment:reviewer:A-1"];
-    assert_eq!(attention.kind, AttentionKind::ProofFailed);
+    let decision_id = "proof_failed:judgment:reviewer:A-1";
     assert_eq!(
-        attention.assertion_ids.as_slice(),
-        core::slice::from_ref(&assertion_id)
-    );
-    assert_eq!(
-        lionclaw_model::decision::legal_actions(&state, attention),
+        decision_actions(&state, decision_id),
         [
             DecisionAction::Retry,
             DecisionAction::Repair,
             DecisionAction::Revise
         ]
     );
-    assert!(matches!(
-        &attention.evidence,
-        lionclaw_model::DecisionEvidence::RoleAttempts { effect_ids }
-            if effect_ids.len() == 1
-    ));
+    let failed_effect = state.contract[&assertion_id].last_advisory[&instance("reviewer")].clone();
+    assert!(state.role_attempt_receipts.contains_key(&failed_effect));
 
     for finish in [
         lionclaw_model::FinishClass::Unverified,
@@ -1051,15 +1112,16 @@ fn failed_required_judgment_parks_and_rejects_below_bar_finish() {
                 },
             ),
         );
-        assert_eq!(forged.phase, MissionPhase::AttentionNeeded);
+        assert_eq!(
+            decision_actions(&forged, decision_id),
+            [
+                DecisionAction::Retry,
+                DecisionAction::Repair,
+                DecisionAction::Revise
+            ]
+        );
     }
 
-    let failed_effect = attention
-        .evidence
-        .role_attempts()
-        .first()
-        .expect("failed judgment receipt")
-        .clone();
     let mut forged = state;
     apply(
         &mut forged,
@@ -1073,10 +1135,14 @@ fn failed_required_judgment_parks_and_rejects_below_bar_finish() {
             },
         ),
     );
-    assert_eq!(forged.phase, MissionPhase::AttentionNeeded);
-    assert!(forged
-        .open_attention
-        .contains_key("proof_failed:judgment:reviewer:A-1"));
+    assert_eq!(
+        decision_actions(&forged, decision_id),
+        [
+            DecisionAction::Retry,
+            DecisionAction::Repair,
+            DecisionAction::Revise
+        ]
+    );
     assert_eq!(
         forged.contract[&assertion_id].last_advisory[&instance("reviewer")],
         failed_effect
@@ -1087,11 +1153,8 @@ fn failed_required_judgment_parks_and_rejects_below_bar_finish() {
 fn failed_required_judgment_recovery_retries_or_replans() {
     let state = failed_required_judgment_state();
     let attention_id = "proof_failed:judgment:reviewer:A-1";
-    let failed_effect = state.open_attention[attention_id]
-        .evidence
-        .role_attempts()
-        .first()
-        .expect("failed judgment receipt")
+    let failed_effect = state.contract[&AssertionId::new("A-1").unwrap()].last_advisory
+        [&instance("reviewer")]
         .clone();
 
     let mut retry = state.clone();
@@ -1112,7 +1175,7 @@ fn failed_required_judgment_recovery_retries_or_replans() {
         retry.advisory_status(&AssertionId::new("A-1").unwrap()),
         AdvisoryStatus::Pending
     );
-    assert!(matches!(step(&retry), StepDecision::DispatchRole(_)));
+    assert!(has_role_dispatch(&retry));
 
     let mut repair = state.clone();
     apply(
@@ -1149,7 +1212,7 @@ fn failed_required_judgment_recovery_retries_or_replans() {
             },
         ),
     );
-    assert_eq!(revise.phase, MissionPhase::Planning);
+    assert!(has_role_dispatch(&revise));
     let Some(lionclaw_model::PlanningRefinement::FailureEvidence(feedback)) =
         &revise.planning_input.refinement
     else {
@@ -1199,9 +1262,8 @@ fn repeated_identical_required_judgment_suppresses_retry() {
         ),
     );
 
-    let attention = &state.open_attention[attention_id];
     assert_eq!(
-        lionclaw_model::decision::legal_actions(&state, attention),
+        decision_actions(&state, attention_id),
         [DecisionAction::Repair, DecisionAction::Revise]
     );
     assert!(state.role_attempt_receipts.contains_key(&second_effect));
@@ -1225,7 +1287,10 @@ fn repeated_identical_required_judgment_suppresses_retry() {
         state.contract[&AssertionId::new("A-1").unwrap()].last_advisory[&instance("reviewer")],
         current
     );
-    assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+    assert_eq!(
+        decision_actions(&state, attention_id),
+        [DecisionAction::Repair, DecisionAction::Revise]
+    );
 }
 
 #[test]
@@ -1265,7 +1330,7 @@ fn changed_judgment_evidence_offers_a_new_retry() {
     );
 
     assert_eq!(
-        lionclaw_model::decision::legal_actions(&state, &state.open_attention[attention_id]),
+        decision_actions(&state, attention_id),
         [
             DecisionAction::Retry,
             DecisionAction::Repair,
@@ -1309,7 +1374,7 @@ fn changed_judgment_identity_offers_a_new_retry() {
         ),
     );
     assert_eq!(
-        lionclaw_model::decision::legal_actions(&state, &state.open_attention[attention_id]),
+        decision_actions(&state, attention_id),
         [
             DecisionAction::Retry,
             DecisionAction::Repair,
@@ -1390,12 +1455,11 @@ fn permanent_taskless_role_failure_parks_until_an_explicit_retry() {
         ),
     );
     let attention_id = "node_failed:reviewer:A-1";
-    assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     assert_eq!(
-        state.open_attention[attention_id].kind,
-        AttentionKind::NodeFailed
+        decision_actions(&state, attention_id),
+        [DecisionAction::Retry, DecisionAction::Revise]
     );
-    assert_eq!(step(&state), StepDecision::Park);
+    assert!(lionclaw_model::next(&state).effects.is_empty());
 
     apply(
         &mut state,
@@ -1409,8 +1473,7 @@ fn permanent_taskless_role_failure_parks_until_an_explicit_retry() {
             },
         ),
     );
-    assert_eq!(state.phase, MissionPhase::Running);
-    assert!(matches!(step(&state), StepDecision::DispatchRole(_)));
+    assert!(has_role_dispatch(&state));
     assert!(!state.parked_effects.contains_key(&effect_id));
 }
 
@@ -1471,9 +1534,14 @@ fn queued_continuation_uses_the_roles_running_serial_task() {
         },
     );
 
-    let StepDecision::DispatchRole(intent) = step(&state) else {
-        panic!("queued continuation should dispatch");
-    };
+    let intent = lionclaw_model::next(&state)
+        .effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            lionclaw_model::EffectIntent::DispatchRole(intent) => Some(intent),
+            _ => None,
+        })
+        .expect("queued continuation should dispatch");
     assert_eq!(intent.task_id, Some(active));
     assert_eq!(intent.body, "finish the later serial task");
 }

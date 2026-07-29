@@ -12,13 +12,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use clap::Parser;
 use lionclaw::config::RuntimeProfiles;
-use lionclaw::engine::{MissionDisposition, ReferenceRejectionReason};
+use lionclaw::engine::ReferenceRejectionReason;
 use lionclaw::model::{
-    apply, fold, Assertion, AssertionId, AttentionKind, AuthorityGrants, FinishClass,
-    MessageReference, MissionEvent, MissionPhase, MissionProposal, MissionState, OracleName,
-    OutputSemantics, PayloadRef, Plan, PlanProposal, Requirement, RequirementDisposition,
-    RequirementId, RequirementKind, RoleInstance, RoleInstanceId, Task, TaskId, TaskStatus,
-    TeamRevision, REDUCER_VERSION, SCHEMA_VERSION,
+    apply, fold, Assertion, AssertionId, AuthorityGrants, Choice, FinishClass, MessageReference,
+    MissionEvent, MissionProposal, MissionState, OracleName, OutputSemantics, PayloadRef, Plan,
+    PlanProposal, Requirement, RequirementDisposition, RequirementId, RequirementKind,
+    RoleInstance, RoleInstanceId, Task, TaskId, TaskStatus, TeamRevision, TerminalState,
+    REDUCER_VERSION, SCHEMA_VERSION,
 };
 use lionclaw::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
 use lionclaw::store::MissionStore;
@@ -32,6 +32,16 @@ use lionclaw_runtime_api::{
     TypedFailure,
 };
 use lionclaw_runtime_codex::CodexRuntimeDriver;
+
+fn decision_id_with_prefix(state: &MissionState, prefix: &str) -> Option<String> {
+    lionclaw::model::next(state)
+        .choices
+        .into_iter()
+        .find_map(|choice| match choice {
+            Choice::Decide { id, .. } if id.starts_with(prefix) => Some(id),
+            _ => None,
+        })
+}
 
 #[derive(Clone, Copy)]
 enum DeliveryTurn {
@@ -377,6 +387,14 @@ fn projected_conversation<'a>(value: &'a serde_json::Value, id: &str) -> &'a ser
         .iter()
         .find(|conversation| conversation["id"] == id)
         .expect("conversation in projection")
+}
+
+fn next_has_send(value: &serde_json::Value, role_instance: &str) -> bool {
+    value["next"]["choices"].as_array().is_some_and(|choices| {
+        choices.iter().any(|choice| {
+            choice["kind"] == "send_message" && choice["role_instance"] == role_instance
+        })
+    })
 }
 
 fn validation_handoff(prompt: &str) -> serde_json::Value {
@@ -1425,7 +1443,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (33, 66));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (33, 67));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -1806,10 +1824,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     assert_ne!(settled.deliverable_head(), base);
     assert_eq!(settled.tasks[&writer_id].status, TaskStatus::Cleared);
     assert!(settled.inflight.is_empty());
-    assert_eq!(
-        (settled.parked_effects.len(), settled.open_attention.len()),
-        (1, 1)
-    );
+    assert_eq!(settled.parked_effects.len(), 1);
+    assert!(decision_id_with_prefix(&settled, "node_failed:").is_some());
     assert_eq!(
         (
             turns.lock().unwrap().len(),
@@ -1819,16 +1835,16 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         (0, 3, 3)
     );
     let view = lionclaw::engine::MissionView::from_state(settled, false);
-    assert_eq!(view.disposition, MissionDisposition::Parked);
-    assert_eq!(
-        view.next_actions(),
-        [
-            "mission continue",
-            "mission decide",
-            "mission send",
-            "mission abort"
-        ]
-    );
+    assert!(view
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
+    assert!(view
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::SendMessage { .. })));
     let conversation_id = conversation_id.to_string();
     let status: serde_json::Value = serde_json::from_str(&stdout(cli_output(
         &repo,
@@ -1843,28 +1859,18 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
     let inbox: serde_json::Value =
         serde_json::from_str(&stdout(cli_output(&repo, &["mission", "inbox", "--json"]))).unwrap();
     for root in [&status, &report, &inbox["missions"][0]] {
-        assert_eq!(
-            root["next_actions"],
-            serde_json::json!([
-                "mission continue",
-                "mission decide",
-                "mission send",
-                "mission abort"
-            ])
-        );
+        assert_eq!(root["next"], serde_json::to_value(&view.next).unwrap());
         let conversation = projected_conversation(root, &conversation_id);
         assert_eq!(conversation["lifecycle"], "retired");
-        assert_eq!(conversation["legal_actions"], serde_json::json!([]));
+        assert!(conversation.get("legal_actions").is_none());
         assert_eq!(
             conversation["final_response"],
             "The requested production flow is complete."
         );
         let validator = projected_conversation(root, validator_conversation.as_str());
         assert_eq!(validator["lifecycle"], "ready");
-        assert_eq!(
-            validator["legal_actions"],
-            serde_json::json!(["mission advance", "mission send"])
-        );
+        assert!(validator.get("legal_actions").is_none());
+        assert!(next_has_send(root, validator_conversation.as_str()));
     }
     for args in [
         vec!["mission", "status", mission.as_str()],
@@ -2084,29 +2090,25 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .unwrap();
         let state = store.require_state(&mission).await.unwrap();
         if !state.authoritative_receipts.is_empty()
-            && state
-                .open_attention
-                .values()
-                .any(|attention| matches!(attention.kind, AttentionKind::ProofFailed))
+            && decision_id_with_prefix(&state, "proof_failed:").is_some()
         {
             break;
         }
     }
     let failed = store.require_state(&mission).await.unwrap();
-    let attention = failed
-        .open_attention
-        .iter()
-        .find_map(|(id, attention)| {
-            matches!(attention.kind, AttentionKind::ProofFailed).then_some(id)
-        })
-        .unwrap_or_else(|| panic!("failed oracle attention: {:#?}", failed.open_attention));
+    let attention = decision_id_with_prefix(&failed, "proof_failed:").unwrap_or_else(|| {
+        panic!(
+            "failed oracle decision: {:#?}",
+            lionclaw::model::next(&failed)
+        )
+    });
     cli::run_with_transports(
         cli::Cli::try_parse_from([
             "lionclaw",
             "mission",
             "decide",
             mission.as_str(),
-            attention,
+            &attention,
             "repair",
             "--justification",
             "retry through a parked reference-bearing turn",
@@ -2199,8 +2201,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .await
         .unwrap();
         if matches!(
-            store.require_state(&mission).await.unwrap().phase,
-            MissionPhase::Done { .. }
+            store.require_state(&mission).await.unwrap().terminal,
+            Some(TerminalState::Done { .. })
         ) {
             break;
         }
@@ -2755,7 +2757,9 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             .iter()
             .all(|message| { message.marker == lionclaw::model::DeliveryMarker::Queued }));
         assert!(revised.conversation_is_messageable(&planner_id));
-        assert!(!revised.conversation_legal_actions(&planner_id).is_empty());
+        assert!(lionclaw::model::next(&revised).choices.iter().any(
+            |choice| matches!(choice, Choice::SendMessage { role_instance } if role_instance == &planner_id)
+        ));
         assert!(revised
             .parked_effects
             .keys()
@@ -3103,12 +3107,11 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             "ordinary work did not move Git base"
         );
         for attempt in 0..4 {
-            if !reloaded_store
-                .require_state(&mission)
-                .await
-                .unwrap()
-                .open_attention
-                .is_empty()
+            if decision_id_with_prefix(
+                &reloaded_store.require_state(&mission).await.unwrap(),
+                "proof_failed:",
+            )
+            .is_some()
             {
                 break;
             }
@@ -3123,13 +3126,12 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         let repair_base = moved.deliverable_head().to_string();
         let old_response = moved.conversations[&old_id].final_response.clone();
         assert!(old_response.is_some());
-        let attention = moved
-            .open_attention
-            .iter()
-            .find_map(|(id, attention)| {
-                matches!(attention.kind, AttentionKind::ProofFailed).then(|| id.clone())
-            })
-            .unwrap_or_else(|| panic!("failed oracle attention: {:#?}", moved.open_attention));
+        let attention = decision_id_with_prefix(&moved, "proof_failed:").unwrap_or_else(|| {
+            panic!(
+                "failed oracle decision: {:#?}",
+                lionclaw::model::next(&moved)
+            )
+        });
         cli::run(
             cli::Cli::try_parse_from([
                 "lionclaw",
@@ -3457,16 +3459,39 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         )
         .await
         .unwrap();
-        if view.disposition == MissionDisposition::Terminal {
+        if view
+            .next
+            .choices
+            .iter()
+            .any(|choice| matches!(choice, Choice::Finish { .. }))
+        {
+            let finish = cli::Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "finish",
+                mission_id.as_str(),
+                "--repo",
+                repo.to_str().unwrap(),
+                "--reason",
+                "verified production conversation proof",
+            ])
+            .unwrap();
+            cli::run_with_transports(finish, transports.clone())
+                .await
+                .unwrap();
+            let view = lionclaw::engine::load_mission_view(
+                &MissionStore::open(&repo).await.unwrap(),
+                &mission_id,
+            )
+            .await
+            .unwrap();
+            break view;
+        }
+        if view.state.is_terminal() {
             break view;
         }
     };
-    assert_eq!(
-        outcome.state.phase,
-        MissionPhase::Done {
-            finish: FinishClass::Verified
-        }
-    );
+    assert_eq!(outcome.state.finish(), Some(FinishClass::Verified));
     for args in [
         vec![
             "lionclaw",
@@ -3815,7 +3840,12 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         let awaiting = lionclaw::engine::load_mission_view(&awaiting_store, &mission_id)
             .await
             .unwrap();
-        assert_eq!(awaiting.disposition, MissionDisposition::AwaitingLead);
+        assert!(awaiting.next.effects.is_empty());
+        assert!(awaiting
+            .next
+            .choices
+            .iter()
+            .any(|choice| matches!(choice, Choice::SendMessage { .. })));
         let (conversation_id, conversation) = awaiting.state.conversations.iter().next().unwrap();
         let response = conversation.final_response.as_ref().unwrap();
         let response = awaiting_store.blobs().resolve(response).unwrap();
@@ -3849,10 +3879,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         for root in [&status_json, &report_json, &inbox_json["missions"][0]] {
             let projected = projected_conversation(root, &conversation_id);
             assert_eq!(projected["lifecycle"], "awaiting_lead");
-            assert_eq!(
-                projected["legal_actions"],
-                serde_json::json!(["mission send"])
-            );
+            assert!(projected.get("legal_actions").is_none());
+            assert!(next_has_send(root, &conversation_id));
             assert_eq!(projected["runtime_resume_mode"], "canonical_reconstruction");
             let final_response = projected["final_response"].as_str().unwrap();
             assert!(final_response.starts_with("Which release target should I use?"));
@@ -3863,8 +3891,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         // delivery boundary, so stale adapter activity must not leak into status.
         assert_eq!(status_json["activity"], serde_json::Value::Null);
         assert_eq!(
-            status_json["next_actions"],
-            serde_json::json!(["mission send", "mission abort"])
+            status_json["next"],
+            serde_json::to_value(&awaiting.next).unwrap()
         );
         for args in [
             vec!["mission", "status", mission_id.as_str()],
@@ -3873,7 +3901,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         ] {
             let human = stdout(cli_output(&repo, &args));
             assert!(human.contains("lifecycle=awaiting_lead"));
-            assert!(human.contains("legal_actions=mission send"));
+            assert!(human.contains("next: mission send | mission abort"));
             assert!(human.contains("final response: Which release target should I use?"));
         }
 
@@ -4109,6 +4137,23 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         assert_eq!(reducer, REDUCER_VERSION);
         assert!(snapshot_head < state.head, "snapshot tail must be nonempty");
         let mission_dir = repo.join(".lionclaw/missions").join(mission_id.as_str());
+        let driver_error = mission_dir.join("driver-error.txt");
+        let driver_stderr = mission_dir.join("driver-stderr.txt");
+        std::fs::write(&driver_error, "retain active driver error\n").unwrap();
+        std::fs::write(&driver_stderr, "retain active driver stderr\n").unwrap();
+        let active_advance = stdout(cli_output(
+            &repo,
+            &["mission", "advance", mission_id.as_str()],
+        ));
+        assert!(active_advance.contains("running"));
+        assert_eq!(
+            std::fs::read_to_string(&driver_error).unwrap(),
+            "retain active driver error\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&driver_stderr).unwrap(),
+            "retain active driver stderr\n"
+        );
         let exact_work = mission_dir
             .join("tasks")
             .join(request_task.as_str())
@@ -4167,10 +4212,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         assert!(!active_human.contains("misleading-legacy-change.txt"));
         let active_projection = projected_conversation(&active_status, &conversation_id);
         assert_eq!(active_projection["lifecycle"], "running");
-        assert_eq!(
-            active_projection["legal_actions"],
-            serde_json::json!(["mission status", "mission send"])
-        );
+        assert!(active_projection.get("legal_actions").is_none());
+        assert!(next_has_send(&active_status, &conversation_id));
         assert_eq!(
             active_projection["runtime_resume_mode"],
             "canonical_reconstruction"
@@ -4289,23 +4332,22 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             refreshed_status["conversations"]
         );
         assert_eq!(watched_activity["tasks"], refreshed_status["tasks"]);
-        assert_eq!(
-            watched_activity["next_actions"],
-            refreshed_status["next_actions"]
-        );
+        assert_eq!(watched_activity["next"], refreshed_status["next"]);
         let watched_human =
             watch_observation(&repo, mission_id.as_str(), false, Some("marker=queued"));
         assert!(watched_human.contains(&format!("{} ", effect_id.as_str())));
         assert!(watched_human.contains("lifecycle=running"));
         assert!(watched_human.contains("resume=canonical_reconstruction"));
-        assert!(watched_human.contains("legal_actions=mission status|mission send"));
+        assert!(!watched_human.contains("legal_actions="));
         assert!(watched_human.contains("marker=queued"));
         assert!(watched_human.contains(base.as_str()));
         let active_human = stdout(cli_output(
             &repo,
             &["mission", "status", mission_id.as_str()],
         ));
-        assert!(active_human.contains("legal_actions=mission status|mission send"));
+        assert!(active_human.contains(
+            "next: mission advance | mission stop | mission extend | mission send | mission abort"
+        ));
         assert!(active_human.contains("activity "));
 
         // The remainder of this settlement scenario deliberately tests a clean
@@ -4521,10 +4563,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
                 base
             );
             assert_eq!(projected["runtime_resume_mode"], "native_session");
-            assert_eq!(
-                projected["legal_actions"],
-                serde_json::json!(["mission advance", "mission send"])
-            );
+            assert!(projected.get("legal_actions").is_none());
+            assert!(next_has_send(root, &conversation_id));
         }
         for args in [
             vec!["mission", "status", mission_id.as_str()],
@@ -4535,7 +4575,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             assert!(human.contains("marker=previously_delivered"));
             assert!(human.contains("marker=possibly_delivered"));
             assert!(human.contains("body=Use the preserved release target."));
-            assert!(human.contains("legal_actions=mission advance|mission send"));
+            assert!(human.contains("mission send"));
+            assert!(!human.contains("legal_actions="));
         }
         let failed_effect = failed.parked_effects.keys().next().unwrap().to_string();
         cli::run(
@@ -4644,15 +4685,32 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         completion_driver.await.unwrap().unwrap();
         let mut completed_store = MissionStore::open(&repo).await.unwrap();
         for attempt in 0..6 {
-            if completed_store
-                .require_state(&mission_id)
-                .await
-                .unwrap()
-                .phase
-                == (MissionPhase::Done {
-                    finish: FinishClass::Verified,
-                })
+            let state = completed_store.require_state(&mission_id).await.unwrap();
+            if state.finish() == Some(FinishClass::Verified) {
+                break;
+            }
+            if lionclaw::model::next(&state)
+                .choices
+                .iter()
+                .any(|choice| matches!(choice, Choice::Finish { .. }))
             {
+                cli::run_with_transports(
+                    cli::Cli::try_parse_from([
+                        "lionclaw",
+                        "mission",
+                        "finish",
+                        mission_id.as_str(),
+                        "--repo",
+                        repo.to_str().unwrap(),
+                        "--reason",
+                        "verified delivery-boundary proof",
+                    ])
+                    .unwrap(),
+                    transports.clone(),
+                )
+                .await
+                .unwrap();
+                completed_store = MissionStore::open(&repo).await.unwrap();
                 break;
             }
             let handshake = temp
@@ -4677,15 +4735,10 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             lionclaw::model::ConversationLifecycle::Retired
         );
         assert!(delivery.active_delivery.is_none());
-        assert!(completed
-            .conversation_legal_actions(&exact_conversation_id)
-            .is_empty());
-        assert_eq!(
-            completed.phase,
-            MissionPhase::Done {
-                finish: FinishClass::Verified
-            }
-        );
+        assert!(!lionclaw::model::next(&completed).choices.iter().any(
+            |choice| matches!(choice, Choice::SendMessage { role_instance } if role_instance == &exact_conversation_id)
+        ));
+        assert_eq!(completed.finish(), Some(FinishClass::Verified));
         let mut completed_effect = activity.clone();
         completed_effect.event_head = completed.head;
         std::fs::write(
@@ -5009,7 +5062,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .next()
         .expect("production oracle receipt")
         .clone();
-    let attention = failed_oracle.open_attention.keys().next().unwrap().clone();
+    let attention = decision_id_with_prefix(&failed_oracle, "proof_failed:")
+        .expect("production oracle decision");
     cli::run(
         cli::Cli::try_parse_from([
             "lionclaw",
@@ -5393,7 +5447,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         .next()
         .unwrap()
         .clone();
-    let foreign_attention = foreign_failed.open_attention.keys().next().unwrap().clone();
+    let foreign_attention =
+        decision_id_with_prefix(&foreign_failed, "proof_failed:").expect("foreign oracle decision");
     cli::run(
         cli::Cli::try_parse_from([
             "lionclaw",

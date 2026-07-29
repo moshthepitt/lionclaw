@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use lionclaw::cli;
 use lionclaw::model::{
-    ready_to_finish, resolve_role_assignment, role_prompt_template, ArtifactOutcome, AssertionId,
-    EffectId, EnvironmentPreflight, FinishClass, Handoff, MissionEvent, OracleName,
-    OracleRunSuccess, OutputSemantics, PayloadRef, RoleAssignmentContext, RoleInstanceId,
-    RoleTurnSuccess, TaskId, WorkspacePreparation,
+    resolve_role_assignment, role_prompt_template, ArtifactOutcome, AssertionId, EffectId,
+    EnvironmentPreflight, FinishClass, Handoff, MissionEvent, OracleName, OracleRunSuccess,
+    OutputSemantics, PayloadRef, RoleAssignmentContext, RoleInstanceId, RoleTurnSuccess, TaskId,
+    WorkspacePreparation,
 };
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -63,12 +63,21 @@ fn guide_json(repo: &Path, mission_id: &lionclaw::model::MissionId) -> serde_jso
     serde_json::from_slice(&output.stdout).expect("guide JSON")
 }
 
-fn assert_guide_phase(repo: &Path, mission_id: &lionclaw::model::MissionId, phase: &str) {
+fn assert_guide_projection(
+    repo: &Path,
+    mission_id: &lionclaw::model::MissionId,
+    terminal: Option<&str>,
+) {
     let guide = guide_json(repo, mission_id);
-    assert_eq!(guide["phase"], phase);
     assert_eq!(guide["mission_id"], mission_id.as_str());
     assert!(guide["environment"]["image_id"].is_string());
-    assert!(guide["next_actions"].is_array());
+    assert!(guide["next"]["effects"].is_array());
+    assert!(guide["next"]["choices"].is_array());
+    assert_eq!(
+        guide["terminal"]["kind"].as_str(),
+        terminal,
+        "unexpected terminal projection: {guide:#}"
+    );
 }
 
 fn transports_with_oci(root: &Path, script: &str) -> cli::MissionTransports {
@@ -406,7 +415,7 @@ async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle(
         .expect("proof under image A");
     assert_eq!(verdict.environment_digest(), image_a);
     assert!(verdict.is_fresh_at(&proved));
-    assert_eq!(ready_to_finish(&proved), Some(FinishClass::Verified));
+    assert_eq!(common::finish_choice(&proved), Some(FinishClass::Verified));
 
     let image_b = format!("sha256:{}", digest('b'));
     common::fault_append_events(
@@ -427,10 +436,10 @@ async fn environment_digest_change_stales_authoritative_proof_and_reruns_oracle(
         .expect("historical proof remains inspectable");
     assert_eq!(stale_verdict.environment_digest(), image_a);
     assert!(!stale_verdict.is_fresh_at(&stale));
-    assert_eq!(ready_to_finish(&stale), None);
+    assert_eq!(common::finish_choice(&stale), None);
 
-    let rerun = h.engine.advance(&mission_id).await.unwrap();
-    assert_eq!(rerun.state.phase.finish(), Some(FinishClass::Verified));
+    let rerun = common::advance_to_finished(&h.engine, &mission_id).await;
+    assert_eq!(rerun.state.finish(), Some(FinishClass::Verified));
     {
         let rerun_calls = h.oracle_runner.calls.lock().expect("oracle calls");
         assert_eq!(
@@ -478,7 +487,7 @@ async fn mission_guide_renders_every_phase() {
         )
         .await
         .unwrap();
-    assert_guide_phase(planning_dir.path(), &planning_id, "planning");
+    assert_guide_projection(planning_dir.path(), &planning_id, None);
 
     let running_dir = tempfile::tempdir().expect("tempdir");
     let running = common::harness(
@@ -502,7 +511,7 @@ async fn mission_guide_renders_every_phase() {
         .await
         .unwrap();
     common::approve_plan(&running.engine, &running_id).await;
-    assert_guide_phase(running_dir.path(), &running_id, "running");
+    assert_guide_projection(running_dir.path(), &running_id, None);
 
     let attention_dir = tempfile::tempdir().expect("tempdir");
     let failing = MockRoleRunner::new(Box::new(|_request| {
@@ -526,7 +535,7 @@ async fn mission_guide_renders_every_phase() {
         .unwrap();
     common::approve_plan(&attention.engine, &attention_id).await;
     attention.engine.advance(&attention_id).await.unwrap();
-    assert_guide_phase(attention_dir.path(), &attention_id, "attention_needed");
+    assert_guide_projection(attention_dir.path(), &attention_id, None);
 
     let done_dir = tempfile::tempdir().expect("tempdir");
     let done = common::harness(
@@ -545,8 +554,8 @@ async fn mission_guide_renders_every_phase() {
         .await
         .unwrap();
     common::approve_plan(&done.engine, &done_id).await;
-    done.engine.advance(&done_id).await.unwrap();
-    assert_guide_phase(done_dir.path(), &done_id, "done:verified");
+    common::advance_to_finished(&done.engine, &done_id).await;
+    assert_guide_projection(done_dir.path(), &done_id, Some("done"));
 
     let aborted_dir = tempfile::tempdir().expect("tempdir");
     let aborted = common::harness(
@@ -565,7 +574,7 @@ async fn mission_guide_renders_every_phase() {
         .await
         .unwrap();
     aborted.engine.abort(&aborted_id, "stop").await.unwrap();
-    assert_guide_phase(aborted_dir.path(), &aborted_id, "aborted");
+    assert_guide_projection(aborted_dir.path(), &aborted_id, Some("aborted"));
 }
 
 #[tokio::test]

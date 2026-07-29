@@ -6,10 +6,9 @@ mod common;
 use common::{
     approve_plan, fault_append_events, proposal, review_runner, simple_plan, BASE_SHA, HEAD_SHA,
 };
-use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{
-    EffectId, MissionEvent, MissionPhase, MissionState, OracleName, RoleInstanceId,
-    RolePromptTemplate, TaskId, WorkspacePreparation,
+    Choice, EffectId, MissionEvent, MissionState, OracleName, RoleInstanceId, RolePromptTemplate,
+    TaskId, WorkspacePreparation,
 };
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -69,12 +68,12 @@ async fn rerun_after_finish_appends_nothing_and_invokes_nothing() {
         .await
         .unwrap();
     approve_plan(&harness.engine, &id).await;
-    let first = harness.engine.advance(&id).await.unwrap();
-    assert_eq!(first.disposition, MissionDisposition::Terminal);
+    let first = common::advance_to_finished(&harness.engine, &id).await;
+    assert!(first.state.is_terminal());
     let role_calls = harness.role_runner.calls.lock().unwrap().len();
     let oracle_calls = harness.oracle_runner.calls.lock().unwrap().len();
     let second = harness.engine.advance(&id).await.unwrap();
-    assert_eq!(second.disposition, MissionDisposition::Terminal);
+    assert!(second.state.is_terminal());
     assert_eq!(second.state.head, first.state.head);
     assert_eq!(harness.role_runner.calls.lock().unwrap().len(), role_calls);
     assert_eq!(
@@ -115,8 +114,9 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
     .await;
 
     let view = harness.engine.advance(&id).await.unwrap();
-    assert_eq!(view.disposition, MissionDisposition::Parked);
-    assert!(matches!(view.state.phase, MissionPhase::AttentionNeeded));
+    assert!(view.next.choices.iter().any(
+        |choice| matches!(choice, Choice::Continue { effect_id, .. } if effect_id == &effect)
+    ));
     assert!(view.state.inflight.is_empty());
     assert!(harness.role_runner.calls.lock().unwrap().is_empty());
     assert!(harness
@@ -189,8 +189,9 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
     .await;
     let before = harness.oracle_runner.calls.lock().unwrap().len();
     let view = harness.engine.advance(&id).await.unwrap();
-    assert_eq!(view.disposition, MissionDisposition::Parked);
-    assert!(matches!(view.state.phase, MissionPhase::AttentionNeeded));
+    assert!(view.next.choices.iter().any(
+        |choice| matches!(choice, Choice::Continue { effect_id, .. } if effect_id == &effect)
+    ));
     assert_eq!(harness.oracle_runner.calls.lock().unwrap().len(), before);
     assert!(view.state.inflight.is_empty());
     assert!(harness

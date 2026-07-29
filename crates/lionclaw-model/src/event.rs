@@ -2,7 +2,7 @@
 //!
 //! An event is a **fact the fold cannot compute**: a recorded outcome, a
 //! proposed plan, a human decision. Everything the engine can derive
-//! (task/assertion status, gate results, attention, phase, finish class) is
+//! (task/assertion status, gate results, workflow choices, finish class) is
 //! fold-derived and never stored, so state/log divergence is unrepresentable.
 //!
 //! Non-deterministic or side-effecting steps are two events: `…Requested`
@@ -739,10 +739,9 @@ pub enum MissionEvent {
         sha: String,
         reason: String,
     },
-    /// A human/orchestrator decision resolving an open attention item (a
-    /// durable interrupt). The fold applies the action and marks the item
-    /// resolved. Ported from Zenith's `decide_attention` (Apache-2.0,
-    /// Intelligent Internet, `controller.py`).
+    /// A human/orchestrator decision selecting a derived workflow choice. The
+    /// fold applies the action only when the current `next` projection exposes
+    /// the matching choice.
     DecisionRecorded {
         attention_id: String,
         action: DecisionAction,
@@ -803,7 +802,7 @@ impl WorkspacePreparation {
     }
 }
 
-/// The actions a decision can take on an open attention item.
+/// The actions a decision can take on a derived workflow target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionAction {

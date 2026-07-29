@@ -190,31 +190,6 @@ pub(crate) enum ProofReadiness {
     Satisfied(FinishClass),
 }
 
-pub(crate) fn proof_failure_for_attention(
-    state: &MissionState,
-    item: &super::AttentionItem,
-) -> Option<ProofFailure> {
-    if item.kind != super::AttentionKind::ProofFailed {
-        return None;
-    }
-    let ProofReadiness::Failed(failures) = proof_readiness(state) else {
-        return None;
-    };
-    let receipt_id = item
-        .evidence
-        .authoritative_receipts()
-        .first()
-        .or_else(|| item.evidence.role_attempts().first());
-    match receipt_id {
-        Some(receipt_id) => failures
-            .into_iter()
-            .find(|failure| failure.effect_id() == Some(receipt_id)),
-        None => failures
-            .into_iter()
-            .find(|failure| matches!(failure, ProofFailure::StopBar { .. })),
-    }
-}
-
 /// How honest a finish is. The engine says "verified" only with fresh
 /// authoritative coverage of every assertion; judged-only green is
 /// "attested", never verified.

@@ -5,10 +5,10 @@ mod common;
 use common::{
     approve_plan, harness, proposal, proposal_from_plan, review_runner, simple_plan, BASE_SHA,
 };
-use lionclaw::engine::{MissionDisposition, MissionView};
+use lionclaw::engine::MissionView;
 use lionclaw::model::{
-    apply, fold, step, AssertionSupersession, ContinueMode, DecisionAction, EventEnvelope,
-    MissionEvent, MissionPhase, PlanProposal, StepDecision, VersionStamps, SCHEMA_VERSION,
+    apply, fold, AssertionSupersession, Choice, DecisionAction, EffectIntent, EventEnvelope,
+    MissionEvent, PlanProposal, TerminalState, VersionStamps, SCHEMA_VERSION,
 };
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 use lionclaw_runtime_api::TypedFailure;
@@ -43,42 +43,75 @@ fn has_current_recipient(state: &lionclaw::model::MissionState) -> bool {
 }
 
 fn assert_advertised_actions_are_legal(view: &MissionView) {
-    for action in view.next_actions() {
-        match action {
-            "mission advance" => assert!(
-                !view.state.phase.is_terminal() || !view.state.inflight.is_empty(),
-                "terminal advance is legal only to settle inherited effects"
-            ),
-            "mission status" => assert_eq!(view.disposition, MissionDisposition::Running),
-            "mission send" => assert!(has_current_recipient(&view.state)),
-            "mission plan propose" => {
-                assert_eq!(view.disposition, MissionDisposition::AwaitingPlan)
+    for effect in &view.next.effects {
+        match effect {
+            EffectIntent::DriveEffect { effect_id } => {
+                assert!(view.state.inflight.contains_key(effect_id));
             }
-            "mission continue" => assert!(view.state.parked_effects.keys().any(|effect_id| view
-                .state
-                .parked_continue_is_legal(effect_id, ContinueMode::Preserve))),
-            "mission continue --recreate" => {
-                assert!(view.state.parked_effects.keys().any(|effect_id| view
-                    .state
-                    .parked_continue_is_legal(effect_id, ContinueMode::RecreateWorkspace)))
+            EffectIntent::DispatchRole(_) | EffectIntent::DispatchOracle(_) => {
+                assert!(!view.state.is_terminal());
+                assert!(view.state.inflight.is_empty());
             }
-            "mission decide" => assert!(!view.state.open_attention.is_empty()),
-            "mission abort" => assert!(!view.state.phase.is_terminal()),
-            "mission log" => assert_eq!(view.disposition, MissionDisposition::CleanupBlocked),
-            "mission report" => assert_eq!(view.disposition, MissionDisposition::Terminal),
-            "mission apply" => {
-                assert!(matches!(view.state.phase, MissionPhase::Done { .. }));
-                assert_ne!(view.state.deliverable_head(), view.state.base_sha);
+        }
+    }
+    for choice in &view.next.choices {
+        match choice {
+            Choice::Decide { id, action } => {
+                lionclaw::model::validate_decision(&view.state, id, action, "liveness probe")
+                    .expect("advertised decision must validate");
             }
-            unexpected => panic!("unclassified advertised action: {unexpected}"),
+            Choice::SendMessage { role_instance } => {
+                assert!(view.state.conversation_accepts_message(role_instance));
+                assert!(has_current_recipient(&view.state));
+            }
+            Choice::Stop { effect_id } => {
+                assert!(view.state.inflight.contains_key(effect_id));
+                assert!(!view.state.reached_deadlines.contains_key(effect_id));
+            }
+            Choice::ExtendDeadline {
+                effect_id,
+                old_deadline_ms,
+            } => {
+                assert_eq!(
+                    view.state.inflight[effect_id].deadline_ms(),
+                    *old_deadline_ms
+                );
+                assert!(!view.state.reached_deadlines.contains_key(effect_id));
+            }
+            Choice::Continue { effect_id, mode } => {
+                assert!(view.state.parked_continue_is_legal(effect_id, *mode));
+            }
+            Choice::Finish { finish } => {
+                let mut finished = view.state.clone();
+                apply(
+                    &mut finished,
+                    &envelope(
+                        &view.state,
+                        MissionEvent::MissionFinished {
+                            finish: *finish,
+                            reason: "liveness probe".to_string(),
+                        },
+                    ),
+                );
+                assert_eq!(finished.finish(), Some(*finish));
+            }
+            Choice::Abort => assert!(!view.state.is_terminal()),
+            Choice::Apply { branch, sha } => {
+                assert!(matches!(
+                    view.state.terminal,
+                    Some(TerminalState::Done { .. })
+                ));
+                assert_eq!(sha, view.state.deliverable_head());
+                assert_eq!(branch, &format!("lionclaw/{}", view.state.mission_id));
+            }
         }
     }
 }
 
 fn assert_decisions_change_authority(state: &lionclaw::model::MissionState) -> bool {
     let mut found = false;
-    for item in state.open_attention.values() {
-        for action in lionclaw::model::decision::legal_actions(state, item) {
+    for choice in lionclaw::model::next(state).choices {
+        if let Choice::Decide { id, action } = choice {
             found = true;
             let requirement_changes = if action == DecisionAction::Approve {
                 state
@@ -96,7 +129,7 @@ fn assert_decisions_change_authority(state: &lionclaw::model::MissionState) -> b
                 &envelope(
                     state,
                     MissionEvent::DecisionRecorded {
-                        attention_id: item.id.clone(),
+                        attention_id: id.clone(),
                         action: action.clone(),
                         justification: "liveness probe".to_string(),
                         requirement_changes,
@@ -107,7 +140,7 @@ fn assert_decisions_change_authority(state: &lionclaw::model::MissionState) -> b
             assert_ne!(
                 &changed, state,
                 "advertised {action:?} did not change '{}'",
-                item.id
+                id
             );
         }
     }
@@ -125,7 +158,10 @@ fn assert_abort_preserves_authority(state: &lionclaw::model::MissionState) {
             },
         ),
     );
-    assert!(matches!(aborted.phase, MissionPhase::Aborted { .. }));
+    assert!(matches!(
+        aborted.terminal,
+        Some(TerminalState::Aborted { .. })
+    ));
     assert_eq!(aborted.plan, state.plan);
     assert_eq!(aborted.proposal, state.proposal);
     assert_eq!(aborted.revision, state.revision);
@@ -163,16 +199,13 @@ fn assert_abort_preserves_authority(state: &lionclaw::model::MissionState) {
     assert_eq!(aborted.parked_effects, state.parked_effects);
     for driver_running in [false, true] {
         let view = MissionView::from_state(aborted.clone(), driver_running);
-        let expected = if aborted.inflight.is_empty() {
-            MissionDisposition::Terminal
-        } else if driver_running {
-            MissionDisposition::Running
-        } else {
-            MissionDisposition::CleanupBlocked
-        };
-        assert_eq!(view.disposition, expected);
+        assert_eq!(view.driver_running, driver_running);
         assert_advertised_actions_are_legal(&view);
-        assert!(!view.next_actions().contains(&"mission abort"));
+        assert!(!view
+            .next
+            .choices
+            .iter()
+            .any(|choice| matches!(choice, Choice::Abort)));
     }
 }
 
@@ -198,19 +231,24 @@ fn assert_prefix_liveness(name: &str, events: &[EventEnvelope]) {
 
         let view = MissionView::from_state(state.clone(), false);
         assert_advertised_actions_are_legal(&view);
-        if state.phase.is_terminal() {
-            assert!(!view.next_actions().contains(&"mission abort"));
+        if state.is_terminal() {
+            assert!(!view
+                .next
+                .choices
+                .iter()
+                .any(|choice| matches!(choice, Choice::Abort)));
             continue;
         }
 
-        let deterministic_progress = !matches!(
-            step(&state),
-            StepDecision::Idle | StepDecision::Park | StepDecision::Terminal
-        ) || !state.inflight.is_empty()
+        let deterministic_progress = !view.next.effects.is_empty()
+            || !state.inflight.is_empty()
             || state.cleanup_failure.is_some();
-        let repair_changes_state = assert_decisions_change_authority(&state)
-            || view.disposition == MissionDisposition::AwaitingPlan;
-        let abort_is_legal = view.next_actions().contains(&"mission abort");
+        let repair_changes_state = assert_decisions_change_authority(&state);
+        let abort_is_legal = view
+            .next
+            .choices
+            .iter()
+            .any(|choice| matches!(choice, Choice::Abort));
         assert!(
             deterministic_progress || repair_changes_state || abort_is_legal,
             "{name} prefix {end} has no legal state-changing exit"
@@ -305,27 +343,25 @@ async fn every_historical_wedge_seed_has_a_replay_safe_exit() {
     failed.engine.advance(&failed_id).await.unwrap();
     let failure_events = failed.engine.store().load(&failed_id).await.unwrap();
     let failed_state = failed.engine.load_state(&failed_id).await.unwrap();
-    let item = failed_state
-        .open_attention
-        .values()
-        .find(|item| item.kind == lionclaw::model::AttentionKind::NodeFailed)
-        .unwrap();
-    assert!(matches!(
-        item.evidence,
-        lionclaw::model::DecisionEvidence::RoleAttempts { .. }
-    ));
+    let attention_id = common::decision_id_with_prefix(&failed_state, "node_failed:");
+    assert!(failed_state
+        .task_last_role_attempt(&lionclaw::model::TaskId::new("fix").unwrap())
+        .is_some());
     failed
         .engine
         .decide(
             &failed_id,
-            &item.id,
+            &attention_id,
             DecisionAction::Revise,
             "replace the failed assignment",
         )
         .await
         .unwrap();
     let replanning_state = failed.engine.load_state(&failed_id).await.unwrap();
-    assert_eq!(replanning_state.phase, MissionPhase::Planning);
+    assert!(lionclaw::model::next(&replanning_state)
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, EffectIntent::DispatchRole(_))));
     assert!(matches!(
         replanning_state.planning_input.refinement,
         Some(lionclaw::model::PlanningRefinement::FailureEvidence(ref feedback))
@@ -374,7 +410,7 @@ async fn automatic_recovery_is_bounded_and_abort_preserves_retained_evidence() {
         .unwrap();
     approve_plan(&h.engine, &id).await;
     let parked = h.engine.advance(&id).await.unwrap();
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert!(common::has_decision(&parked.state, "node_failed:fix"));
     let attempts = parked.state.tasks.values().next().unwrap().attempts;
     assert_eq!(attempts, parked.state.config.recovery.max_attempts);
     let head = parked.state.head;

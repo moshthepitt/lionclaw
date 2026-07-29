@@ -14,12 +14,12 @@ use common::{
     proposal_with_team, review_mission_type, review_proposal, review_runner, simple_plan,
     test_mission_type, ParseTask, BASE_SHA, HEAD_SHA,
 };
-use lionclaw::engine::{MissionDisposition, MissionView};
+use lionclaw::engine::MissionView;
 use lionclaw::model::{
-    ready_to_finish, BlobRef, DecisionAction, EffectId, EnvironmentPreflight, FinishClass, Gap,
-    GapSeverity, Handoff, MissionEvent, MissionPhase, MissionState, OutputSemantics, PayloadRef,
-    ReviewAcceptanceKind, RoleAttemptReceipt, RoleEffectSource, RolePromptTemplate,
-    RoleResourceLifetime, SettledHandoff, Task, WorkspacePreparation,
+    BlobRef, Choice, DecisionAction, EffectId, EnvironmentPreflight, FinishClass, Gap, GapSeverity,
+    Handoff, MissionEvent, MissionState, OutputSemantics, PayloadRef, ReviewAcceptanceKind,
+    RoleAttemptReceipt, RoleEffectSource, RolePromptTemplate, RoleResourceLifetime, SettledHandoff,
+    Task, WorkspacePreparation,
 };
 use lionclaw::ports::{CapturedArtifact, RoleTurnOutcome, RoleTurnRequest};
 use lionclaw::testing::{review_verdict, MockOracleRunner, MockRoleRunner};
@@ -44,17 +44,14 @@ fn environment_event(image_digest: &str, team_revision: Option<u32>) -> MissionE
     }
 }
 
-fn parked(view: &MissionView) -> Vec<&lionclaw::model::AttentionItem> {
-    assert_eq!(view.disposition, MissionDisposition::Parked, "got {view:?}");
-    view.state.open_attention.values().collect()
+fn parked(view: &MissionView) -> Vec<String> {
+    let decisions = common::decision_ids(&view.state);
+    assert!(!decisions.is_empty(), "got {view:?}");
+    decisions
 }
 
 fn assert_terminal(view: &MissionView) {
-    assert_eq!(
-        view.disposition,
-        MissionDisposition::Terminal,
-        "got {view:?}"
-    );
+    assert!(view.state.is_terminal(), "got {view:?}");
 }
 
 fn gap_review_receipt(state: &MissionState) -> &RoleAttemptReceipt {
@@ -143,7 +140,10 @@ fn failing_review_runner() -> MockRoleRunner {
 
 async fn reopen_failed_review(h: &common::TestHarness, mission_id: &lionclaw::model::MissionId) {
     let parked = h.engine.advance(mission_id).await.expect("initial advance");
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert!(common::has_decision(
+        &parked.state,
+        "gap_review_failed:mission"
+    ));
     h.engine
         .decide(
             mission_id,
@@ -264,14 +264,9 @@ async fn a_clean_review_closes_verified_with_no_park() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (h, mission_id) = started(&dir, review_runner(vec![(true, vec![])])).await;
 
-    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
     assert_terminal(&outcome);
-    assert!(matches!(
-        outcome.state.phase,
-        MissionPhase::Done {
-            finish: FinishClass::Verified
-        }
-    ));
+    assert_eq!(outcome.state.finish(), Some(FinishClass::Verified));
     // Exactly one reviewer run, judged at the final commit, recorded fresh.
     assert_eq!(review_calls(&h, &mission_id).await.len(), 1);
     let state = h.engine.load_state(&mission_id).await.expect("state");
@@ -313,7 +308,7 @@ async fn gap_review_uses_effect_owned_resources() {
     }));
     let (h, mission_id) = started(&dir, runner).await;
 
-    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
     assert_terminal(&outcome);
 }
 
@@ -463,7 +458,10 @@ async fn gap_review_uses_the_shared_role_output_boundary() {
         let (h, mission_id) = started_with_recovery(&dir, runner, 1).await;
 
         let view = h.engine.advance(&mission_id).await.expect("advance");
-        assert_eq!(view.disposition, MissionDisposition::Parked);
+        assert!(common::has_decision(
+            &view.state,
+            "gap_review_failed:mission"
+        ));
         let failure = gap_review_failure(&view.state);
         assert_eq!(failure.evidence().code.as_deref(), Some(expected_code));
     }
@@ -575,7 +573,7 @@ async fn blocking_gaps_park_then_accept_closes_with_acknowledged_gaps() {
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
     assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0].id, "gap_review_gaps:mission");
+    assert_eq!(attention[0], "gap_review_gaps:mission");
 
     h.engine
         .decide(
@@ -586,7 +584,7 @@ async fn blocking_gaps_park_then_accept_closes_with_acknowledged_gaps() {
         )
         .await
         .expect("decide");
-    let outcome = h.engine.advance(&mission_id).await.expect("re-advance");
+    let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
     assert_terminal(&outcome);
     let state = h.engine.load_state(&mission_id).await.expect("state");
     let accepted = state
@@ -620,7 +618,7 @@ async fn accepted_blocking_gap_review_reopens_after_environment_change() {
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
     assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0].id, "gap_review_gaps:mission");
+    assert_eq!(attention[0], "gap_review_gaps:mission");
     let image_a = outcome.state.environment_digest().to_string();
 
     h.engine
@@ -642,7 +640,10 @@ async fn accepted_blocking_gap_review_reopens_after_environment_change() {
     assert_eq!(acceptance.freshness.judged_sha, HEAD_SHA);
     assert_eq!(acceptance.freshness.environment_digest, image_a);
     assert!(acceptance.is_fresh_at(&accepted));
-    assert_eq!(ready_to_finish(&accepted), Some(FinishClass::Verified));
+    assert_eq!(
+        common::finish_choice(&accepted),
+        Some(FinishClass::Verified)
+    );
 
     fault_append_events(
         dir.path(),
@@ -665,7 +666,7 @@ async fn accepted_blocking_gap_review_reopens_after_environment_change() {
     assert_eq!(stale_acceptance.freshness.environment_digest, image_a);
     assert!(!stale_acceptance.is_fresh_at(&stale));
     assert!(stale.gap_review.fresh_acceptance(&stale).is_none());
-    assert_eq!(ready_to_finish(&stale), None);
+    assert_eq!(common::finish_choice(&stale), None);
 
     let reopened = h
         .engine
@@ -674,7 +675,7 @@ async fn accepted_blocking_gap_review_reopens_after_environment_change() {
         .expect("re-open gap review");
     let attention = parked(&reopened);
     assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0].id, "gap_review_gaps:mission");
+    assert_eq!(attention[0], "gap_review_gaps:mission");
     assert_eq!(
         review_calls(&h, &mission_id).await.len(),
         2,
@@ -761,7 +762,10 @@ async fn a_revision_resumes_work_and_re_reviews_at_the_new_head() {
     let (h, mission_id) = started(&dir, runner).await;
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    assert!(common::has_decision(
+        &outcome.state,
+        "gap_review_gaps:mission"
+    ));
     let first_head = outcome.state.current_sha.clone();
 
     // Remediation is a complete next plan; the park auto-clears.
@@ -777,7 +781,7 @@ async fn a_revision_resumes_work_and_re_reviews_at_the_new_head() {
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
-    let outcome = h.engine.advance(&mission_id).await.expect("re-advance");
+    let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
     assert_terminal(&outcome);
 
     // Two reviews: distinct attempts, distinct effect IDs, and the
@@ -823,7 +827,7 @@ async fn a_failed_review_parks_then_retry_re_rolls() {
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
-    assert_eq!(attention[0].id, "gap_review_failed:mission");
+    assert_eq!(attention[0], "gap_review_failed:mission");
 
     h.engine
         .decide(
@@ -834,7 +838,7 @@ async fn a_failed_review_parks_then_retry_re_rolls() {
         )
         .await
         .expect("decide");
-    let outcome = h.engine.advance(&mission_id).await.expect("re-advance");
+    let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
     assert_terminal(&outcome);
     let calls = review_calls(&h, &mission_id).await;
     assert_eq!(calls.len(), 2);
@@ -870,7 +874,7 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
-    assert_eq!(attention[0].id, "gap_review_failed:mission");
+    assert_eq!(attention[0], "gap_review_failed:mission");
     let failure = gap_review_failure(&outcome.state);
     assert!(failure.evidence().detail.contains("nonce does not match"));
     let final_response = gap_review_receipt(&outcome.state)
@@ -898,7 +902,11 @@ async fn a_crashed_review_is_interrupted_without_rerunning_the_llm() {
     let (id, event) = orphaned_gap_review_request(&mission_id, &state, 2);
     fault_append_events(dir.path(), &mission_id, state.head, &[event], 1).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    assert!(outcome
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
     let state = h.engine.load_state(&mission_id).await.expect("state");
     assert!(state.inflight.is_empty());
     let failure = gap_review_failure(&state);
@@ -935,7 +943,7 @@ async fn a_mission_type_without_a_review_never_dispatches_one() {
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
-    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
     assert_terminal(&outcome);
     assert!(
         review_calls(&h, &mission_id).await.is_empty(),
@@ -961,7 +969,11 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_review() {
         .expect("rebuild");
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    assert!(outcome
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
     assert_eq!(
         h.role_runner
             .invocations_by_key
@@ -1066,7 +1078,7 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
         .await
         .expect("waive");
 
-    let outcome = h.engine.advance(&mission_id).await.expect("re-advance");
+    let outcome = common::advance_to_finished(&h.engine, &mission_id).await;
     assert_terminal(&outcome);
     // The revised work moved the head, staling the waiver: a second review
     // ran at the new head and its verdict is on record.
@@ -1145,7 +1157,7 @@ async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
     let (h, mission_id) = started(&dir, runner).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
-    assert_eq!(attention[0].id, "gap_review_failed:mission");
+    assert_eq!(attention[0], "gap_review_failed:mission");
     let failure = gap_review_failure(&outcome.state);
     assert!(failure.evidence().detail.contains("did not complete"));
 }
@@ -1178,7 +1190,7 @@ async fn an_ordinary_validator_handoff_cannot_seal_the_gap_review() {
     let (h, mission_id) = started(&dir, runner).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
-    assert_eq!(attention[0].id, "gap_review_failed:mission");
+    assert_eq!(attention[0], "gap_review_failed:mission");
     let failure = gap_review_failure(&outcome.state);
     assert_eq!(failure.evidence().code.as_deref(), Some("handoff.schema"));
 }

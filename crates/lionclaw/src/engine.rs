@@ -1,14 +1,14 @@
-//! The impure shell around the pure core: lock → load → recover → drive
-//! effects → step → append, until the mission parks (durable interrupt) or
-//! reaches a terminal phase. Structure ported from Zenith (Apache-2.0,
-//! Intelligent Internet) `controller.py::advance_project` /
-//! `coordinator.py::step`, re-based onto the event-sourced store.
+//! The impure shell around the pure core: lock → load → project `next` →
+//! execute effect intents → append facts, until the mission parks or reaches a
+//! terminal state. Structure ported from Zenith (Apache-2.0, Intelligent
+//! Internet) `controller.py::advance_project` / `coordinator.py::step`,
+//! re-based onto the event-sourced store.
 //!
 //! A request without an outcome belongs to a previous driver process. Resume
 //! reaps its resources and records an interrupted failure; it never guesses
 //! whether an external turn completed and never silently replays one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,11 +19,11 @@ use sha2::{Digest, Sha256};
 use crate::driver_lock::DriverGuard;
 use crate::mission_type::MissionType;
 use crate::model::{
-    ready_to_finish, step, validate_mission_proposal, EffectEventClass, EffectId, Handoff,
-    InflightEffect, MissionEvent, MissionId, MissionPhase, MissionProposal, MissionState,
+    next, validate_mission_proposal, Choice, EffectEventClass, EffectId, EffectIntent, Handoff,
+    InflightEffect, MissionEvent, MissionId, MissionProposal, MissionState, Next,
     OracleDispatchIntent, OracleRunSuccess, PayloadRef, ProposalError, RoleDispatchIntent,
-    RoleInstance, RoleInstanceId, RoleTurnSuccess, RuntimeInstrumentIdentity, StepDecision, TaskId,
-    MAX_ROLE_REPORT_BYTES,
+    RoleInstance, RoleInstanceId, RoleTurnSuccess, RuntimeInstrumentIdentity, TaskId,
+    TerminalState, MAX_ROLE_REPORT_BYTES,
 };
 use crate::ports::{
     ArtifactCapture, Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl,
@@ -166,126 +166,22 @@ fn default_runtime_identities() -> BTreeMap<String, RuntimeInstrumentIdentity> {
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MissionDisposition {
-    Ready,
-    Running,
-    AwaitingLead,
-    AwaitingPlan,
-    Parked,
-    CleanupBlocked,
-    Terminal,
-}
-
-impl MissionDisposition {
-    pub const fn slug(self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::Running => "running",
-            Self::AwaitingLead => "awaiting_lead",
-            Self::AwaitingPlan => "awaiting_plan",
-            Self::Parked => "parked",
-            Self::CleanupBlocked => "cleanup_blocked",
-            Self::Terminal => "terminal",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct MissionView {
     pub state: MissionState,
-    pub disposition: MissionDisposition,
+    pub next: Next,
+    pub driver_running: bool,
 }
 
 impl MissionView {
-    /// Project one replayed state into its operator disposition and actions.
+    /// Project one replayed state into the canonical workflow value.
     pub fn from_state(state: MissionState, driver_running: bool) -> Self {
-        let terminal = state.phase.is_terminal();
-        let disposition = if terminal && state.inflight.is_empty() {
-            MissionDisposition::Terminal
-        } else if driver_running {
-            MissionDisposition::Running
-        } else if state
-            .cleanup_failure
-            .as_ref()
-            .is_some_and(|failure| state.inflight.contains_key(&failure.effect_id))
-            || terminal
-        {
-            MissionDisposition::CleanupBlocked
-        } else if state.conversations.iter().any(|(id, conversation)| {
-            conversation.lifecycle == crate::model::ConversationLifecycle::AwaitingLead
-                && state.conversation_is_messageable(id)
-        }) {
-            MissionDisposition::AwaitingLead
-        } else if !state.open_attention.is_empty() {
-            MissionDisposition::Parked
-        } else if state.phase == MissionPhase::Planning && state.proposal.is_none() {
-            MissionDisposition::AwaitingPlan
-        } else {
-            MissionDisposition::Ready
-        };
-        Self { state, disposition }
-    }
-
-    pub fn next_actions(&self) -> Vec<&'static str> {
-        let can_send = self
-            .state
-            .conversations
-            .keys()
-            .any(|id| self.state.conversation_accepts_message(id));
-        let can_decide = !self.state.open_attention.is_empty();
-        let can_preserve = self.state.parked_effects.keys().any(|effect_id| {
-            self.state
-                .parked_continue_is_legal(effect_id, crate::model::ContinueMode::Preserve)
-        });
-        let can_recreate = self.state.parked_effects.keys().any(|effect_id| {
-            self.state
-                .parked_continue_is_legal(effect_id, crate::model::ContinueMode::RecreateWorkspace)
-        });
-        let continue_actions = [
-            can_preserve.then_some("mission continue"),
-            can_recreate.then_some("mission continue --recreate"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-        let mut actions = match self.disposition {
-            MissionDisposition::Ready => vec!["mission advance"],
-            MissionDisposition::Running => vec!["mission status"],
-            MissionDisposition::AwaitingLead if can_send => vec!["mission send"],
-            MissionDisposition::AwaitingLead => Vec::new(),
-            MissionDisposition::AwaitingPlan => vec!["mission plan propose"],
-            MissionDisposition::Parked if !continue_actions.is_empty() => {
-                let mut actions = continue_actions.clone();
-                actions.push("mission decide");
-                actions
-            }
-            MissionDisposition::Parked => vec!["mission decide"],
-            MissionDisposition::CleanupBlocked => vec!["mission advance", "mission log"],
-            MissionDisposition::Terminal => {
-                let mut actions = vec!["mission report"];
-                if matches!(self.state.phase, MissionPhase::Done { .. })
-                    && self.state.deliverable_head() != self.state.base_sha
-                {
-                    actions.push("mission apply");
-                }
-                actions
-            }
-        };
-        if self.disposition == MissionDisposition::AwaitingLead {
-            actions.extend(continue_actions);
+        let next = next(&state);
+        Self {
+            state,
+            next,
+            driver_running,
         }
-        if self.disposition == MissionDisposition::AwaitingLead && can_decide {
-            actions.push("mission decide");
-        }
-        if can_send && !actions.contains(&"mission send") && !self.state.phase.is_terminal() {
-            actions.push("mission send");
-        }
-        if !self.state.phase.is_terminal() {
-            actions.push("mission abort");
-        }
-        actions
     }
 }
 
@@ -393,59 +289,79 @@ impl Engine {
         effect_id: &EffectId,
     ) -> Result<String> {
         let events = self.store.load(mission_id).await?;
-        let request = events.iter().find(|envelope| {
+        let request_index = events
+            .iter()
+            .position(|envelope| {
             matches!(&envelope.event, MissionEvent::RoleTurnRequested { effect_id: id, .. } if id == effect_id)
-        }).context("role request not found")?;
-        let request_seq = request.sequence_no;
-        let (role_instance, team_revision, template, expected_hash) = match &request.event {
+            })
+            .context("role request not found")?;
+        let request = &events[request_index];
+        let (
+            role_instance,
+            team_revision,
+            task_id,
+            assertion_ids,
+            attempt_no,
+            template,
+            expected_hash,
+            base_sha,
+            dependency_refs,
+            message_boundary,
+        ) = match &request.event {
             MissionEvent::RoleTurnRequested {
                 role_instance,
                 team_revision,
+                task_id,
+                assertion_ids,
+                attempt_no,
                 prompt_template,
                 prompt_hash,
+                base_sha,
+                dependency_refs,
+                message_boundary,
                 ..
             } => (
                 role_instance.clone(),
                 *team_revision,
+                task_id.clone(),
+                assertion_ids.clone(),
+                *attempt_no,
                 *prompt_template,
                 prompt_hash.clone(),
+                base_sha.clone(),
+                dependency_refs.clone(),
+                *message_boundary,
             ),
             _ => unreachable!(),
         };
-        let prefix: Vec<_> = events
-            .into_iter()
-            .filter(|event| event.sequence_no < request_seq)
-            .collect();
-        let state =
-            crate::model::fold(prefix).context("role request prefix has no creation event")?;
-        let StepDecision::DispatchRole(intent) = step(&state) else {
-            let StepDecision::DispatchRoles(intents) = step(&state) else {
-                bail!("role request prefix no longer reconstructs its dispatch")
-            };
-            let Some(intent) = intents.into_iter().find(|intent| {
-                intent.role_instance == role_instance && intent.team_revision == team_revision
-            }) else {
-                bail!("role request prefix no longer reconstructs its dispatch")
-            };
-            let role = state
-                .team_history
-                .get(&team_revision)
-                .and_then(|team| team.role(&role_instance))
-                .context("role instance missing from recorded team revision")?;
-            let dialogue =
-                materialize_conversation_messages(self, &state, &role_instance, state.head).await?;
-            let prompt = self.assemble_role_request(&state, role, &intent, &dialogue)?;
-            let actual_template = crate::model::role_prompt_template(role.output);
-            let actual_hash = hex::encode(Sha256::digest(prompt.as_bytes()));
-            if template != actual_template || expected_hash != actual_hash {
-                bail!("canonical role prompt drift")
-            }
-            return Ok(prompt);
-        };
         ensure!(
-            intent.role_instance == role_instance && intent.team_revision == team_revision,
-            "role request prefix reconstructed a different team assignment"
+            message_boundary < request.sequence_no,
+            "role request has an invalid prompt boundary"
         );
+        let state = crate::model::fold(
+            events
+                .iter()
+                .take_while(|event| event.sequence_no <= message_boundary)
+                .cloned(),
+        )
+        .context("role request prompt boundary has no creation event")?;
+        let intent = next(&state)
+            .effects
+            .into_iter()
+            .find_map(|effect| {
+                let EffectIntent::DispatchRole(intent) = effect else {
+                    return None;
+                };
+                (intent.role_instance == role_instance
+                    && intent.team_revision == team_revision
+                    && intent.task_id == task_id
+                    && intent.targets == assertion_ids
+                    && intent.attempt_no == attempt_no
+                    && intent.base_sha == base_sha
+                    && intent.dependency_refs == dependency_refs)
+                    .then_some(intent)
+            })
+            .context("role request prefix no longer reconstructs its dispatch")?;
         let role = state
             .team_history
             .get(&team_revision)
@@ -760,8 +676,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Record a decision resolving an open attention item (a durable
-    /// interrupt). Validated fail-closed: an illegal decision records nothing.
+    /// Record one currently advertised decision. Validation is fail-closed: an
+    /// illegal decision records nothing.
     pub async fn decide(
         &self,
         mission_id: &MissionId,
@@ -856,18 +772,13 @@ impl Engine {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
+        crate::activity::clear_driver_run_evidence(&self.store.mission_dirs(mission_id))?;
         if let Some(path) = handshake {
             let temporary = path.with_extension("tmp");
             std::fs::write(&temporary, b"ready\n")
                 .with_context(|| format!("writing driver handshake '{}'", temporary.display()))?;
             std::fs::rename(&temporary, path)
                 .with_context(|| format!("publishing driver handshake '{}'", path.display()))?;
-        }
-        if !self.recover_interrupted(mission_id).await? {
-            return Ok(MissionView::from_state(
-                self.load_state(mission_id).await?,
-                false,
-            ));
         }
         let (activity, observed_activity) = tokio::sync::watch::channel(None);
         let reporter =
@@ -896,49 +807,49 @@ impl Engine {
         mission_id: &MissionId,
         activity: tokio::sync::watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
     ) -> Result<()> {
+        let mut owned_effects = BTreeSet::new();
         for _ in 0..MAX_LOOP_ITERATIONS {
             let state = self.load_state(mission_id).await?;
-            if !state.inflight.is_empty() {
-                if Box::pin(self.drive_active(&state, activity.clone())).await? {
+            let projection = next(&state);
+            if projection.effects.is_empty() {
+                return Ok(());
+            }
+            let mut drive_effects = Vec::new();
+            let mut role_intents = Vec::new();
+            let mut oracle_intents = Vec::new();
+            for effect in projection.effects {
+                match effect {
+                    EffectIntent::DriveEffect { effect_id } => drive_effects.push(effect_id),
+                    EffectIntent::DispatchRole(intent) => role_intents.push(intent),
+                    EffectIntent::DispatchOracle(intent) => oracle_intents.push(intent),
+                }
+            }
+            if !drive_effects.is_empty() {
+                if drive_effects
+                    .iter()
+                    .all(|effect_id| owned_effects.contains(effect_id))
+                {
+                    if Box::pin(self.drive_active(&state, activity.clone())).await? {
+                        continue;
+                    }
+                    return Ok(());
+                }
+                if self.recover_interrupted(mission_id).await? {
                     continue;
                 }
                 return Ok(());
             }
-            match step(&state) {
-                StepDecision::Idle => {
-                    if let Some(finish) = ready_to_finish(&state) {
-                        self.ensure_current_team_runtime_identities(&state)?;
-                        self.append_fact(
-                            &state.mission_id,
-                            state.head,
-                            NewEvent::new(MissionEvent::MissionFinished {
-                                finish,
-                                reason: "proof bar satisfied".into(),
-                            }),
-                        )
-                        .await?;
-                        continue;
-                    }
-                    return if state.phase == MissionPhase::Planning
-                        || state.conversations.values().any(|conversation| {
-                            conversation.lifecycle
-                                == crate::model::ConversationLifecycle::AwaitingLead
-                        }) {
-                        Ok(())
-                    } else {
-                        bail!("engine idle in unexpected phase {:?}", state.phase)
-                    };
-                }
-                StepDecision::Park | StepDecision::Terminal => return Ok(()),
-                StepDecision::DispatchRole(intent) => {
-                    self.materialize_role_turn_request(&state, intent).await?;
-                }
-                StepDecision::DispatchRoles(intents) => {
-                    self.materialize_role_turn_requests(&state, intents).await?;
-                }
-                StepDecision::RunOracles(intents) => {
-                    self.materialize_oracle_requests(&state, intents).await?;
-                }
+            if !role_intents.is_empty() {
+                self.materialize_role_turn_requests(&state, role_intents)
+                    .await?;
+                owned_effects.extend(self.load_state(mission_id).await?.inflight.keys().cloned());
+                continue;
+            }
+            if !oracle_intents.is_empty() {
+                self.materialize_oracle_requests(&state, oracle_intents)
+                    .await?;
+                owned_effects.extend(self.load_state(mission_id).await?.inflight.keys().cloned());
+                continue;
             }
         }
         bail!("advance exceeded {MAX_LOOP_ITERATIONS} iterations; aborting as a safety stop")
@@ -1074,7 +985,7 @@ impl Engine {
             let Some(active) = current.inflight.get(&effect_id) else {
                 return Ok(true);
             };
-            if let MissionPhase::Aborted { reason } = &current.phase {
+            if let Some(TerminalState::Aborted { reason }) = &current.terminal {
                 if matches!(
                     self.cleanup_effect(&current, &effect_id, true).await?,
                     EffectCleanupDisposition::Blocked
@@ -1148,7 +1059,7 @@ impl Engine {
                     let Some(active) = current.inflight.get(&effect_id) else {
                         bail!("active effect '{effect_id}' disappeared without an outcome");
                     };
-                    if let MissionPhase::Aborted { reason } = &current.phase {
+                    if let Some(TerminalState::Aborted { reason }) = &current.terminal {
                         control_tx.send_replace(ExecutionControl::Abort(reason.clone()));
                         continue;
                     }
@@ -1241,20 +1152,6 @@ impl Engine {
         };
         let checkpoint = checkpoint_after(&outcome.event, &effect, &state.config.execution);
         let Some((automatic, reason)) = checkpoint else {
-            let current = self.load_state(&state.mission_id).await?;
-            if let Some(finish) = ready_to_finish(&current) {
-                self.ensure_current_team_runtime_identities(&current)?;
-                self.append_fact(
-                    &current.mission_id,
-                    current.head,
-                    NewEvent::new(MissionEvent::MissionFinished {
-                        finish,
-                        reason: "proof bar satisfied".into(),
-                    }),
-                )
-                .await?;
-                return Ok(true);
-            }
             return Ok(true);
         };
         if !automatic {
@@ -2103,16 +2000,6 @@ impl Engine {
 
     /// Turn a role-dispatch intent into a recorded request: assemble the
     /// prompt (engine-owned), persist it, derive the effect ID.
-    async fn materialize_role_turn_request(
-        &self,
-        state: &MissionState,
-        intent: RoleDispatchIntent,
-    ) -> Result<()> {
-        let events = self.build_role_turn_events(state, intent).await?;
-        self.append_idempotent(&state.mission_id, state.head, &events)
-            .await
-    }
-
     async fn materialize_role_turn_requests(
         &self,
         state: &MissionState,
@@ -2592,11 +2479,18 @@ fn decision_requirement_changes(
     if action != &crate::model::DecisionAction::Approve {
         return Vec::new();
     }
+    if !crate::model::next(state).choices.iter().any(|choice| {
+        matches!(
+            choice,
+            Choice::Decide { id, action: crate::model::DecisionAction::Approve }
+                if id == attention_id
+        )
+    }) {
+        return Vec::new();
+    }
     state
-        .open_attention
-        .get(attention_id)
-        .filter(|item| item.kind == crate::model::AttentionKind::PlanProposal)
-        .and(state.proposal.as_ref())
+        .proposal
+        .as_ref()
         .and_then(|proposal| proposal.plan.as_ref())
         .map(|proposal| proposal.requirement_changes.clone())
         .unwrap_or_default()
@@ -2606,11 +2500,18 @@ fn approved_team_proposal(
     state: &MissionState,
     attention_id: &str,
 ) -> Option<crate::model::TeamRevision> {
+    if !crate::model::next(state).choices.iter().any(|choice| {
+        matches!(
+            choice,
+            Choice::Decide { id, action: crate::model::DecisionAction::Approve }
+                if id == attention_id
+        )
+    }) {
+        return None;
+    }
     state
-        .open_attention
-        .get(attention_id)
-        .filter(|item| item.kind == crate::model::AttentionKind::PlanProposal)
-        .and(state.proposal.as_ref())
+        .proposal
+        .as_ref()
         .and_then(|proposal| proposal.team.clone())
 }
 
@@ -2625,9 +2526,8 @@ pub async fn record_decision(
     justification: &str,
 ) -> Result<()> {
     let state = store.require_state(mission_id).await?;
-    // Preserve the typed `DecisionError` as the error source (its `Display` is
-    // already specific: unknown item vs illegal action for the item's kind), so
-    // a JSON caller sees the real reason, not a flattened string.
+    // Preserve the typed `DecisionError` as the error source so a JSON caller
+    // sees the exact target/action rejection, not a flattened string.
     crate::model::validate_decision(&state, attention_id, &action, justification)?;
     if action == crate::model::DecisionAction::Approve
         && approved_team_proposal(&state, attention_id).is_some()
@@ -2655,7 +2555,7 @@ pub async fn record_decision(
     Ok(())
 }
 
-/// Record mission closure without requiring or resolving an attention item.
+/// Record mission closure without requiring a decision target.
 /// Abort never approves, accepts, verifies, or deletes retained mission evidence.
 pub async fn record_abort(
     store: &MissionStore,
@@ -2671,7 +2571,12 @@ pub async fn record_abort(
     });
     for _ in 0..MAX_LOOP_ITERATIONS {
         let state = store.require_state(mission_id).await?;
-        if state.phase.is_terminal() {
+        let projection = next(&state);
+        if !projection
+            .choices
+            .iter()
+            .any(|choice| matches!(choice, Choice::Abort))
+        {
             bail!("mission '{mission_id}' is terminal; abort is not legal");
         }
         match store
@@ -2707,10 +2612,11 @@ pub async fn record_finish(
         bail!("finish requires a non-empty reason");
     }
     let state = store.require_state(mission_id).await?;
-    if state.phase.is_terminal() {
-        bail!("mission '{mission_id}' is terminal; finish is not legal");
-    }
-    let Some(finish) = ready_to_finish(&state) else {
+    let projection = next(&state);
+    let Some(finish) = projection.choices.iter().find_map(|choice| match choice {
+        Choice::Finish { finish } => Some(*finish),
+        _ => None,
+    }) else {
         bail!("mission '{mission_id}' is not ready to finish");
     };
     store
@@ -2820,8 +2726,8 @@ pub async fn record_control(
         bail!("control reason must not be empty");
     }
     let state = store.require_state(mission_id).await?;
-    if state.phase.is_terminal() {
-        bail!("mission '{mission_id}' is terminal; controls are not legal");
+    if state.is_terminal() {
+        bail!("mission '{mission_id}' is terminal; control is not legal");
     }
     match &action {
         crate::model::ControlAction::Stop => {
@@ -2864,6 +2770,38 @@ pub async fn record_control(
                 bail!("effect '{effect_id}' does not allow the requested continuation mode");
             }
         }
+    }
+    if !next(&state)
+        .choices
+        .iter()
+        .any(|choice| match (&action, choice) {
+            (
+                crate::model::ControlAction::Stop,
+                Choice::Stop {
+                    effect_id: choice_effect,
+                },
+            ) => choice_effect == effect_id,
+            (
+                crate::model::ControlAction::ExtendDeadline {
+                    old_deadline_ms, ..
+                },
+                Choice::ExtendDeadline {
+                    effect_id: choice_effect,
+                    old_deadline_ms: choice_deadline,
+                },
+            ) => choice_effect == effect_id && choice_deadline == old_deadline_ms,
+            (
+                crate::model::ControlAction::Continue { mode, .. },
+                Choice::Continue {
+                    effect_id: choice_effect,
+                    mode: choice_mode,
+                },
+            ) => choice_effect == effect_id && choice_mode == mode,
+            (crate::model::ControlAction::DeadlineReached { .. }, _) => false,
+            _ => false,
+        })
+    {
+        bail!("effect '{effect_id}' does not advertise the requested control");
     }
     store
         .append(
@@ -3065,6 +3003,20 @@ pub async fn record_message(
             limit: crate::model::MAX_QUEUED_MESSAGES_PER_CONVERSATION,
         }
         .into());
+    }
+    let legal_recipients: BTreeSet<_> = next(&state)
+        .choices
+        .into_iter()
+        .filter_map(|choice| match choice {
+            Choice::SendMessage { role_instance } => Some(role_instance),
+            _ => None,
+        })
+        .collect();
+    if let Some(recipient) = recipients
+        .iter()
+        .find(|recipient| !legal_recipients.contains(*recipient))
+    {
+        bail!("recipient '{recipient}' is not currently messageable");
     }
     validate_reference_eligibility(&state, &recipients, &references)?;
     for reference in &references {

@@ -12,8 +12,8 @@ use lionclaw::authority::AuthorityCeiling;
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::load_mission_type;
 use lionclaw::model::{
-    AssertionId, FinishClass, Handoff, MissionPhase, OutputSemantics, PayloadRef, Plan, StopBar,
-    Task, TaskId, ValidationItem,
+    AssertionId, FinishClass, Handoff, OutputSemantics, PayloadRef, Plan, StopBar, Task, TaskId,
+    ValidationItem,
 };
 use lionclaw::ports::{CapturedArtifact, RoleTurnOutcome, RoleTurnRequest};
 use lionclaw::store::MissionStore;
@@ -132,24 +132,12 @@ async fn advisory_only_mission_type_never_verifies() {
         .await
         .expect("propose");
     approve_plan(&engine, &mission_id).await;
-    let mut state = None;
-    for _ in 0..6 {
-        let outcome = engine.advance(&mission_id).await.expect("advance");
-        if matches!(outcome.state.phase, MissionPhase::Done { .. }) {
-            state = Some(outcome.state);
-            break;
-        }
-    }
-    let state = state.unwrap_or_else(|| panic!("mission did not finish after bounded advances"));
-
-    match state.phase {
-        MissionPhase::Done { finish } => {
-            assert_eq!(
-                finish,
-                FinishClass::Attested,
-                "advisory-only all-pass is internally consistent, never verified"
-            );
-        }
-        other => panic!("expected Done, got {other:?}"),
-    }
+    let state = common::advance_to_finished(&engine, &mission_id)
+        .await
+        .state;
+    assert_eq!(
+        state.finish(),
+        Some(FinishClass::Attested),
+        "advisory-only all-pass is internally consistent, never verified"
+    );
 }

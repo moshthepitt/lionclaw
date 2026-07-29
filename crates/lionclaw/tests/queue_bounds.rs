@@ -475,10 +475,9 @@ async fn exact_queue_capacity_is_typed_atomic_replay_safe_and_recoverable() {
         MAX_QUEUED_MESSAGES_PER_CONVERSATION
     );
     assert_eq!(conversation.lifecycle, ConversationLifecycle::Ready);
-    assert_eq!(
-        full.conversation_legal_actions(&conversation_id),
-        vec!["mission advance"]
-    );
+    assert!(!lionclaw::model::next(&full).choices.iter().any(
+        |choice| matches!(choice, lionclaw::model::Choice::SendMessage { role_instance } if role_instance == &conversation_id)
+    ));
 
     // A raw over-cap event advances the log cursor but is fold-inert. Production
     // ingress rejects before append and returns the exact full conversation.
@@ -530,21 +529,20 @@ async fn exact_queue_capacity_is_typed_atomic_replay_safe_and_recoverable() {
             .len(),
         MAX_QUEUED_MESSAGES_PER_CONVERSATION
     );
-    assert_eq!(
-        json["conversations"][0]["legal_actions"],
-        serde_json::json!(["mission advance"])
-    );
-    assert_eq!(
-        json["next_actions"],
-        serde_json::json!(["mission advance", "mission abort"])
-    );
+    assert!(json["conversations"][0].get("legal_actions").is_none());
+    assert!(!json["next"]["effects"].as_array().unwrap().is_empty());
+    assert!(json["next"]["choices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|choice| choice["kind"] == "abort"));
     let report_json = cli_output(
         dir.path(),
         &["mission", "report", mission.as_str(), "--json"],
     );
     assert!(report_json.status.success());
     let report_json: serde_json::Value = serde_json::from_slice(&report_json.stdout).unwrap();
-    assert_eq!(report_json["next_actions"], json["next_actions"]);
+    assert_eq!(report_json["next"], json["next"]);
     let inbox_json = cli_output(dir.path(), &["mission", "inbox", "--json"]);
     assert!(inbox_json.status.success());
     let inbox_json: serde_json::Value = serde_json::from_slice(&inbox_json.stdout).unwrap();
@@ -564,7 +562,7 @@ async fn exact_queue_capacity_is_typed_atomic_replay_safe_and_recoverable() {
         assert!(!human.contains("mission send"));
         if args[1] == "status" {
             assert!(human.contains(&format!("queued={MAX_QUEUED_MESSAGES_PER_CONVERSATION}")));
-            assert!(human.contains("legal_actions=mission advance"));
+            assert!(!human.contains("legal_actions="));
         }
     }
 

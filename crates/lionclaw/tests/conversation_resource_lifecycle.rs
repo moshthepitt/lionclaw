@@ -2,16 +2,15 @@
 
 mod common;
 
+use lionclaw::model::TerminalState;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use common::{approve_plan, harness, harness_with_type, proposal, simple_plan, BASE_SHA, HEAD_SHA};
 use lionclaw::authority::AuthorityCeiling;
-use lionclaw::engine::MissionDisposition;
 use lionclaw::mission_type::{load_mission_type, materialize_mission_type};
 use lionclaw::model::{
-    ConversationLifecycle, FinishClass, Handoff, MissionId, MissionPhase, OutputSemantics,
-    RoleInstanceId,
+    ConversationLifecycle, FinishClass, Handoff, MissionId, OutputSemantics, RoleInstanceId,
 };
 use lionclaw::ports::{CapturedArtifact, RoleTurnOutcome};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -173,7 +172,12 @@ async fn awaiting_lead_with_resources(
         .advance(&mission_id)
         .await
         .expect("advance to question");
-    assert_eq!(checkpoint.disposition, MissionDisposition::AwaitingLead);
+    assert!(checkpoint.next.effects.is_empty());
+    assert!(checkpoint
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, lionclaw::model::Choice::SendMessage { .. })));
     let root = observed_root
         .lock()
         .expect("lock")
@@ -259,13 +263,8 @@ async fn successful_settlement_removes_only_the_exact_conversation_scratch() {
         .expect("propose plan");
     approve_plan(&harness.engine, &mission_id).await;
 
-    let settled = harness.engine.advance(&mission_id).await.expect("advance");
-    assert_eq!(
-        settled.state.phase,
-        MissionPhase::Done {
-            finish: FinishClass::Verified
-        }
-    );
+    let settled = common::advance_to_finished(&harness.engine, &mission_id).await;
+    assert_eq!(settled.state.finish(), Some(FinishClass::Verified));
     assert!(settled.state.inflight.is_empty());
     assert!(settled.state.conversations.values().all(|conversation| {
         matches!(
@@ -308,7 +307,10 @@ async fn aborting_an_idle_question_reconciles_only_disposable_scratch() {
         .expect("abort and reconcile");
 
     let state = harness.engine.load_state(&mission_id).await.expect("state");
-    assert!(matches!(state.phase, MissionPhase::Aborted { .. }));
+    assert!(matches!(
+        state.terminal,
+        Some(TerminalState::Aborted { .. })
+    ));
     assert!(!root.join("scratch").exists());
     assert!(task_work(&root).join("retained").is_file());
     assert!(root.join("runtime/native-session").is_file());
@@ -355,7 +357,7 @@ async fn abort_reloads_state_after_waiting_for_the_driver_lock() {
                 .require_state(&mission_id)
                 .await
                 .expect("observe state");
-            if state.phase.is_terminal() {
+            if state.is_terminal() {
                 break state;
             }
             tokio::task::yield_now().await;
@@ -363,7 +365,10 @@ async fn abort_reloads_state_after_waiting_for_the_driver_lock() {
     })
     .await
     .expect("abort event must commit before lock acquisition");
-    assert!(matches!(aborted.phase, MissionPhase::Aborted { .. }));
+    assert!(matches!(
+        aborted.terminal,
+        Some(TerminalState::Aborted { .. })
+    ));
     assert!(
         !abort.is_finished(),
         "cleanup must wait for driver ownership"
@@ -442,7 +447,10 @@ async fn terminal_advance_retries_a_failed_abort_cleanup_without_rerunning_the_r
         .expect_err("unsafe cleanup must fail closed after durable abort");
     assert!(error.to_string().contains("was aborted durably"));
     let state = harness.engine.load_state(&mission_id).await.expect("state");
-    assert!(matches!(state.phase, MissionPhase::Aborted { .. }));
+    assert!(matches!(
+        state.terminal,
+        Some(TerminalState::Aborted { .. })
+    ));
     let aborted_head = state.head;
     assert!(outside.join("sentinel").is_file());
 
@@ -476,5 +484,8 @@ async fn terminal_advance_retries_a_failed_abort_cleanup_without_rerunning_the_r
         .await
         .expect("state after cleanup retry");
     assert_eq!(retried.head, aborted_head, "cleanup must append no events");
-    assert!(matches!(retried.phase, MissionPhase::Aborted { .. }));
+    assert!(matches!(
+        retried.terminal,
+        Some(TerminalState::Aborted { .. })
+    ));
 }

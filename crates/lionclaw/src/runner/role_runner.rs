@@ -603,38 +603,40 @@ impl RoleRunner for OciRoleRunner {
             });
         prefer_terminal_control(&profile, &request, prelaunch, None, "")?;
 
-        let setup = async {
-            let is_writer = authority.output() == OutputSemantics::ProducesArtifact;
-            let (workspace_source, observer_index) = if is_writer {
-                debug_assert_eq!(lifetime, RoleResourceLifetime::Conversation);
-                let capture = request.artifact_capture.as_ref().ok_or_else(|| {
-                    launch("artifact-producing role has no capture authority".into())
-                })?;
-                let task = task_dirs.as_ref().ok_or_else(|| {
-                    launch("artifact-producing role has no task workspace authority".into())
-                })?;
-                if capture.checkout_dir() != task.work() {
-                    return Err(launch(
-                        "artifact capture authority names a different task checkout".into(),
-                    ));
-                }
-                (
-                    capture.checkout_dir().to_path_buf(),
-                    Some(
-                        state_observer_index
-                            .clone()
-                            .expect("writer conversation has an observer index"),
-                    ),
-                )
-            } else {
-                if request.artifact_capture.is_some() {
-                    return Err(launch(
-                        "read-only role received artifact capture authority".into(),
-                    ));
-                }
-                (role_state.work().to_path_buf(), None)
-            };
-            {
+        let is_writer = authority.output() == OutputSemantics::ProducesArtifact;
+        let (workspace_source, observer_index) = if is_writer {
+            debug_assert_eq!(lifetime, RoleResourceLifetime::Conversation);
+            let capture = request
+                .artifact_capture
+                .as_ref()
+                .ok_or_else(|| launch("artifact-producing role has no capture authority".into()))?;
+            let task = task_dirs.as_ref().ok_or_else(|| {
+                launch("artifact-producing role has no task workspace authority".into())
+            })?;
+            if capture.checkout_dir() != task.work() {
+                return Err(launch(
+                    "artifact capture authority names a different task checkout".into(),
+                ));
+            }
+            (
+                capture.checkout_dir().to_path_buf(),
+                Some(
+                    state_observer_index
+                        .clone()
+                        .expect("writer conversation has an observer index"),
+                ),
+            )
+        } else {
+            if request.artifact_capture.is_some() {
+                return Err(launch(
+                    "read-only role received artifact capture authority".into(),
+                ));
+            }
+            (role_state.work().to_path_buf(), None)
+        };
+
+        await_controlled(
+            Box::pin(async {
                 let _guard = self.repo_lock.lock().await;
                 if is_writer {
                     prepare_writer_checkout(
@@ -656,65 +658,73 @@ impl RoleRunner for OciRoleRunner {
                     .await
                     .map_err(|e| launch(format!("failed to create checkout: {e}")))?;
                 }
+                Ok(())
+            }),
+            request.control.clone(),
+            |control| setup_control_failure(&profile, control),
+        )
+        .await?;
+
+        // Compile the plan through the moat. Judged roots = the workspace the
+        // verdict is about (only meaningful for verdict roles, but the
+        // predicate is applied uniformly). Keep the blocking setup work in
+        // separate controlled futures so this runner does not build one large
+        // async frame on the test/runtime thread stack.
+        let mut extras = effect_mounts(&dirs, &runtime_profile);
+        extras.extend(skill_mounts);
+        let prepared = if request.prepared_inputs.is_empty() {
+            PreparedInputs {
+                mounts: Vec::new(),
+                environment: Vec::new(),
+                refs: Vec::new(),
             }
-            // Compile the plan through the moat. Judged roots = the workspace
-            // the verdict is about (only meaningful for verdict roles, but the
-            // predicate is applied uniformly).
-            let mut extras = effect_mounts(&dirs, &runtime_profile);
-            extras.extend(skill_mounts);
-            let prepared = if request.prepared_inputs.is_empty() {
-                PreparedInputs {
-                    mounts: Vec::new(),
-                    environment: Vec::new(),
-                    refs: Vec::new(),
-                }
-            } else {
-                let _guard = self.input_lock.lock().await;
-                prepare_inputs(
-                    &profile,
-                    &request.state_dir,
-                    dirs.root(),
-                    &workspace_source,
-                    &request.prepared_inputs,
-                    &request.effect_id,
-                )
-                .await
-                .map_err(|error| {
-                    launch(format!(
-                        "failed to prepare granted mission inputs: {error:#}"
-                    ))
-                })?
-            };
-            let PreparedInputs {
-                mounts,
-                environment: prepared_environment,
-                refs: prepared_refs,
-            } = prepared;
-            extras.extend(mounts);
-            let environment =
-                mission_environment(&dirs, &request.environment, prepared_environment);
-            let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
-            let compiled = compile_role_plan(RolePlanRequest {
-                authority: &authority,
-                runtime_id: profile.name.clone(),
-                confinement: profile.confinement.clone(),
-                mounts: MissionMounts {
-                    workspace: workspace_source.clone(),
-                    extras,
-                },
-                judged_roots: &judged_roots,
-                environment,
-                resources: request.role.resources.clone(),
-                resource_ceilings: &request.resource_ceilings,
-            })
-            .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
-            Ok((is_writer, compiled.plan().clone(), prepared_refs))
+        } else {
+            await_controlled(
+                Box::pin(async {
+                    let _guard = self.input_lock.lock().await;
+                    prepare_inputs(
+                        &profile,
+                        &request.state_dir,
+                        dirs.root(),
+                        &workspace_source,
+                        &request.prepared_inputs,
+                        &request.effect_id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        launch(format!(
+                            "failed to prepare granted mission inputs: {error:#}"
+                        ))
+                    })
+                }),
+                request.control.clone(),
+                |control| setup_control_failure(&profile, control),
+            )
+            .await?
         };
-        let (is_writer, plan, prepared_inputs) =
-            await_controlled(Box::pin(setup), request.control.clone(), |control| {
-                setup_control_failure(&profile, control)
-            })
-            .await?;
+        let PreparedInputs {
+            mounts,
+            environment: prepared_environment,
+            refs: prepared_inputs,
+        } = prepared;
+        extras.extend(mounts);
+        let environment = mission_environment(&dirs, &request.environment, prepared_environment);
+        let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
+        let compiled = compile_role_plan(RolePlanRequest {
+            authority: &authority,
+            runtime_id: profile.name.clone(),
+            confinement: profile.confinement.clone(),
+            mounts: MissionMounts {
+                workspace: workspace_source.clone(),
+                extras,
+            },
+            judged_roots: &judged_roots,
+            environment,
+            resources: request.role.resources.clone(),
+            resource_ceilings: &request.resource_ceilings,
+        })
+        .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
+        let plan = compiled.plan().clone();
 
         // The adapter owns cancellation acknowledgement while its turn is
         // live. Setup and capture use the same engine control, but are simply

@@ -321,9 +321,9 @@ async fn production_cli_routes_atomically_only_to_explicit_live_conversations() 
         .queued
         .iter()
         .all(|message| message.marker == DeliveryMarker::Undeliverable));
-    assert!(retired
-        .conversation_legal_actions(&current_conversation)
-        .is_empty());
+    assert!(!lionclaw::model::next(&retired).choices.iter().any(
+        |choice| matches!(choice, lionclaw::model::Choice::SendMessage { role_instance } if role_instance == &current_conversation)
+    ));
     reject_without_mutation(
         &store,
         &mission,

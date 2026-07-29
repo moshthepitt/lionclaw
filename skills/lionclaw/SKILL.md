@@ -25,8 +25,8 @@ binary separately from its skill instructions.
 5. Run `lionclaw mission advance --wait` as the lead's blocking orchestration
    primitive. Plain `mission advance` starts or observes the detached driver
    and returns after its startup handshake. Read `mission status --json` at
-   each checkpoint and repeat until the mission is terminal or needs a
-   decision. Status is the source of current evidence and legal actions.
+   each checkpoint and repeat until the mission is terminal or exposes an
+   operator choice. Status is the source of current evidence and legal choices.
 6. When a plan proposal parks, inspect it with `lionclaw mission plan show
    --json`. If the initiating request did not explicitly delegate plan
    ratification to you, show the proposal to the human and wait for their
@@ -39,13 +39,14 @@ binary separately from its skill instructions.
    complete proposal until the ratifier approves it or ends the mission with
    `mission abort --reason <reason>`. LionClaw has no
    `--yes` approval bypass; do not invent one.
-7. Use `mission decide` only for an action listed on an open attention item.
+7. Use `mission decide` only for an exact decision target and action listed in
+   `next.choices`.
    Non-revise actions require `--justification`. Required proof failure can
-   never be accepted: a `ProofFailed` item never exposes `Accept`. Preserve any
-   listed terminal-review `Accept` decision for the human unless the initiating
-   request explicitly delegates that decision. Routine retry, repair, and
-   evidence-led replanning may be driven autonomously when the listed action is
-   supported by the evidence.
+   never be accepted: a failed-proof target never exposes `accept`. Preserve
+   any listed terminal-review `accept` decision for the human unless the
+   initiating request explicitly delegates that decision. Routine retry,
+   repair, and evidence-led replanning may be driven autonomously when the
+   listed action is supported by the evidence.
    `mission abort --reason <reason>` is independently legal for every
    nonterminal mission and never accepts or verifies work.
 8. A concurrent observer may use `mission status --watch` and can target the
@@ -54,9 +55,10 @@ binary separately from its skill instructions.
    that exact effect generation. Ctrl-C detaches an observer; it does not stop
    the driver. If the driver dies, the next `mission advance` attributes the
    interruption to each inherited effect while preserving task workspaces.
-9. Finish by reading `lionclaw mission report` and state clearly what was
-   verified, attested, accepted with review gaps, waived at review, or left
-   unresolved.
+9. When `next.choices` exposes `finish`, run `lionclaw mission finish --reason
+   <reason>`. A green mission never finishes automatically. Then read
+   `lionclaw mission report` and state clearly what was verified, attested,
+   accepted with review gaps, waived at review, or left unresolved.
 
 Use `lionclaw --help`, subcommand `--help`, or the bundled `lionclaw(1)` manual
 for the command contract. Mission-specific behavior belongs to the selected

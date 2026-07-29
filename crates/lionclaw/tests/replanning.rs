@@ -261,13 +261,11 @@ async fn host_acceptance_obligations_are_reported_and_do_not_become_confined_wor
     h.engine.propose_plan(&id, proposal(0, plan)).await.unwrap();
     approve_plan(&h.engine, &id).await;
 
-    let outcome = h.engine.advance(&id).await.unwrap();
-    assert!(matches!(
-        outcome.state.phase,
-        lionclaw::model::MissionPhase::Done {
-            finish: lionclaw::model::FinishClass::Verified
-        }
-    ));
+    let outcome = common::advance_to_finished(&h.engine, &id).await;
+    assert_eq!(
+        outcome.state.finish(),
+        Some(lionclaw::model::FinishClass::Verified)
+    );
     assert_eq!(outcome.state.contract.len(), 1);
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_lionclaw"))

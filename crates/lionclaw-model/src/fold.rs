@@ -5,21 +5,20 @@ use alloc::collections::btree_map::Entry;
 use super::event::{ControlAction, EventEnvelope, Handoff, MissionEvent};
 use super::ids::{AssertionId, RoleInstanceId, TaskId};
 use super::state::{
-    ActiveDelivery, AssertionState, AttentionItem, AttentionKind, ConversationLifecycle,
-    ConversationState, DeliveryMarker, InflightEffect, MissionPhase, MissionState, ParkedEffect,
-    PlanningInput, PlanningRefinement, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
-    RoleAttemptDisposition, RoleAttemptReceipt, SettledHandoff, TaskAttemptOutcome,
-    TaskRoleAssignment, TaskRuntimeState, TaskStatus,
+    ActiveDelivery, AppliedResult, AssertionState, ConversationLifecycle, ConversationState,
+    DeliveryMarker, InflightEffect, MissionState, ParkedEffect, PlanningInput, PlanningRefinement,
+    ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, RoleAttemptDisposition, SettledHandoff,
+    TaskAttemptOutcome, TaskRoleAssignment, TaskRuntimeState, TaskStatus, TerminalState,
 };
 use super::verdict::{
-    proof_readiness, AuthoritativeVerdict, FinishClass, ProofFailure, ProofReadiness, ProofSource,
+    proof_readiness, AuthoritativeVerdict, ProofFailure, ProofReadiness, ProofSource,
 };
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 66 derives required proof once from immutable receipt ledgers,
-/// uses one failure path, and preserves exact evidence across every revision.
-pub const REDUCER_VERSION: u32 = 66;
+/// Reducer 67 removes persisted non-terminal workflow state. Durable replay
+/// stores facts; `next` derives effects and choices.
+pub const REDUCER_VERSION: u32 = 67;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -57,7 +56,8 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         team_history: BTreeMap::new(),
         runtime_identity_history: BTreeMap::new(),
         skills: BTreeMap::new(),
-        phase: MissionPhase::Planning,
+        terminal: None,
+        applied_result: None,
         plan: None,
         contract: BTreeMap::new(),
         superseded_assertions: Vec::new(),
@@ -79,7 +79,6 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         reached_deadlines: BTreeMap::new(),
         parked_effects: BTreeMap::new(),
         cleanup_failure: None,
-        open_attention: BTreeMap::new(),
         proposal_approved: false,
         revision: 0,
         acknowledged_gates: BTreeSet::new(),
@@ -217,21 +216,23 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }
         }
         MissionEvent::MissionAborted { reason } => {
-            if !state.phase.is_terminal() && !reason.trim().is_empty() {
-                state.phase = MissionPhase::Aborted {
+            if state.terminal.is_none() && !reason.trim().is_empty() {
+                state.terminal = Some(TerminalState::Aborted {
                     reason: reason.clone(),
-                };
+                });
                 for conversation in state.conversations.values_mut() {
                     retire_conversation(conversation);
                 }
             }
         }
         MissionEvent::MissionFinished { finish, reason } => {
-            if !state.phase.is_terminal()
+            if state.terminal.is_none()
                 && !reason.trim().is_empty()
-                && ready_to_finish(state) == Some(*finish)
+                && super::next(state).choices.iter().any(
+                    |choice| matches!(choice, super::Choice::Finish { finish: legal } if legal == finish),
+                )
             {
-                state.phase = MissionPhase::Done { finish: *finish };
+                state.terminal = Some(TerminalState::Done { finish: *finish });
                 for conversation in state.conversations.values_mut() {
                     retire_conversation(conversation);
                 }
@@ -242,10 +243,18 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             sha,
             reason,
         } => {
-            let _valid = matches!(state.phase, MissionPhase::Done { .. })
+            if matches!(state.terminal, Some(TerminalState::Done { .. }))
                 && !branch.trim().is_empty()
                 && sha == state.deliverable_head()
-                && !reason.trim().is_empty();
+                && !reason.trim().is_empty()
+                && state.applied_result.is_none()
+            {
+                state.applied_result = Some(AppliedResult {
+                    branch: branch.clone(),
+                    sha: sha.clone(),
+                    reason: reason.clone(),
+                });
+            }
         }
         MissionEvent::DecisionRecorded {
             attention_id,
@@ -268,7 +277,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         state.cleanup_failure = None;
     }
     state.head = seq;
-    derive(state);
+    recompute_current_sha(state);
 }
 
 fn valid_skill(skill: &super::MissionSkill) -> bool {
@@ -289,7 +298,7 @@ fn apply_environment_assignment(
     team_revision: Option<u32>,
     reason: &str,
 ) {
-    if state.phase.is_terminal()
+    if state.is_terminal()
         || !state.inflight.is_empty()
         || reason.trim().is_empty()
         || !valid_environment_image_ref(image_ref)
@@ -890,13 +899,14 @@ fn settle_role_failure(
             task_id: request.task_id.clone(),
         },
     );
+    let terminal = state.is_terminal();
     if let Some(conversation) = state.conversations.get_mut(&request.role_instance) {
         if !failure.evidence().final_response.is_empty() {
             conversation.final_response = Some(super::PayloadRef::inline(
                 failure.evidence().final_response.clone(),
             ));
         }
-        if state.phase.is_terminal() {
+        if terminal {
             retire_conversation(conversation);
         } else if failure.is_invalid_output()
             && conversation.invalid_handoff_reworks < max_recovery_attempts
@@ -1139,146 +1149,139 @@ fn apply_control(
 
 fn apply_decision(
     state: &mut MissionState,
-    attention_id: &str,
+    decision_id: &str,
     action: &super::DecisionAction,
     justification: &str,
     requirement_changes: &[super::RequirementId],
 ) {
-    let Some(item) = state.open_attention.get(attention_id).cloned() else {
-        return;
-    };
-    if justification.trim().is_empty()
-        || !super::decision::legal_actions(state, &item).contains(action)
-    {
+    if super::validate_decision(state, decision_id, action, justification).is_err() {
         return;
     }
-    match (action, item.kind) {
-        (super::DecisionAction::Approve, AttentionKind::PlanProposal) => {
-            let expected = state
-                .proposal
-                .as_ref()
-                .and_then(|proposal| proposal.plan.as_ref())
-                .map(|proposal| proposal.requirement_changes.as_slice())
-                .unwrap_or(&[]);
-            if expected != requirement_changes {
-                return;
-            }
-            state.proposal_approved = true;
-            state.planning_input.latest_rejected_proposal = None;
-            state.planning_input.refinement = None;
-            if state
-                .proposal
-                .as_ref()
-                .is_some_and(|proposal| proposal.team.is_none())
-            {
-                promote_proposal_plan(state);
-            }
-        }
-        (
-            super::DecisionAction::Retry,
-            AttentionKind::GapReviewGaps | AttentionKind::GapReviewFailed,
-        ) => {
-            if let Some(outcome) = state.gap_review.outcome.take() {
-                state.parked_effects.remove(outcome.effect_id());
-            }
-            state.gap_review.accepted = None;
-        }
-        (super::DecisionAction::Retry, AttentionKind::NodeFailed) => {
-            retry_failed_node(state, &item);
-        }
-        (super::DecisionAction::Retry, AttentionKind::OracleFailed) => {
-            retry_failed_oracle(state, &item);
-        }
-        (super::DecisionAction::Retry, AttentionKind::ProofFailed) => {
-            apply_proof_recovery(state, &item, action, justification);
-        }
-        (super::DecisionAction::Repair, AttentionKind::ProofFailed) => {
-            apply_proof_recovery(state, &item, action, justification);
-        }
-        (super::DecisionAction::Repair, _) => {}
-        (super::DecisionAction::Revise, AttentionKind::PlanProposal) => {
-            state.planning_input.latest_rejected_proposal = state.proposal.take();
-            state.planning_input.refinement =
-                Some(PlanningRefinement::Guidance(justification.to_string()));
-            state.phase = MissionPhase::Planning;
-            state.proposal_approved = false;
-            state.gap_review.accepted = None;
-            ready_planning_conversation(state);
-        }
-        (super::DecisionAction::Revise, _) => {
-            let feedback = revision_feedback(state, &item, justification);
-            match item.kind {
-                AttentionKind::NodeFailed => retry_failed_node(state, &item),
-                AttentionKind::OracleFailed => retry_failed_oracle(state, &item),
-                AttentionKind::ProofFailed => {
-                    apply_proof_recovery(state, &item, action, justification)
-                }
-                AttentionKind::NodeAttention
-                | AttentionKind::GateFailed
-                | AttentionKind::GateCheckpoint
-                | AttentionKind::PlanProposal
-                | AttentionKind::GapReviewGaps
-                | AttentionKind::GapReviewFailed => {}
-            }
-            state.phase = MissionPhase::Planning;
-            state.proposal = None;
-            state.proposal_approved = false;
-            state.gap_review.accepted = None;
-            state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(feedback));
-            ready_planning_conversation(state);
-        }
-        (super::DecisionAction::Accept, AttentionKind::GapReviewGaps) => {
-            let freshness = state
-                .gap_review_receipt()
-                .map(|receipt| match &receipt.source {
-                    super::RoleEffectSource::Turn { request, .. } => request.freshness(),
-                });
-            if let Some(freshness) = freshness {
-                state.gap_review.accepted = Some(ReviewAcceptance {
-                    kind: ReviewAcceptanceKind::AcknowledgedGaps,
-                    freshness,
-                    justification: justification.to_string(),
-                });
-            }
-        }
-        (super::DecisionAction::Accept, AttentionKind::GapReviewFailed) => {
-            let freshness = state
-                .gap_review_receipt()
-                .map(|receipt| match &receipt.source {
-                    super::RoleEffectSource::Turn { request, .. } => request.freshness(),
-                });
-            if let Some(outcome) = state.gap_review.outcome.take() {
-                state.parked_effects.remove(outcome.effect_id());
-            }
-            state.gap_review.consecutive_failures = 0;
-            if let Some(freshness) = freshness {
-                state.gap_review.accepted = Some(ReviewAcceptance {
-                    kind: ReviewAcceptanceKind::Waived,
-                    freshness,
-                    justification: justification.to_string(),
-                });
-            }
-        }
-        (super::DecisionAction::Accept, _) => {
-            if let Some(task_id) = &item.task_id {
-                if !task_accept_candidate_is_lineage_complete(state, task_id) {
+
+    if decision_id == "mission" && action == &super::DecisionAction::Revise {
+        state.proposal = None;
+        state.proposal_approved = false;
+        state.gap_review.accepted = None;
+        state.planning_input.refinement =
+            Some(PlanningRefinement::Guidance(justification.to_string()));
+        ready_planning_conversation(state);
+        return;
+    }
+
+    if decision_id == "plan_proposal:mission" {
+        match action {
+            super::DecisionAction::Approve => {
+                let expected = state
+                    .proposal
+                    .as_ref()
+                    .and_then(|proposal| proposal.plan.as_ref())
+                    .map(|proposal| proposal.requirement_changes.as_slice())
+                    .unwrap_or(&[]);
+                if expected != requirement_changes {
                     return;
                 }
-                if let Some(task) = state.tasks.get_mut(task_id) {
-                    task.status = TaskStatus::Cleared;
-                    if task.candidate_sha.is_none() {
-                        task.candidate_sha = task
-                            .role_assignment
-                            .as_ref()
-                            .map(|assignment| assignment.base_sha.clone());
-                    }
-                    task.pending_base_sha = None;
+                state.proposal_approved = true;
+                state.planning_input.latest_rejected_proposal = None;
+                state.planning_input.refinement = None;
+                if state
+                    .proposal
+                    .as_ref()
+                    .is_some_and(|proposal| proposal.team.is_none())
+                {
+                    promote_proposal_plan(state);
                 }
             }
+            super::DecisionAction::Revise => {
+                state.planning_input.latest_rejected_proposal = state.proposal.take();
+                state.planning_input.refinement =
+                    Some(PlanningRefinement::Guidance(justification.to_string()));
+                state.proposal_approved = false;
+                state.gap_review.accepted = None;
+                ready_planning_conversation(state);
+            }
+            super::DecisionAction::Retry
+            | super::DecisionAction::Repair
+            | super::DecisionAction::Accept => {}
         }
-        _ => {}
+        return;
     }
-    state.open_attention.remove(attention_id);
+
+    if matches!(
+        decision_id,
+        "gap_review_gaps:mission" | "gap_review_failed:mission"
+    ) {
+        match action {
+            super::DecisionAction::Retry => {
+                if let Some(outcome) = state.gap_review.outcome.take() {
+                    state.parked_effects.remove(outcome.effect_id());
+                }
+                state.gap_review.accepted = None;
+            }
+            super::DecisionAction::Revise => {
+                revise_from_failure(state, decision_id, justification);
+            }
+            super::DecisionAction::Accept => {
+                accept_gap_review(state, decision_id, justification);
+            }
+            super::DecisionAction::Approve | super::DecisionAction::Repair => {}
+        }
+        return;
+    }
+
+    if let Some((task_id, effect_id)) = failed_node(state, decision_id) {
+        match action {
+            super::DecisionAction::Retry => {
+                retry_failed_node(state, task_id.as_ref(), effect_id.as_ref());
+            }
+            super::DecisionAction::Revise => {
+                revise_from_failure(state, decision_id, justification);
+            }
+            super::DecisionAction::Accept => {
+                if let Some(task_id) = task_id {
+                    if !task_accept_candidate_is_lineage_complete(state, &task_id) {
+                        return;
+                    }
+                    if let Some(task) = state.tasks.get_mut(&task_id) {
+                        task.status = TaskStatus::Cleared;
+                        if task.candidate_sha.is_none() {
+                            task.candidate_sha = task
+                                .role_assignment
+                                .as_ref()
+                                .map(|assignment| assignment.base_sha.clone());
+                        }
+                        task.pending_base_sha = None;
+                    }
+                }
+            }
+            super::DecisionAction::Approve | super::DecisionAction::Repair => {}
+        }
+        return;
+    }
+
+    if let Some(oracle) = failed_oracle(state, decision_id) {
+        match action {
+            super::DecisionAction::Retry => retry_failed_oracle(state, &oracle),
+            super::DecisionAction::Revise => {
+                revise_from_failure(state, decision_id, justification);
+            }
+            super::DecisionAction::Approve
+            | super::DecisionAction::Repair
+            | super::DecisionAction::Accept => {}
+        }
+        return;
+    }
+
+    if let Some(failure) = proof_failure(state, decision_id) {
+        match action {
+            super::DecisionAction::Retry | super::DecisionAction::Repair => {
+                apply_proof_recovery(state, &failure, action, justification);
+            }
+            super::DecisionAction::Revise => {
+                revise_from_failure(state, decision_id, justification);
+            }
+            super::DecisionAction::Approve | super::DecisionAction::Accept => {}
+        }
+    }
 }
 
 fn task_accept_candidate_is_lineage_complete(
@@ -1312,14 +1315,50 @@ fn ready_planning_conversation(state: &mut MissionState) {
     }
 }
 
-fn retry_failed_node(state: &mut MissionState, item: &AttentionItem) {
-    if let Some(task_id) = &item.task_id {
+fn failed_node(
+    state: &MissionState,
+    decision_id: &str,
+) -> Option<(Option<TaskId>, Option<super::EffectId>)> {
+    for (task_id, task) in &state.tasks {
+        if super::workflow::task_failure_id(task_id) != decision_id {
+            continue;
+        }
+        let effect_id = match &task.last_outcome {
+            Some(TaskAttemptOutcome::Failed { effect_id }) => Some(effect_id.clone()),
+            Some(TaskAttemptOutcome::Accepted { .. }) | None => None,
+        };
+        return Some((Some(task_id.clone()), effect_id));
+    }
+    let team = state.team.as_ref()?;
+    let mut assignments = vec![(team.planning_assignment.clone(), Vec::new())];
+    for (assertion_id, panel) in &team.judgment_assignments {
+        for role_instance in panel {
+            assignments.push((role_instance.clone(), vec![assertion_id.clone()]));
+        }
+    }
+    for (role_instance, assertion_ids) in assignments {
+        if super::workflow::role_failure_id(&role_instance, &assertion_ids) != decision_id {
+            continue;
+        }
+        let (effect_id, _, _) =
+            state.taskless_assignment_failure(&role_instance, &assertion_ids)?;
+        return Some((None, Some(effect_id.clone())));
+    }
+    None
+}
+
+fn retry_failed_node(
+    state: &mut MissionState,
+    task_id: Option<&TaskId>,
+    effect_id: Option<&super::EffectId>,
+) {
+    if let Some(task_id) = task_id {
         if let Some(task) = state.tasks.get_mut(task_id) {
             task.status = TaskStatus::Pending;
             task.consecutive_failures = 0;
         }
     }
-    for effect_id in item.evidence.role_attempts() {
+    if let Some(effect_id) = effect_id {
         if let Some(ParkedEffect::RoleTurn { role_instance, .. }) =
             state.parked_effects.remove(effect_id)
         {
@@ -1330,45 +1369,42 @@ fn retry_failed_node(state: &mut MissionState, item: &AttentionItem) {
     }
 }
 
-fn retry_failed_oracle(state: &mut MissionState, item: &AttentionItem) {
-    let Some(oracle) = &item.oracle else {
-        return;
-    };
+fn failed_oracle(state: &MissionState, decision_id: &str) -> Option<super::OracleName> {
+    state
+        .oracle_failures
+        .keys()
+        .find(|oracle| super::workflow::oracle_failure_id(oracle) == decision_id)
+        .cloned()
+}
+
+fn retry_failed_oracle(state: &mut MissionState, oracle: &super::OracleName) {
     state.oracle_failures.remove(oracle);
     state.parked_effects.retain(
         |_, parked| !matches!(parked, ParkedEffect::OracleRun { oracle: parked } if parked == oracle),
     );
 }
 
+fn proof_failure(state: &MissionState, decision_id: &str) -> Option<ProofFailure> {
+    let ProofReadiness::Failed(failures) = proof_readiness(state) else {
+        return None;
+    };
+    failures
+        .into_iter()
+        .find(|failure| super::workflow::proof_failure_id(failure) == decision_id)
+}
+
 fn apply_proof_recovery(
     state: &mut MissionState,
-    item: &AttentionItem,
+    failure: &ProofFailure,
     action: &super::DecisionAction,
     justification: &str,
 ) {
-    if action == &super::DecisionAction::Revise {
-        let ProofReadiness::Failed(failures) = proof_readiness(state) else {
-            return;
-        };
-        for failure in &failures {
-            clear_failed_proof(state, failure);
-        }
-        return;
-    }
-
-    let Some(failure) = super::verdict::proof_failure_for_attention(state, item) else {
-        return;
-    };
-    clear_failed_proof(state, &failure);
+    clear_failed_proof(state, failure);
     if action != &super::DecisionAction::Repair {
         return;
     }
 
-    let feedback = super::FailureFeedback {
-        summary: item.report.clone(),
-        evidence: item.evidence.clone(),
-        justification: justification.to_string(),
-    };
+    let feedback = proof_failure_feedback(state, failure, justification);
     let repair_base = state.deliverable_head().to_string();
     let mut repaired_tasks = Vec::new();
     if let Some(plan) = &state.plan {
@@ -1393,32 +1429,161 @@ fn apply_proof_recovery(
     state.gap_review = Default::default();
 }
 
+fn revise_from_failure(state: &mut MissionState, decision_id: &str, justification: &str) {
+    let feedback = revision_feedback(state, decision_id, justification);
+    if let Some((task_id, effect_id)) = failed_node(state, decision_id) {
+        retry_failed_node(state, task_id.as_ref(), effect_id.as_ref());
+    } else if let Some(oracle) = failed_oracle(state, decision_id) {
+        retry_failed_oracle(state, &oracle);
+    } else if proof_failure(state, decision_id).is_some() {
+        let ProofReadiness::Failed(failures) = proof_readiness(state) else {
+            return;
+        };
+        for failure in &failures {
+            clear_failed_proof(state, failure);
+        }
+    }
+    state.proposal = None;
+    state.proposal_approved = false;
+    state.gap_review.accepted = None;
+    state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(feedback));
+    ready_planning_conversation(state);
+}
+
 fn revision_feedback(
     state: &MissionState,
-    selected: &AttentionItem,
+    decision_id: &str,
     justification: &str,
 ) -> Vec<super::FailureFeedback> {
     let mut feedback = match &state.planning_input.refinement {
         Some(PlanningRefinement::FailureEvidence(feedback)) => feedback.clone(),
         Some(PlanningRefinement::Guidance(_)) | None => Vec::new(),
     };
-    let as_feedback = |item: &AttentionItem| super::FailureFeedback {
-        summary: item.report.clone(),
-        evidence: item.evidence.clone(),
-        justification: justification.to_string(),
-    };
-    if selected.kind == AttentionKind::ProofFailed {
-        feedback.extend(
-            state
-                .open_attention
-                .values()
-                .filter(|item| item.kind == AttentionKind::ProofFailed)
-                .map(as_feedback),
-        );
-    } else {
-        feedback.push(as_feedback(selected));
+    if proof_failure(state, decision_id).is_some() {
+        if let ProofReadiness::Failed(failures) = proof_readiness(state) {
+            feedback.extend(
+                failures
+                    .iter()
+                    .map(|failure| proof_failure_feedback(state, failure, justification)),
+            );
+        }
+        return feedback;
+    }
+    if let Some(item) = decision_feedback(state, decision_id, justification) {
+        feedback.push(item);
     }
     feedback
+}
+
+fn decision_feedback(
+    state: &MissionState,
+    decision_id: &str,
+    justification: &str,
+) -> Option<super::FailureFeedback> {
+    if let Some((task_id, effect_id)) = failed_node(state, decision_id) {
+        let summary = task_id.as_ref().map_or_else(
+            || "A taskless role assignment is parked.".to_string(),
+            |task_id| format!("Task '{task_id}' is parked."),
+        );
+        let evidence = effect_id.map_or(super::DecisionEvidence::None, |effect_id| {
+            super::DecisionEvidence::RoleAttempts {
+                effect_ids: vec![effect_id],
+            }
+        });
+        return Some(super::FailureFeedback {
+            summary,
+            evidence,
+            justification: justification.to_string(),
+        });
+    }
+    if let Some(oracle) = failed_oracle(state, decision_id) {
+        let failure = state.oracle_failures.get(&oracle)?.clone();
+        return Some(super::FailureFeedback {
+            summary: format!("Oracle '{oracle}' is parked."),
+            evidence: super::DecisionEvidence::OracleRuntimeFailure { failure },
+            justification: justification.to_string(),
+        });
+    }
+    let effect_id = match decision_id {
+        "gap_review_gaps:mission" => state.gap_review.outcome.as_ref()?.effect_id().clone(),
+        "gap_review_failed:mission" => state.gap_review.outcome.as_ref()?.effect_id().clone(),
+        _ => return None,
+    };
+    Some(super::FailureFeedback {
+        summary: if decision_id == "gap_review_gaps:mission" {
+            "Gap review found blocking gaps.".to_string()
+        } else {
+            "Gap review failed to run.".to_string()
+        },
+        evidence: super::DecisionEvidence::RoleAttempts {
+            effect_ids: vec![effect_id],
+        },
+        justification: justification.to_string(),
+    })
+}
+
+fn proof_failure_feedback(
+    state: &MissionState,
+    failure: &ProofFailure,
+    justification: &str,
+) -> super::FailureFeedback {
+    let (summary, evidence) = match failure {
+        ProofFailure::Receipt {
+            source: ProofSource::Command { oracle, .. },
+            effect_id,
+        } => (
+            format!("Required command proof '{oracle}' failed."),
+            super::DecisionEvidence::AuthoritativeReceipts {
+                effect_ids: vec![effect_id.clone()],
+            },
+        ),
+        ProofFailure::Receipt {
+            source: ProofSource::Judgment { role_instance, .. },
+            effect_id,
+        } => (
+            format!("Required judgment by '{role_instance}' failed."),
+            super::DecisionEvidence::RoleAttempts {
+                effect_ids: vec![effect_id.clone()],
+            },
+        ),
+        ProofFailure::StopBar { finish, .. } => (
+            format!(
+                "Settled proof class '{}' is below the declared stop bar '{}'.",
+                finish.slug(),
+                state.config.stop.slug()
+            ),
+            super::DecisionEvidence::None,
+        ),
+    };
+    super::FailureFeedback {
+        summary,
+        evidence,
+        justification: justification.to_string(),
+    }
+}
+
+fn accept_gap_review(state: &mut MissionState, decision_id: &str, justification: &str) {
+    let freshness = state
+        .gap_review_receipt()
+        .map(|receipt| match &receipt.source {
+            super::RoleEffectSource::Turn { request, .. } => request.freshness(),
+        });
+    let kind = if decision_id == "gap_review_gaps:mission" {
+        ReviewAcceptanceKind::AcknowledgedGaps
+    } else {
+        if let Some(outcome) = state.gap_review.outcome.take() {
+            state.parked_effects.remove(outcome.effect_id());
+        }
+        state.gap_review.consecutive_failures = 0;
+        ReviewAcceptanceKind::Waived
+    };
+    if let Some(freshness) = freshness {
+        state.gap_review.accepted = Some(ReviewAcceptance {
+            kind,
+            freshness,
+            justification: justification.to_string(),
+        });
+    }
 }
 
 fn clear_failed_proof(state: &mut MissionState, failure: &ProofFailure) {
@@ -1518,327 +1683,7 @@ fn promote_proposal_plan(state: &mut MissionState) {
     }
     state.proposal = None;
     state.proposal_approved = false;
-    state.phase = MissionPhase::Running;
     recompute_current_sha(state);
-}
-
-fn derive(state: &mut MissionState) {
-    recompute_current_sha(state);
-    if state.phase.is_terminal() {
-        return;
-    }
-    let mut attention = BTreeMap::new();
-    if state.proposal.is_some() && !state.proposal_approved {
-        attention.insert(
-            "plan_proposal:mission".to_string(),
-            AttentionItem {
-                id: "plan_proposal:mission".to_string(),
-                kind: AttentionKind::PlanProposal,
-                task_id: None,
-                oracle: None,
-                assertion_ids: Vec::new(),
-                evidence: super::DecisionEvidence::None,
-                report: "A complete plan or team proposal awaits approval.".to_string(),
-            },
-        );
-    }
-    for (task_id, task) in &state.tasks {
-        if task.status == TaskStatus::Failed && !state.task_automatic_retry_remaining(task_id) {
-            let id = format!("node_failed:{task_id}");
-            let evidence = match &task.last_outcome {
-                Some(TaskAttemptOutcome::Failed { effect_id }) => {
-                    super::DecisionEvidence::RoleAttempts {
-                        effect_ids: vec![effect_id.clone()],
-                    }
-                }
-                _ => super::DecisionEvidence::None,
-            };
-            attention.insert(
-                id.clone(),
-                AttentionItem {
-                    id,
-                    kind: AttentionKind::NodeFailed,
-                    task_id: Some(task_id.clone()),
-                    oracle: None,
-                    assertion_ids: Vec::new(),
-                    evidence,
-                    report: format!("Task '{task_id}' is parked."),
-                },
-            );
-        }
-    }
-    if let Some(team) = &state.team {
-        let mut assignments = vec![(team.planning_assignment.clone(), Vec::new())];
-        for (assertion_id, panel) in &team.judgment_assignments {
-            for role_instance in panel {
-                assignments.push((role_instance.clone(), vec![assertion_id.clone()]));
-            }
-        }
-        for (role_instance, assertion_ids) in assignments {
-            let Some((effect_id, failure, consecutive)) =
-                state.taskless_assignment_failure(&role_instance, &assertion_ids)
-            else {
-                continue;
-            };
-            if failure.automatically_retryable() && consecutive < state.config.recovery.max_attempts
-            {
-                continue;
-            }
-            let scope = assertion_ids.first().map_or_else(
-                || role_instance.to_string(),
-                |id| format!("{role_instance}:{id}"),
-            );
-            let id = format!("node_failed:{scope}");
-            attention.insert(
-                id.clone(),
-                AttentionItem {
-                    id,
-                    kind: AttentionKind::NodeFailed,
-                    task_id: None,
-                    oracle: None,
-                    assertion_ids,
-                    evidence: super::DecisionEvidence::RoleAttempts {
-                        effect_ids: vec![effect_id.clone()],
-                    },
-                    report: format!("Role instance '{role_instance}' is parked."),
-                },
-            );
-        }
-    }
-    for (oracle, failure) in &state.oracle_failures {
-        if !state.oracle_automatic_retry_remaining(oracle) {
-            let id = format!("oracle_failed:{oracle}");
-            attention.insert(
-                id.clone(),
-                AttentionItem {
-                    id,
-                    kind: AttentionKind::OracleFailed,
-                    task_id: None,
-                    oracle: Some(oracle.clone()),
-                    assertion_ids: state.owed_assertions_for_oracle(oracle),
-                    evidence: super::DecisionEvidence::OracleRuntimeFailure {
-                        failure: failure.clone(),
-                    },
-                    report: format!("Oracle '{oracle}' is parked."),
-                },
-            );
-        }
-    }
-    if let ProofReadiness::Failed(failures) = proof_readiness(state) {
-        for failure in failures {
-            let assertion_ids = failure.assertion_ids().to_vec();
-            let (id, oracle, evidence, report) = match &failure {
-                ProofFailure::Receipt {
-                    source: ProofSource::Command { oracle, .. },
-                    effect_id,
-                } => (
-                    format!("proof_failed:oracle:{oracle}"),
-                    Some(oracle.clone()),
-                    super::DecisionEvidence::AuthoritativeReceipts {
-                        effect_ids: vec![effect_id.clone()],
-                    },
-                    format!("Required command proof '{oracle}' failed."),
-                ),
-                ProofFailure::Receipt {
-                    source:
-                        ProofSource::Judgment {
-                            role_instance,
-                            assertion_ids,
-                        },
-                    effect_id,
-                } => {
-                    let anchor = assertion_ids
-                        .first()
-                        .map_or_else(|| role_instance.to_string(), ToString::to_string);
-                    (
-                        format!("proof_failed:judgment:{role_instance}:{anchor}"),
-                        None,
-                        super::DecisionEvidence::RoleAttempts {
-                            effect_ids: vec![effect_id.clone()],
-                        },
-                        format!("Required judgment by '{role_instance}' failed."),
-                    )
-                }
-                ProofFailure::StopBar { finish, .. } => (
-                    "proof_failed:mission".to_string(),
-                    None,
-                    super::DecisionEvidence::None,
-                    format!(
-                        "Settled proof class '{}' is below the declared stop bar '{}'.",
-                        finish.slug(),
-                        state.config.stop.slug()
-                    ),
-                ),
-            };
-            attention.insert(
-                id.clone(),
-                AttentionItem {
-                    id,
-                    kind: AttentionKind::ProofFailed,
-                    task_id: None,
-                    oracle,
-                    assertion_ids,
-                    evidence,
-                    report,
-                },
-            );
-        }
-    }
-    if state.config.requires_gap_review {
-        match &state.gap_review.outcome {
-            Some(ReviewOutcome::Failed { effect_id })
-                if state
-                    .role_attempt_receipts
-                    .get(effect_id)
-                    .and_then(RoleAttemptReceipt::failure)
-                    .is_some_and(|failure| !failure.automatically_retryable())
-                    || state.gap_review.consecutive_failures
-                        >= state.config.recovery.max_attempts =>
-            {
-                let id = "gap_review_failed:mission".to_string();
-                attention.insert(
-                    id.clone(),
-                    AttentionItem {
-                        id,
-                        kind: AttentionKind::GapReviewFailed,
-                        task_id: None,
-                        oracle: None,
-                        assertion_ids: Vec::new(),
-                        evidence: super::DecisionEvidence::RoleAttempts {
-                            effect_ids: vec![effect_id.clone()],
-                        },
-                        report: "Gap review failed to run.".to_string(),
-                    },
-                );
-            }
-            Some(ReviewOutcome::Verdict { effect_id }) => {
-                let blocking = state
-                    .role_attempt_receipts
-                    .get(effect_id)
-                    .and_then(
-                        |receipt| match (&receipt.source, receipt.settled_handoff()) {
-                            (
-                                super::RoleEffectSource::Turn { request, .. },
-                                Some(SettledHandoff::Review { passed, gaps }),
-                            ) if request.is_fresh_at(state) => Some(
-                                !passed
-                                    || gaps
-                                        .iter()
-                                        .any(|gap| gap.severity == super::GapSeverity::Blocking),
-                            ),
-                            _ => None,
-                        },
-                    )
-                    .unwrap_or(false);
-                let work_settled = state
-                    .tasks
-                    .values()
-                    .filter(|task| task.status != TaskStatus::Superseded)
-                    .all(|task| task.status == TaskStatus::Cleared)
-                    && state.inflight.is_empty()
-                    && matches!(proof_readiness(state), ProofReadiness::Satisfied(_));
-                if blocking
-                    && work_settled
-                    && !state
-                        .gap_review
-                        .acknowledges_sha(state, state.deliverable_head())
-                {
-                    let id = "gap_review_gaps:mission".to_string();
-                    attention.insert(
-                        id.clone(),
-                        AttentionItem {
-                            id,
-                            kind: AttentionKind::GapReviewGaps,
-                            task_id: None,
-                            oracle: None,
-                            assertion_ids: Vec::new(),
-                            evidence: super::DecisionEvidence::RoleAttempts {
-                                effect_ids: vec![effect_id.clone()],
-                            },
-                            report: "Gap review found blocking gaps.".to_string(),
-                        },
-                    );
-                }
-            }
-            Some(ReviewOutcome::Failed { .. }) => {}
-            None => {}
-        }
-    }
-    state.open_attention = attention;
-    if !state.open_attention.is_empty() {
-        state.phase = MissionPhase::AttentionNeeded;
-        return;
-    }
-    if state.plan.is_none()
-        || (state.planning_input.refinement.is_some() && state.proposal.is_none())
-    {
-        state.phase = MissionPhase::Planning;
-        return;
-    }
-    state.phase = MissionPhase::Running;
-}
-
-pub fn ready_to_finish(state: &MissionState) -> Option<FinishClass> {
-    if state.phase.is_terminal()
-        || state.plan.is_none()
-        || !state.inflight.is_empty()
-        || !state.open_attention.is_empty()
-        || gap_review_outstanding(state)
-    {
-        return None;
-    }
-    let tasks_settled = state
-        .tasks
-        .values()
-        .filter(|task| task.status != TaskStatus::Superseded)
-        .all(|task| task.status == TaskStatus::Cleared);
-    if !tasks_settled {
-        return None;
-    }
-    match proof_readiness(state) {
-        ProofReadiness::Satisfied(finish) => Some(finish),
-        ProofReadiness::Pending(_) | ProofReadiness::Failed(_) => None,
-    }
-}
-
-pub(crate) fn gap_review_outstanding(state: &MissionState) -> bool {
-    if !state.config.requires_gap_review {
-        return false;
-    }
-    if state.gap_review.waived_at(state)
-        || state
-            .gap_review
-            .acknowledges_sha(state, state.deliverable_head())
-    {
-        return false;
-    }
-    let Some(team) = state.team.as_ref() else {
-        return true;
-    };
-    let Some(role_id) = team.gap_review_assignment.as_ref() else {
-        return true;
-    };
-    let Some(ReviewOutcome::Verdict { effect_id }) = &state.gap_review.outcome else {
-        return true;
-    };
-    state
-        .role_attempt_receipts
-        .get(effect_id)
-        .and_then(
-            |receipt| match (&receipt.source, receipt.settled_handoff()) {
-                (
-                    super::RoleEffectSource::Turn { request, .. },
-                    Some(SettledHandoff::Review { passed, gaps }),
-                ) if &request.role_instance == role_id && request.is_fresh_at(state) => Some(
-                    *passed
-                        && gaps
-                            .iter()
-                            .all(|gap| gap.severity != super::GapSeverity::Blocking),
-                ),
-                _ => None,
-            },
-        )
-        != Some(true)
 }
 
 fn pending_task() -> TaskRuntimeState {

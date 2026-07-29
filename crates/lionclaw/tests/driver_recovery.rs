@@ -2,6 +2,7 @@
 
 mod common;
 
+use lionclaw::model::TerminalState;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier as StdBarrier, Mutex};
 
@@ -11,13 +12,13 @@ use common::{
     simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::authority::AuthorityCeiling;
-use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
+use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::{load_mission_type, materialize_mission_type};
 use lionclaw::model::{
-    fold, ConversationLifecycle, DecisionAction, EffectId, EffectResource, EventEnvelope, Handoff,
-    MissionEvent, MissionId, MissionPhase, MissionState, OutputSemantics, PayloadRef,
-    RoleAttemptDisposition, RoleEffectSource, RuntimeConfigurationEvidence, TaskId, ValidationItem,
-    REDUCER_VERSION,
+    fold, Choice, ContinueMode, ControlAction, ConversationLifecycle, EffectId, EffectIntent,
+    EffectResource, EventEnvelope, Handoff, MissionEvent, MissionId, MissionState, OutputSemantics,
+    PayloadRef, RoleAttemptDisposition, RoleEffectSource, RuntimeConfigurationEvidence, TaskId,
+    ValidationItem, REDUCER_VERSION,
 };
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, EventSink, RoleRunner,
@@ -742,17 +743,18 @@ async fn concurrent_advance_reports_running_and_never_double_dispatches() {
     started.wait().await;
 
     let concurrent = engine.advance(&mission_id).await.unwrap();
-    assert_eq!(concurrent.disposition, MissionDisposition::Running);
-    assert_eq!(
-        concurrent.next_actions(),
-        vec!["mission status", "mission send", "mission abort"]
-    );
+    assert!(concurrent.driver_running);
+    assert!(!concurrent.next.effects.is_empty());
     assert_eq!(concurrent.state.inflight.len(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     release.wait().await;
     let finished = first.await.unwrap().unwrap();
-    assert_eq!(finished.disposition, MissionDisposition::Terminal);
+    assert!(finished
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Finish { .. })));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -808,7 +810,11 @@ async fn detached_startup_waits_out_a_short_observer_lock_probe() {
 
     let finished = driver.await.unwrap();
     assert!(handshake.exists());
-    assert_eq!(finished.disposition, MissionDisposition::Terminal);
+    assert!(finished
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Finish { .. })));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1002,7 +1008,11 @@ async fn completed_writer_turn_without_handoff_recovers_as_same_conversation_che
         .expect("recover optional writer checkpoint");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "writer must not rerun");
     assert_eq!(cleaner.deletions.load(Ordering::SeqCst), 1);
-    assert_eq!(recovered.disposition, MissionDisposition::Parked);
+    assert!(recovered
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
 
     let state = store.require_state(&mission_id).await.unwrap();
     assert!(state.inflight.is_empty());
@@ -1077,9 +1087,9 @@ async fn accepted_handoff_is_refused_before_recording_over_limit_state() {
     );
     let mission_id = create_approved_mission(&engine, dir.path()).await;
 
-    let outcome = engine.advance(&mission_id).await.unwrap();
+    let outcome = common::advance_to_finished(&engine, &mission_id).await;
 
-    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
+    assert!(outcome.state.is_terminal());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(outcome.state.current_sha, HEAD_SHA);
     let receipt = outcome
@@ -1136,9 +1146,9 @@ async fn cleanup_backstop_discards_artifact_after_noncompliant_post_ack_growth()
     let mission_id = create_approved_mission(&engine, dir.path()).await;
     let snapshot = store.rebuild_cursors(&mission_id, 10).await.unwrap();
 
-    let outcome = engine.advance(&mission_id).await.unwrap();
+    let outcome = common::advance_to_finished(&engine, &mission_id).await;
 
-    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
+    assert!(outcome.state.is_terminal());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(outcome.state.current_sha, HEAD_SHA);
     let receipt = outcome
@@ -1223,7 +1233,11 @@ async fn crash_after_accepted_handoff_recovers_limit_and_discards_artifact() {
 
     let recovered = engine.advance(&mission_id).await.unwrap();
 
-    assert_eq!(recovered.disposition, MissionDisposition::Parked);
+    assert!(recovered
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
     assert_eq!(calls.load(Ordering::SeqCst), 1, "role must not rerun");
     assert_eq!(recovered.state.current_sha, BASE_SHA);
     let receipt = recovered
@@ -1365,7 +1379,11 @@ async fn completed_turn_with_oversized_retained_state_recovers_as_typed_failure(
         .advance(&mission_id)
         .await
         .expect("recover retained-state limit failure");
-    assert_eq!(recovered.disposition, MissionDisposition::Parked);
+    assert!(recovered
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
     assert_eq!(calls.load(Ordering::SeqCst), 1, "role must not rerun");
     assert_eq!(cleaner.deletions.load(Ordering::SeqCst), 1);
     let receipt = recovered
@@ -1466,8 +1484,8 @@ async fn durable_abort_outranks_recovered_retained_state_failure() {
 
     let recovered = engine.advance(&mission_id).await.unwrap();
     assert!(matches!(
-        recovered.state.phase,
-        MissionPhase::Aborted { .. }
+        recovered.state.terminal,
+        Some(TerminalState::Aborted { .. })
     ));
     let receipt = recovered
         .state
@@ -1593,22 +1611,26 @@ async fn completed_validator_turn_without_handoff_recovers_as_typed_rework() {
         .advance(&mission_id)
         .await
         .expect("recover and rework mandatory validator output");
-    let attention_id = parked
-        .state
-        .open_attention
-        .keys()
-        .next()
-        .expect("validator recovery attention")
-        .clone();
-    engine
-        .decide(
-            &mission_id,
-            &attention_id,
-            DecisionAction::Retry,
-            "retry interrupted validator",
-        )
-        .await
-        .expect("retry validator");
+    assert!(parked.next.choices.iter().any(|choice| matches!(
+        choice,
+        Choice::Continue {
+            effect_id: choice_effect,
+            mode: ContinueMode::Preserve,
+        } if choice_effect == &effect_id
+    )));
+    lionclaw::engine::record_control(
+        &store,
+        11,
+        &mission_id,
+        &effect_id,
+        ControlAction::Continue {
+            automatic: false,
+            mode: ContinueMode::Preserve,
+        },
+        "continue interrupted validator",
+    )
+    .await
+    .expect("continue validator");
     engine
         .advance(&mission_id)
         .await
@@ -1737,7 +1759,7 @@ async fn malformed_retained_handoff_recovers_as_typed_invalid_output() {
     let snapshot_head = snapshot.head;
 
     let settled = engine.advance(&mission_id).await.unwrap();
-    assert_eq!(settled.disposition, MissionDisposition::Parked);
+    assert!(common::has_decision(&settled.state, "node_failed:fix"));
     assert!(settled.state.inflight.is_empty());
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -1853,8 +1875,8 @@ async fn unacknowledged_handoff_preserves_the_active_effect_and_resources() {
     );
     let mission_id = create_approved_mission(&engine, dir.path()).await;
 
-    let settled = engine.advance(&mission_id).await.expect("atomic outcome");
-    assert_eq!(settled.disposition, MissionDisposition::Terminal);
+    let settled = common::advance_to_finished(&engine, &mission_id).await;
+    assert!(settled.state.is_terminal());
     assert_eq!(runner_calls.load(Ordering::SeqCst), 1);
     assert!(settled.state.inflight.is_empty());
     let (effect_id, receipt) = settled
@@ -1913,16 +1935,11 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
     let mission_id = create_approved_mission(&engine, dir.path()).await;
 
     let blocked = engine.advance(&mission_id).await.unwrap();
-    assert_eq!(blocked.disposition, MissionDisposition::CleanupBlocked);
-    assert_eq!(
-        blocked.next_actions(),
-        vec![
-            "mission advance",
-            "mission log",
-            "mission send",
-            "mission abort"
-        ]
-    );
+    assert!(blocked
+        .next
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, EffectIntent::DriveEffect { .. })));
     let failure = blocked.state.cleanup_failure.as_ref().unwrap();
     assert_eq!(failure.resource, EffectResource::EffectDirectory);
     assert_eq!(
@@ -1938,9 +1955,13 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
         }
         parked = engine.advance(&mission_id).await.unwrap();
     }
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
     assert!(parked.state.cleanup_failure.is_none());
     assert!(parked.state.inflight.is_empty());
+    assert!(parked
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
     assert_eq!(runner.calls.lock().unwrap().len(), 1);
     let task_id = TaskId::new("fix").unwrap();
     let failure = parked
@@ -1954,10 +1975,6 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
         &RuntimeConfigurationEvidence::default(),
         "crash recovery must not invent runtime evidence absent an atomic outcome"
     );
-    let attention = parked.state.open_attention.values().next().unwrap();
-    assert_eq!(attention.task_id.as_ref(), Some(&task_id));
-    assert_eq!(attention.report, "Task 'fix' is parked.");
-
     let calls = cleaner.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].effect_id, calls[1].effect_id);
@@ -2061,7 +2078,6 @@ async fn terminal_inflight_cleanup_is_recoverable_through_the_production_cli() {
                 .require_state(&mission_id)
                 .await
                 .unwrap()
-                .phase
                 .is_terminal()
             {
                 break;
@@ -2076,7 +2092,10 @@ async fn terminal_inflight_cleanup_is_recoverable_through_the_production_cli() {
     abort.await.unwrap().unwrap();
 
     let inherited = store.require_state(&mission_id).await.unwrap();
-    assert!(matches!(inherited.phase, MissionPhase::Aborted { .. }));
+    assert!(matches!(
+        inherited.terminal,
+        Some(TerminalState::Aborted { .. })
+    ));
     assert_eq!(inherited.inflight.len(), 1);
     assert_eq!(
         inherited.conversations[&request.role_instance].lifecycle,
@@ -2095,11 +2114,15 @@ async fn terminal_inflight_cleanup_is_recoverable_through_the_production_cli() {
     let inbox = String::from_utf8(inbox.stdout).expect("UTF-8 inbox");
     assert!(inbox.contains("aborted with 1 inherited effect(s) awaiting cleanup"));
     assert!(inbox.contains("no live driver; recovery required"));
-    assert!(inbox.contains("next: mission advance | mission log"));
+    assert!(inbox.contains("next: mission advance"));
 
     let blocked = engine.advance(&mission_id).await.unwrap();
-    assert_eq!(blocked.disposition, MissionDisposition::CleanupBlocked);
-    assert_eq!(blocked.next_actions(), ["mission advance", "mission log"]);
+    assert!(blocked.state.cleanup_failure.is_some());
+    assert!(blocked
+        .next
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, EffectIntent::DriveEffect { .. })));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(conversation_root.join("scratch/build-output").is_file());
 
@@ -2121,7 +2144,10 @@ async fn terminal_inflight_cleanup_is_recoverable_through_the_production_cli() {
     );
 
     let recovered = store.require_state(&mission_id).await.unwrap();
-    assert!(matches!(recovered.phase, MissionPhase::Aborted { .. }));
+    assert!(matches!(
+        recovered.terminal,
+        Some(TerminalState::Aborted { .. })
+    ));
     assert!(recovered.inflight.is_empty());
     assert_eq!(
         recovered.conversations[&request.role_instance].lifecycle,
@@ -2154,7 +2180,7 @@ async fn persistent_cleanup_failure_never_settles_or_replays_the_effect() {
 
     for _ in 0..3 {
         let blocked = engine.advance(&mission_id).await.unwrap();
-        assert_eq!(blocked.disposition, MissionDisposition::CleanupBlocked);
+        assert!(blocked.state.cleanup_failure.is_some());
         assert_eq!(blocked.state.inflight.len(), 1);
         assert_eq!(
             blocked

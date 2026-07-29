@@ -1,5 +1,6 @@
 mod common;
 
+use lionclaw::model::TerminalState;
 use std::sync::{
     atomic::{AtomicI64, Ordering},
     Arc, Mutex,
@@ -10,13 +11,11 @@ use common::{
     approve_plan, covered_requirement, initialize_repository, proposal, simple_plan,
     test_mission_type, BASE_SHA, HEAD_SHA,
 };
-use lionclaw::engine::{
-    record_control, record_message, Engine, EngineServices, MessageCommand, MissionDisposition,
-};
+use lionclaw::engine::{record_control, record_message, Engine, EngineServices, MessageCommand};
 use lionclaw::model::{
-    fold, Assertion, AssertionId, ControlAction, DeliveryMarker, Handoff, MessageReference,
-    MissionPhase, OracleName, OutputSemantics, PayloadRef, RuntimeConfigurationEvidence, TaskId,
-    TaskStatus, REDUCER_VERSION,
+    fold, Assertion, AssertionId, Choice, ControlAction, DeliveryMarker, EffectIntent, Handoff,
+    MessageReference, OracleName, OutputSemantics, PayloadRef, RuntimeConfigurationEvidence,
+    TaskId, TaskStatus, REDUCER_VERSION,
 };
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, OracleOutcome,
@@ -759,21 +758,26 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
     .unwrap();
 
     let parked = driver.await.unwrap();
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert!(parked
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
     assert_eq!(
         parked.state.tasks.values().next().unwrap().status,
         TaskStatus::Failed
     );
     assert!(parked.state.parked_effects.contains_key(&effect_id));
-    assert_eq!(
-        parked.next_actions(),
-        [
-            "mission continue",
-            "mission decide",
-            "mission send",
-            "mission abort"
-        ]
-    );
+    assert!(parked
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::SendMessage { .. })));
+    assert!(parked
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Abort)));
     let mut awaiting_and_parked = parked.state.clone();
     awaiting_and_parked
         .conversations
@@ -782,16 +786,16 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
         .expect("parked role conversation")
         .lifecycle = lionclaw::model::ConversationLifecycle::AwaitingLead;
     let composed = lionclaw::engine::MissionView::from_state(awaiting_and_parked, false);
-    assert_eq!(composed.disposition, MissionDisposition::AwaitingLead);
-    assert_eq!(
-        composed.next_actions(),
-        [
-            "mission send",
-            "mission continue",
-            "mission decide",
-            "mission abort"
-        ]
-    );
+    assert!(composed
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
+    assert!(composed
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::SendMessage { .. })));
     assert_eq!(
         parked
             .state
@@ -839,8 +843,8 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
             .status,
         TaskStatus::Pending
     );
-    let checkpoint = engine.advance(&mission_id).await.unwrap();
-    assert_eq!(checkpoint.disposition, MissionDisposition::Terminal);
+    let checkpoint = common::advance_to_finished(&engine, &mission_id).await;
+    assert!(checkpoint.state.is_terminal());
     assert_eq!(
         requests.lock().unwrap().as_slice(),
         &[(BASE_SHA.into(), 1), (BASE_SHA.into(), 1)]
@@ -938,8 +942,8 @@ async fn abort_cancels_an_active_oracle_while_the_driver_drains_its_batch() {
     assert!(abort_observed.load(std::sync::atomic::Ordering::SeqCst));
     let state = engine.load_state(&mission_id).await.unwrap();
     assert!(matches!(
-        state.phase,
-        lionclaw::model::MissionPhase::Aborted { .. }
+        state.terminal,
+        Some(TerminalState::Aborted { .. })
     ));
     assert!(state.inflight.is_empty());
     assert_eq!(state.current_sha, HEAD_SHA);
@@ -1030,7 +1034,11 @@ async fn durable_stop_wins_the_outcome_append_race_and_discards_the_candidate() 
     release.notify_one();
 
     let parked = driver.await.unwrap();
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert!(parked
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
     let failure = parked
         .state
         .task_last_failure(&TaskId::new("fix").unwrap())
@@ -1219,7 +1227,6 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
                                 .require_state(&mission_id)
                                 .await
                                 .unwrap()
-                                .phase
                                 .is_terminal()
                             {
                                 break;
@@ -1313,7 +1320,7 @@ async fn role_cancellation_matrix_preserves_exact_durable_settlement_evidence() 
                 }
             }
             if matches!(cancellation, SettlementCancellation::Abort) {
-                assert!(matches!(live.phase, MissionPhase::Aborted { .. }));
+                assert!(matches!(live.terminal, Some(TerminalState::Aborted { .. })));
             }
             assert!(matches!(
                 live.parked_effects.get(&effect_id),
@@ -1399,7 +1406,11 @@ async fn settlement_retains_bounded_blob_backed_oracle_stderr() {
     release.notify_one();
 
     let parked = driver.await.unwrap();
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert!(parked
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
     let failure = parked.state.oracle_failures.values().next().unwrap();
     assert!(matches!(failure, TypedFailure::OperatorStopped { .. }));
     assert!(!failure.evidence().stderr.is_empty());
@@ -1442,7 +1453,11 @@ async fn deadline_is_durably_linearized_before_one_adapter_cancellation() {
     approve_plan(&engine, &mission_id).await;
 
     let parked = engine.advance(&mission_id).await.unwrap();
-    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert!(parked
+        .next
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Continue { .. })));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(parked.state.reached_deadlines.len(), 1);
     let events = store.load(&mission_id).await.unwrap();
@@ -1514,7 +1529,11 @@ async fn finite_policy_budget_extends_before_the_initial_deadline() {
     approve_plan(&engine, &mission_id).await;
 
     let checkpoint = engine.advance(&mission_id).await.unwrap();
-    assert_eq!(checkpoint.disposition, MissionDisposition::Ready);
+    assert!(checkpoint
+        .next
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, EffectIntent::DispatchOracle(_))));
     let events = store.load(&mission_id).await.unwrap();
     assert!(events.iter().any(|event| matches!(
         &event.event,
@@ -1557,8 +1576,8 @@ async fn policy_auto_continues_candidate_and_proof_with_recorded_controls() {
         .unwrap();
     approve_plan(&engine, &mission_id).await;
 
-    let finished = engine.advance(&mission_id).await.unwrap();
-    assert_eq!(finished.disposition, MissionDisposition::Terminal);
+    let finished = common::advance_to_finished(&engine, &mission_id).await;
+    assert!(finished.state.is_terminal());
     let events = store.load(&mission_id).await.unwrap();
     let automatic = events
         .iter()
@@ -1611,9 +1630,9 @@ async fn policy_auto_continues_an_artifactless_writer_success() {
         .unwrap();
     approve_plan(&engine, &mission_id).await;
 
-    let finished = engine.advance(&mission_id).await.unwrap();
+    let finished = common::advance_to_finished(&engine, &mission_id).await;
 
-    assert_eq!(finished.disposition, MissionDisposition::Terminal);
+    assert!(finished.state.is_terminal());
     assert_eq!(finished.state.deliverable_head(), BASE_SHA);
     let events = store.load(&mission_id).await.unwrap();
     let automatic = events

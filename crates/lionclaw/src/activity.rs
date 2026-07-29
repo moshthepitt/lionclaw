@@ -127,13 +127,6 @@ pub(crate) fn clear_driver_run_evidence(mission_dirs: &MissionDirs) -> Result<()
     Ok(())
 }
 
-pub(crate) fn clear_driver_error(mission_dirs: &MissionDirs) -> Result<()> {
-    let _removed = mission_dirs
-        .files()?
-        .remove_file(OsStr::new(DRIVER_ERROR_FILE), "driver error")?;
-    Ok(())
-}
-
 pub(crate) fn spool_driver_stderr(mut input: impl Read, mission_dirs: &MissionDirs) -> Result<()> {
     let mut bytes = Vec::with_capacity(MAX_DRIVER_STDERR_BYTES as usize);
     let mut retained = 0_u64;

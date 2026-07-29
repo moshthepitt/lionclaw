@@ -5,13 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use lionclaw::engine::{Engine, EngineServices};
+use lionclaw::engine::{Engine, EngineServices, MissionView};
 use lionclaw::mission_type::{MissionType, MissionTypeDefinition};
 use lionclaw::model::{
-    Assertion, AssertionId, AuthorityCeilings, AuthorityGrants, MissionProposal, OracleName,
-    OutputSemantics, Plan, PlanProposal, Requirement, RequirementDisposition, RequirementId,
-    RequirementKind, RoleInstance, RoleInstanceId, RuntimeInstrumentIdentity, StopBar, Task,
-    TeamRevision,
+    Assertion, AssertionId, AuthorityCeilings, AuthorityGrants, Choice, FinishClass, MissionId,
+    MissionProposal, OracleName, OutputSemantics, Plan, PlanProposal, Requirement,
+    RequirementDisposition, RequirementId, RequirementKind, RoleInstance, RoleInstanceId,
+    RuntimeInstrumentIdentity, StopBar, Task, TeamRevision,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
@@ -118,6 +118,83 @@ pub async fn approve_plan(engine: &Engine, mission_id: &lionclaw::model::Mission
         )
         .await
         .expect("approve plan");
+}
+
+pub fn decision_actions(
+    state: &lionclaw::model::MissionState,
+    id: &str,
+) -> Vec<lionclaw::model::DecisionAction> {
+    lionclaw::model::next(state)
+        .choices
+        .into_iter()
+        .filter_map(|choice| match choice {
+            Choice::Decide {
+                id: choice_id,
+                action,
+            } if choice_id == id => Some(action),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn has_decision(state: &lionclaw::model::MissionState, id: &str) -> bool {
+    !decision_actions(state, id).is_empty()
+}
+
+pub fn finish_choice(state: &lionclaw::model::MissionState) -> Option<FinishClass> {
+    lionclaw::model::next(state)
+        .choices
+        .into_iter()
+        .find_map(|choice| match choice {
+            Choice::Finish { finish } => Some(finish),
+            _ => None,
+        })
+}
+
+pub fn decision_ids(state: &lionclaw::model::MissionState) -> Vec<String> {
+    lionclaw::model::next(state)
+        .choices
+        .into_iter()
+        .filter_map(|choice| match choice {
+            Choice::Decide { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+pub fn decision_id_with_prefix(state: &lionclaw::model::MissionState, prefix: &str) -> String {
+    let matches = decision_ids(state)
+        .into_iter()
+        .filter(|id| id.starts_with(prefix))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected one decision starting with {prefix:?}, got {matches:?}"
+    );
+    matches.into_iter().next().unwrap()
+}
+
+pub async fn advance_to_finished(engine: &Engine, mission_id: &MissionId) -> MissionView {
+    let ready = engine
+        .advance(mission_id)
+        .await
+        .expect("advance to finish gate");
+    assert!(
+        ready
+            .next
+            .choices
+            .iter()
+            .any(|choice| matches!(choice, Choice::Finish { .. })),
+        "mission was not ready to finish: {ready:?}"
+    );
+    engine
+        .finish(mission_id, "test finish")
+        .await
+        .expect("record finish");
+    engine.advance(mission_id).await.expect("advance terminal")
 }
 
 pub fn role(id: &str, output: OutputSemantics) -> RoleInstance {

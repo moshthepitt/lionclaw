@@ -1,5 +1,5 @@
 //! The pure deterministic core: identifiers, plan vocabulary, events, state,
-//! the fold, validation, and the step decision function.
+//! the fold, validation, and the `next` workflow projection.
 //!
 //! Dependency wall: this crate has only deterministic value/hash dependencies.
 //! No I/O, clock, RNG, or async dependencies may enter the kernel model.
@@ -30,11 +30,11 @@ pub mod ids;
 pub mod plan;
 pub mod plan_validation;
 pub mod state;
-pub mod step;
 pub mod team;
 pub mod verdict;
+pub mod workflow;
 
-pub use decision::{legal_actions, validate_decision, DecisionError};
+pub use decision::{validate_decision, DecisionError};
 pub use event::{
     resolve_execution_deadline_ms, role_prompt_template, role_success_contract_error,
     ArtifactOutcome, BlobRef, ContinueMode, ControlAction, DecisionAction, EffectEventClass,
@@ -53,7 +53,7 @@ pub use failure::{
     RuntimeConfigurationConfirmation, RuntimeUsage, RuntimeUsageCost, RuntimeUsageCostScope,
     RuntimeUsageDetails, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT,
 };
-pub use fold::{apply, fold, ready_to_finish, REDUCER_VERSION};
+pub use fold::{apply, fold, REDUCER_VERSION};
 pub use ids::{
     short_hex, AssertionId, EffectId, IdError, InputName, MissionId, OracleName, RequirementId,
     RoleInstanceId, TaskId,
@@ -67,20 +67,20 @@ pub use plan_validation::{
     ProposalError, MAX_TASK_DEPENDENCIES,
 };
 pub use state::{
-    resolve_role_assignment, resolve_task_assignment, AdvisoryStatus, AssertionState,
-    AttentionItem, AttentionKind, ConversationLifecycle, ConversationState, DecisionEvidence,
-    DeliveryMarker, DurableCancellation, EffectCleanupFailure, FailureFeedback, GapReviewState,
-    InflightEffect, MissionPhase, MissionState, ParkedEffect, PlanningInput, PlanningRefinement,
-    QueuedMessage, ReferenceRecipientPolicy, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
+    resolve_role_assignment, resolve_task_assignment, AdvisoryStatus, AppliedResult,
+    AssertionState, ConversationLifecycle, ConversationState, DecisionEvidence, DeliveryMarker,
+    DurableCancellation, EffectCleanupFailure, FailureFeedback, GapReviewState, InflightEffect,
+    MissionState, ParkedEffect, PlanningInput, PlanningRefinement, QueuedMessage,
+    ReferenceRecipientPolicy, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
     RoleAssignment, RoleAssignmentContext, RoleAttemptAuthority, RoleAttemptDisposition,
     RoleAttemptEvidenceUse, RoleAttemptGeneration, RoleAttemptReceipt, RoleEffectSource,
     RoleTurnProvenance, SettledHandoff, SupersededAssertion, TaskAttemptOutcome,
-    TaskRoleAssignment, TaskRuntimeState, TaskStatus, TaskWorkspaceProvenance,
+    TaskRoleAssignment, TaskRuntimeState, TaskStatus, TaskWorkspaceProvenance, TerminalState,
 };
-pub use step::{step, OracleDispatchIntent, RoleDispatchIntent, StepDecision};
 pub use team::{
     parse_confinement_size_bytes, validate_environment_entry, AuthorityCeilings, AuthorityGrants,
     ConfinementResources, ConfinementTmpfsResource, MissionGuidance, RoleInstance, TeamRevision,
     KERNEL_ENVIRONMENT_KEYS, MAX_GUIDANCE_BYTES, MAX_TMPFS_RESOURCE_OVERRIDES,
 };
 pub use verdict::{AuthoritativeVerdict, FinishClass};
+pub use workflow::{next, Choice, EffectIntent, Next, OracleDispatchIntent, RoleDispatchIntent};
