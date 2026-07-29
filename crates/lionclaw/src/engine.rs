@@ -2774,32 +2774,7 @@ pub async fn record_control(
     if !next(&state)
         .choices
         .iter()
-        .any(|choice| match (&action, choice) {
-            (
-                crate::model::ControlAction::Stop,
-                Choice::Stop {
-                    effect_id: choice_effect,
-                },
-            ) => choice_effect == effect_id,
-            (
-                crate::model::ControlAction::ExtendDeadline {
-                    old_deadline_ms, ..
-                },
-                Choice::ExtendDeadline {
-                    effect_id: choice_effect,
-                    old_deadline_ms: choice_deadline,
-                },
-            ) => choice_effect == effect_id && choice_deadline == old_deadline_ms,
-            (
-                crate::model::ControlAction::Continue { mode, .. },
-                Choice::Continue {
-                    effect_id: choice_effect,
-                    mode: choice_mode,
-                },
-            ) => choice_effect == effect_id && choice_mode == mode,
-            (crate::model::ControlAction::DeadlineReached { .. }, _) => false,
-            _ => false,
-        })
+        .any(|choice| choice.authorizes_control(effect_id, &action))
     {
         bail!("effect '{effect_id}' does not advertise the requested control");
     }

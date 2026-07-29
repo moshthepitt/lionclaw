@@ -80,6 +80,38 @@ pub enum Choice {
     },
 }
 
+impl Choice {
+    /// Whether this exact operator choice authorizes the requested control.
+    /// Automatic controls are engine-owned and never match a `Choice`.
+    pub fn authorizes_control(&self, effect_id: &EffectId, action: &super::ControlAction) -> bool {
+        match (self, action) {
+            (Self::Stop { effect_id: legal }, super::ControlAction::Stop) => legal == effect_id,
+            (
+                Self::ExtendDeadline {
+                    effect_id: legal,
+                    old_deadline_ms: legal_deadline,
+                },
+                super::ControlAction::ExtendDeadline {
+                    old_deadline_ms,
+                    automatic: false,
+                    ..
+                },
+            ) => legal == effect_id && legal_deadline == old_deadline_ms,
+            (
+                Self::Continue {
+                    effect_id: legal,
+                    mode: legal_mode,
+                },
+                super::ControlAction::Continue {
+                    automatic: false,
+                    mode,
+                },
+            ) => legal == effect_id && legal_mode == mode,
+            _ => false,
+        }
+    }
+}
+
 pub fn next(state: &MissionState) -> Next {
     if state.terminal.is_some() {
         let effects = active_effects(state);

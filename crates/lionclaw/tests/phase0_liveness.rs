@@ -207,6 +207,24 @@ fn assert_abort_preserves_authority(state: &lionclaw::model::MissionState) {
             .iter()
             .any(|choice| matches!(choice, Choice::Abort)));
     }
+    for effect_id in state.inflight.keys() {
+        let mut forged = aborted.clone();
+        apply(
+            &mut forged,
+            &envelope(
+                &aborted,
+                MissionEvent::ControlRequested {
+                    effect_id: effect_id.clone(),
+                    action: lionclaw::model::ControlAction::Stop,
+                    reason: "forged terminal stop".to_string(),
+                },
+            ),
+        );
+        assert_eq!(
+            forged.stop_requests, aborted.stop_requests,
+            "an unadvertised terminal control must be inert"
+        );
+    }
 }
 
 fn assert_prefix_liveness(name: &str, events: &[EventEnvelope]) {

@@ -2114,7 +2114,7 @@ async fn terminal_inflight_cleanup_is_recoverable_through_the_production_cli() {
     let inbox = String::from_utf8(inbox.stdout).expect("UTF-8 inbox");
     assert!(inbox.contains("aborted with 1 inherited effect(s) awaiting cleanup"));
     assert!(inbox.contains("no live driver; recovery required"));
-    assert!(inbox.contains("next: mission advance"));
+    assert!(inbox.contains(&format!("next: mission advance {mission_id}")));
 
     let blocked = engine.advance(&mission_id).await.unwrap();
     assert!(blocked.state.cleanup_failure.is_some());

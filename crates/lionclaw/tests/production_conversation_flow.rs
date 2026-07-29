@@ -1878,7 +1878,10 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         vec!["mission", "inbox"],
     ] {
         let human = stdout(cli_output(&repo, &args));
-        assert!(human.contains("mission continue | mission decide | mission send | mission abort"));
+        assert!(human.contains("mission continue "));
+        assert!(human.contains(" | mission decide "));
+        assert!(human.contains(" | mission send "));
+        assert!(human.contains(" | mission abort "));
         assert!(human.contains("lifecycle=retired"));
     }
     let database = sqlx::SqlitePool::connect(&format!(
@@ -3901,7 +3904,8 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
         ] {
             let human = stdout(cli_output(&repo, &args));
             assert!(human.contains("lifecycle=awaiting_lead"));
-            assert!(human.contains("next: mission send | mission abort"));
+            assert!(human.contains("next: mission send "));
+            assert!(human.contains(" | mission abort "));
             assert!(human.contains("final response: Which release target should I use?"));
         }
 
@@ -4345,9 +4349,11 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
             &repo,
             &["mission", "status", mission_id.as_str()],
         ));
-        assert!(active_human.contains(
-            "next: mission advance | mission stop | mission extend | mission send | mission abort"
-        ));
+        assert!(active_human.contains("next: mission advance "));
+        assert!(active_human.contains(" | mission stop "));
+        assert!(active_human.contains(" | mission extend "));
+        assert!(active_human.contains(" | mission send "));
+        assert!(active_human.contains(" | mission abort "));
         assert!(active_human.contains("activity "));
 
         // The remainder of this settlement scenario deliberately tests a clean

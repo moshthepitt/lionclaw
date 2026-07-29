@@ -1193,7 +1193,6 @@ async fn cmd_inbox(args: InboxArgs) -> Result<()> {
         for view in &pending {
             print_mission_view(view, &store, false).await?;
             println!("  objective: {}", view.state.objective);
-            println!("  next: {}", next_commands(view).join(" | "));
         }
     }
     Ok(())
@@ -1218,32 +1217,54 @@ fn finish_is_advertised(view: &MissionView) -> bool {
         .any(|choice| matches!(choice, Choice::Finish { .. }))
 }
 
-fn next_commands(view: &MissionView) -> Vec<&'static str> {
+fn decision_action_name(action: &DecisionAction) -> &'static str {
+    match action {
+        DecisionAction::Approve => "approve",
+        DecisionAction::Retry => "retry",
+        DecisionAction::Repair => "repair",
+        DecisionAction::Revise => "revise",
+        DecisionAction::Accept => "accept",
+    }
+}
+
+fn next_commands(view: &MissionView) -> Vec<String> {
+    let mission_id = &view.state.mission_id;
     let mut commands = Vec::new();
     if !view.next.effects.is_empty() {
-        commands.push("mission advance");
+        commands.push(format!("mission advance {mission_id}"));
     }
     for choice in &view.next.choices {
         let command = match choice {
-            Choice::Decide { .. } => "mission decide",
-            Choice::SendMessage { .. } => "mission send",
-            Choice::Stop { .. } => "mission stop",
-            Choice::ExtendDeadline { .. } => "mission extend",
+            Choice::Decide {
+                id,
+                action: DecisionAction::Revise,
+            } => format!("mission decide {mission_id} {id} revise --feedback-file FEEDBACK_FILE"),
+            Choice::Decide { id, action } => format!(
+                "mission decide {mission_id} {id} {} --justification JUSTIFICATION",
+                decision_action_name(action)
+            ),
+            Choice::SendMessage { role_instance } => {
+                format!("mission send --mission-id {mission_id} --to {role_instance} MESSAGE")
+            }
+            Choice::Stop { effect_id } => {
+                format!("mission stop {mission_id} {effect_id} --reason REASON")
+            }
+            Choice::ExtendDeadline { effect_id, .. } => {
+                format!("mission extend {mission_id} {effect_id} --seconds SECONDS --reason REASON")
+            }
             Choice::Continue {
                 mode: crate::model::ContinueMode::Preserve,
-                ..
-            } => "mission continue",
+                effect_id,
+            } => format!("mission continue {mission_id} {effect_id} --reason REASON"),
             Choice::Continue {
                 mode: crate::model::ContinueMode::RecreateWorkspace,
-                ..
-            } => "mission continue --recreate",
-            Choice::Finish { .. } => "mission finish",
-            Choice::Abort => "mission abort",
-            Choice::Apply { .. } => "mission apply",
+                effect_id,
+            } => format!("mission continue {mission_id} {effect_id} --reason REASON --recreate"),
+            Choice::Finish { .. } => format!("mission finish {mission_id} --reason REASON"),
+            Choice::Abort => format!("mission abort {mission_id} --reason REASON"),
+            Choice::Apply { .. } => format!("mission apply {mission_id}"),
         };
-        if !commands.contains(&command) {
-            commands.push(command);
-        }
+        commands.push(command);
     }
     commands
 }
@@ -2040,8 +2061,9 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 .join(", ")
         );
     }
-    if state.terminal.is_none() {
-        println!("\n  next: {}", next_commands(&view).join(" | "));
+    let commands = next_commands(&view);
+    if !commands.is_empty() {
+        println!("\n  next: {}", commands.join(" | "));
     }
     if args.patch && state.deliverable_head() != state.base_sha {
         let diff = workspace::diff(&repo, &state.base_sha, state.deliverable_head()).await?;
@@ -3430,6 +3452,10 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
         print_workspace_control_state(state, "  ");
         print_parked_controls(state, "  ");
         print_superseded_assertions(state, blobs, "  ");
+        let commands = next_commands(view);
+        if !commands.is_empty() {
+            println!("  next: {}", commands.join(" | "));
+        }
     }
     Ok(())
 }

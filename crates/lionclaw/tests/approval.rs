@@ -50,6 +50,23 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
         common::decision_actions(&parked.state, "plan_proposal:mission"),
         [DecisionAction::Approve, DecisionAction::Revise]
     );
+    let inbox = std::process::Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+        .args(["mission", "inbox", "--repo"])
+        .arg(dir.path())
+        .output()
+        .expect("render proposal-ready human inbox");
+    assert!(
+        inbox.status.success(),
+        "inbox failed: {}",
+        String::from_utf8_lossy(&inbox.stderr)
+    );
+    let inbox = String::from_utf8(inbox.stdout).expect("UTF-8 inbox");
+    assert!(inbox.contains(&format!(
+        "mission decide {mission_id} plan_proposal:mission approve --justification JUSTIFICATION"
+    )));
+    assert!(inbox.contains(&format!(
+        "mission decide {mission_id} plan_proposal:mission revise --feedback-file FEEDBACK_FILE"
+    )));
 
     // The model contract rejects an empty reason even when the action itself
     // is legal; callers cannot bypass the CLI's required flag.
@@ -151,7 +168,11 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
     );
     let inbox = String::from_utf8(inbox.stdout).expect("UTF-8 inbox");
     assert!(inbox.contains("ready to finish"));
-    assert!(inbox.contains("next: mission finish | mission decide | mission abort"));
+    assert!(inbox.contains(&format!("mission finish {mission_id} --reason REASON")));
+    assert!(inbox.contains(&format!(
+        "mission decide {mission_id} mission revise --feedback-file FEEDBACK_FILE"
+    )));
+    assert!(inbox.contains(&format!("mission abort {mission_id} --reason REASON")));
 
     engine.finish(&mission_id, "done").await.expect("finish");
     let done = engine.advance(&mission_id).await.expect("advance terminal");

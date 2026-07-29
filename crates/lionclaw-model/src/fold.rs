@@ -243,11 +243,16 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             sha,
             reason,
         } => {
-            if matches!(state.terminal, Some(TerminalState::Done { .. }))
-                && !branch.trim().is_empty()
-                && sha == state.deliverable_head()
-                && !reason.trim().is_empty()
-                && state.applied_result.is_none()
+            if !reason.trim().is_empty()
+                && super::next(state).choices.iter().any(|choice| {
+                    matches!(
+                        choice,
+                        super::Choice::Apply {
+                            branch: legal_branch,
+                            sha: legal_sha,
+                        } if legal_branch == branch && legal_sha == sha
+                    )
+                })
             {
                 state.applied_result = Some(AppliedResult {
                     branch: branch.clone(),
@@ -1085,6 +1090,20 @@ fn apply_control(
     if reason.trim().is_empty() {
         return;
     }
+    let requires_choice = match action {
+        ControlAction::Stop => true,
+        ControlAction::ExtendDeadline { automatic, .. }
+        | ControlAction::Continue { automatic, .. } => !automatic,
+        ControlAction::DeadlineReached { .. } => false,
+    };
+    if requires_choice
+        && !super::next(state)
+            .choices
+            .iter()
+            .any(|choice| choice.authorizes_control(effect_id, action))
+    {
+        return;
+    }
     match action {
         ControlAction::Stop if state.inflight.contains_key(effect_id) => {
             state
@@ -1238,9 +1257,6 @@ fn apply_decision(
             }
             super::DecisionAction::Accept => {
                 if let Some(task_id) = task_id {
-                    if !task_accept_candidate_is_lineage_complete(state, &task_id) {
-                        return;
-                    }
                     if let Some(task) = state.tasks.get_mut(&task_id) {
                         task.status = TaskStatus::Cleared;
                         if task.candidate_sha.is_none() {
@@ -1282,23 +1298,6 @@ fn apply_decision(
             super::DecisionAction::Approve | super::DecisionAction::Accept => {}
         }
     }
-}
-
-fn task_accept_candidate_is_lineage_complete(
-    state: &MissionState,
-    task_id: &super::TaskId,
-) -> bool {
-    if state
-        .tasks
-        .get(task_id)
-        .and_then(|task| task.candidate_sha.as_ref())
-        .is_some()
-    {
-        return true;
-    }
-    state
-        .task_dependency_refs(task_id)
-        .is_some_and(|dependencies| dependencies.len() <= 1)
 }
 
 fn ready_planning_conversation(state: &mut MissionState) {

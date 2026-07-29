@@ -27,6 +27,8 @@ After the cutover:
 - stale proof removes `Finish` and returns the required proof effect;
 - a queued continuation outranks finish, and a forged `MissionFinished` is
   inert;
+- forged apply targets and manual controls absent from the exact current
+  `Choice` set are inert during replay;
 - every event-log prefix refolds to the same `Next`.
 
 ## Result
@@ -48,6 +50,12 @@ After the cutover:
 - Finish authority is not duplicated in another helper: the fold admits
   `MissionFinished` only when the exact current `Next` contains the matching
   `Finish`.
+- One `Choice::authorizes_control` predicate is shared by command admission and
+  replay admission for manual controls. Engine-owned deadline and automatic
+  continuation facts retain their existing policy checks.
+- Human guidance renders the exact mission, decision target, action, effect,
+  recipient, mode, and required justification or feedback argument accepted by
+  each CLI route.
 - Role prompt reconstruction folds once at the durable request's recorded
   message boundary and validates the exact intent tuple.
 - Role setup is split across two ordinary boxed async boundaries. Reverting
@@ -84,7 +92,14 @@ No test file or prior test coverage was deleted. Existing scenario tests were
 ported from phase, attention, and action-list assertions to exact `Next`
 effects and choices. New regressions cover universal abort, explicit finish,
 unadvertised transition rejection, queued-work finish rejection, prefix-stable
-`Next`, and exact CLI serialization.
+`Next`, exact CLI serialization, exact apply replay admission, terminal control
+rejection, and complete human decision commands.
+
+Two adversarial QA rounds followed the initial implementation. The first found
+and fixed exact apply admission and incomplete human choice rendering. The
+second rechecked replay, recovery, concurrency, terminal cleanup, JSON parity,
+and command completeness; it found and fixed the missing reducer-side manual
+control guard and removed a duplicated task-acceptance predicate.
 
 ## Verification
 

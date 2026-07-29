@@ -1047,6 +1047,66 @@ fn attested_closure_waits_for_every_assigned_judge() {
             finish: lionclaw_model::FinishClass::Attested
         })
     );
+
+    state
+        .tasks
+        .get_mut(&TaskId::new("implement").unwrap())
+        .unwrap()
+        .candidate_sha = Some("delivered".into());
+    state.current_sha = "delivered".into();
+    let Choice::Apply { branch, sha } = lionclaw_model::next(&state)
+        .choices
+        .into_iter()
+        .find(|choice| matches!(choice, Choice::Apply { .. }))
+        .expect("completed result should be applicable")
+    else {
+        unreachable!()
+    };
+    let mut forged = state.clone();
+    apply(
+        &mut forged,
+        &event(
+            10,
+            MissionEvent::ResultApplied {
+                branch: "unadvertised-branch".into(),
+                sha: sha.clone(),
+                reason: "forged apply target".into(),
+            },
+        ),
+    );
+    assert!(
+        forged.applied_result.is_none(),
+        "an unadvertised apply target must be inert"
+    );
+    assert!(lionclaw_model::next(&forged).choices.iter().any(
+        |choice| matches!(choice, Choice::Apply {
+            branch: legal_branch,
+            sha: legal_sha,
+        } if legal_branch == &branch && legal_sha == &sha)
+    ));
+
+    apply(
+        &mut state,
+        &event(
+            10,
+            MissionEvent::ResultApplied {
+                branch: branch.clone(),
+                sha: sha.clone(),
+                reason: "applied exact advertised result".into(),
+            },
+        ),
+    );
+    assert_eq!(
+        state
+            .applied_result
+            .as_ref()
+            .map(|result| (&result.branch, &result.sha)),
+        Some((&branch, &sha))
+    );
+    assert!(!lionclaw_model::next(&state)
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Apply { .. })));
 }
 
 fn failed_required_judgment_state() -> MissionState {
