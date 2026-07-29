@@ -102,6 +102,62 @@ async fn terminal_mission_rejects_every_administrative_mutation_without_appendin
 }
 
 #[tokio::test]
+async fn pending_joint_proposal_blocks_direct_team_mutation_then_promotes_atomically() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = gated_engine(dir.path()).await;
+    let mission_id = engine
+        .create_mission(dir.path().to_str().unwrap(), "joint proposal", BASE_SHA)
+        .await
+        .expect("create");
+    let proposal = proposal(0, simple_plan());
+    let proposed_team = proposal.team.clone().expect("proposed team");
+    engine
+        .propose_plan(&mission_id, proposal)
+        .await
+        .expect("propose");
+
+    let pending = engine.load_state(&mission_id).await.expect("pending");
+    assert!(pending.proposal.is_some());
+    let projected = lionclaw::model::next(&pending);
+    assert!(projected.effects.is_empty());
+    assert!(projected.choices.iter().all(|choice| match choice {
+        Choice::Decide { id, action }
+            if id == "plan_proposal:mission"
+                && matches!(action, DecisionAction::Approve | DecisionAction::Revise) =>
+        {
+            true
+        }
+        Choice::SendMessage { .. } | Choice::Abort => true,
+        _ => false,
+    }));
+    assert!(engine
+        .configure_team(&mission_id, proposed_team.clone())
+        .await
+        .is_err());
+    let unchanged = engine
+        .load_state(&mission_id)
+        .await
+        .expect("unchanged pending proposal");
+    assert_eq!(unchanged.head, pending.head);
+    assert_eq!(unchanged.team, pending.team);
+
+    engine
+        .decide(
+            &mission_id,
+            "plan_proposal:mission",
+            DecisionAction::Approve,
+            "approve the joint proposal",
+        )
+        .await
+        .expect("approve");
+    let approved = engine.load_state(&mission_id).await.expect("approved");
+    assert_eq!(approved.revision, 1);
+    assert_eq!(approved.team, Some(proposed_team));
+    assert!(approved.plan.is_some());
+    assert!(approved.proposal.is_none());
+}
+
+#[tokio::test]
 async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = gated_engine(dir.path()).await;

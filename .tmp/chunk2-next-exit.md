@@ -16,20 +16,22 @@ left: ["choices", "effects", "issues", "state"]
 right: ["choices", "effects"]
 ```
 
-The final authority audit added two more RED regressions:
+The authority audits added three more RED regressions:
 
 - a terminal mission still accepted plan, team, and mission-skill mutations;
 - failed terminal conversation cleanup changed the filesystem but remained
-  absent from `Next` and had no durable completion fact.
+  absent from `Next` and had no durable completion fact;
+- a direct team revision could consume a pending joint proposal's team before
+  approval, leaving the approved proposal permanently unpromotable.
 
 After the cutover:
 
 - every nonterminal state exposes at least one exact effect or choice;
 - every nonterminal state exposes `Abort`;
 - active effects expose their exact control choices;
-- inherited requests expose exact `RecoverEffect` intents, while fresh role and
-  oracle dispatches execute only the request identities materialized from the
-  current projection;
+- inflight requests expose exact neutral `ResolveEffect` intents, while fresh
+  role and oracle dispatches execute only the request identities materialized
+  from the current projection and later drivers recover them without replay;
 - settled conversation scratch remains an exact `CleanupConversation` intent
   until its completion fact folds;
 - plan proposals, team revisions, mission skills, and environment assignments
@@ -52,8 +54,9 @@ After the cutover:
   retains the existing typed role and oracle dispatch payloads.
 - The driver has no private owned-effect set or second execute-versus-recover
   state machine. A fresh dispatch carries its exact materialized effect IDs
-  through the same driver action; an inflight request inherited by a later
-  driver projects as `RecoverEffect`.
+  through the same driver action. Any inflight request projects as neutral
+  `ResolveEffect` in live views; a later driver encountering it recovers it
+  without replay.
 - Disposable conversation scratch is owned by the exact folded role attempt.
   `Next` projects cleanup before terminal apply or later work, and
   `ConversationResourcesCleaned` is the sole fact that retires the obligation.
@@ -90,8 +93,8 @@ After the cutover:
 ## Versions and Contracts
 
 - `SCHEMA_VERSION`: `33 -> 34` for exact conversation cleanup completion facts.
-- `REDUCER_VERSION`: `66 -> 68` across the original workflow replacement and
-  the follow-up administrative/cleanup authority hardening.
+- `REDUCER_VERSION`: `66 -> 69` across the original workflow replacement,
+  administrative/cleanup authority hardening, and pending-proposal isolation.
 - Folded state replaces nonterminal `phase` and stored `open_attention` with an
   optional `terminal` fact and optional `applied_result`.
 - CLI JSON removes `phase`, `disposition`, attention/issues, `next_actions`,
@@ -121,7 +124,8 @@ ported from phase, attention, and action-list assertions to exact `Next`
 effects and choices. New regressions cover universal abort, explicit finish,
 unadvertised transition rejection, queued-work finish rejection, prefix-stable
 `Next`, exact CLI serialization, exact apply replay admission, terminal control
-rejection, and complete human decision commands.
+rejection, complete human decision commands, pending joint-proposal isolation,
+and live-driver `ResolveEffect` projection.
 
 Two adversarial QA rounds followed the initial implementation. The first found
 and fixed exact apply admission, incomplete human choice rendering, terminal
@@ -132,6 +136,12 @@ reducer-side manual control guard, role-cleanup-before-policy-park ordering,
 default-stack future growth, guidance ordering, and pure-model fixtures. It
 also removed a duplicated task-acceptance predicate and a no-op oracle cleanup
 call.
+
+A follow-up adversarial rereview found and fixed the joint-proposal
+administrative interleaving and the misleading recovery-only name for live
+inflight work. The fix uses one shared pending-proposal predicate and one
+neutral effect intent; it adds no phase, lease, owner set, or compatibility
+state machine.
 
 ## Verification
 

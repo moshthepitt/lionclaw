@@ -23,8 +23,9 @@ pub struct Next {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectIntent {
-    /// Clean and settle an unfinished request inherited by this driver.
-    RecoverEffect {
+    /// Resolve one already-materialized request under current driver ownership.
+    /// A live driver completes it; a later driver recovers it without replay.
+    ResolveEffect {
         effect_id: EffectId,
     },
     /// Remove disposable scratch after one exact role attempt settles.
@@ -204,7 +205,7 @@ fn complete_nonterminal(
             .cloned()
             .map(|role_instance| Choice::SendMessage { role_instance }),
     );
-    if state.inflight.is_empty() {
+    if state.inflight.is_empty() && !proposal_awaits_decision(state) {
         choices.extend(administrative_choices(state));
     }
     choices.push(Choice::Abort);
@@ -216,7 +217,7 @@ fn active_effects(state: &MissionState) -> Vec<EffectIntent> {
         .inflight
         .keys()
         .cloned()
-        .map(|effect_id| EffectIntent::RecoverEffect { effect_id })
+        .map(|effect_id| EffectIntent::ResolveEffect { effect_id })
         .collect()
 }
 
@@ -341,7 +342,7 @@ fn push_decisions(
 }
 
 fn proposal_choices(state: &MissionState) -> Vec<Choice> {
-    if state.proposal.is_none() || state.proposal_approved {
+    if !proposal_awaits_decision(state) {
         return Vec::new();
     }
     let mut choices = Vec::new();
@@ -354,6 +355,10 @@ fn proposal_choices(state: &MissionState) -> Vec<Choice> {
         ],
     );
     choices
+}
+
+fn proposal_awaits_decision(state: &MissionState) -> bool {
+    state.proposal.is_some() && !state.proposal_approved
 }
 
 pub(crate) fn task_failure_id(task_id: &TaskId) -> String {
@@ -411,7 +416,7 @@ fn task_accept_is_legal(state: &MissionState, task_id: &TaskId) -> bool {
 
 fn failure_choices(state: &MissionState) -> Vec<Choice> {
     let mut choices = Vec::new();
-    if state.proposal.is_some() && !state.proposal_approved {
+    if proposal_awaits_decision(state) {
         return choices;
     }
     for (task_id, task) in &state.tasks {

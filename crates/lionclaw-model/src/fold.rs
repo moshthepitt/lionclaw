@@ -16,9 +16,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 68 makes administrative authority and conversation cleanup part of
-/// the single `next` workflow projection.
-pub const REDUCER_VERSION: u32 = 68;
+/// Reducer 69 prevents direct administrative mutation while a proposal awaits
+/// its exact approve-or-revise decision.
+pub const REDUCER_VERSION: u32 = 69;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;

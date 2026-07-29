@@ -45,7 +45,7 @@ fn has_current_recipient(state: &lionclaw::model::MissionState) -> bool {
 fn assert_advertised_actions_are_legal(view: &MissionView) {
     for effect in &view.next.effects {
         match effect {
-            EffectIntent::RecoverEffect { effect_id } => {
+            EffectIntent::ResolveEffect { effect_id } => {
                 assert!(view.state.inflight.contains_key(effect_id));
             }
             EffectIntent::CleanupConversation {

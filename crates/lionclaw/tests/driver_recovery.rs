@@ -744,7 +744,13 @@ async fn concurrent_advance_reports_running_and_never_double_dispatches() {
 
     let concurrent = engine.advance(&mission_id).await.unwrap();
     assert!(concurrent.driver_running);
-    assert!(!concurrent.next.effects.is_empty());
+    assert!(concurrent.next.effects.iter().any(|effect| {
+        matches!(
+            effect,
+            EffectIntent::ResolveEffect { effect_id }
+                if concurrent.state.inflight.contains_key(effect_id)
+        )
+    }));
     assert_eq!(concurrent.state.inflight.len(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -1939,7 +1945,7 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
         .next
         .effects
         .iter()
-        .any(|effect| matches!(effect, EffectIntent::RecoverEffect { .. })));
+        .any(|effect| matches!(effect, EffectIntent::ResolveEffect { .. })));
     let failure = blocked.state.cleanup_failure.as_ref().unwrap();
     assert_eq!(failure.resource, EffectResource::EffectDirectory);
     assert_eq!(
@@ -2122,7 +2128,7 @@ async fn terminal_inflight_cleanup_is_recoverable_through_the_production_cli() {
         .next
         .effects
         .iter()
-        .any(|effect| matches!(effect, EffectIntent::RecoverEffect { .. })));
+        .any(|effect| matches!(effect, EffectIntent::ResolveEffect { .. })));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(conversation_root.join("scratch/build-output").is_file());
 

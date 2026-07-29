@@ -250,7 +250,7 @@ async fn execute_projected_conversation_cleanup(
                         role_instance,
                         effect_id,
                     } => Some((role_instance, effect_id)),
-                    EffectIntent::RecoverEffect { .. }
+                    EffectIntent::ResolveEffect { .. }
                     | EffectIntent::DispatchRole(_)
                     | EffectIntent::DispatchOracle(_) => None,
                 })
@@ -851,13 +851,13 @@ impl Engine {
             if projection.effects.is_empty() {
                 return Ok(());
             }
-            let mut recovery_effects = Vec::new();
+            let mut resolve_effects = Vec::new();
             let mut has_conversation_cleanup = false;
             let mut role_intents = Vec::new();
             let mut oracle_intents = Vec::new();
             for effect in projection.effects {
                 match effect {
-                    EffectIntent::RecoverEffect { effect_id } => recovery_effects.push(effect_id),
+                    EffectIntent::ResolveEffect { effect_id } => resolve_effects.push(effect_id),
                     EffectIntent::CleanupConversation { .. } => {
                         has_conversation_cleanup = true;
                     }
@@ -875,8 +875,10 @@ impl Engine {
                 .await?;
                 continue;
             }
-            if !recovery_effects.is_empty() {
-                for effect_id in recovery_effects {
+            if !resolve_effects.is_empty() {
+                // A fresh dispatch is driven directly from its carried IDs.
+                // Anything projected here predates this driver invocation.
+                for effect_id in resolve_effects {
                     if !self
                         .recover_interrupted_effect(mission_id, &effect_id)
                         .await?
