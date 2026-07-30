@@ -77,7 +77,6 @@ const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 const LIONCLAW_METADATA_DIR: &str = ".lionclaw";
 const WORKSPACE_LIONCLAW_METADATA_TMPFS: &str = "/workspace/.lionclaw:size=1m,mode=700,notmpcopyup";
 const NETWORK_PROXY_ALIAS: &str = "lionclaw-proxy";
-const NETWORK_PROXY_EGRESS_NETWORK: &str = "bridge";
 const NETWORK_PROXY_HTTP_PORT: u16 = 3128;
 const NETWORK_PROXY_SOCKS_PORT: u16 = 3129;
 const NETWORK_PROXY_BINARY_TARGET: &str = "/lionclaw/network-proxy";
@@ -100,7 +99,8 @@ enum PreparedOciNetwork {
     Deny,
     Proxy {
         destinations: BTreeSet<lionclaw_runtime_api::Destination>,
-        network_name: String,
+        internal_network_name: String,
+        egress_network_name: String,
         proxy_name: String,
         proxy_binary: PathBuf,
     },
@@ -472,15 +472,18 @@ fn prepare_oci_network(
         anyhow!("destination-scoped OCI network requires an effect resource name")
     })?;
     validate_oci_resource_name(resource_name)?;
-    let network_name = format!("{resource_name}-net");
+    let internal_network_name = format!("{resource_name}-net");
+    let egress_network_name = format!("{resource_name}-egress");
     let proxy_name = format!("{resource_name}-proxy");
-    validate_oci_resource_name(&network_name)?;
+    validate_oci_resource_name(&internal_network_name)?;
+    validate_oci_resource_name(&egress_network_name)?;
     validate_oci_resource_name(&proxy_name)?;
     let proxy_binary =
         std::env::current_exe().context("resolving LionClaw network proxy binary")?;
     Ok(PreparedOciNetwork::Proxy {
         destinations: destinations.clone(),
-        network_name,
+        internal_network_name,
+        egress_network_name,
         proxy_name,
         proxy_binary,
     })
@@ -635,9 +638,12 @@ fn build_oci_process_invocation_with_terminal(
             args.push("--network".to_string());
             args.push("none".to_string());
         }
-        PreparedOciNetwork::Proxy { network_name, .. } => {
+        PreparedOciNetwork::Proxy {
+            internal_network_name,
+            ..
+        } => {
             args.push("--network".to_string());
-            args.push(network_name.clone());
+            args.push(internal_network_name.clone());
         }
     }
 
@@ -722,7 +728,8 @@ async fn ensure_oci_network_registered(
 ) -> Result<Option<OciNetworkSession>> {
     let PreparedOciNetwork::Proxy {
         destinations,
-        network_name,
+        internal_network_name,
+        egress_network_name,
         proxy_name,
         proxy_binary,
     } = &prepared.network
@@ -732,15 +739,17 @@ async fn ensure_oci_network_registered(
 
     let network = OciNetworkSession {
         engine: prepared.engine.clone(),
-        network_name: network_name.clone(),
+        internal_network_name: internal_network_name.clone(),
+        egress_network_name: egress_network_name.clone(),
         proxy_name: proxy_name.clone(),
         cleanup: Some(OciNetworkCleanup {
             engine: prepared.engine.clone(),
             proxy_name: proxy_name.clone(),
-            network_name: network_name.clone(),
+            internal_network_name: internal_network_name.clone(),
+            egress_network_name: egress_network_name.clone(),
         }),
     };
-    network.create_network().await?;
+    network.create_networks().await?;
     let start_result = network
         .start_proxy(&prepared.image, proxy_binary, destinations)
         .await;
@@ -759,16 +768,23 @@ async fn ensure_oci_network_registered(
 #[derive(Debug)]
 struct OciNetworkSession {
     engine: String,
-    network_name: String,
+    internal_network_name: String,
+    egress_network_name: String,
     proxy_name: String,
     cleanup: Option<OciNetworkCleanup>,
 }
 
 impl OciNetworkSession {
-    async fn create_network(&self) -> Result<()> {
+    async fn create_networks(&self) -> Result<()> {
+        self.create_network(&self.internal_network_name, true)
+            .await?;
+        self.create_network(&self.egress_network_name, false).await
+    }
+
+    async fn create_network(&self, network_name: &str, internal: bool) -> Result<()> {
         let output = run_oci_preflight_command(
-            &build_network_create_invocation(&self.engine, &self.network_name),
-            &format!("create OCI internal network '{}'", self.network_name),
+            &build_network_create_invocation(&self.engine, network_name, internal),
+            &format!("create OCI network '{network_name}'"),
             OCI_PREFLIGHT_TIMEOUT,
         )
         .await?;
@@ -777,8 +793,8 @@ impl OciNetworkSession {
         }
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!(
-            "failed to create OCI internal network '{}' ({}): {stderr}",
-            self.network_name,
+            "failed to create OCI network '{}' ({}): {stderr}",
+            network_name,
             output.status_description()
         )
     }
@@ -792,7 +808,8 @@ impl OciNetworkSession {
         let output = run_oci_preflight_command(
             &build_network_proxy_invocation(
                 &self.engine,
-                &self.network_name,
+                &self.internal_network_name,
+                &self.egress_network_name,
                 &self.proxy_name,
                 image,
                 proxy_binary,
@@ -833,14 +850,16 @@ impl Drop for OciNetworkSession {
 struct OciNetworkCleanup {
     engine: String,
     proxy_name: String,
-    network_name: String,
+    internal_network_name: String,
+    egress_network_name: String,
 }
 
 impl OciNetworkCleanup {
     async fn remove(&self) -> Result<()> {
         let container = remove_oci_container(&self.engine, &self.proxy_name).await;
-        let network = remove_oci_network(&self.engine, &self.network_name).await;
-        container.and(network)
+        let internal_network = remove_oci_network(&self.engine, &self.internal_network_name).await;
+        let egress_network = remove_oci_network(&self.engine, &self.egress_network_name).await;
+        container.and(internal_network).and(egress_network)
     }
 
     fn spawn(self) {
@@ -849,8 +868,16 @@ impl OciNetworkCleanup {
                 if let Err(error) = remove_oci_container(&self.engine, &self.proxy_name).await {
                     warn!(?error, "failed to clean up OCI network proxy container");
                 }
-                if let Err(error) = remove_oci_network(&self.engine, &self.network_name).await {
-                    warn!(?error, "failed to clean up OCI internal network");
+                for (network_name, network_kind) in [
+                    (&self.internal_network_name, "internal"),
+                    (&self.egress_network_name, "egress"),
+                ] {
+                    if let Err(error) = remove_oci_network(&self.engine, network_name).await {
+                        warn!(
+                            ?error,
+                            network_name, network_kind, "failed to clean up OCI network"
+                        );
+                    }
                 }
             });
             return;
@@ -875,23 +902,30 @@ impl OciNetworkCleanup {
                     "failed to run OCI network proxy cleanup command"
                 ),
             }
-            match std::process::Command::new(&self.engine)
-                .args(["network", "rm", "--force", &self.network_name])
-                .status()
-            {
-                Ok(status) if status.success() => {}
-                Ok(status) => warn!(
-                    engine = %self.engine,
-                    network_name = %self.network_name,
-                    status = %status,
-                    "OCI network cleanup command failed"
-                ),
-                Err(error) => warn!(
-                    ?error,
-                    engine = %self.engine,
-                    network_name = %self.network_name,
-                    "failed to run OCI network cleanup command"
-                ),
+            for (network_name, network_kind) in [
+                (&self.internal_network_name, "internal"),
+                (&self.egress_network_name, "egress"),
+            ] {
+                match std::process::Command::new(&self.engine)
+                    .args(["network", "rm", "--force", network_name])
+                    .status()
+                {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => warn!(
+                        engine = %self.engine,
+                        network_name,
+                        network_kind,
+                        status = %status,
+                        "OCI network cleanup command failed"
+                    ),
+                    Err(error) => warn!(
+                        ?error,
+                        engine = %self.engine,
+                        network_name,
+                        network_kind,
+                        "failed to run OCI network cleanup command"
+                    ),
+                }
             }
         });
     }
@@ -1036,15 +1070,19 @@ fn build_runtime_secret_remove_invocation(engine: &str, secret_name: &str) -> Pr
     }
 }
 
-fn build_network_create_invocation(engine: &str, network_name: &str) -> ProcessInvocation {
+fn build_network_create_invocation(
+    engine: &str,
+    network_name: &str,
+    internal: bool,
+) -> ProcessInvocation {
+    let mut args = vec!["network".to_string(), "create".to_string()];
+    if internal {
+        args.push("--internal".to_string());
+    }
+    args.push(network_name.to_string());
     ProcessInvocation {
         executable: engine.to_string(),
-        args: vec![
-            "network".to_string(),
-            "create".to_string(),
-            "--internal".to_string(),
-            network_name.to_string(),
-        ],
+        args,
         working_dir: None,
         environment: Vec::new(),
         input: String::new(),
@@ -1053,7 +1091,8 @@ fn build_network_create_invocation(engine: &str, network_name: &str) -> ProcessI
 
 fn build_network_proxy_invocation(
     engine: &str,
-    network_name: &str,
+    internal_network_name: &str,
+    egress_network_name: &str,
     proxy_name: &str,
     image: &str,
     proxy_binary: &Path,
@@ -1074,9 +1113,9 @@ fn build_network_proxy_invocation(
         "--name".to_string(),
         proxy_name.to_string(),
         "--network".to_string(),
-        format!("{network_name}:alias={NETWORK_PROXY_ALIAS}"),
+        format!("{internal_network_name}:alias={NETWORK_PROXY_ALIAS}"),
         "--network".to_string(),
-        NETWORK_PROXY_EGRESS_NETWORK.to_string(),
+        egress_network_name.to_string(),
         mount_flag.to_string(),
         mount_spec,
         image.to_string(),
@@ -1989,10 +2028,10 @@ mod tests {
             lionclaw_runtime_api::Destination::single("auth.openai.com", 443).unwrap(),
         ]);
 
-        let network = super::build_network_create_invocation("podman", "effect-net");
-        assert_eq!(network.executable, "podman");
+        let internal_network = super::build_network_create_invocation("podman", "effect-net", true);
+        assert_eq!(internal_network.executable, "podman");
         assert_eq!(
-            network.args,
+            internal_network.args,
             [
                 "network".to_string(),
                 "create".to_string(),
@@ -2000,10 +2039,21 @@ mod tests {
                 "effect-net".to_string(),
             ]
         );
+        let egress_network =
+            super::build_network_create_invocation("podman", "effect-egress", false);
+        assert_eq!(
+            egress_network.args,
+            [
+                "network".to_string(),
+                "create".to_string(),
+                "effect-egress".to_string(),
+            ]
+        );
 
         let proxy = super::build_network_proxy_invocation(
             "podman",
             "effect-net",
+            "effect-egress",
             "effect-proxy",
             "localhost/lionclaw-runtime:v1",
             Path::new("/usr/local/bin/lionclaw"),
@@ -2020,7 +2070,7 @@ mod tests {
         assert!(proxy
             .args
             .windows(2)
-            .any(|pair| pair == ["--network".to_string(), "bridge".to_string()]));
+            .any(|pair| pair == ["--network".to_string(), "effect-egress".to_string()]));
         assert!(!proxy
             .args
             .windows(2)
