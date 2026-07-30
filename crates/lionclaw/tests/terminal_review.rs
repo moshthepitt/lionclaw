@@ -17,14 +17,15 @@ use common::{
 use lionclaw::engine::MissionView;
 use lionclaw::model::{
     BlobRef, Choice, DecisionAction, EffectId, EnvironmentPreflight, FinishClass, Gap, GapSeverity,
-    Handoff, MissionEvent, MissionState, OutputSemantics, PayloadRef, RoleAttemptReceipt,
-    RoleEffectSource, RolePromptTemplate, RoleResourceLifetime, SettledHandoff, Task,
-    WorkspacePreparation,
+    Handoff, MissionEvent, MissionProposal, MissionState, OutputSemantics, PayloadRef,
+    RequirementId, RoleAttemptReceipt, RoleEffectSource, RolePromptTemplate, RoleResourceLifetime,
+    SettledHandoff, Task, WorkspacePreparation,
 };
 use lionclaw::ports::{CapturedArtifact, RoleTurnOutcome, RoleTurnRequest};
 use lionclaw::testing::{review_verdict, MockOracleRunner, MockRoleRunner};
 
 const REVIEW_ROLE: &str = "gap-reviewer";
+const REVIEW_FAILURE: &str = "proof_failed:review:gap-reviewer";
 
 fn digest(ch: char) -> String {
     ch.to_string().repeat(64)
@@ -48,6 +49,17 @@ fn parked(view: &MissionView) -> Vec<String> {
     let decisions = common::decision_ids(&view.state);
     assert!(!decisions.is_empty(), "got {view:?}");
     decisions
+}
+
+fn review_failure_actions(view: &MissionView, decision_id: &str) -> Vec<DecisionAction> {
+    view.next
+        .choices
+        .iter()
+        .filter_map(|choice| match choice {
+            Choice::Decide { id, action } if id == decision_id => Some(action.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn assert_terminal(view: &MissionView) {
@@ -589,17 +601,9 @@ async fn blocking_gaps_offer_retry_repair_revise_but_never_accept() {
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let attention = parked(&outcome);
     assert_eq!(attention.len(), 1);
-    let decision_id = "proof_failed:review:gap-reviewer";
+    let decision_id = REVIEW_FAILURE;
     assert_eq!(attention[0], decision_id);
-    let actions = outcome
-        .next
-        .choices
-        .iter()
-        .filter_map(|choice| match choice {
-            Choice::Decide { id, action } if id == decision_id => Some(action.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let actions = review_failure_actions(&outcome, decision_id);
     assert_eq!(
         actions,
         vec![
@@ -610,6 +614,203 @@ async fn blocking_gaps_offer_retry_repair_revise_but_never_accept() {
     );
     assert!(!actions.contains(&DecisionAction::Accept));
     assert_eq!(common::finish_choice(&outcome.state), None);
+}
+
+#[tokio::test]
+async fn repeated_identical_blocking_review_suppresses_retry_and_rejects_forgery() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (h, mission_id) = started(
+        &dir,
+        review_runner(vec![
+            (false, vec![blocking_gap()]),
+            (false, vec![blocking_gap()]),
+        ]),
+    )
+    .await;
+
+    let first = h.engine.advance(&mission_id).await.expect("first review");
+    assert!(review_failure_actions(&first, REVIEW_FAILURE).contains(&DecisionAction::Retry));
+    h.engine
+        .decide(
+            &mission_id,
+            REVIEW_FAILURE,
+            DecisionAction::Retry,
+            "one retry for the blocking review",
+        )
+        .await
+        .expect("first retry");
+
+    let second = h.engine.advance(&mission_id).await.expect("second review");
+    assert_eq!(
+        review_failure_actions(&second, REVIEW_FAILURE),
+        [DecisionAction::Repair, DecisionAction::Revise]
+    );
+    let head = second.state.head;
+    assert_eq!(review_calls(&h, &mission_id).await.len(), 2);
+
+    h.engine
+        .decide(
+            &mission_id,
+            REVIEW_FAILURE,
+            DecisionAction::Retry,
+            "forged identical retry",
+        )
+        .await
+        .expect_err("suppressed retry must not append");
+    let unchanged = h.engine.load_state(&mission_id).await.expect("unchanged");
+    assert_eq!(unchanged.head, head);
+    assert_eq!(review_calls(&h, &mission_id).await.len(), 2);
+}
+
+#[tokio::test]
+async fn changed_review_report_offers_a_fresh_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reviews = Mutex::new(0usize);
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        if request.role.id.as_str() != REVIEW_ROLE {
+            return Ok(normal_outcome(request, HEAD_SHA));
+        }
+        let mut seen = reviews.lock().expect("lock");
+        *seen += 1;
+        let report = format!("blocking review evidence {}", *seen);
+        let mut outcome = review_verdict(request, false, vec![blocking_gap()]);
+        let Some(Handoff::Review {
+            report: handoff_report,
+            ..
+        }) = &mut outcome.handoff
+        else {
+            unreachable!("review_verdict returns review handoff")
+        };
+        *handoff_report = PayloadRef::inline(report.clone());
+        outcome.final_response = report;
+        Ok(outcome)
+    }));
+    let (h, mission_id) = started(&dir, runner).await;
+
+    h.engine.advance(&mission_id).await.expect("first review");
+    h.engine
+        .decide(
+            &mission_id,
+            REVIEW_FAILURE,
+            DecisionAction::Retry,
+            "retry for new review evidence",
+        )
+        .await
+        .expect("first retry");
+    let second = h.engine.advance(&mission_id).await.expect("second review");
+
+    assert!(review_failure_actions(&second, REVIEW_FAILURE).contains(&DecisionAction::Retry));
+}
+
+#[tokio::test]
+async fn changed_review_artifact_offers_a_fresh_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work_heads = Mutex::new(vec![HEAD_SHA.to_string(), "repaired-worker-commit".into()]);
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        if request.role.id.as_str() == REVIEW_ROLE {
+            Ok(review_verdict(request, false, vec![blocking_gap()]))
+        } else if request.role.output == OutputSemantics::EmitsVerdict {
+            Ok(normal_outcome(request, HEAD_SHA))
+        } else {
+            let mut heads = work_heads.lock().expect("lock");
+            let head = if heads.len() > 1 {
+                heads.remove(0)
+            } else {
+                heads[0].clone()
+            };
+            Ok(work_outcome(request, &head))
+        }
+    }));
+    let (h, mission_id) = started(&dir, runner).await;
+
+    let first = h.engine.advance(&mission_id).await.expect("first review");
+    let first_head = first.state.current_sha;
+    h.engine
+        .decide(
+            &mission_id,
+            REVIEW_FAILURE,
+            DecisionAction::Repair,
+            "repair the blocking gap",
+        )
+        .await
+        .expect("repair");
+    let second = h.engine.advance(&mission_id).await.expect("second review");
+
+    assert_ne!(second.state.current_sha, first_head);
+    assert!(review_failure_actions(&second, REVIEW_FAILURE).contains(&DecisionAction::Retry));
+}
+
+#[tokio::test]
+async fn changed_review_plan_offers_a_fresh_retry_at_the_same_artifact() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (h, mission_id) = started(
+        &dir,
+        review_runner(vec![
+            (false, vec![blocking_gap()]),
+            (false, vec![blocking_gap()]),
+        ]),
+    )
+    .await;
+
+    let first = h.engine.advance(&mission_id).await.expect("first review");
+    let first_head = first.state.current_sha;
+    let mut next_plan = simple_plan();
+    next_plan.requirements[0].prose = "green tests under the clarified contract".to_string();
+    let mut next = review_proposal(1, next_plan);
+    next.plan
+        .as_mut()
+        .expect("plan proposal")
+        .requirement_changes = vec![RequirementId::new("GREEN-TESTS").unwrap()];
+    h.engine
+        .propose_plan(&mission_id, next)
+        .await
+        .expect("propose revision");
+    approve_plan(&h.engine, &mission_id).await;
+    let second = h.engine.advance(&mission_id).await.expect("second review");
+
+    assert_eq!(second.state.current_sha, first_head);
+    assert!(review_failure_actions(&second, REVIEW_FAILURE).contains(&DecisionAction::Retry));
+}
+
+#[tokio::test]
+async fn changed_reviewer_identity_offers_a_fresh_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        if request.role.output == OutputSemantics::EmitsGapVerdict {
+            Ok(review_verdict(request, false, vec![blocking_gap()]))
+        } else {
+            Ok(normal_outcome(request, HEAD_SHA))
+        }
+    }));
+    let (h, mission_id) = started(&dir, runner).await;
+    h.engine.advance(&mission_id).await.expect("first review");
+
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    let plan = state.plan.as_ref().expect("plan");
+    let mut next_team = common::team(2, Some(plan), true);
+    let old_reviewer = lionclaw::model::RoleInstanceId::new(REVIEW_ROLE).unwrap();
+    let next_reviewer = lionclaw::model::RoleInstanceId::new("gap-reviewer-v2").unwrap();
+    let mut next_role = common::role("gap-reviewer-v2", OutputSemantics::EmitsGapVerdict);
+    next_role.runtime = "opencode".to_string();
+    next_team.roles.remove(&old_reviewer);
+    next_team.roles.insert(next_reviewer.clone(), next_role);
+    next_team.gap_review_assignment = Some(next_reviewer.clone());
+    h.engine
+        .propose_plan(
+            &mission_id,
+            MissionProposal {
+                plan: None,
+                team: Some(next_team),
+                oracles: None,
+            },
+        )
+        .await
+        .expect("propose reviewer replacement");
+    approve_plan(&h.engine, &mission_id).await;
+    let second = h.engine.advance(&mission_id).await.expect("second review");
+    let decision_id = format!("proof_failed:review:{next_reviewer}");
+
+    assert!(review_failure_actions(&second, &decision_id).contains(&DecisionAction::Retry));
 }
 
 #[tokio::test]
@@ -667,7 +868,8 @@ async fn retried_blocking_review_reopens_after_environment_change() {
         .expect("re-open gap review");
     let attention = parked(&reopened);
     assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0], "proof_failed:review:gap-reviewer");
+    assert_eq!(attention[0], REVIEW_FAILURE);
+    assert!(review_failure_actions(&reopened, REVIEW_FAILURE).contains(&DecisionAction::Retry));
     assert_eq!(
         review_calls(&h, &mission_id).await.len(),
         2,

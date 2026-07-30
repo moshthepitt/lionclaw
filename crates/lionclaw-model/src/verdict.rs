@@ -191,13 +191,9 @@ impl ProofFailure {
                 effect_id,
             } => command_retry_available(state, effect_id),
             Self::Receipt {
-                source: ProofSource::Judgment { .. },
+                source: ProofSource::Judgment { .. } | ProofSource::Review { .. },
                 effect_id,
-            } => judgment_retry_available(state, effect_id),
-            Self::Receipt {
-                source: ProofSource::Review { .. },
-                ..
-            } => true,
+            } => role_proof_retry_available(state, effect_id),
             Self::StopBar { .. } => false,
         }
     }
@@ -482,7 +478,7 @@ fn command_retry_available(state: &MissionState, effect_id: &EffectId) -> bool {
         .is_none_or(|previous| !previous.same_outcome(current))
 }
 
-fn judgment_retry_available(state: &MissionState, effect_id: &EffectId) -> bool {
+fn role_proof_retry_available(state: &MissionState, effect_id: &EffectId) -> bool {
     let Some(current) = state.role_attempt_receipts.get(effect_id) else {
         return false;
     };
@@ -500,14 +496,14 @@ fn judgment_retry_available(state: &MissionState, effect_id: &EffectId) -> bool 
             } = &receipt.source;
             (*plan_revision == *current_revision
                 && request.attempt_no < current_request.attempt_no
-                && same_judgment_identity(request, current_request))
+                && same_role_proof_identity(request, current_request))
             .then_some((request.attempt_no, receipt))
         })
         .max_by_key(|(attempt_no, _)| *attempt_no)
-        .is_none_or(|(_, previous)| !same_judgment_outcome(previous, current))
+        .is_none_or(|(_, previous)| !same_role_proof_outcome(previous, current))
 }
 
-fn same_judgment_identity(
+fn same_role_proof_identity(
     left: &super::RoleTurnProvenance,
     right: &super::RoleTurnProvenance,
 ) -> bool {
@@ -517,15 +513,17 @@ fn same_judgment_identity(
         && left.assertion_ids == right.assertion_ids
         && left.assignment_epoch == right.assignment_epoch
         && left.prompt_template == right.prompt_template
-        && left.prompt_hash == right.prompt_hash
+        && (left.prompt_template == super::RolePromptTemplate::GapReview
+            || left.prompt_hash == right.prompt_hash)
         && left.base_sha == right.base_sha
         && left.environment_digest == right.environment_digest
         && left.instrument_identity == right.instrument_identity
+        && left.dependency_refs == right.dependency_refs
+        && left.workspace_preparation == right.workspace_preparation
 }
 
-fn same_judgment_outcome(left: &RoleAttemptReceipt, right: &RoleAttemptReceipt) -> bool {
-    left.settled_handoff() == right.settled_handoff()
-        && left.accepted_report() == right.accepted_report()
+fn same_role_proof_outcome(left: &RoleAttemptReceipt, right: &RoleAttemptReceipt) -> bool {
+    left.disposition == right.disposition && left.accepted_report() == right.accepted_report()
 }
 
 #[cfg(test)]

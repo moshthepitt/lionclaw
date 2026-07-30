@@ -124,6 +124,33 @@ The production self-test adds real confined Rust, Python, and JavaScript
 commands, including nested working directories and a literal shell-syntax
 argument. All execute through the OCI runner rather than a mock.
 
+## Review Follow-Up
+
+An independent post-commit review found that successful-but-blocking gap
+reviews could be retried indefinitely: Review unconditionally advertised
+`Retry`, while Judgment already suppressed a repeated identical result.
+
+The RED integration reproduced the second identical review still offering
+`[Retry, Repair, Revise]`. The fix generalizes the existing judgment comparison
+into one role-proof retry rule shared by Judgment and Review. It compares
+stable plan, team, role, assignment, artifact, environment, instrument, and
+proof-scope identity plus the settled disposition and accepted report. The
+per-attempt gap-review prompt nonce is deliberately excluded from stable
+identity; ordinary judgment prompt changes retain their prior behavior.
+
+New scenarios prove:
+
+- the first blocking review offers `Retry`;
+- a second identical blocking review offers only `Repair` and `Revise`;
+- a forged suppressed `Retry` appends nothing;
+- changed report, artifact, environment, plan, or reviewer identity offers one
+  fresh `Retry`;
+- existing identical-result suppression and changed-result retry behavior for
+  ordinary judgments remain unchanged.
+
+No new state, counter, compatibility path, schema change, or reducer-version
+change was required.
+
 ## Verification
 
 Passed from the worktree root after the final code change:
