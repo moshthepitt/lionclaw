@@ -8,8 +8,10 @@ Accepted base: `fbaa4d4634c19a20c5d2189f563797e5ed74a5a5`
 
 Reviewed Chunk 4 head: `8dee5d06ab934fbe198826b4dc2ecefcc60e4179`
 
-Final implementation commit:
-`209e1c745728d8a3a3bed10d9c43cda575ec693d`
+Final Chunk 4 implementation commits:
+
+- `209e1c745728d8a3a3bed10d9c43cda575ec693d`
+- `4533d8f01e8cf4ed52ee2c4dc8a05dad5e4fe3ab`
 
 `git log --show-signature` reports a good signature from
 `Kelvin Jayanoris <kelvin@jayanoris.com>` using key
@@ -57,6 +59,15 @@ prove two read-only dependencies at one commit are legal and two distinct
 artifact candidates fail with `task.divergent_read_only_lineage` before the
 report runner is called.
 
+Authenticated Hermes continuity testing then exposed one ACP protocol defect:
+the first-class `session/set_mode` success response is legally empty, but the
+client treated the pre-set `default` observation as post-set evidence and
+rejected `dont_ask`. A focused RED regression reproduced the exact failure.
+The ACP client now records a successful empty first-class setter as
+`Acknowledged`, clears only the superseded pre-set observation before the RPC,
+retains an intervening runtime notification as `Observed`, and continues to
+reject explicit mismatches and post-configuration drift.
+
 ## Determinism and Honesty
 
 `Next` remains the only workflow projection and exact advertised choices remain
@@ -86,6 +97,10 @@ the host executable behind the private authenticated socket.
 - Task-bound `ProducesReport` requests now use `RolePromptTemplate::Execution`;
   taskless report/planning requests retain `RolePromptTemplate::Planning`.
 - `lionclaw run` adds the public `--new` option.
+- First-class ACP model/mode setters may produce the existing
+  `RuntimeConfigurationConfirmation::Acknowledged` evidence when the successful
+  protocol response carries no current-value observation. Echoed selections
+  and runtime notifications remain `Observed`.
 - No raw HTTP, new mission state, alternative decision projection, or
   compatibility alias was added.
 
@@ -94,6 +109,9 @@ logs fail closed. Fold/snapshot/resume coverage was rerun at reducer 72. During
 the final adversarial review, one snapshot-forgery test was found to still
 write reducer 71; it was corrected to use `REDUCER_VERSION`, restoring the
 intended attack path.
+
+The ACP confirmation correction uses the existing event shape and enum, so it
+requires no additional schema or reducer bump.
 
 ## Security Impact
 
@@ -107,6 +125,9 @@ intended attack path.
 - Runtime profile validation, auth preparation, confinement compilation,
   pinned image resolution, and native session persistence remain on the
   existing production paths.
+- ACP first-class selection acknowledgements are accepted only after the
+  requested id was uniquely advertised and the typed setter RPC succeeded.
+  Explicit returned mismatches and later observed drift still fail closed.
 - `--new` cannot release a live mission and cannot destroy, abort, apply, or
   otherwise mutate the old mission.
 - The projected bridge retains token authentication, validated argv, no shell
@@ -127,9 +148,41 @@ Passed from the final worktree after the last source change:
   - rustdoc passed with warnings denied;
   - all runnable workspace tests passed;
   - all nine Podman mission self-tests passed.
-- `cargo run -p lionclaw -- mission self-test`
-  - all nine Podman self-tests passed again explicitly.
 - `git diff --check`
+
+The final authenticated native-session continuity runs passed from clean,
+signed source commit `4533d8f01e8cf4ed52ee2c4dc8a05dad5e4fe3ab`
+against image identity
+`9ed8b30de84295193f92baf66e88e6f28bd4f0f4aa77d1448e7f22220bb3a126`:
+
+- Codex: `1 passed; 0 failed`, 26.17 seconds. Preserved root:
+  `/tmp/lionclaw-chunk4-live-final-codex-20260730-204737`
+- OpenCode: `1 passed; 0 failed`, 14.53 seconds. Preserved root:
+  `/tmp/lionclaw-chunk4-live-final-opencode-20260730-204737`
+- Hermes: `1 passed; 0 failed`, 24.12 seconds. Preserved root:
+  `/tmp/lionclaw-chunk4-live-final-hermes-20260730-204737`
+
+Receipt SHA-256 digests, in the same runtime order, are
+`d92cf10b5b0892a82b0e742a36b1abe95786d4623b63f604aab724f95140e290`,
+`8c8c1151b615880b895724fd6bfeaffeeddcc98410dee180c64ed76e925faa1c`,
+and `a62b055bb415971f3eb0b30d43a4a489bdfc9e72b9890b3990de0a38ee249403`.
+
+Each `lionclaw.runtime-continuity-proof.v2` receipt records:
+
+- first observation `Reconstructed` and second observation `Resumed`;
+- distinct first and second effect ids with exact effect cleanup;
+- retained native home and runtime state;
+- removal of the declared credential projection after cleanup;
+- the same executing test-binary and proof-harness digests;
+- a second-response digest equal to the hidden token digest.
+
+The original failing Hermes root is preserved at
+`/tmp/lionclaw-chunk4-live-hermes-20260730-203754`. It contains the pre-fix
+typed `acp.runtime` failure and no passing receipt; it is retained as RED
+evidence rather than represented as acceptance.
+
+Earlier Chunk 4 acceptance also passed:
+
 - generated root help, `lionclaw run --help`, and `lionclaw man`
 - isolated clean install probe:
   `design optimization research review software-dev`, with no
@@ -165,13 +218,12 @@ judgment prompts through real Codex while preserving the read-only product
 head. The deterministic `lionclaw run` bridge test separately proves the whole
 attached launcher, crash/recovery, report, and apply path.
 
-## Residual and Blocked Coverage
+## Residual Coverage
 
-Three authenticated native-session continuity tests remain ignored by default:
-real Codex, OpenCode, and Hermes continuity across exact effect cleanup. Each
-requires an explicit preserved root, corresponding real auth, network, and the
-OCI image. They were not newly enabled or claimed as run. The authenticated
-mission matrix did run successfully with real Codex auth.
+The three authenticated native-session continuity tests remain ignored by
+default because they require explicit preserved roots, corresponding real auth,
+network, and the OCI image. All three were explicitly run and passed as
+recorded above. No authenticated continuity test remains blocked.
 
 No work was pushed, merged, rebased, submitted for review, or ported to
 `main`.
