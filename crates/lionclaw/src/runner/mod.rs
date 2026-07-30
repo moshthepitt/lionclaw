@@ -60,6 +60,23 @@ where
 pub const HANDOFF_MOUNT_TARGET: &str = "/mission/handoff";
 pub const SCRATCH_MOUNT_TARGET: &str = "/scratch";
 
+pub(crate) fn runtime_home_environment() -> Vec<(String, String)> {
+    let home = RUNTIME_HOME_MOUNT_TARGET;
+    vec![
+        ("HOME".to_string(), home.to_string()),
+        ("XDG_CONFIG_HOME".to_string(), format!("{home}/.config")),
+        ("XDG_CACHE_HOME".to_string(), format!("{home}/.cache")),
+        ("XDG_DATA_HOME".to_string(), format!("{home}/.local/share")),
+        ("XDG_STATE_HOME".to_string(), format!("{home}/.local/state")),
+        ("TMPDIR".to_string(), "/tmp".to_string()),
+        ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+        (
+            "LIONCLAW_WORKSPACE_DIR".to_string(),
+            lionclaw_confinement::WORKSPACE_MOUNT_TARGET.to_string(),
+        ),
+    ]
+}
+
 pub(crate) fn effect_mounts(
     effect: &RoleEffectDirs,
     runtime_profile: &RuntimeProfileDirs,

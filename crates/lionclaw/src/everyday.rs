@@ -28,6 +28,7 @@ use crate::model::{
     fold, next, AuthorityGrants, ConfinementResources, MissionId, Next, OutputSemantics,
     RecoveryConfig, RoleInstance, RoleInstanceId, TerminalState,
 };
+use crate::operator_bridge::{OperatorBridge, SOCKET_MOUNT_TARGET};
 use crate::resources::EverydayDirs;
 use crate::runner::OciRoleRunner;
 use crate::store::MissionStore;
@@ -141,7 +142,11 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
     dirs.prepare().context("preparing everyday runtime state")?;
     let _guard = DriverGuard::try_acquire(dirs.driver_lock())?
         .context("another `lionclaw run` owns this repository")?;
-    prepare_standard_skill(dirs.operator_skill())?;
+    let operator_bridge = OperatorBridge::start(&repo)?;
+    prepare_standard_skill(
+        dirs.operator_skill(),
+        operator_bridge.client_script()?.as_bytes(),
+    )?;
 
     let auth = runner
         .materialize_runtime_auth(&profile, NetworkMode::On, dirs.auth_staging().to_path_buf())
@@ -163,14 +168,20 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
     runtime_profile
         .prepare_native_home_dir(&skills_dir.relative_skill_path(STANDARD_SKILL_NAME)?)?;
 
-    let plan = everyday_plan(&repo, &profile, &dirs, &runtime_profile)?;
+    let plan = everyday_plan(
+        &repo,
+        &profile,
+        &dirs,
+        &runtime_profile,
+        operator_bridge.socket_path(),
+    )?;
     let adapter = driver.create_adapter(config);
     let maximum_attempts = RecoveryConfig::default().max_attempts;
     let mut runtime_status = "without an exit status".to_string();
     let mut crashed = true;
 
     for attempt_no in 1..=maximum_attempts {
-        let facts = load_facts(&store).await?;
+        let facts = load_facts(&store, &profile.name).await?;
         write_runtime_context(dirs.role_state().runtime(), &facts)?;
         let session_attempt = profile
             .native_resume
@@ -242,7 +253,7 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
         .assess_runtime_retention_async()
         .await
         .context("retained everyday runtime state post-run check refused")?;
-    let facts = load_facts(&store).await?;
+    let facts = load_facts(&store, &profile.name).await?;
     Ok(EverydayRunOutcome {
         runtime: profile.name,
         runtime_status,
@@ -256,6 +267,7 @@ fn everyday_plan(
     profile: &MissionRuntimeProfile,
     dirs: &EverydayDirs,
     runtime_profile: &crate::resources::RuntimeProfileDirs,
+    operator_socket: &Path,
 ) -> Result<lionclaw_confinement::EffectiveExecutionPlan> {
     let role = RoleInstance {
         id: RoleInstanceId::new("orchestrator")?,
@@ -301,6 +313,11 @@ fn everyday_plan(
             target: skill_target,
             access: MountAccess::ReadOnly,
         },
+        MountSpec {
+            source: operator_socket.to_path_buf(),
+            target: SOCKET_MOUNT_TARGET.to_string(),
+            access: MountAccess::ReadWrite,
+        },
     ];
     let judged_roots = [crate::authority::canonical_or_lexical(repo)];
     Ok(compile_role_plan(RolePlanRequest {
@@ -313,7 +330,7 @@ fn everyday_plan(
         },
         working_dir: repo.to_path_buf(),
         judged_roots: &judged_roots,
-        environment: Vec::new(),
+        environment: crate::runner::runtime_home_environment(),
         resources: ConfinementResources::default(),
         resource_ceilings: &ConfinementResources::default(),
     })?
@@ -324,6 +341,7 @@ fn everyday_plan(
 #[derive(Debug, Serialize)]
 struct EverydayFacts {
     repository: &'static str,
+    runtime: String,
     selection: MissionSelection,
     mission: Option<SelectedMission>,
 }
@@ -368,7 +386,7 @@ impl EverydayFacts {
     }
 }
 
-async fn load_facts(store: &MissionStore) -> Result<EverydayFacts> {
+async fn load_facts(store: &MissionStore, runtime: &str) -> Result<EverydayFacts> {
     let mut all = Vec::new();
     let mut live = Vec::new();
     for mission_id in store.list_missions().await? {
@@ -405,6 +423,7 @@ async fn load_facts(store: &MissionStore) -> Result<EverydayFacts> {
     };
     Ok(EverydayFacts {
         repository: "/workspace",
+        runtime: runtime.to_string(),
         selection,
         mission,
     })
@@ -422,10 +441,9 @@ fn write_runtime_context(runtime_dir: &Path, facts: &EverydayFacts) -> Result<()
     write_atomic(runtime_dir, RUNTIME_CONTEXT_FILE, context.as_bytes(), 0o600)
 }
 
-fn prepare_standard_skill(root: &Path) -> Result<()> {
+fn prepare_standard_skill(root: &Path, client: &[u8]) -> Result<()> {
     write_atomic(root, "SKILL.md", STANDARD_SKILL.as_bytes(), 0o600)?;
-    let executable = std::env::current_exe().context("resolving the LionClaw executable")?;
-    copy_atomic(root, "lionclaw", &executable, 0o700)
+    write_atomic(root, "lionclaw", client, 0o700)
 }
 
 fn write_atomic(root: &Path, name: &str, contents: &[u8], mode: u32) -> Result<()> {
@@ -434,22 +452,6 @@ fn write_atomic(root: &Path, name: &str, contents: &[u8], mode: u32) -> Result<(
     temporary
         .write_all(contents)
         .with_context(|| format!("writing temporary '{name}'"))?;
-    temporary
-        .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(mode))?;
-    temporary
-        .persist(root.join(name))
-        .map(|_| ())
-        .with_context(|| format!("publishing '{}'", root.join(name).display()))
-}
-
-fn copy_atomic(root: &Path, name: &str, source: &Path, mode: u32) -> Result<()> {
-    let mut input = std::fs::File::open(source)
-        .with_context(|| format!("opening LionClaw executable '{}'", source.display()))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(root)
-        .with_context(|| format!("creating temporary file beneath '{}'", root.display()))?;
-    std::io::copy(&mut input, &mut temporary)
-        .with_context(|| format!("copying LionClaw executable '{}'", source.display()))?;
     temporary
         .as_file()
         .set_permissions(std::fs::Permissions::from_mode(mode))?;

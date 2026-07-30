@@ -29,7 +29,16 @@ test -x "$ROOT/lionclaw"
 test "$(find "$ROOT" -name SKILL.md -type f | wc -l)" -eq 1
 test -s "$ROOT/share/man/man1/lionclaw.1"
 LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" install
-LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" mission type check software-dev
+EXPECTED_TYPES=$'design\noptimization\nresearch\nreview\nsoftware-dev'
+ACTUAL_TYPES=$(LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" mission type list)
+if [[ "$ACTUAL_TYPES" != "$EXPECTED_TYPES" ]]; then
+  echo "clean install has unexpected mission types:" >&2
+  printf '%s\n' "$ACTUAL_TYPES" >&2
+  exit 1
+fi
+for mission_type in design optimization research review software-dev; do
+  LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" mission type check "$mission_type"
+done
 
 tar -C "$STAGE" -czf "$DIST/$ASSET" lionclaw
 (

@@ -18,6 +18,7 @@ pub mod everyday;
 pub mod evidence;
 pub mod mission_type;
 pub use lionclaw_model as model;
+mod operator_bridge;
 pub mod oracle;
 pub mod ports;
 pub mod prompt;

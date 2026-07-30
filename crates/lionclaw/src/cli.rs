@@ -87,7 +87,11 @@ impl MissionTransports {
 }
 
 #[derive(Parser)]
-#[command(name = "lionclaw", about = "LionClaw mission engine")]
+#[command(
+    name = "lionclaw",
+    about = "Run real agents under a small trusted core and explicit local boundary",
+    long_about = "Run real agents under a small trusted core and explicit local boundary.\n\nThe everyday path is `lionclaw run [runtime]`. It launches or resumes the selected real agent in the target repository while LionClaw retains durable mission truth, exact legal actions, confinement, receipts, and finish authority. A clean runtime exit returns 0 only for a done mission, 1 for a runtime crash or aborted mission, and 2 when work remains nonterminal."
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -96,6 +100,9 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Launch or resume the everyday orchestrator in this repository.
+    #[command(
+        long_about = "Launch or resume the selected real agent as the everyday LionClaw orchestrator in this repository.\n\nThe runtime keeps its native conversation. LionClaw projects the standard skill and folded mission facts, while the event log and current Next remain authoritative. A clean runtime exit returns 0 only for a done mission, 1 for a runtime crash or aborted mission, and 2 when no mission exists, selection is ambiguous, or work remains nonterminal."
+    )]
     Run(RunArgs),
     /// Install the bundled mission types into `~/.lionclaw` (run once).
     Install(InstallArgs),

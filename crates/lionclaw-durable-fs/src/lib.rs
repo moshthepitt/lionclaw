@@ -395,7 +395,7 @@ impl RootedDirectory {
             let parent = frame.directory_fd(label)?;
 
             match inspect_metadata_entry(parent, &name, &display, label)? {
-                AccountedEntry::RegularFile(bytes) => {
+                AccountedEntry::Leaf(bytes) => {
                     usage.bytes = usage.bytes.checked_add(bytes).ok_or_else(|| {
                         anyhow!(MetadataTreeLimitExceeded {
                             limit: MetadataTreeLimit::Bytes,
@@ -576,7 +576,7 @@ impl RootedDirectory {
 
 #[derive(Debug)]
 enum AccountedEntry {
-    RegularFile(u64),
+    Leaf(u64),
     Directory(File),
 }
 
@@ -676,10 +676,10 @@ fn inspect_metadata_entry(
         return readable_directory_from_authority(&authority, display, label)
             .map(AccountedEntry::Directory);
     }
-    if file_type.is_file() {
+    if file_type.is_file() || file_type.is_symlink() {
         let bytes = u64::try_from(metadata.st_size)
             .map_err(|_| anyhow!("{label} entry '{}' has an invalid size", display.display()))?;
-        return Ok(AccountedEntry::RegularFile(bytes));
+        return Ok(AccountedEntry::Leaf(bytes));
     }
     Err(unsafe_metadata_entry(label, display))
 }
@@ -1406,41 +1406,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn metadata_accounting_rejects_links_and_nonregular_entries() {
+    fn metadata_accounting_counts_symlinks_without_following_them_and_rejects_special_entries() {
         use std::os::unix::fs::symlink;
 
-        for entry in ["symlink", "fifo"] {
-            let root = tempfile::tempdir().unwrap();
-            let directory = rooted(&root);
-            std::fs::create_dir_all(directory.path()).unwrap();
-            match entry {
-                "symlink" => symlink(root.path(), directory.path().join(entry)).unwrap(),
-                "fifo" => rustix::fs::mkfifoat(
-                    rustix::fs::CWD,
-                    directory.path().join(entry),
-                    Mode::RUSR | Mode::WUSR,
-                )
-                .unwrap(),
-                _ => unreachable!(),
-            }
+        let root = tempfile::tempdir().unwrap();
+        let directory = rooted(&root);
+        std::fs::create_dir_all(directory.path()).unwrap();
+        let target = root.path().join("outside");
+        std::fs::write(&target, vec![0_u8; 1_024]).unwrap();
+        symlink(&target, directory.path().join("symlink")).unwrap();
+        let link_bytes = std::fs::symlink_metadata(directory.path().join("symlink"))
+            .unwrap()
+            .len();
 
-            let error = directory
+        assert_eq!(
+            directory
                 .account_metadata(
                     MetadataTreeLimits {
-                        max_bytes: 100,
-                        max_entries: 100,
-                        max_depth: 100,
+                        max_bytes: link_bytes,
+                        max_entries: 1,
+                        max_depth: 1,
                     },
                     "runtime profile",
                 )
-                .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("must be a regular file or directory"),
-                "{entry}: {error}"
-            );
-        }
+                .unwrap(),
+            MetadataTreeUsage {
+                bytes: link_bytes,
+                entries: 1,
+                max_depth: 1,
+            }
+        );
+
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            directory.path().join("fifo"),
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap();
+        assert!(directory
+            .account_metadata(
+                MetadataTreeLimits {
+                    max_bytes: 10_000,
+                    max_entries: 10,
+                    max_depth: 10,
+                },
+                "runtime profile",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("must be a regular file or directory"));
     }
 
     #[cfg(unix)]

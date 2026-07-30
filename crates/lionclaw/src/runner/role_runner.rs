@@ -1477,28 +1477,12 @@ fn mission_environment(
     declared: &std::collections::BTreeMap<String, String>,
     prepared_input: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<(String, String)> {
-    let home = lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET;
-    crate::mission_type::execution_environment(
-        [
-            ("HOME".to_string(), home.to_string()),
-            ("XDG_CONFIG_HOME".to_string(), format!("{home}/.config")),
-            ("XDG_CACHE_HOME".to_string(), format!("{home}/.cache")),
-            ("XDG_DATA_HOME".to_string(), format!("{home}/.local/share")),
-            ("XDG_STATE_HOME".to_string(), format!("{home}/.local/state")),
-            ("TMPDIR".to_string(), "/tmp".to_string()),
-            ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
-            (
-                "LIONCLAW_WORKSPACE_DIR".to_string(),
-                WORKSPACE_MOUNT_TARGET.to_string(),
-            ),
-            (
-                "MISSION_EFFECT".to_string(),
-                dirs.root().to_string_lossy().into_owned(),
-            ),
-        ],
-        declared,
-        prepared_input,
-    )
+    let mut kernel = super::runtime_home_environment();
+    kernel.push((
+        "MISSION_EFFECT".to_string(),
+        dirs.root().to_string_lossy().into_owned(),
+    ));
+    crate::mission_type::execution_environment(kernel, declared, prepared_input)
 }
 
 /// Deterministic session UUID derived from the effect ID (no RNG).

@@ -1,6 +1,7 @@
 mod common;
 
 use std::collections::VecDeque;
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +31,8 @@ struct Observations {
     terminal_inputs: Vec<RuntimeTerminalProgramInput>,
     requests: Vec<ExecutionRequest>,
     context: Vec<String>,
+    bridge_socket_mounts: usize,
+    projected_clients: Vec<String>,
 }
 
 struct FakeDriver {
@@ -172,8 +175,28 @@ impl AttachedRuntimeExecutor for FakeAttached {
             .expect("runtime mount");
         let context = std::fs::read_to_string(runtime_mount.source.join("AGENTS.generated.md"))
             .expect("neutral bootstrap context");
+        let bridge_mount = request
+            .plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime/lionclaw/operator.sock")
+            .expect("operator bridge socket mount");
+        assert!(std::fs::symlink_metadata(&bridge_mount.source)
+            .expect("live operator bridge socket")
+            .file_type()
+            .is_socket());
+        let skill_mount = request
+            .plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime/home/.agents/skills/lionclaw")
+            .expect("standard skill mount");
+        let projected_client =
+            std::fs::read_to_string(skill_mount.source.join("lionclaw")).unwrap();
         let mut observations = self.observations.lock().unwrap();
         observations.context.push(context);
+        observations.bridge_socket_mounts += 1;
+        observations.projected_clients.push(projected_client);
         observations.requests.push(request);
         drop(observations);
         Ok(self.outputs.lock().unwrap().pop_front().unwrap_or_default())
@@ -248,12 +271,25 @@ async fn everyday_run_reaches_validated_profile_auth_and_confinement() {
     let request = &observations.requests[0];
     assert_eq!(request.plan.workspace_access.as_str(), "read-write");
     assert_eq!(request.plan.network_mode.as_str(), "on");
+    assert!(request
+        .plan
+        .environment
+        .contains(&("HOME".to_string(), "/runtime/home".to_string())));
+    assert!(request.plan.environment.contains(&(
+        "XDG_DATA_HOME".to_string(),
+        "/runtime/home/.local/share".to_string()
+    )));
     assert!(request.runtime_auth.is_some());
     assert!(request.plan.mounts.iter().any(|mount| {
         mount.target == "/runtime/home/.agents/skills/lionclaw"
             && mount.access == MountAccess::ReadOnly
     }));
+    assert_eq!(observations.bridge_socket_mounts, 1);
+    assert!(observations.projected_clients[0].starts_with("#!/usr/bin/env node\n"));
+    assert!(!observations.projected_clients[0]
+        .contains(std::env::current_exe().unwrap().to_str().unwrap()));
     assert!(observations.context[0].contains("\"repository\": \"/workspace\""));
+    assert!(observations.context[0].contains("\"runtime\": \"fake\""));
     assert!(observations.context[0].contains("\"mission\": null"));
 }
 

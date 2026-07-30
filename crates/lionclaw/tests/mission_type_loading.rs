@@ -101,6 +101,27 @@ fn exactly_five_generic_mission_types_load() {
 }
 
 #[test]
+fn review_method_can_produce_a_report_without_mutating_the_judged_product() {
+    let mission_type = load_mission_type(
+        &repo_root().join("mission-types/review"),
+        &AuthorityCeiling::default(),
+    )
+    .expect("review mission type loads");
+    let investigator =
+        &mission_type.default_team.roles[&RoleInstanceId::new("investigator").unwrap()];
+    assert_eq!(
+        investigator.output,
+        lionclaw::model::OutputSemantics::ProducesArtifact
+    );
+    assert!(investigator.grants.writes);
+    assert!(mission_type.ceilings.writes);
+    assert!(investigator.instructions.contains("review report"));
+    assert!(investigator
+        .instructions
+        .contains("Do not modify the judged product"));
+}
+
+#[test]
 fn mission_type_loads_role_resource_declarations_within_ceiling() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_minimal_bundle(dir.path());

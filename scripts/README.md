@@ -1,13 +1,16 @@
 # Scripts
 
-Developer and CI helpers — not the everyday path. For real use, install the
-mission types once and drive a mission:
+Developer and CI helpers — not the everyday path. For real use:
 
 ```bash
 lionclaw install && lionclaw doctor
-lionclaw mission start --type software-dev --objective "…"
-lionclaw mission advance   # drives until it parks, finishes, or awaits input
+lionclaw run               # defaults to the Codex runtime
+lionclaw run opencode      # or select another configured runtime
 ```
+
+The real agent session selects a generic method, proposes repository-specific
+work and command oracles, and drives only actions advertised by current
+mission state.
 
 ## Available scripts
 

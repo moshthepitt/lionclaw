@@ -9,6 +9,7 @@ requires-gap-review = false
 
 [ceilings]
 network = true
+writes = true
 
 [recovery]
 max-attempts = 3
