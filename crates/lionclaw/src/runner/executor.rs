@@ -107,7 +107,7 @@ pub fn mission_execution_context(
         .map(|mount| RuntimePathProjection::directory(mount.target.clone(), mount.source.clone()))
         .collect::<Result<Vec<_>>>()?;
     Ok(RuntimeExecutionContext {
-        network_mode: plan.network_mode,
+        network: plan.network.clone(),
         working_dir: plan
             .working_dir
             .as_deref()

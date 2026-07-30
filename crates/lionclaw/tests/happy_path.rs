@@ -17,9 +17,9 @@ use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::PreparedInput;
 use lionclaw::model::{
     apply, Assertion, AssertionId, Choice, DecisionAction, EffectIntent, EventEnvelope,
-    FinishClass, InputName, MissionEvent, OracleName, OutputSemantics, RoleInstanceId,
-    RuntimeUsage, RuntimeUsageCost, RuntimeUsageCostScope, RuntimeUsageDetails, TaskStatus,
-    VersionStamps, SCHEMA_VERSION,
+    FinishClass, InputName, MissionEvent, NetworkGrant, OracleName, OutputSemantics,
+    RoleInstanceId, RuntimeUsage, RuntimeUsageCost, RuntimeUsageCostScope, RuntimeUsageDetails,
+    TaskStatus, VersionStamps, SCHEMA_VERSION,
 };
 use lionclaw::testing::{MockClock, NoopEffectCleaner};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -352,7 +352,7 @@ async fn direct_engine_creation_rejects_invalid_mission_type_policy() {
             PreparedInput {
                 name: input_name,
                 program,
-                network: false,
+                network: NetworkGrant::Deny,
                 key_files: vec!["../outside".into()],
                 environment: BTreeMap::new(),
             },

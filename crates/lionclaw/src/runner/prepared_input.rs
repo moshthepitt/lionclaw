@@ -139,7 +139,8 @@ async fn input_cache_key_for_format(
             .as_bytes(),
         false,
     );
-    digest.feed("network", &[u8::from(input.network)], false);
+    let network = serde_json::to_vec(&input.network).context("encoding prepared-input network")?;
+    digest.feed("network", &network, false);
     let mut budget = InputHashBudget::default();
     let program_metadata = tokio::fs::symlink_metadata(&input.program)
         .await
@@ -385,7 +386,7 @@ async fn run_preparation_program(
     tokio::fs::copy(&input.program, &program).await?;
     crate::workspace::make_executable(&program)?;
 
-    let authority = prepared_input_authority(input.name.as_str(), input.network);
+    let authority = prepared_input_authority(input.name.as_str(), input.network.clone());
     let judged_roots = [crate::authority::canonical_or_lexical(checkout)];
     let compiled = compile_role_plan(RolePlanRequest {
         authority: &authority,
@@ -416,6 +417,7 @@ async fn run_preparation_program(
         environment: preparation_environment(),
         resources: Default::default(),
         resource_ceilings: &Default::default(),
+        runtime_network: crate::model::NetworkGrant::Deny,
     })
     .map_err(|error| anyhow::anyhow!("prepared-input plan refused to compile: {error}"))?;
     let program = RuntimeProgramSpec {
@@ -478,7 +480,8 @@ mod tests {
         PreparedInput {
             name: InputName::new("deps").unwrap(),
             program,
-            network: true,
+            network: crate::model::NetworkGrant::allow_single("cache.example.com", 443)
+                .expect("prepared input network grant"),
             key_files: vec![PathBuf::from(key)],
             environment: BTreeMap::new(),
         }

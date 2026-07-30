@@ -61,7 +61,7 @@ impl CodexAppServerTurnRunner<'_> {
         input: TurnInput,
         journal: RuntimeTurnJournalSender,
     ) -> Result<TurnResult> {
-        let network_mode = self.context.network_mode;
+        let network = self.context.network.clone();
         let thread_state = self.adapter.thread_state_for(&input.runtime_session_id);
         let transport = self
             .adapter
@@ -91,7 +91,7 @@ impl CodexAppServerTurnRunner<'_> {
                         &thread_id,
                         &input.prompt,
                         self.adapter.config.model.as_deref(),
-                        network_mode,
+                        &network,
                     ),
                     sink,
                     &thread_state,

@@ -12,7 +12,7 @@ use lionclaw_runtime_api::{RuntimeProgramExecutor, TypedFailure, TypedFailureEvi
 use tokio::sync::Mutex;
 
 use crate::authority::{
-    compile_role_plan, oracle_authority_with_devices, MissionMounts, RolePlanRequest,
+    compile_role_plan, oracle_authority_with_network, MissionMounts, RolePlanRequest,
 };
 use crate::config::MissionRuntimeProfile;
 use crate::ports::{ExecutionControl, OracleOutcome, OracleRunRequest, OracleRunner};
@@ -149,9 +149,10 @@ impl OracleRunner for OciOracleRunner {
                 .map_err(|error| fail(format!("failed to prepare mission inputs: {error:#}")))?
             };
 
-            let authority = oracle_authority_with_devices(
+            let authority = oracle_authority_with_network(
                 request.oracle.as_str(),
                 request.command.grants.devices.clone(),
+                request.command.grants.network.clone(),
             );
             let mut extras = vec![MountSpec {
                 source: dirs.scratch().to_path_buf(),
@@ -192,6 +193,7 @@ impl OracleRunner for OciOracleRunner {
                 environment,
                 resources: request.command.resources.clone(),
                 resource_ceilings: &request.resource_ceilings,
+                runtime_network: crate::model::NetworkGrant::Deny,
             })
             .map_err(|e| fail(format!("oracle plan refused to compile (moat): {e}")))?;
 

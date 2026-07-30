@@ -69,10 +69,11 @@ pub use lionclaw_model::{
     RuntimeConfigurationConfirmation, RuntimeUsage, RuntimeUsageCost, RuntimeUsageCostScope,
     RuntimeUsageDetails, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT,
 };
+pub use lionclaw_model::{Destination, NetworkGrant, NetworkGrantError};
 pub use program::{
-    ExecutionOutput, NetworkMode, RuntimeProgramExecutor, RuntimeProgramSession,
-    RuntimeProgramSpec, RuntimeProgramStdoutLine, RuntimeProgramStdoutLineError,
-    RuntimeProgramStdoutSender, RUNTIME_PROGRAM_STDOUT_LINE_LIMIT,
+    ExecutionOutput, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+    RuntimeProgramStdoutLine, RuntimeProgramStdoutLineError, RuntimeProgramStdoutSender,
+    RUNTIME_PROGRAM_STDOUT_LINE_LIMIT,
 };
 pub use state::{
     begin_runtime_session_attempt, clear_state_value, load_ready_state_value, load_state_value,

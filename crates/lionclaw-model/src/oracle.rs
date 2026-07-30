@@ -93,7 +93,10 @@ impl OracleSpec {
                 digest.map("environment", command.environment.iter());
                 digest.u64("timeout_secs", command.timeout_secs);
                 digest.bool("grants.secrets", command.grants.secrets);
-                digest.bool("grants.network", command.grants.network);
+                command
+                    .grants
+                    .network
+                    .feed_digest(&mut digest, "grants.network");
                 digest.bool("grants.install", command.grants.install);
                 digest.bool("grants.writes", command.grants.writes);
                 digest.set("grants.devices", command.grants.devices.iter());
@@ -182,7 +185,7 @@ impl CommandOracle {
         if !self.grants.within(ceilings) {
             return Err(OracleSpecError::AuthorityExceedsCeilings);
         }
-        if self.grants.secrets || self.grants.network || self.grants.install || self.grants.writes {
+        if self.grants.secrets || self.grants.install || self.grants.writes {
             return Err(OracleSpecError::AuthorityViolatesProofFloor);
         }
         self.resources
@@ -221,7 +224,7 @@ pub enum OracleSpecError {
     InvalidTimeout { requested: u64, maximum: u64 },
     #[error("oracle authority exceeds mission ceilings")]
     AuthorityExceedsCeilings,
-    #[error("command oracles may not request secrets, network, install, or writes")]
+    #[error("command oracles may not request secrets, install, or writes")]
     AuthorityViolatesProofFloor,
     #[error("oracle resources exceed mission ceilings: {0}")]
     ResourcesExceedCeilings(String),

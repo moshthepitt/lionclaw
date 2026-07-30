@@ -172,7 +172,7 @@ pub async fn execute_attached(request: ExecutionRequest) -> Result<ExecutionOutp
 mod tests {
     use super::{ExecutionRequest, RuntimeSecretsMount, RUNTIME_SECRETS_NAME_PREFIX};
     use crate::{
-        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, NetworkMode,
+        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, NetworkGrant,
         OciConfinementConfig, RuntimeProgramSpec, WorkspaceAccess,
     };
 
@@ -186,7 +186,7 @@ mod tests {
                     preset_name: "everyday".to_string(),
                     confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
                     workspace_access: WorkspaceAccess::ReadWrite,
-                    network_mode: NetworkMode::On,
+                    network: NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
                     install_policy: crate::InstallPolicy::User,
                     root_in_userns: false,
                     working_dir: None,

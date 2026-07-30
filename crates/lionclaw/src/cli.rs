@@ -23,9 +23,10 @@ use crate::mission_type::{
     MissionType, MissionTypeLocator, SkillSource,
 };
 use crate::model::{
-    fold, short_hex, AuthorityGrants, Choice, ControlAction, DecisionAction, EffectId,
+    fold, short_hex, AuthorityGrants, Choice, ControlAction, DecisionAction, Destination, EffectId,
     EnvironmentPreflight, FinishClass, InputName, MissionGuidance, MissionId, MissionSkill,
-    OutputSemantics, RequirementDisposition, RoleInstance, RoleInstanceId, TaskId, TerminalState,
+    NetworkGrant, OutputSemantics, RequirementDisposition, RoleInstance, RoleInstanceId, TaskId,
+    TerminalState,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, EffectCleaner, OracleRunner, RoleRunner, SystemClock};
@@ -156,6 +157,8 @@ pub enum Command {
     Mission(MissionCommand),
     /// Render the lionclaw(1) manual page to stdout.
     Man,
+    #[command(name = "__network-proxy", hide = true)]
+    NetworkProxy(NetworkProxyArgs),
 }
 
 #[derive(Args)]
@@ -178,6 +181,16 @@ pub struct InstallArgs {
     /// Overwrite mission types already installed.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Args)]
+pub struct NetworkProxyArgs {
+    #[arg(long)]
+    pub http: String,
+    #[arg(long)]
+    pub socks: String,
+    #[arg(long = "allow", value_name = "HOST:PORT")]
+    pub allow: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -340,8 +353,8 @@ pub struct TeamAddArgs {
     pub deadline_secs: Option<u64>,
     #[arg(long)]
     pub secrets: bool,
-    #[arg(long)]
-    pub network: bool,
+    #[arg(long = "network", value_name = "HOST:PORT")]
+    pub network: Vec<String>,
     #[arg(long)]
     pub install: bool,
     #[arg(long)]
@@ -756,6 +769,9 @@ pub async fn run_with_transports(
             clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::NetworkProxy(args) => crate::network_proxy::run(args.http, args.socks, args.allow)
+            .await
+            .map(|()| ExitCode::SUCCESS),
     }
 }
 
@@ -1588,7 +1604,7 @@ async fn cmd_team(command: TeamCommand, transports: &MissionTransports) -> Resul
                 environment: Default::default(),
                 grants: AuthorityGrants {
                     secrets: args.secrets,
-                    network: args.network,
+                    network: parse_network_grant_args(args.network)?,
                     install: args.install,
                     writes: args.writes,
                     devices: args.devices.into_iter().collect(),
@@ -1763,6 +1779,44 @@ fn parse_output(raw: &str) -> Result<OutputSemantics> {
             "unknown output '{raw}'; expected produces-report, produces-artifact, emits-verdict, emits-gap-verdict, or proposes-plan"
         ),
     }
+}
+
+fn parse_network_grant_args(raw: Vec<String>) -> Result<NetworkGrant> {
+    if raw.is_empty() {
+        return Ok(NetworkGrant::Deny);
+    }
+    let destinations = raw
+        .iter()
+        .map(|value| parse_destination_arg(value))
+        .collect::<Result<BTreeSet<_>>>()?;
+    NetworkGrant::allow(destinations).context("invalid network destination grant")
+}
+
+fn parse_destination_arg(raw: &str) -> Result<Destination> {
+    let (host, port) = raw
+        .rsplit_once(':')
+        .with_context(|| format!("network destination '{raw}' must be HOST:PORT"))?;
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("network destination '{raw}' has an invalid port"))?;
+    Destination::single(host, port)
+        .with_context(|| format!("network destination '{raw}' is not allowed"))
+}
+
+fn format_network_grant(grant: &NetworkGrant) -> String {
+    let Some(destinations) = grant.destinations() else {
+        return "deny".to_string();
+    };
+    destinations
+        .iter()
+        .flat_map(|destination| {
+            destination
+                .ports()
+                .iter()
+                .map(move |port| format!("{}:{port}", destination.host()))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn output_name(output: OutputSemantics) -> &'static str {
@@ -3479,7 +3533,7 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
             .map(|input| format!(
                 "{} (network={}, keys={})",
                 input.name,
-                input.network,
+                format_network_grant(&input.network),
                 input
                     .key_files
                     .iter()

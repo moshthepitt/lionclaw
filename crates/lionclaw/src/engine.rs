@@ -2503,7 +2503,7 @@ mod prepared_input_grant_tests {
         crate::mission_type::PreparedInput {
             name: crate::model::InputName::new(name).unwrap(),
             program: PathBuf::from(format!("/mission/inputs/{name}")),
-            network: false,
+            network: crate::model::NetworkGrant::Deny,
             key_files: Vec::new(),
             environment: BTreeMap::new(),
         }

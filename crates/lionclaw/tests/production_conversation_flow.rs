@@ -1447,7 +1447,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (36, 72));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (37, 73));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;
@@ -3253,7 +3253,6 @@ gap-review-assignment = "gap-reviewer"
 requires-gap-review = true
 
 [ceilings]
-network = true
 install = true
 writes = true
 

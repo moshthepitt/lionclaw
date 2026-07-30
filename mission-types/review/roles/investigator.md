@@ -2,7 +2,6 @@
 output: produces-report
 runtime: codex
 install: false
-network: true
 writes: false
 ---
 Investigate the assigned review scope from the read-only judged product and

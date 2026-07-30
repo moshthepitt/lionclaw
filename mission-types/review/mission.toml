@@ -8,7 +8,6 @@ planning-assignment = "planner"
 requires-gap-review = false
 
 [ceilings]
-network = true
 writes = false
 
 [recovery]

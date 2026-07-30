@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use lionclaw_runtime_api::{
-    canonical_events, ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAuthKind,
+    canonical_events, ExecutionOutput, NetworkGrant, RuntimeAdapter, RuntimeAuthKind,
     RuntimeConfigurationConfirmation, RuntimeEvent, RuntimeExecutionContext, RuntimeMcpServerSpec,
     RuntimeMessageLane, RuntimeNativeSessionObservation, RuntimeNativeStateAvailability,
     RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
@@ -69,7 +69,7 @@ async fn acp_adapter_preserves_typed_launch_refusal() {
                     prompt: "launch refusal probe".into(),
                 },
                 context: RuntimeExecutionContext {
-                    network_mode: NetworkMode::None,
+                    network: NetworkGrant::Deny,
                     working_dir: None,
                     environment: Vec::new(),
                     runtime_state: None,
@@ -558,7 +558,7 @@ fn project_opencode_acp_fixture_events() -> Vec<RuntimeEvent> {
 
 fn acp_driver_context(runtime_state_root: PathBuf) -> RuntimeExecutionContext {
     RuntimeExecutionContext {
-        network_mode: NetworkMode::On,
+        network: NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
         working_dir: None,
         environment: Vec::new(),
         runtime_state: Some(runtime_state(runtime_state_root)),

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use lionclaw_confinement::{
-    ExecutionOutput, ExecutionRequest, MountAccess, MountSpec, NetworkMode,
-    RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
+    ExecutionOutput, ExecutionRequest, MountAccess, MountSpec, RUNTIME_HOME_MOUNT_TARGET,
+    RUNTIME_MOUNT_TARGET,
 };
 use lionclaw_runtime_api::{
     RuntimeDriverRegistry, RuntimeNativeSessionObservation, RuntimeNativeStateAvailability,
@@ -206,7 +206,11 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
     )?;
 
     let auth = runner
-        .materialize_runtime_auth(&profile, NetworkMode::On, dirs.auth_staging().to_path_buf())
+        .materialize_runtime_auth(
+            &profile,
+            &profile.model_network,
+            dirs.auth_staging().to_path_buf(),
+        )
         .await
         .context("runtime auth materialization is invalid")?;
     let profile_key = profile.native_state_key(auth.identity());
@@ -365,7 +369,6 @@ fn everyday_plan(
         skills: vec![STANDARD_SKILL_NAME.to_string()],
         environment: BTreeMap::new(),
         grants: AuthorityGrants {
-            network: true,
             install: true,
             writes: false,
             ..Default::default()
@@ -420,6 +423,7 @@ fn everyday_plan(
         environment: crate::runner::runtime_home_environment(),
         resources: ConfinementResources::default(),
         resource_ceilings: &ConfinementResources::default(),
+        runtime_network: profile.model_network.clone(),
     })?
     .plan()
     .clone())

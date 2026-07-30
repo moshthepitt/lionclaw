@@ -17,11 +17,13 @@ use std::path::{Path, PathBuf};
 
 use lionclaw_confinement::{
     parse_runtime_tmpfs_entry, ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset,
-    InstallPolicy, MountAccess, MountSpec, NetworkMode, WorkspaceAccess, RUNTIME_HOME_MOUNT_TARGET,
+    InstallPolicy, MountAccess, MountSpec, WorkspaceAccess, RUNTIME_HOME_MOUNT_TARGET,
     RUNTIME_MOUNT_TARGET, WORKSPACE_MOUNT_TARGET,
 };
 
-use crate::model::{ConfinementResources, ConfinementTmpfsResource, OutputSemantics, RoleInstance};
+use crate::model::{
+    ConfinementResources, ConfinementTmpfsResource, NetworkGrant, OutputSemantics, RoleInstance,
+};
 
 /// Mission targets no mount may shadow.
 const RESERVED_TARGETS: &[&str] = &[
@@ -77,6 +79,8 @@ pub enum MoatViolation {
     ResourceExceedsCeiling { role: String, detail: String },
     #[error("resource override for '{role}' would shrink profile default: {detail}")]
     ResourceShrinksDefault { role: String, detail: String },
+    #[error("network grant for '{role}' is invalid: {detail}")]
+    InvalidNetworkGrant { role: String, detail: String },
 }
 
 /// The engine-compiled authority of one role: preset + the output axis it
@@ -116,14 +120,7 @@ pub fn compile_authority(
     };
     let preset = ExecutionPreset {
         workspace_access,
-        // Enforced from the role's `network` flag (default on — agent roles
-        // reach the model API; `network: false` air-gaps the container).
-        // Oracles take the separate network-off path (`oracle_authority`).
-        network_mode: if role.grants.network {
-            NetworkMode::On
-        } else {
-            NetworkMode::None
-        },
+        network: role.grants.network.clone(),
         install_policy: if role.grants.install {
             InstallPolicy::User
         } else {
@@ -178,12 +175,20 @@ pub fn oracle_authority_with_devices(
     oracle_name: &str,
     devices: BTreeSet<String>,
 ) -> CompiledAuthority {
+    oracle_authority_with_network(oracle_name, devices, NetworkGrant::Deny)
+}
+
+pub fn oracle_authority_with_network(
+    oracle_name: &str,
+    devices: BTreeSet<String>,
+    network: NetworkGrant,
+) -> CompiledAuthority {
     CompiledAuthority {
         role_name: format!("oracle:{oracle_name}"),
         output: OutputSemantics::EmitsVerdict,
         preset: ExecutionPreset {
             workspace_access: WorkspaceAccess::ReadOnly,
-            network_mode: NetworkMode::None,
+            network,
             install_policy: InstallPolicy::None,
             mount_runtime_secrets: false,
             escape_classes: BTreeSet::new(),
@@ -195,17 +200,13 @@ pub fn oracle_authority_with_devices(
 /// Authority for producing one declared, immutable mission input. The source
 /// workspace is read-only and secret-free; only the declaration controls
 /// network access, and the output mount lives outside the judged tree.
-pub fn prepared_input_authority(input_name: &str, network: bool) -> CompiledAuthority {
+pub fn prepared_input_authority(input_name: &str, network: NetworkGrant) -> CompiledAuthority {
     CompiledAuthority {
         role_name: format!("input:{input_name}"),
         output: OutputSemantics::EmitsVerdict,
         preset: ExecutionPreset {
             workspace_access: WorkspaceAccess::ReadOnly,
-            network_mode: if network {
-                NetworkMode::On
-            } else {
-                NetworkMode::None
-            },
+            network,
             install_policy: InstallPolicy::None,
             mount_runtime_secrets: false,
             escape_classes: BTreeSet::new(),
@@ -238,6 +239,7 @@ pub struct RolePlanRequest<'a> {
     pub environment: Vec<(String, String)>,
     pub resources: ConfinementResources,
     pub resource_ceilings: &'a ConfinementResources,
+    pub runtime_network: NetworkGrant,
 }
 
 /// A moat-vetted execution plan. Private field, no other constructor: the
@@ -379,12 +381,21 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
     mounts.extend(confinement.oci().additional_mounts.clone());
     let limits = confinement.oci().limits.clone();
 
+    let network = authority
+        .preset
+        .network
+        .union(&request.runtime_network)
+        .map_err(|detail| MoatViolation::InvalidNetworkGrant {
+            role: role.clone(),
+            detail: detail.to_string(),
+        })?;
+
     Ok(CompiledRolePlan(EffectiveExecutionPlan {
         runtime_id: request.runtime_id,
         preset_name: format!("mission-{}", authority.output.slug()),
         confinement,
         workspace_access: authority.preset.workspace_access,
-        network_mode: authority.preset.network_mode,
+        network,
         install_policy: authority.preset.install_policy,
         root_in_userns: false,
         working_dir: Some(working_dir),
@@ -535,6 +546,7 @@ mod team_authority_tests {
             environment: Vec::new(),
             resources: ConfinementResources::default(),
             resource_ceilings: &ConfinementResources::default(),
+            runtime_network: NetworkGrant::Deny,
         })
         .unwrap();
         assert_eq!(
@@ -562,6 +574,7 @@ mod team_authority_tests {
             environment: Vec::new(),
             resources: ConfinementResources::default(),
             resource_ceilings: &ConfinementResources::default(),
+            runtime_network: NetworkGrant::Deny,
         })
         .unwrap();
         assert_eq!(
@@ -592,6 +605,41 @@ mod team_authority_tests {
             }
         )
         .is_ok());
+    }
+
+    #[test]
+    fn runtime_profile_destinations_compose_without_becoming_role_grants() {
+        let role_grant = NetworkGrant::allow_single("artifact.example", 443).unwrap();
+        let runtime_grant = NetworkGrant::allow_single("api.openai.com", 443).unwrap();
+        let role = role(
+            OutputSemantics::ProducesArtifact,
+            AuthorityGrants {
+                writes: true,
+                network: role_grant.clone(),
+                ..Default::default()
+            },
+        );
+        let authority = compile_authority(&role, &Default::default()).unwrap();
+        let compiled = compile_role_plan(RolePlanRequest {
+            authority: &authority,
+            runtime_id: "codex".into(),
+            confinement: ConfinementConfig::Oci(Default::default()),
+            mounts: MissionMounts {
+                workspace: "/tmp/work".into(),
+                extras: Vec::new(),
+            },
+            working_dir: "/tmp/work".into(),
+            judged_roots: &["/tmp/work".into()],
+            environment: Vec::new(),
+            resources: ConfinementResources::default(),
+            resource_ceilings: &ConfinementResources::default(),
+            runtime_network: runtime_grant,
+        })
+        .unwrap();
+
+        assert_eq!(role.grants.network, role_grant);
+        assert!(compiled.plan().network.allows("artifact.example", 443));
+        assert!(compiled.plan().network.allows("api.openai.com", 443));
     }
 
     #[test]
@@ -626,6 +674,7 @@ mod team_authority_tests {
             resource_ceilings: &ConfinementResources {
                 tmpfs: vec!["/tmp:rw,size=2g".to_string()],
             },
+            runtime_network: NetworkGrant::Deny,
         })
         .unwrap();
 
@@ -655,6 +704,7 @@ mod team_authority_tests {
             resource_ceilings: &ConfinementResources {
                 tmpfs: vec!["/tmp:rw,size=2g".to_string()],
             },
+            runtime_network: NetworkGrant::Deny,
         })
         .unwrap();
 
@@ -686,6 +736,7 @@ mod team_authority_tests {
             resource_ceilings: &ConfinementResources {
                 tmpfs: vec!["/tmp:rw,size=2g".to_string()],
             },
+            runtime_network: NetworkGrant::Deny,
         })
         .expect_err("over-ceiling resource override must refuse before runtime");
 
@@ -714,6 +765,7 @@ mod team_authority_tests {
             resource_ceilings: &ConfinementResources {
                 tmpfs: vec!["/tmp:rw,size=2g".to_string()],
             },
+            runtime_network: NetworkGrant::Deny,
         })
         .expect_err("resource override must not shrink the profile tmpfs default");
 
@@ -742,6 +794,7 @@ mod team_authority_tests {
             resource_ceilings: &ConfinementResources {
                 tmpfs: vec!["/tmp:rw,size=2g".to_string()],
             },
+            runtime_network: NetworkGrant::Deny,
         })
         .expect_err("resource override must not pass through tmpfs authority flags");
 

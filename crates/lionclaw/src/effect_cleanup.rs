@@ -17,13 +17,20 @@ impl LocalEffectCleaner {
 #[async_trait]
 impl EffectCleaner for LocalEffectCleaner {
     async fn quiesce(&self, request: &EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
+        let resource_name = request.effect_id.resource_name();
+        lionclaw_confinement::remove_oci_container(&self.oci_engine, &resource_name)
+            .await
+            .map_err(|error| EffectCleanupFailure {
+                resource: EffectResource::Container,
+                detail: error.to_string(),
+            })?;
         lionclaw_confinement::remove_oci_container(
             &self.oci_engine,
-            &request.effect_id.resource_name(),
+            &format!("{resource_name}-proxy"),
         )
         .await
         .map_err(|error| EffectCleanupFailure {
-            resource: EffectResource::Container,
+            resource: EffectResource::NetworkProxyContainer,
             detail: error.to_string(),
         })
     }
@@ -39,6 +46,22 @@ impl EffectCleaner for LocalEffectCleaner {
             lionclaw_confinement::remove_oci_secret(&self.oci_engine, &resource_name).await
         {
             failures.push((EffectResource::RuntimeSecret, error.to_string()));
+        }
+        if let Err(error) = lionclaw_confinement::remove_oci_container(
+            &self.oci_engine,
+            &format!("{resource_name}-proxy"),
+        )
+        .await
+        {
+            failures.push((EffectResource::NetworkProxyContainer, error.to_string()));
+        }
+        if let Err(error) = lionclaw_confinement::remove_oci_network(
+            &self.oci_engine,
+            &format!("{resource_name}-net"),
+        )
+        .await
+        {
+            failures.push((EffectResource::Network, error.to_string()));
         }
         if let Err(error) = effect_dir.remove().await {
             failures.push((EffectResource::EffectDirectory, error.to_string()));

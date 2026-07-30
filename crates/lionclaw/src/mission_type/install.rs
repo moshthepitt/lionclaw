@@ -132,7 +132,7 @@ mod tests {
             source.join("mission.toml"),
             "[mission-type]\nname = \"install-test\"\nstop = \"verified\"\nimage = \"img\"\n\
              \n[team]\nplanning-assignment = \"planner\"\nrequires-gap-review = false\n\
-             \n[ceilings]\nnetwork = true\ninstall = true\nwrites = true\n",
+             \n[ceilings]\ninstall = true\nwrites = true\n",
         )
         .unwrap();
         std::fs::write(

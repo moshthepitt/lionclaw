@@ -335,7 +335,7 @@ fn source_identity(stat: &rustix::fs::Stat) -> (u64, u64, i64, i64, u64, i64, u6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lionclaw_runtime_api::{NetworkMode, RuntimeAuthContext, RuntimeAuthPreparation};
+    use lionclaw_runtime_api::{NetworkGrant, RuntimeAuthContext, RuntimeAuthPreparation};
     use std::path::PathBuf;
 
     fn config(source: PathBuf) -> NativeHomeAuthConfig {
@@ -347,15 +347,20 @@ mod tests {
         }
     }
 
+    fn model_network() -> NetworkGrant {
+        NetworkGrant::allow_single("api.example.com", 443).expect("model network grant")
+    }
+
     async fn materialize(
         provider: &NativeHomeAuthProvider,
         staging: &Path,
     ) -> RuntimeAuthMaterialization {
         let context = RuntimeAuthContext::default();
+        let network = model_network();
         provider
             .prepare(RuntimeAuthPreparation {
                 runtime_id: "example",
-                network_mode: NetworkMode::On,
+                network: &network,
                 auth_staging_root: Some(staging),
                 host_context: &context,
             })
@@ -522,11 +527,12 @@ mod tests {
             .unwrap();
         let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
         let context = RuntimeAuthContext::default();
+        let network = model_network();
 
         let materialization = provider
             .prepare(RuntimeAuthPreparation {
                 runtime_id: "example",
-                network_mode: NetworkMode::On,
+                network: &network,
                 auth_staging_root: Some(staging.path()),
                 host_context: &context,
             })
@@ -587,10 +593,11 @@ mod tests {
         let staging = tempfile::tempdir().expect("staging");
         let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
         let context = RuntimeAuthContext::default();
+        let network = model_network();
         let err = provider
             .prepare(RuntimeAuthPreparation {
                 runtime_id: "example",
-                network_mode: NetworkMode::On,
+                network: &network,
                 auth_staging_root: Some(staging.path()),
                 host_context: &context,
             })
@@ -609,7 +616,7 @@ mod tests {
             let err = provider
                 .prepare(RuntimeAuthPreparation {
                     runtime_id: "example",
-                    network_mode: NetworkMode::On,
+                    network: &network,
                     auth_staging_root: Some(staging.path()),
                     host_context: &context,
                 })
@@ -629,11 +636,12 @@ mod tests {
             .unwrap();
         let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
         let context = RuntimeAuthContext::default();
+        let network = model_network();
 
         let error = provider
             .prepare(RuntimeAuthPreparation {
                 runtime_id: "example",
-                network_mode: NetworkMode::On,
+                network: &network,
                 auth_staging_root: Some(staging.path()),
                 host_context: &context,
             })
@@ -664,11 +672,12 @@ mod tests {
             optional_files: Vec::new(),
         });
         let context = RuntimeAuthContext::default();
+        let network = model_network();
 
         let error = provider
             .prepare(RuntimeAuthPreparation {
                 runtime_id: "example",
-                network_mode: NetworkMode::On,
+                network: &network,
                 auth_staging_root: Some(staging.path()),
                 host_context: &context,
             })
@@ -696,11 +705,12 @@ mod tests {
         let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
 
         let context = RuntimeAuthContext::default();
+        let network = model_network();
         let staging = tempfile::tempdir().expect("staging");
         let err = provider
             .prepare(RuntimeAuthPreparation {
                 runtime_id: "example",
-                network_mode: NetworkMode::On,
+                network: &network,
                 auth_staging_root: Some(staging.path()),
                 host_context: &context,
             })
@@ -724,9 +734,10 @@ mod tests {
         tokio::fs::write(&optional, b"secret").await.unwrap();
         let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
         let context = RuntimeAuthContext::default();
+        let network = model_network();
         let input = || RuntimeAuthPreparation {
             runtime_id: "example",
-            network_mode: NetworkMode::On,
+            network: &network,
             auth_staging_root: Some(staging.path()),
             host_context: &context,
         };

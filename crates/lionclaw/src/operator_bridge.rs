@@ -561,6 +561,9 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         Command::Mission(command) => validate_mission_command(command),
         Command::Install(_) => bail!("the everyday bridge installs only bundled mission types"),
         Command::Run(_) => bail!("nested `lionclaw run` is not available through the bridge"),
+        Command::NetworkProxy(_) => {
+            bail!("network proxy is OCI boundary plumbing, not a bridge command")
+        }
         Command::Skill(SkillCommand::Add(_) | SkillCommand::Remove(_)) => {
             bail!("installed mission types are host-owned through the everyday bridge")
         }

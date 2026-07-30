@@ -28,6 +28,7 @@ pub mod event;
 pub mod failure;
 pub mod fold;
 pub mod ids;
+pub mod network;
 pub mod oracle;
 pub mod plan;
 pub mod plan_validation;
@@ -60,6 +61,10 @@ pub use fold::{apply, fold, REDUCER_VERSION};
 pub use ids::{
     short_hex, AssertionId, EffectId, IdError, InputName, MissionId, OracleName, RequirementId,
     RoleInstanceId, TaskId,
+};
+pub use network::{
+    canonical_host, Destination, NetworkGrant, NetworkGrantError, MAX_DESTINATION_HOST_BYTES,
+    MAX_DESTINATION_PORTS, MAX_NETWORK_DESTINATIONS,
 };
 pub use oracle::{
     CommandOracle, OracleSpec, OracleSpecError, WorkspaceRelativeDir, MAX_ORACLE_ARGV_BYTES,

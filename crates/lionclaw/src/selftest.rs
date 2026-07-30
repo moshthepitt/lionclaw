@@ -360,7 +360,7 @@ fn manifest_toml(name: &str) -> String {
     format!(
         "[mission-type]\nname = \"{name}\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n\
          \n[team]\nplanning-assignment = \"strategist\"\nrequires-gap-review = false\n\
-         \n[ceilings]\nwrites = true\nnetwork = true\ninstall = true\n\
+         \n[ceilings]\nwrites = true\ninstall = true\n\
          \n[execution]\ndefault-timeout-secs = 1800\nmax-task-time-secs = 1800\n\
          extension-step-secs = 300\neffect-capacity = 4\nauto-continue-candidate = true\nauto-continue-proof = true\n"
     )
@@ -428,7 +428,7 @@ fn materialize_input_mission_type(root: &Path) -> Result<()> {
     std::fs::write(
         root.join("mission.toml"),
         format!(
-            "{}\n[[inputs]]\nname = \"fixture\"\nnetwork = true\nkey-files = [\"Cargo.lock\"]\n",
+            "{}\n[[inputs]]\nname = \"fixture\"\nkey-files = [\"Cargo.lock\"]\n",
             manifest_toml("input-selftest").replace(
                 "install = true\n",
                 "install = true\ninputs = [\"fixture\"]\n"
@@ -746,6 +746,7 @@ async fn run_confined_sh(
         environment: vec![("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string())],
         resources: Default::default(),
         resource_ceilings: &Default::default(),
+        runtime_network: crate::model::NetworkGrant::Deny,
     })
     .map_err(|e| anyhow::anyhow!("plan refused to compile: {e}"))?;
     let mut executor = MissionProgramExecutor::new(
@@ -1442,6 +1443,7 @@ async fn check_runtime_skill_mount() -> Result<()> {
         )],
         resources: Default::default(),
         resource_ceilings: &Default::default(),
+        runtime_network: crate::model::NetworkGrant::Deny,
     })
     .map_err(|err| anyhow::anyhow!("plan refused to compile: {err}"))?;
     let mut executor = MissionProgramExecutor::new(

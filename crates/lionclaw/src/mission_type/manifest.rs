@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AuthorityCeilings, ConfinementResources, RoleInstanceId};
+use crate::model::{AuthorityCeilings, ConfinementResources, NetworkGrant, RoleInstanceId};
 
 pub const MISSION_LOCK_FILE: &str = "mission.lock.toml";
 
@@ -49,7 +49,8 @@ pub(crate) struct ManifestTeam {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct ManifestInput {
     pub name: String,
-    pub network: bool,
+    #[serde(default)]
+    pub network: NetworkGrant,
     pub key_files: Vec<PathBuf>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,

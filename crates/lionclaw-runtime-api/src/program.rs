@@ -2,26 +2,9 @@ use std::fmt;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::auth::RuntimeAuthKind;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum NetworkMode {
-    None,
-    On,
-}
-
-impl NetworkMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::On => "on",
-        }
-    }
-}
 
 /// Adapter-produced program invocation details, independent from how LionClaw
 /// chooses to confine the process.

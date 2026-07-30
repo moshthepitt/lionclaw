@@ -526,6 +526,7 @@ fn profiles_with_image(home: &Path, image: &str) -> RuntimeProfiles {
         native-resume = true
         auth = "fake-auth"
         skills-dir = ".agents/skills"
+        model-network = {{ mode = "allow", destinations = [{{ host = "api.fake.example", ports = [443] }}] }}
         confinement = {{ backend = "podman", image = "{image}", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=64m"] }}
 
         [runtimes.codex]
@@ -534,6 +535,7 @@ fn profiles_with_image(home: &Path, image: &str) -> RuntimeProfiles {
         native-resume = true
         auth = "fake-auth"
         skills-dir = ".agents/skills"
+        model-network = {{ mode = "allow", destinations = [{{ host = "api.codex.example", ports = [443] }}] }}
         confinement = {{ backend = "podman", image = "{image}", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=64m"] }}
 
         [runtimes.opencode]
@@ -542,6 +544,7 @@ fn profiles_with_image(home: &Path, image: &str) -> RuntimeProfiles {
         native-resume = true
         auth = "fake-auth"
         skills-dir = ".agents/skills"
+        model-network = {{ mode = "allow", destinations = [{{ host = "api.opencode.example", ports = [443] }}] }}
         confinement = {{ backend = "podman", image = "{image}", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=64m"] }}
         "#
         ),
@@ -665,7 +668,7 @@ async fn everyday_run_reaches_validated_profile_auth_and_confinement() {
     assert_eq!(observations.requests.len(), 1);
     let request = &observations.requests[0];
     assert_eq!(request.plan.workspace_access.as_str(), "read-only");
-    assert_eq!(request.plan.network_mode.as_str(), "on");
+    assert!(request.plan.network.allows("api.fake.example", 443));
     assert!(request
         .plan
         .environment

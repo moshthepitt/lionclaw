@@ -7,19 +7,21 @@
 //! ---
 //! output: produces-artifact
 //! runtime: codex
-//! network: false
+//! network: [api.example.com:443]
 //! secrets: false
 //! skills: []          # optional mission skill aliases
 //! ---
 //! <prompt body>
 //! ```
 
-use crate::model::{ConfinementResources, OutputSemantics, MAX_EXECUTION_DURATION_SECS};
+use crate::model::{
+    ConfinementResources, Destination, NetworkGrant, OutputSemantics, MAX_EXECUTION_DURATION_SECS,
+};
 
 #[derive(Debug)]
 pub struct RoleFrontmatter {
     pub output: OutputSemantics,
-    pub network: bool,
+    pub network: NetworkGrant,
     pub secrets: bool,
     pub install: Option<bool>,
     pub writes: Option<bool>,
@@ -35,9 +37,7 @@ pub struct RoleFrontmatter {
 pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
     let (frontmatter, body) = split_frontmatter(text)?;
     let mut output: Option<OutputSemantics> = None;
-    // Agent roles reach the model API, so network is on by default; a role
-    // opts out with `network: false` (enforced in `compile_authority`).
-    let mut network = true;
+    let mut network = NetworkGrant::Deny;
     let mut secrets = false;
     let mut install = None;
     let mut writes = None;
@@ -64,7 +64,7 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
         }
         match key {
             "output" => output = Some(parse_output(value)?),
-            "network" => network = parse_bool(key, value)?,
+            "network" => network = parse_network_grant(value)?,
             "secrets" => secrets = parse_bool(key, value)?,
             "install" => install = Some(parse_bool(key, value)?),
             "writes" => writes = Some(parse_bool(key, value)?),
@@ -159,6 +159,32 @@ fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
     }
 }
 
+fn parse_network_grant(value: &str) -> Result<NetworkGrant, String> {
+    let destinations = parse_string_list(value)?
+        .into_iter()
+        .map(|item| parse_destination_item(&item))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    if destinations.is_empty() {
+        return Ok(NetworkGrant::Deny);
+    }
+    NetworkGrant::allow(destinations).map_err(|error| error.to_string())
+}
+
+fn parse_destination_item(item: &str) -> Result<Destination, String> {
+    let (host, port) = item
+        .rsplit_once(':')
+        .ok_or_else(|| format!("network destination '{item}' must be host:port"))?;
+    if host.contains(':') {
+        return Err(format!(
+            "network destination '{item}' must use a DNS host and one declared port"
+        ));
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| format!("network destination '{item}' has invalid port"))?;
+    Destination::single(host, port).map_err(|error| error.to_string())
+}
+
 fn parse_scalar(key: &str, value: &str) -> Result<String, String> {
     let value = value.trim_matches('"').trim();
     if value.is_empty() {
@@ -213,11 +239,11 @@ mod tests {
 
     #[test]
     fn parses_full_frontmatter() {
-        let text = "---\noutput: emits-verdict\nruntime: codex\nnetwork: true\nsecrets: false\nskills: [rust, git]\n---\nJudge the work.\n";
+        let text = "---\noutput: emits-verdict\nruntime: codex\nnetwork: [api.example.com:443]\nsecrets: false\nskills: [rust, git]\n---\nJudge the work.\n";
         let fm = parse_role_file(text).expect("parse");
         assert_eq!(fm.output, OutputSemantics::EmitsVerdict);
         assert_eq!(fm.runtime.as_deref(), Some("codex"));
-        assert!(fm.network);
+        assert!(fm.network.allows("api.example.com", 443));
         assert!(!fm.secrets);
         assert_eq!(fm.skills, vec!["rust", "git"]);
         assert_eq!(fm.prompt_body, "Judge the work.");
@@ -228,7 +254,7 @@ mod tests {
         let text = "---\noutput: produces-artifact\n---\nDo it.";
         let fm = parse_role_file(text).expect("parse");
         assert_eq!(fm.output, OutputSemantics::ProducesArtifact);
-        assert!(fm.network, "agent roles are network-on by default");
+        assert!(fm.network.is_denied());
         assert!(!fm.secrets);
         assert!(fm.runtime.is_none());
         assert!(fm.skills.is_empty());
@@ -248,7 +274,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_output() {
-        let text = "---\nnetwork: true\n---\nx";
+        let text = "---\nnetwork: [api.example.com:443]\n---\nx";
         assert!(parse_role_file(text).unwrap_err().contains("output"));
     }
 
@@ -267,7 +293,7 @@ mod tests {
     #[test]
     fn rejects_bad_bool() {
         let text = "---\noutput: produces-report\nnetwork: yes\n---\nx";
-        assert!(parse_role_file(text).unwrap_err().contains("true or false"));
+        assert!(parse_role_file(text).unwrap_err().contains("inline list"));
     }
 
     #[test]

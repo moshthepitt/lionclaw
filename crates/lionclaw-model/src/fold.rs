@@ -18,7 +18,7 @@ use crate::{TypedFailure, TypedFailureEvidence};
 
 /// Reducer 72 binds judgment receipts to the current report deliverables and
 /// invalidates proof when any producing effect or report digest changes.
-pub const REDUCER_VERSION: u32 = 72;
+pub const REDUCER_VERSION: u32 = 73;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;

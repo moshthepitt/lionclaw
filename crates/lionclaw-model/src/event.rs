@@ -23,7 +23,7 @@ use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailur
 
 /// Version 36 binds judgment requests to the exact report deliverables they
 /// assess, including each report's content digest and producing effect.
-pub const SCHEMA_VERSION: u32 = 36;
+pub const SCHEMA_VERSION: u32 = 37;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -623,6 +623,8 @@ pub struct MissionSkill {
 pub enum EffectResource {
     Container,
     RuntimeSecret,
+    NetworkProxyContainer,
+    Network,
     EffectDirectory,
     WriterRef,
 }

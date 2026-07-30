@@ -20,7 +20,7 @@ fn write_minimal_type(root: &Path) {
         root.join("mission.toml"),
         "[mission-type]\nname = \"digest-test\"\nstop = \"verified\"\nimage = \"img\"\n\
          \n[team]\nplanning-assignment = \"strategist\"\n\
-         \n[ceilings]\nnetwork = true\ninstall = true\nwrites = true\n",
+         \n[ceilings]\ninstall = true\nwrites = true\n",
     )
     .unwrap();
     std::fs::write(
@@ -88,7 +88,7 @@ fn the_digest_tracks_recursive_skill_content() {
         root.join("mission.toml"),
         "[mission-type]\nname = \"digest-test\"\nstop = \"verified\"\nimage = \"img\"\n\
          \n[team]\nplanning-assignment = \"strategist\"\n\
-         \n[ceilings]\nnetwork = true\ninstall = true\nwrites = true\n",
+         \n[ceilings]\ninstall = true\nwrites = true\n",
     )
     .unwrap();
     std::fs::write(

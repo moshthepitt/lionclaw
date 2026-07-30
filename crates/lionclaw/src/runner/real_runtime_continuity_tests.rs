@@ -289,7 +289,6 @@ async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) 
         skills: Vec::new(),
         environment: BTreeMap::new(),
         grants: AuthorityGrants {
-            network: true,
             ..Default::default()
         },
         resources: Default::default(),

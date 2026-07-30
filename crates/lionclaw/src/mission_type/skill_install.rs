@@ -479,7 +479,7 @@ mod tests {
             root.join("mission.toml"),
             "[mission-type]\nname = \"skill-test\"\nstop = \"verified\"\nimage = \"img\"\n\
              \n[team]\nplanning-assignment = \"strategist\"\nrequires-gap-review = false\n\
-             \n[ceilings]\nnetwork = true\ninstall = true\nwrites = true\n",
+             \n[ceilings]\ninstall = true\nwrites = true\n",
         )
         .unwrap();
         let skills = assigned_skill

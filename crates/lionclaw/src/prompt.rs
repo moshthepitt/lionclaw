@@ -240,7 +240,7 @@ fn render_planning(role: &RoleInstance, ctx: &PlanningPromptContext<'_>) -> Stri
     );
     prompt.push_str("\n```\n");
     prompt.push_str("\n\n## Current command oracles\n\n");
-    prompt.push_str("Return one complete `oracles` map alongside every plan revision. Preserve a current oracle by reproducing its exact spec. Add or replace checks using structured argv only: the first item is a non-shell executable and every later item is one literal argument. Shell syntax is data and is never evaluated. `cwd` is `.` or a clean workspace-relative directory. Command oracles are read-only proof: they can never request secrets, network, installs, or writes. Inputs, devices, environment, timeouts, and tmpfs resources must stay within the immutable ceilings below.\n\n");
+    prompt.push_str("Return one complete `oracles` map alongside every plan revision. Preserve a current oracle by reproducing its exact spec. Add or replace checks using structured argv only: the first item is a non-shell executable and every later item is one literal argument. Shell syntax is data and is never evaluated. `cwd` is `.` or a clean workspace-relative directory. Command oracles are read-only proof: they can request network only as explicit DNS host:port destinations within the immutable ceilings, and can never request secrets, installs, or writes. Inputs, devices, environment, timeouts, and tmpfs resources must stay within the immutable ceilings below.\n\n");
     prompt.push_str("Current accepted oracle set:\n\n```json\n");
     prompt.push_str(&serde_json::to_string_pretty(ctx.current_oracles).expect("oracles serialize"));
     prompt.push_str("\n```\n\nAuthority ceilings:\n\n```json\n");

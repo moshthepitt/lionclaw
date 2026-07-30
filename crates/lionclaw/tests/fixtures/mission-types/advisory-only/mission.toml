@@ -9,7 +9,6 @@ gap-review-assignment = "gap-reviewer"
 requires-gap-review = true
 
 [ceilings]
-network = true
 install = true
 writes = true
 

@@ -4,10 +4,10 @@ use lionclaw_model::{
     apply, fold, next, validate_mission_proposal, Assertion, AssertionId, AuthorityCeilings,
     AuthorityGrants, Choice, CommandOracle, ConfinementResources, DecisionAction, EffectId,
     EffectIntent, EventEnvelope, MissionConfig, MissionEvent, MissionProposal, MissionTypeRef,
-    OracleName, OracleRunSuccess, OracleSpec, OutputSemantics, PayloadRef, Plan, PlanProposal,
-    Requirement, RequirementDisposition, RequirementId, RequirementKind, RoleInstance,
-    RoleInstanceId, RuntimeInstrumentIdentity, StopBar, Task, TaskId, TaskStatus, TeamRevision,
-    VersionStamps, WorkspaceRelativeDir, SCHEMA_VERSION,
+    NetworkGrant, OracleName, OracleRunSuccess, OracleSpec, OutputSemantics, PayloadRef, Plan,
+    PlanProposal, Requirement, RequirementDisposition, RequirementId, RequirementKind,
+    RoleInstance, RoleInstanceId, RuntimeInstrumentIdentity, StopBar, Task, TaskId, TaskStatus,
+    TeamRevision, VersionStamps, WorkspaceRelativeDir, SCHEMA_VERSION,
 };
 
 fn role(id: &str, output: OutputSemantics) -> RoleInstance {
@@ -250,6 +250,45 @@ fn declared_shell_executables_are_rejected() {
             ),
             "{executable} must not cross the command-oracle boundary"
         );
+    }
+}
+
+#[test]
+fn command_oracles_may_request_only_destination_scoped_network() {
+    let ceilings = AuthorityCeilings {
+        secrets: true,
+        network: NetworkGrant::allow_single("api.example.com", 443).unwrap(),
+        install: true,
+        writes: true,
+        ..Default::default()
+    };
+    let mut spec = command(&["curl", "https://api.example.com/health"]);
+    let OracleSpec::Command(command) = &mut spec;
+    command.grants.network = NetworkGrant::allow_single("api.example.com", 443).unwrap();
+
+    spec.validate(
+        &ceilings,
+        &ConfinementResources::default(),
+        &Default::default(),
+    )
+    .expect("explicit network destination is allowed under ceiling");
+
+    for mutate in [
+        |grants: &mut AuthorityGrants| grants.secrets = true,
+        |grants: &mut AuthorityGrants| grants.install = true,
+        |grants: &mut AuthorityGrants| grants.writes = true,
+    ] {
+        let mut forbidden = spec.clone();
+        let OracleSpec::Command(command) = &mut forbidden;
+        mutate(&mut command.grants);
+        assert!(matches!(
+            forbidden.validate(
+                &ceilings,
+                &ConfinementResources::default(),
+                &Default::default(),
+            ),
+            Err(lionclaw_model::OracleSpecError::AuthorityViolatesProofFloor)
+        ));
     }
 }
 

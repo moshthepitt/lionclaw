@@ -27,7 +27,7 @@ fn write_minimal_bundle(root: &std::path::Path) {
     .unwrap();
     std::fs::write(
         root.join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\n---\nDo it.\n",
     )
     .unwrap();
     std::fs::write(root.join("playbook.md"), "# Bounded\n").unwrap();
@@ -140,7 +140,7 @@ tmpfs = ["/tmp:rw,size=2g"]
     .unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\ntmpfs: [\"/tmp:rw,size=1g\"]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\ntmpfs: [\"/tmp:rw,size=1g\"]\n---\nDo it.\n",
     )
     .unwrap();
     let mission_type =
@@ -174,7 +174,7 @@ tmpfs = ["/tmp:rw,size=1g"]
     .unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\ntmpfs: [\"/tmp:rw,size=2g\"]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\ntmpfs: [\"/tmp:rw,size=2g\"]\n---\nDo it.\n",
     )
     .unwrap();
 
@@ -283,7 +283,7 @@ fn skill_control_text_is_bounded_before_whole_file_loading() {
         .unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\nskills: [large]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\nskills: [large]\n---\nDo it.\n",
     )
     .unwrap();
 
@@ -320,7 +320,7 @@ fn mission_control_text_has_one_aggregate_budget() {
     std::fs::write(
         dir.path().join("roles/worker.md"),
         format!(
-            "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\nskills: [{}]\n---\nDo it.\n",
+            "---\noutput: proposes-plan\nruntime: codex\nskills: [{}]\n---\nDo it.\n",
             assigned.join(", ")
         ),
     )
@@ -347,7 +347,7 @@ fn mission_digest_seals_runtime_visible_empty_skill_directories() {
     .unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\nskills: [visible]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\nskills: [visible]\n---\nDo it.\n",
     )
     .unwrap();
 
@@ -400,7 +400,7 @@ fn role_declaring_a_bundled_skill_loads_the_resolved_package() {
     .unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\nskills: [rust]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\nskills: [rust]\n---\nDo it.\n",
     )
     .unwrap();
     std::fs::write(dir.path().join("playbook.md"), "# Skilled\n").unwrap();
@@ -431,7 +431,7 @@ fn manifest_skill_declarations_are_rejected() {
     .unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\n---\nDo it.\n",
     )
     .unwrap();
     std::fs::write(dir.path().join("playbook.md"), "# Planning\n").unwrap();
@@ -451,7 +451,7 @@ fn role_referencing_a_missing_skill_package_is_rejected() {
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\nskills: [missing]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\nskills: [missing]\n---\nDo it.\n",
     )
     .unwrap();
 
@@ -481,7 +481,7 @@ fn a_symlinked_skill_package_is_rejected() {
     std::os::unix::fs::symlink(external.path(), dir.path().join("skills/rust")).unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\nskills: [rust]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\nskills: [rust]\n---\nDo it.\n",
     )
     .unwrap();
 
@@ -504,7 +504,7 @@ fn a_symlink_anywhere_in_the_bundle_is_rejected() {
     .unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\n---\nDo it.\n",
     )
     .unwrap();
     std::os::unix::fs::symlink(external.path(), dir.path().join("unrelated-link")).unwrap();
@@ -536,7 +536,7 @@ fn a_skill_package_through_an_escaping_parent_symlink_is_rejected() {
     std::os::unix::fs::symlink(external.path(), dir.path().join("skills")).unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\nskills: [rust]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\nskills: [rust]\n---\nDo it.\n",
     )
     .unwrap();
 
@@ -564,7 +564,7 @@ fn skill_frontmatter_name_must_match_the_declared_package() {
     .unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\nskills: [expected]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\nskills: [expected]\n---\nDo it.\n",
     )
     .unwrap();
 
@@ -592,7 +592,7 @@ fn duplicate_role_skill_references_are_rejected() {
     .unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\nskills: [rust, rust]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\nskills: [rust, rust]\n---\nDo it.\n",
     )
     .unwrap();
 
@@ -616,7 +616,7 @@ fn a_planning_dag_naming_an_execution_role_fails_to_load() {
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: produces-artifact\nruntime: codex\nnetwork: false\n---\nDo it.\n",
+        "---\noutput: produces-artifact\nruntime: codex\n---\nDo it.\n",
     )
     .unwrap();
     std::fs::write(dir.path().join("playbook.md"), "# Planning\n").unwrap();
@@ -647,7 +647,7 @@ fn write_valid_type(root: &std::path::Path) {
     .unwrap();
     std::fs::write(
         root.join("roles/implementer.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\n---\nDo it.\n",
     )
     .unwrap();
     std::fs::write(root.join("playbook.md"), "# Guarded\n").unwrap();
@@ -698,14 +698,15 @@ fn prepared_input_declarations_load_as_plain_mission_type_data() {
     std::fs::write(
         dir.path().join("mission.toml"),
         "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"implementer\"\n\
-         \n[[inputs]]\nname = \"cargo-home\"\nnetwork = true\nkey-files = [\"Cargo.lock\"]\nenvironment = { CARGO_HOME = \"/inputs/cargo-home\" }\n",
+         \n[ceilings]\nnetwork = { mode = \"allow\", destinations = [{ host = \"cache.example.com\", ports = [443] }] }\n\
+         \n[[inputs]]\nname = \"cargo-home\"\nnetwork = { mode = \"allow\", destinations = [{ host = \"cache.example.com\", ports = [443] }] }\nkey-files = [\"Cargo.lock\"]\nenvironment = { CARGO_HOME = \"/inputs/cargo-home\" }\n",
     )
     .unwrap();
 
     let mission_type =
         load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("valid input");
     let input = &mission_type.inputs[&lionclaw::model::InputName::new("cargo-home").unwrap()];
-    assert!(input.network);
+    assert!(input.network.allows("cache.example.com", 443));
     assert_eq!(input.key_files, [PathBuf::from("Cargo.lock")]);
     assert_eq!(input.environment["CARGO_HOME"], "/inputs/cargo-home");
 }
@@ -718,7 +719,7 @@ fn prepared_input_environment_cannot_replace_kernel_coordinates() {
     std::fs::write(
         dir.path().join("mission.toml"),
         "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"implementer\"\n\
-         \n[[inputs]]\nname = \"cache\"\nnetwork = false\nkey-files = [\"Cargo.lock\"]\nenvironment = { TMPDIR = \"/inputs/cache\" }\n",
+         \n[[inputs]]\nname = \"cache\"\nnetwork = { mode = \"deny\" }\nkey-files = [\"Cargo.lock\"]\nenvironment = { TMPDIR = \"/inputs/cache\" }\n",
     )
     .unwrap();
 
@@ -743,7 +744,7 @@ fn loaded_runtime_files_survive_removal_of_the_source_bundle() {
     std::fs::write(
         dir.path().join("mission.toml"),
         "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"implementer\"\n\
-         \n[[inputs]]\nname = \"cargo-home\"\nnetwork = false\nkey-files = [\"Cargo.lock\"]\n",
+         \n[[inputs]]\nname = \"cargo-home\"\nnetwork = { mode = \"deny\" }\nkey-files = [\"Cargo.lock\"]\n",
     )
     .unwrap();
 
@@ -778,7 +779,7 @@ fn oversized_prepared_input_programs_fail_from_metadata() {
     std::fs::write(
         dir.path().join("mission.toml"),
         "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"implementer\"\n\
-         \n[[inputs]]\nname = \"cargo-home\"\nnetwork = true\nkey-files = [\"Cargo.lock\"]\n",
+         \n[[inputs]]\nname = \"cargo-home\"\nkey-files = [\"Cargo.lock\"]\n",
     )
     .unwrap();
 
@@ -789,23 +790,16 @@ fn oversized_prepared_input_programs_fail_from_metadata() {
 }
 
 #[test]
-fn prepared_inputs_require_explicit_authority_and_safe_keys() {
+fn prepared_inputs_require_safe_keys() {
     let dir = tempfile::tempdir().unwrap();
     write_valid_type(dir.path());
     add_input_program(dir.path(), "cargo-home");
-    for declaration in [
-        "name = \"cargo-home\"\nkey-files = [\"Cargo.lock\"]",
-        "name = \"cargo-home\"\nnetwork = false\nkey-files = [\"../Cargo.lock\"]",
-    ] {
-        std::fs::write(
-            dir.path().join("mission.toml"),
-            format!(
-                "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"implementer\"\n\n[[inputs]]\n{declaration}\n"
-            ),
-        )
-        .unwrap();
-        assert!(load_mission_type(dir.path(), &AuthorityCeiling::default()).is_err());
-    }
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\n[team]\nplanning-assignment = \"implementer\"\n\n[[inputs]]\nname = \"cargo-home\"\nnetwork = { mode = \"deny\" }\nkey-files = [\"../Cargo.lock\"]\n",
+    )
+    .unwrap();
+    assert!(load_mission_type(dir.path(), &AuthorityCeiling::default()).is_err());
 }
 
 #[test]
@@ -836,7 +830,7 @@ fn a_path_unsafe_mission_type_name_is_rejected() {
 fn write_reviewer_role(root: &std::path::Path) {
     std::fs::write(
         root.join("roles/gap-reviewer.md"),
-        "---\noutput: emits-gap-verdict\nruntime: codex\nnetwork: false\n---\nHunt gaps.\n",
+        "---\noutput: emits-gap-verdict\nruntime: codex\n---\nHunt gaps.\n",
     )
     .unwrap();
 }
@@ -946,7 +940,7 @@ fn skill_description_is_loaded_and_trimmed_into_the_package() {
     .unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\nskills: [rust]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\nskills: [rust]\n---\nDo it.\n",
     )
     .unwrap();
     std::fs::write(dir.path().join("playbook.md"), "# Skilled\n").unwrap();
@@ -989,7 +983,7 @@ fn load_skill_with_description(
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
-        "---\noutput: proposes-plan\nruntime: codex\nnetwork: false\nskills: [rust]\n---\nDo it.\n",
+        "---\noutput: proposes-plan\nruntime: codex\nskills: [rust]\n---\nDo it.\n",
     )
     .unwrap();
     std::fs::write(dir.path().join("playbook.md"), "# Skilled\n").unwrap();

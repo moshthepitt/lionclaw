@@ -13,6 +13,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::mission_type::Home;
+use crate::model::NetworkGrant;
 
 const DEFAULT_RUNTIMES_TOML: &str = r#"
 [runtimes.codex]
@@ -21,6 +22,10 @@ command = "codex"
 native-resume = true
 auth = "codex"
 skills-dir = ".agents/skills"
+model-network = { mode = "allow", destinations = [
+  { host = "api.openai.com", ports = [443] },
+  { host = "auth.openai.com", ports = [443] }
+] }
 confinement = { backend = "podman", image = "localhost/lionclaw-runtime-dev:v1", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 
 [runtimes.opencode]
@@ -34,6 +39,12 @@ model = "opencode/big-pickle"
 mode = "build"
 auth = { kind = "native-home", source = "~/.local/share/opencode", target = ".local/share/opencode", required-files = ["auth.json"] }
 skills-dir = ".agents/skills"
+model-network = { mode = "allow", destinations = [
+  { host = "api.opencode.ai", ports = [443] },
+  { host = "opencode.ai", ports = [443] },
+  { host = "api.openai.com", ports = [443] },
+  { host = "api.anthropic.com", ports = [443] }
+] }
 confinement = { backend = "podman", image = "localhost/lionclaw-runtime-dev:v1", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 
 [runtimes.hermes]
@@ -46,6 +57,11 @@ environment = { HERMES_HOME = "/runtime/home/.hermes" }
 mode = "dont_ask"
 auth = { kind = "native-home", source = "~/.hermes", target = ".hermes", required-files = ["config.yaml"], optional-files = [".env", "auth.json", ".anthropic_oauth.json"] }
 skills-dir = ".hermes/skills"
+model-network = { mode = "allow", destinations = [
+  { host = "api.anthropic.com", ports = [443] },
+  { host = "api.openai.com", ports = [443] },
+  { host = "auth.openai.com", ports = [443] }
+] }
 confinement = { backend = "podman", image = "localhost/lionclaw-runtime-dev:v1", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 "#;
 
@@ -61,6 +77,7 @@ pub struct MissionRuntimeProfile {
     pub auth: Option<RuntimeAuthConfig>,
     pub skills_dir: Option<RuntimeSkillsDir>,
     pub terminal: RuntimeTerminalConfig,
+    pub model_network: NetworkGrant,
     /// Whether this profile can retain and reopen a native conversation.
     pub native_resume: bool,
     pub confinement: ConfinementConfig,
@@ -85,6 +102,7 @@ impl MissionRuntimeProfile {
         }
         digest_optional(&mut digest, b"model", self.model.as_deref());
         digest_optional(&mut digest, b"mode", self.mode.as_deref());
+        digest_network(&mut digest, b"model-network", &self.model_network);
         match &self.skills_dir {
             Some(skills_dir) => digest_field(
                 &mut digest,
@@ -167,6 +185,21 @@ fn digest_paths(digest: &mut Sha256, label: &[u8], paths: &[PathBuf]) {
     });
     for path in paths {
         digest_field(digest, label, path.as_os_str().as_bytes());
+    }
+}
+
+fn digest_network(digest: &mut Sha256, label: &[u8], network: &NetworkGrant) {
+    match network {
+        NetworkGrant::Deny => digest_field(digest, label, b"deny"),
+        NetworkGrant::Allow { destinations } => {
+            digest_field(digest, label, b"allow");
+            for destination in destinations {
+                digest_field(digest, b"network-host", destination.host().as_bytes());
+                for port in destination.ports() {
+                    digest_field(digest, b"network-port", port.to_string().as_bytes());
+                }
+            }
+        }
     }
 }
 
@@ -321,6 +354,8 @@ struct RuntimeProfileFile {
     terminal: RuntimeTerminalConfig,
     #[serde(default)]
     native_resume: bool,
+    #[serde(default, rename = "model-network")]
+    model_network: NetworkGrant,
     #[serde(default = "default_confinement")]
     confinement: ConfinementConfig,
 }
@@ -390,6 +425,7 @@ impl RuntimeProfileFile {
             auth,
             skills_dir,
             terminal: self.terminal,
+            model_network: self.model_network,
             native_resume: self.native_resume,
             confinement: self.confinement,
         })
@@ -599,6 +635,42 @@ mod tests {
 
         assert!(profiles.get("native").unwrap().native_resume);
         assert!(!profiles.get("reconstructed").unwrap().native_resume);
+    }
+
+    #[test]
+    fn runtime_model_network_is_profile_owned_and_validated() {
+        let profiles = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.codex]
+            driver = "codex"
+            command = "codex"
+            model-network = { mode = "allow", destinations = [
+              { host = "API.OpenAI.Com", ports = [443] }
+            ] }
+            "#,
+            Path::new("/home/alice"),
+        )
+        .expect("profile");
+
+        assert!(profiles
+            .get("codex")
+            .unwrap()
+            .model_network
+            .allows("api.openai.com", 443));
+
+        let error = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.bad]
+            driver = "codex"
+            command = "codex"
+            model-network = { mode = "allow", destinations = [
+              { host = "127.0.0.1", ports = [443] }
+            ] }
+            "#,
+            Path::new("/home/alice"),
+        )
+        .expect_err("IP literal destination must fail");
+        assert!(format!("{error:#}").contains("IP literal"));
     }
 
     #[test]

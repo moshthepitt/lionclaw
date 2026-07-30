@@ -11,7 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw_runtime_api::{
     append_streamed_text_boundary, append_streamed_text_delta, canonical_events, ExecutionOutput,
-    NetworkMode, RuntimeAdapter, RuntimeDriverConfig, RuntimeDriverProvider, RuntimeEvent,
+    NetworkGrant, RuntimeAdapter, RuntimeDriverConfig, RuntimeDriverProvider, RuntimeEvent,
     RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMcpServerSpec, RuntimeMessageLane,
     RuntimeNativeSessionObservation, RuntimeNativeStateAvailability, RuntimePathProjection,
     RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
@@ -68,7 +68,7 @@ fn runtime_home_projection_context(
     runtime_home_root: PathBuf,
 ) -> RuntimeExecutionContext {
     RuntimeExecutionContext {
-        network_mode: NetworkMode::On,
+        network: NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
         working_dir: None,
         environment: Vec::new(),
         runtime_state: None,
@@ -231,7 +231,7 @@ async fn codex_adapter_preserves_typed_launch_refusal() {
                     prompt: "launch refusal probe".into(),
                 },
                 context: RuntimeExecutionContext {
-                    network_mode: NetworkMode::None,
+                    network: NetworkGrant::Deny,
                     working_dir: None,
                     environment: Vec::new(),
                     runtime_state: None,
@@ -776,7 +776,7 @@ async fn app_server_rejects_oversized_turn_id_from_start_response() {
                     prompt: "test".into(),
                 },
                 context: RuntimeExecutionContext {
-                    network_mode: NetworkMode::None,
+                    network: NetworkGrant::Deny,
                     working_dir: None,
                     environment: Vec::new(),
                     runtime_state: None,
@@ -1013,7 +1013,12 @@ async fn codex_app_server_protocol_streams_turn_and_saves_thread_id() {
     let response = client
         .request(
             "turn/start",
-            super::turn_start_params(&thread_id, "hello", Some("gpt-5-codex"), NetworkMode::None),
+            super::turn_start_params(
+                &thread_id,
+                "hello",
+                Some("gpt-5-codex"),
+                &NetworkGrant::Deny,
+            ),
             &event_tx,
             &thread_state,
         )
@@ -1378,7 +1383,7 @@ fn codex_generated_image_path_uses_runtime_home_projection() {
 fn codex_generated_image_path_respects_blocked_runtime_projection() {
     let runtime_state_root = PathBuf::from("/host/runtime-state");
     let context = RuntimeExecutionContext {
-        network_mode: NetworkMode::On,
+        network: NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
         working_dir: None,
         environment: Vec::new(),
         runtime_state: None,

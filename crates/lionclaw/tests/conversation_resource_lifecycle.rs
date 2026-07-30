@@ -40,7 +40,6 @@ auto-continue-proof = true
 planning-assignment = "strategist"
 
 [ceilings]
-network = true
 writes = true
 install = true
 "#,

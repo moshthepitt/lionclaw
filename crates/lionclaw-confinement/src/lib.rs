@@ -21,14 +21,15 @@ pub use backend::{
 };
 pub use mount_validation::{parse_runtime_tmpfs_entry, RuntimeTmpfsEntry};
 pub use oci::{
-    remove_oci_container, remove_oci_secret, resolve_oci_image_compatibility_identity,
-    validate_oci_launch_prerequisites, OciExecutionBackend,
+    remove_oci_container, remove_oci_network, remove_oci_secret,
+    resolve_oci_image_compatibility_identity, validate_oci_launch_prerequisites,
+    OciExecutionBackend,
 };
 pub use plan::{
     map_host_path_into_runtime_mount, mount_source_for_target, runtime_native_home_mount_source,
     runtime_state_mount_source, ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan,
     EscapeClass, ExecutionLimits, ExecutionPreset, InstallPolicy, MountAccess, MountSpec,
-    NetworkMode, OciConfinementConfig, RuntimeAuthKind, RuntimeProgramSpec, WorkspaceAccess,
+    NetworkGrant, OciConfinementConfig, RuntimeAuthKind, RuntimeProgramSpec, WorkspaceAccess,
     DRAFTS_MOUNT_TARGET, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_INSTALL_ENV_DIR,
     RUNTIME_INSTALL_ENV_FILE, RUNTIME_INSTALL_ENV_PATH, RUNTIME_MOUNT_TARGET,
     WORKSPACE_MOUNT_TARGET,

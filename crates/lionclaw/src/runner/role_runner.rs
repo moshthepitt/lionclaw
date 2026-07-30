@@ -158,7 +158,7 @@ impl OciRoleRunner {
     pub(crate) async fn materialize_runtime_auth(
         &self,
         profile: &MissionRuntimeProfile,
-        network_mode: lionclaw_runtime_api::NetworkMode,
+        network: &crate::model::NetworkGrant,
         staging_root: PathBuf,
     ) -> anyhow::Result<RuntimeTurnAuth> {
         let registry = self.auth_registry(profile)?;
@@ -175,7 +175,7 @@ impl OciRoleRunner {
                 let materialization = provider
                     .prepare(RuntimeAuthPreparation {
                         runtime_id: &profile.name,
-                        network_mode,
+                        network,
                         auth_staging_root: Some(&staging_root),
                         host_context: &context,
                     })
@@ -538,11 +538,16 @@ impl RoleRunner for OciRoleRunner {
             .map_err(|e| launch(format!("failed to prepare role state dirs: {e}")))?;
         let authority = compile_authority(&request.role, &self.ceiling)
             .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
+        let auth_network = authority
+            .preset()
+            .network
+            .union(&profile.model_network)
+            .map_err(|err| launch(format!("runtime auth network grant is invalid: {err}")))?;
         let auth = await_controlled(
             Box::pin(async {
                 self.materialize_runtime_auth(
                     &profile,
-                    authority.preset().network_mode,
+                    &auth_network,
                     dirs.auth_staging().to_path_buf(),
                 )
                 .await
@@ -733,6 +738,7 @@ impl RoleRunner for OciRoleRunner {
             environment,
             resources: request.role.resources.clone(),
             resource_ceilings: &request.resource_ceilings,
+            runtime_network: profile.model_network.clone(),
         })
         .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
         let plan = compiled.plan().clone();

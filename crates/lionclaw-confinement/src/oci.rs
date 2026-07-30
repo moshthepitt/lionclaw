@@ -1,4 +1,9 @@
-use std::{fs, path::Path, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -16,7 +21,7 @@ use super::{
     },
     mount_validation::{podman_bind_mount_argument, PodmanBindMountArgumentForm},
     plan::{
-        map_host_path_into_runtime_mount, ConfinementBackend, MountAccess, MountSpec, NetworkMode,
+        map_host_path_into_runtime_mount, ConfinementBackend, MountAccess, MountSpec, NetworkGrant,
         RuntimeAuthKind,
     },
     process::{
@@ -34,6 +39,7 @@ pub struct OciExecutionBackend;
 pub struct OciExecutionSession {
     process: ProcessSession,
     runtime_secrets: Option<OciRuntimeSecretsSession>,
+    network: Option<OciNetworkSession>,
 }
 
 impl OciExecutionSession {
@@ -49,18 +55,12 @@ impl OciExecutionSession {
         let Self {
             process,
             runtime_secrets,
+            network,
         } = self;
         let result = process.wait().await;
-        let runtime_secrets_cleanup_result = match runtime_secrets {
-            Some(cleanup) => cleanup.shutdown().await,
-            None => Ok(()),
-        };
+        let cleanup_result = cleanup_runtime_resources(runtime_secrets, network).await;
 
-        finish_oci_execution(
-            result,
-            runtime_secrets_cleanup_result,
-            "interactive OCI runtime turn",
-        )
+        finish_oci_execution(result, cleanup_result, "interactive OCI runtime turn")
     }
 }
 
@@ -76,18 +76,33 @@ const RUNTIME_HOME_MOUNT_TARGET: &str = "/runtime/home";
 const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 const LIONCLAW_METADATA_DIR: &str = ".lionclaw";
 const WORKSPACE_LIONCLAW_METADATA_TMPFS: &str = "/workspace/.lionclaw:size=1m,mode=700,notmpcopyup";
+const NETWORK_PROXY_ALIAS: &str = "lionclaw-proxy";
+const NETWORK_PROXY_HTTP_PORT: u16 = 3128;
+const NETWORK_PROXY_SOCKS_PORT: u16 = 3129;
+const NETWORK_PROXY_BINARY_TARGET: &str = "/lionclaw/network-proxy";
 
 #[derive(Debug, Clone)]
 struct PreparedOciProcessLaunch {
     engine: String,
     args: Vec<String>,
     root_in_userns: bool,
-    network_mode: NetworkMode,
+    network: PreparedOciNetwork,
     environment: Vec<(String, String)>,
     image: String,
     program_executable: String,
     program_args: Vec<String>,
     stdin: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreparedOciNetwork {
+    Deny,
+    Proxy {
+        destinations: BTreeSet<lionclaw_runtime_api::Destination>,
+        network_name: String,
+        proxy_name: String,
+        proxy_binary: PathBuf,
+    },
 }
 
 #[async_trait]
@@ -118,11 +133,13 @@ impl ExecutionBackend for OciExecutionBackend {
                 .map(|secrets| secrets.secret_name.as_str()),
             &runtime_auth,
         )?;
+        let network = ensure_oci_network_registered(&prepared).await?;
         let invocation = build_oci_process_invocation(prepared, runtime_auth.environment());
         let process = spawn_process_session(&invocation).await?;
         Ok(ExecutionSession::Oci(OciExecutionSession {
             process,
             runtime_secrets,
+            network,
         }))
     }
 
@@ -136,19 +153,13 @@ impl ExecutionBackend for OciExecutionBackend {
                 .map(|secrets| secrets.secret_name.as_str()),
             &runtime_auth,
         )?;
+        let network = ensure_oci_network_registered(&prepared).await?;
         let invocation =
             build_oci_attached_process_invocation(prepared, runtime_auth.environment());
         let result = run_process_attached(&invocation).await;
-        let runtime_secrets_cleanup_result = match runtime_secrets {
-            Some(cleanup) => cleanup.shutdown().await,
-            None => Ok(()),
-        };
+        let cleanup_result = cleanup_runtime_resources(runtime_secrets, network).await;
 
-        finish_oci_execution(
-            result,
-            runtime_secrets_cleanup_result,
-            "attached OCI runtime",
-        )
+        finish_oci_execution(result, cleanup_result, "attached OCI runtime")
     }
 }
 
@@ -166,26 +177,39 @@ async fn execute_oci_process(
             .map(|secrets| secrets.secret_name.as_str()),
         &runtime_auth,
     )?;
+    let network = ensure_oci_network_registered(&prepared).await?;
     let invocation = build_oci_process_invocation(prepared, runtime_auth.environment());
     let result = run_process_streaming(&invocation, stdout.as_ref()).await;
+    let cleanup_result = cleanup_runtime_resources(runtime_secrets, network).await;
+
+    finish_oci_execution(result, cleanup_result, cleanup_context)
+}
+
+async fn cleanup_runtime_resources(
+    runtime_secrets: Option<OciRuntimeSecretsSession>,
+    network: Option<OciNetworkSession>,
+) -> Result<()> {
     let runtime_secrets_cleanup_result = match runtime_secrets {
         Some(cleanup) => cleanup.shutdown().await,
         None => Ok(()),
     };
-
-    finish_oci_execution(result, runtime_secrets_cleanup_result, cleanup_context)
+    let network_cleanup_result = match network {
+        Some(cleanup) => cleanup.shutdown().await,
+        None => Ok(()),
+    };
+    runtime_secrets_cleanup_result.and(network_cleanup_result)
 }
 
 fn finish_oci_execution(
     result: Result<ExecutionOutput>,
-    runtime_secrets_cleanup_result: Result<()>,
+    cleanup_result: Result<()>,
     context: &'static str,
 ) -> Result<ExecutionOutput> {
-    if let Err(err) = runtime_secrets_cleanup_result {
+    if let Err(err) = cleanup_result {
         warn!(
             error = %err,
             context,
-            "runtime secret cleanup failed after OCI runtime"
+            "OCI resource cleanup failed after runtime"
         );
     }
     result
@@ -240,14 +264,14 @@ pub async fn validate_oci_private_network_prerequisites(
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
         bail!(
-            "runtime '{runtime_id}' requires network-mode 'on', but OCI engine '{}' exited with {} while starting a private network on this host",
+            "runtime '{runtime_id}' requires destination-scoped OCI networking, but OCI engine '{}' exited with {} while starting a private network on this host",
             confinement.engine,
             output.status_description()
         );
     }
 
     bail!(
-        "runtime '{runtime_id}' requires network-mode 'on', but OCI engine '{}' could not start a private network on this host: {stderr}",
+        "runtime '{runtime_id}' requires destination-scoped OCI networking, but OCI engine '{}' could not start a private network on this host: {stderr}",
         confinement.engine
     )
 }
@@ -421,16 +445,43 @@ fn prepare_oci_process_launch_with_runtime_auth(
         args.push(pids_limit.to_string());
     }
 
+    let network = prepare_oci_network(&request.plan.network, request.resource_name.as_deref())?;
+
     Ok(PreparedOciProcessLaunch {
         engine: config.engine.clone(),
         args,
         root_in_userns: request.plan.root_in_userns,
-        network_mode: request.plan.network_mode,
+        network,
         environment,
         image: image.to_string(),
         program_executable: request.program.executable.clone(),
         program_args: request.program.args.clone(),
         stdin: request.program.stdin.clone(),
+    })
+}
+
+fn prepare_oci_network(
+    network: &NetworkGrant,
+    resource_name: Option<&str>,
+) -> Result<PreparedOciNetwork> {
+    let Some(destinations) = network.destinations() else {
+        return Ok(PreparedOciNetwork::Deny);
+    };
+    let resource_name = resource_name.ok_or_else(|| {
+        anyhow!("destination-scoped OCI network requires an effect resource name")
+    })?;
+    validate_oci_resource_name(resource_name)?;
+    let network_name = format!("{resource_name}-net");
+    let proxy_name = format!("{resource_name}-proxy");
+    validate_oci_resource_name(&network_name)?;
+    validate_oci_resource_name(&proxy_name)?;
+    let proxy_binary =
+        std::env::current_exe().context("resolving LionClaw network proxy binary")?;
+    Ok(PreparedOciNetwork::Proxy {
+        destinations: destinations.clone(),
+        network_name,
+        proxy_name,
+        proxy_binary,
     })
 }
 
@@ -578,19 +629,21 @@ fn build_oci_process_invocation_with_terminal(
 
     append_bind_mount_identity_args(&mut args, prepared.root_in_userns);
 
-    match prepared.network_mode {
-        NetworkMode::None => {
+    match &prepared.network {
+        PreparedOciNetwork::Deny => {
             args.push("--network".to_string());
             args.push("none".to_string());
         }
-        NetworkMode::On => {
+        PreparedOciNetwork::Proxy { network_name, .. } => {
             args.push("--network".to_string());
-            args.push("private".to_string());
+            args.push(network_name.clone());
         }
     }
 
     let runtime_auth_environment = merged_environment(&[], runtime_auth_environment);
-    let environment = merged_environment(&prepared.environment, &runtime_auth_environment);
+    let proxy_environment = network_proxy_environment(&prepared.network);
+    let plan_environment = merged_environment(&prepared.environment, &proxy_environment);
+    let environment = merged_environment(&plan_environment, &runtime_auth_environment);
     for (key, value) in environment {
         args.push("--env".to_string());
         if runtime_auth_environment
@@ -661,6 +714,186 @@ async fn ensure_runtime_secrets_registered(
     }
 
     bail!("failed to register OCI runtime secrets: {stderr}")
+}
+
+async fn ensure_oci_network_registered(
+    prepared: &PreparedOciProcessLaunch,
+) -> Result<Option<OciNetworkSession>> {
+    let PreparedOciNetwork::Proxy {
+        destinations,
+        network_name,
+        proxy_name,
+        proxy_binary,
+    } = &prepared.network
+    else {
+        return Ok(None);
+    };
+
+    let network = OciNetworkSession {
+        engine: prepared.engine.clone(),
+        network_name: network_name.clone(),
+        proxy_name: proxy_name.clone(),
+        cleanup: Some(OciNetworkCleanup {
+            engine: prepared.engine.clone(),
+            proxy_name: proxy_name.clone(),
+            network_name: network_name.clone(),
+        }),
+    };
+    network.create_network().await?;
+    let start_result = network
+        .start_proxy(&prepared.image, proxy_binary, destinations)
+        .await;
+    if let Err(error) = start_result {
+        if let Err(cleanup_error) = network.shutdown().await {
+            warn!(
+                error = %cleanup_error,
+                "failed to clean up OCI network after proxy launch failure"
+            );
+        }
+        return Err(error);
+    }
+    Ok(Some(network))
+}
+
+#[derive(Debug)]
+struct OciNetworkSession {
+    engine: String,
+    network_name: String,
+    proxy_name: String,
+    cleanup: Option<OciNetworkCleanup>,
+}
+
+impl OciNetworkSession {
+    async fn create_network(&self) -> Result<()> {
+        let output = run_oci_preflight_command(
+            &build_network_create_invocation(&self.engine, &self.network_name),
+            &format!("create OCI internal network '{}'", self.network_name),
+            OCI_PREFLIGHT_TIMEOUT,
+        )
+        .await?;
+        if output.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "failed to create OCI internal network '{}' ({}): {stderr}",
+            self.network_name,
+            output.status_description()
+        )
+    }
+
+    async fn start_proxy(
+        &self,
+        image: &str,
+        proxy_binary: &Path,
+        destinations: &BTreeSet<lionclaw_runtime_api::Destination>,
+    ) -> Result<()> {
+        let output = run_oci_preflight_command(
+            &build_network_proxy_invocation(
+                &self.engine,
+                &self.network_name,
+                &self.proxy_name,
+                image,
+                proxy_binary,
+                destinations,
+            )?,
+            &format!("start OCI network proxy '{}'", self.proxy_name),
+            OCI_PREFLIGHT_TIMEOUT,
+        )
+        .await?;
+        if output.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "failed to start OCI network proxy '{}' ({}): {stderr}",
+            self.proxy_name,
+            output.status_description()
+        )
+    }
+
+    async fn shutdown(mut self) -> Result<()> {
+        let Some(cleanup) = self.cleanup.take() else {
+            return Ok(());
+        };
+        cleanup.remove().await
+    }
+}
+
+impl Drop for OciNetworkSession {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.spawn();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OciNetworkCleanup {
+    engine: String,
+    proxy_name: String,
+    network_name: String,
+}
+
+impl OciNetworkCleanup {
+    async fn remove(&self) -> Result<()> {
+        let container = remove_oci_container(&self.engine, &self.proxy_name).await;
+        let network = remove_oci_network(&self.engine, &self.network_name).await;
+        container.and(network)
+    }
+
+    fn spawn(self) {
+        if let Ok(handle) = Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = remove_oci_container(&self.engine, &self.proxy_name).await {
+                    warn!(?error, "failed to clean up OCI network proxy container");
+                }
+                if let Err(error) = remove_oci_network(&self.engine, &self.network_name).await {
+                    warn!(?error, "failed to clean up OCI internal network");
+                }
+            });
+            return;
+        }
+
+        std::thread::spawn(move || {
+            match std::process::Command::new(&self.engine)
+                .args(["rm", "--force", "--ignore", &self.proxy_name])
+                .status()
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => warn!(
+                    engine = %self.engine,
+                    proxy_name = %self.proxy_name,
+                    status = %status,
+                    "OCI network proxy cleanup command failed"
+                ),
+                Err(error) => warn!(
+                    ?error,
+                    engine = %self.engine,
+                    proxy_name = %self.proxy_name,
+                    "failed to run OCI network proxy cleanup command"
+                ),
+            }
+            match std::process::Command::new(&self.engine)
+                .args(["network", "rm", "--force", &self.network_name])
+                .status()
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => warn!(
+                    engine = %self.engine,
+                    network_name = %self.network_name,
+                    status = %status,
+                    "OCI network cleanup command failed"
+                ),
+                Err(error) => warn!(
+                    ?error,
+                    engine = %self.engine,
+                    network_name = %self.network_name,
+                    "failed to run OCI network cleanup command"
+                ),
+            }
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -802,6 +1035,72 @@ fn build_runtime_secret_remove_invocation(engine: &str, secret_name: &str) -> Pr
     }
 }
 
+fn build_network_create_invocation(engine: &str, network_name: &str) -> ProcessInvocation {
+    ProcessInvocation {
+        executable: engine.to_string(),
+        args: vec![
+            "network".to_string(),
+            "create".to_string(),
+            "--internal".to_string(),
+            network_name.to_string(),
+        ],
+        working_dir: None,
+        environment: Vec::new(),
+        input: String::new(),
+    }
+}
+
+fn build_network_proxy_invocation(
+    engine: &str,
+    network_name: &str,
+    proxy_name: &str,
+    image: &str,
+    proxy_binary: &Path,
+    destinations: &BTreeSet<lionclaw_runtime_api::Destination>,
+) -> Result<ProcessInvocation> {
+    let proxy_mount = MountSpec {
+        source: proxy_binary.to_path_buf(),
+        target: NETWORK_PROXY_BINARY_TARGET.to_string(),
+        access: MountAccess::ReadOnly,
+    };
+    let (mount_flag, mount_spec) =
+        format_bind_mount_arg_with_relabel(&proxy_mount, BindMountRelabel::Private)?;
+    let mut args = vec![
+        "run".to_string(),
+        "--detach".to_string(),
+        "--rm".to_string(),
+        "--pull=never".to_string(),
+        "--name".to_string(),
+        proxy_name.to_string(),
+        "--network".to_string(),
+        format!("{network_name}:alias={NETWORK_PROXY_ALIAS}"),
+        "--network".to_string(),
+        "private".to_string(),
+        mount_flag.to_string(),
+        mount_spec,
+        image.to_string(),
+        NETWORK_PROXY_BINARY_TARGET.to_string(),
+        "__network-proxy".to_string(),
+        "--http".to_string(),
+        format!("0.0.0.0:{NETWORK_PROXY_HTTP_PORT}"),
+        "--socks".to_string(),
+        format!("0.0.0.0:{NETWORK_PROXY_SOCKS_PORT}"),
+    ];
+    for destination in destinations {
+        for port in destination.ports() {
+            args.push("--allow".to_string());
+            args.push(format!("{}:{port}", destination.host()));
+        }
+    }
+    Ok(ProcessInvocation {
+        executable: engine.to_string(),
+        args,
+        working_dir: None,
+        environment: Vec::new(),
+        input: String::new(),
+    })
+}
+
 /// Remove a named OCI container. Absence is success, making this suitable for
 /// crash recovery and unconditional cleanup.
 pub async fn remove_oci_container(engine: &str, name: &str) -> Result<()> {
@@ -822,6 +1121,18 @@ pub async fn remove_oci_secret(engine: &str, name: &str) -> Result<()> {
         name,
         vec!["secret", "rm", "--ignore", name],
         "secret",
+    )
+    .await
+}
+
+/// Remove a named OCI network. Absence is success, making this suitable for
+/// crash recovery and unconditional cleanup.
+pub async fn remove_oci_network(engine: &str, name: &str) -> Result<()> {
+    remove_oci_resource(
+        engine,
+        name,
+        vec!["network", "rm", "--force", name],
+        "network",
     )
     .await
 }
@@ -1010,11 +1321,37 @@ fn merged_environment(
     merged
 }
 
+fn network_proxy_environment(network: &PreparedOciNetwork) -> Vec<(String, String)> {
+    if matches!(network, PreparedOciNetwork::Deny) {
+        return Vec::new();
+    }
+    let http = format!("http://{NETWORK_PROXY_ALIAS}:{NETWORK_PROXY_HTTP_PORT}");
+    let socks = format!("socks5://{NETWORK_PROXY_ALIAS}:{NETWORK_PROXY_SOCKS_PORT}");
+    [
+        ("HTTP_PROXY".to_string(), http.clone()),
+        ("HTTPS_PROXY".to_string(), http.clone()),
+        ("http_proxy".to_string(), http.clone()),
+        ("https_proxy".to_string(), http),
+        ("ALL_PROXY".to_string(), socks.clone()),
+        ("all_proxy".to_string(), socks),
+        (
+            "NO_PROXY".to_string(),
+            "localhost,127.0.0.1,::1".to_string(),
+        ),
+        (
+            "no_proxy".to_string(),
+            "localhost,127.0.0.1,::1".to_string(),
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
     #[cfg(unix)]
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    use std::{collections::BTreeSet, fs, path::Path};
 
     use super::{
         build_oci_attached_process_invocation, build_oci_process_invocation,
@@ -1025,7 +1362,7 @@ mod tests {
     use crate::runtime_auth::PreparedRuntimeAuth;
     use crate::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest,
-        InstallPolicy, NetworkMode, OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount,
+        InstallPolicy, NetworkGrant, OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount,
         WorkspaceAccess,
     };
     use crate::{MountAccess, MountSpec};
@@ -1306,7 +1643,7 @@ mod tests {
         assert!(invocation
             .args
             .windows(2)
-            .any(|pair| pair == ["--network".to_string(), "private".to_string()]));
+            .any(|pair| pair == ["--network".to_string(), "none".to_string()]));
     }
 
     #[cfg(unix)]
@@ -1508,7 +1845,7 @@ mod tests {
     #[test]
     fn oci_backend_adds_none_network_flag() {
         let mut plan = sample_plan();
-        plan.network_mode = NetworkMode::None;
+        plan.network = NetworkGrant::Deny;
 
         let request = ExecutionRequest {
             plan,
@@ -1588,11 +1925,13 @@ mod tests {
     }
 
     #[test]
-    fn oci_backend_adds_private_network_flag_for_on_mode() {
+    fn oci_backend_adds_internal_network_and_proxy_env_for_destination_grant() {
+        let mut plan = sample_plan();
+        plan.network = NetworkGrant::allow_single("api.openai.com", 443).unwrap();
         let request = ExecutionRequest {
-            plan: sample_plan(),
+            plan,
             program: RuntimeProgramSpec::default(),
-            resource_name: None,
+            resource_name: Some("lionclaw-effect-0123456789abcdef".to_string()),
             runtime_secrets_mount: None,
             auth_staging_root: None,
             runtime_auth: None,
@@ -1603,10 +1942,114 @@ mod tests {
             &[],
         );
 
-        assert!(invocation
+        assert!(invocation.args.windows(2).any(|pair| pair
+            == [
+                "--network".to_string(),
+                "lionclaw-effect-0123456789abcdef-net".to_string()
+            ]));
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--env".to_string(),
+                "HTTPS_PROXY=http://lionclaw-proxy:3128".to_string(),
+            ]
+        }));
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--env".to_string(),
+                "ALL_PROXY=socks5://lionclaw-proxy:3129".to_string(),
+            ]
+        }));
+    }
+
+    #[test]
+    fn oci_backend_rejects_destination_grant_without_effect_resource_name() {
+        let mut plan = sample_plan();
+        plan.network = NetworkGrant::allow_single("api.openai.com", 443).unwrap();
+        let request = ExecutionRequest {
+            plan,
+            program: RuntimeProgramSpec::default(),
+            resource_name: None,
+            runtime_secrets_mount: None,
+            auth_staging_root: None,
+            runtime_auth: None,
+        };
+
+        let err = prepare_oci_process_launch(&request, None).expect_err("resource name required");
+
+        assert!(err
+            .to_string()
+            .contains("destination-scoped OCI network requires an effect resource name"));
+    }
+
+    #[test]
+    fn oci_backend_builds_internal_network_and_dual_homed_proxy_invocations() {
+        let destinations = BTreeSet::from([
+            lionclaw_runtime_api::Destination::single("api.openai.com", 443).unwrap(),
+            lionclaw_runtime_api::Destination::single("auth.openai.com", 443).unwrap(),
+        ]);
+
+        let network = super::build_network_create_invocation("podman", "effect-net");
+        assert_eq!(network.executable, "podman");
+        assert_eq!(
+            network.args,
+            [
+                "network".to_string(),
+                "create".to_string(),
+                "--internal".to_string(),
+                "effect-net".to_string(),
+            ]
+        );
+
+        let proxy = super::build_network_proxy_invocation(
+            "podman",
+            "effect-net",
+            "effect-proxy",
+            "localhost/lionclaw-runtime:v1",
+            Path::new("/usr/local/bin/lionclaw"),
+            &destinations,
+        )
+        .expect("proxy invocation");
+
+        assert!(proxy.args.windows(2).any(|pair| {
+            pair == [
+                "--network".to_string(),
+                "effect-net:alias=lionclaw-proxy".to_string(),
+            ]
+        }));
+        assert!(proxy
             .args
             .windows(2)
-            .any(|pair| { pair == ["--network".to_string(), "private".to_string()] }));
+            .any(|pair| pair == ["--network".to_string(), "private".to_string()]));
+        assert!(proxy.args.iter().any(|arg| {
+            arg.contains("/usr/local/bin/lionclaw:/lionclaw/network-proxy:ro")
+                || arg.contains("src=/usr/local/bin/lionclaw,target=/lionclaw/network-proxy")
+        }));
+        let image = proxy
+            .args
+            .iter()
+            .position(|arg| arg == "localhost/lionclaw-runtime:v1")
+            .expect("image");
+        assert_eq!(
+            &proxy.args[image..image + 8],
+            &[
+                "localhost/lionclaw-runtime:v1".to_string(),
+                "/lionclaw/network-proxy".to_string(),
+                "__network-proxy".to_string(),
+                "--http".to_string(),
+                "0.0.0.0:3128".to_string(),
+                "--socks".to_string(),
+                "0.0.0.0:3129".to_string(),
+                "--allow".to_string(),
+            ]
+        );
+        assert!(proxy
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--allow".to_string(), "api.openai.com:443".to_string()]));
+        assert!(proxy
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--allow".to_string(), "auth.openai.com:443".to_string()]));
     }
 
     #[test]
@@ -1667,8 +2110,8 @@ mod tests {
             invocation
                 .args
                 .windows(2)
-                .any(|pair| { pair == ["--network".to_string(), "private".to_string()] }),
-            "direct runtime launch should keep explicit network wiring"
+                .any(|pair| pair == ["--network".to_string(), "none".to_string()]),
+            "runtime auth launch without destinations should have no egress"
         );
     }
 
@@ -1923,7 +2366,7 @@ esac
                 },
             }),
             workspace_access: WorkspaceAccess::ReadWrite,
-            network_mode: NetworkMode::On,
+            network: NetworkGrant::Deny,
             install_policy: InstallPolicy::User,
             root_in_userns: false,
             working_dir: Some("/host/workspace/src".to_string()),

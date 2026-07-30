@@ -10,9 +10,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
+#[cfg(test)]
+use lionclaw_runtime_api::NetworkGrant;
 use lionclaw_runtime_api::{
-    NetworkMode, RuntimeAuthContext, RuntimeAuthIdentity, RuntimeAuthKind,
-    RuntimeAuthMaterialization, RuntimeAuthPreparation, RuntimeAuthProjection, RuntimeAuthProvider,
+    RuntimeAuthContext, RuntimeAuthIdentity, RuntimeAuthKind, RuntimeAuthMaterialization,
+    RuntimeAuthPreparation, RuntimeAuthProjection, RuntimeAuthProvider,
     RuntimeCredentialProjection, MAX_RUNTIME_CREDENTIAL_BYTES,
 };
 use reqwest::StatusCode;
@@ -50,7 +52,7 @@ impl RuntimeAuthProvider for CodexRuntimeAuthProvider {
     ) -> Result<RuntimeAuthMaterialization> {
         prepare_codex_runtime_auth(
             input.runtime_id,
-            input.network_mode == NetworkMode::On,
+            !input.network.is_denied(),
             input.auth_staging_root,
             codex_home_override(input.host_context),
         )
@@ -208,7 +210,7 @@ async fn prepare_codex_runtime_auth(
 ) -> Result<RuntimeAuthMaterialization> {
     if !network_enabled {
         bail!(
-            "runtime '{runtime_id}' requires network-mode 'on' when Codex runtime auth is enabled"
+            "runtime '{runtime_id}' requires explicit model-provider network destinations when Codex runtime auth is enabled"
         );
     }
 
@@ -551,10 +553,11 @@ mod tests {
     ) -> Result<RuntimeAuthMaterialization> {
         let context = RuntimeAuthContext::new()
             .with_home_override(crate::CODEX_RUNTIME_AUTH_KIND, codex_home);
+        let network = NetworkGrant::allow_single("api.openai.com", 443).unwrap();
         CodexRuntimeAuthProvider
             .prepare(RuntimeAuthPreparation {
                 runtime_id: "codex",
-                network_mode: NetworkMode::On,
+                network: &network,
                 auth_staging_root: Some(staging),
                 host_context: &context,
             })

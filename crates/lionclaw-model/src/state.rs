@@ -1068,7 +1068,9 @@ fn role_instrument_digest(role: &super::RoleInstance) -> String {
     digest.str("instructions", &role.instructions);
     digest.map("environment", role.environment.iter());
     digest.bool("grants.secrets", role.grants.secrets);
-    digest.bool("grants.network", role.grants.network);
+    role.grants
+        .network
+        .feed_digest(&mut digest, "grants.network");
     digest.bool("grants.install", role.grants.install);
     digest.bool("grants.writes", role.grants.writes);
     digest.set("grants.devices", role.grants.devices.iter());

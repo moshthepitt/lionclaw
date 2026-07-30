@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{ids::lowercase_hex, AssertionId, InputName, OutputSemantics, RoleInstanceId, TaskId};
+use super::{
+    ids::lowercase_hex, AssertionId, InputName, NetworkGrant, OutputSemantics, RoleInstanceId,
+    TaskId,
+};
 use crate::prelude::*;
 
 pub const MAX_GUIDANCE_BYTES: usize = 64 * 1024;
@@ -45,7 +48,7 @@ pub struct AuthorityGrants {
     #[serde(default)]
     pub secrets: bool,
     #[serde(default)]
-    pub network: bool,
+    pub network: NetworkGrant,
     #[serde(default)]
     pub install: bool,
     #[serde(default)]
@@ -62,7 +65,7 @@ pub struct AuthorityCeilings {
     #[serde(default)]
     pub secrets: bool,
     #[serde(default)]
-    pub network: bool,
+    pub network: NetworkGrant,
     #[serde(default)]
     pub install: bool,
     #[serde(default)]
@@ -76,7 +79,7 @@ pub struct AuthorityCeilings {
 impl AuthorityGrants {
     pub fn within(&self, ceilings: &AuthorityCeilings) -> bool {
         (!self.secrets || ceilings.secrets)
-            && (!self.network || ceilings.network)
+            && self.network.within(&ceilings.network)
             && (!self.install || ceilings.install)
             && (!self.writes || ceilings.writes)
             && self.devices.is_subset(&ceilings.devices)

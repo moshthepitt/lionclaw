@@ -2,7 +2,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
-use crate::program::NetworkMode;
+use crate::NetworkGrant;
 use crate::RuntimeStateDir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +14,7 @@ pub struct RuntimeMcpServerSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionContext {
-    pub network_mode: NetworkMode,
+    pub network: NetworkGrant,
     /// Runtime-visible current working directory for program-backed turns.
     pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
@@ -200,7 +200,7 @@ mod tests {
         )
         .unwrap();
         let mut context = RuntimeExecutionContext {
-            network_mode: NetworkMode::None,
+            network: NetworkGrant::Deny,
             working_dir: None,
             environment: Vec::new(),
             runtime_state: Some(runtime_state),

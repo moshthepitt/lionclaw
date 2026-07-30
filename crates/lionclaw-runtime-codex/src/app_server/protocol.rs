@@ -1,4 +1,4 @@
-use lionclaw_runtime_api::{NetworkMode, TypedFailure};
+use lionclaw_runtime_api::{NetworkGrant, TypedFailure};
 use serde_json::{json, Value};
 
 use super::event_mapping::app_server_error_text;
@@ -87,7 +87,7 @@ pub(crate) fn turn_start_params(
     thread_id: &str,
     prompt: &str,
     model: Option<&str>,
-    network_mode: NetworkMode,
+    network: &NetworkGrant,
 ) -> Value {
     let mut params = json!({
         "threadId": thread_id,
@@ -100,10 +100,7 @@ pub(crate) fn turn_start_params(
         "approvalPolicy": "never",
         "sandboxPolicy": {
             "type": "externalSandbox",
-            "networkAccess": match network_mode {
-                NetworkMode::On => "enabled",
-                NetworkMode::None => "restricted",
-            },
+            "networkAccess": if network.is_denied() { "restricted" } else { "enabled" },
         },
     });
     insert_optional_model(&mut params, model);

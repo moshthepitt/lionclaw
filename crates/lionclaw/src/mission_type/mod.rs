@@ -6,7 +6,7 @@
 //! <domain>/
 //! ├─ mission.toml            # identity + the honesty bar (stop)
 //! ├─ playbook.md             # required mission-specific method
-//! ├─ roles/<name>.md         # frontmatter (output, network, secrets, runtime) + prompt
+//! ├─ roles/<name>.md         # frontmatter (output, destination grant, secrets, runtime) + prompt
 //! ├─ skills/<name>/SKILL.md   # optional role skills and their resources
 //! ├─ inputs/<name>            # optional prepared-input program
 //! ```
@@ -38,8 +38,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::model::{
-    validate_environment_entry, AuthorityCeilings, ConfinementResources, InputName, StopBar,
-    TeamRevision,
+    validate_environment_entry, AuthorityCeilings, ConfinementResources, InputName, NetworkGrant,
+    StopBar, TeamRevision,
 };
 
 /// Aggregate program and declared-key content admitted to one prepared-input
@@ -78,7 +78,7 @@ pub struct SkillPackage {
 pub struct PreparedInput {
     pub name: InputName,
     pub program: PathBuf,
-    pub network: bool,
+    pub network: NetworkGrant,
     pub key_files: Vec<PathBuf>,
     pub environment: BTreeMap<String, String>,
 }

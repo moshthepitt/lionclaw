@@ -9,7 +9,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::program::NetworkMode;
+use crate::NetworkGrant;
 
 pub const MAX_RUNTIME_CREDENTIAL_BYTES: usize = 1024 * 1024;
 /// Provider-neutral headroom over the four-file built-in native-home profile.
@@ -106,7 +106,7 @@ impl RuntimeAuthContext {
 
 pub struct RuntimeAuthPreparation<'a> {
     pub runtime_id: &'a str,
-    pub network_mode: NetworkMode,
+    pub network: &'a NetworkGrant,
     pub auth_staging_root: Option<&'a Path>,
     pub host_context: &'a RuntimeAuthContext,
 }

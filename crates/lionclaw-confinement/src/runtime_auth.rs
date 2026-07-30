@@ -586,7 +586,7 @@ mod tests {
     use super::*;
     use crate::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, MountAccess, MountSpec,
-        NetworkMode, OciConfinementConfig, RuntimeAuthKind, RuntimeProgramSpec, WorkspaceAccess,
+        NetworkGrant, OciConfinementConfig, RuntimeAuthKind, RuntimeProgramSpec, WorkspaceAccess,
     };
 
     const TEST_AUTH_KIND: &str = "test-auth";
@@ -600,7 +600,7 @@ mod tests {
     }
 
     fn sample_request(
-        network_mode: NetworkMode,
+        network: NetworkGrant,
         staging_root: Option<PathBuf>,
         credential: bool,
     ) -> ExecutionRequest {
@@ -621,7 +621,7 @@ mod tests {
                 preset_name: "everyday".to_string(),
                 confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
                 workspace_access: WorkspaceAccess::ReadWrite,
-                network_mode,
+                network,
                 install_policy: crate::InstallPolicy::User,
                 root_in_userns: false,
                 working_dir: None,
@@ -716,8 +716,11 @@ mod tests {
     #[test]
     fn materialized_auth_kind_must_match_the_program_contract() {
         let staging = tempfile::tempdir().unwrap();
-        let mut request =
-            sample_request(NetworkMode::None, Some(staging.path().to_path_buf()), false);
+        let mut request = sample_request(
+            NetworkGrant::Deny,
+            Some(staging.path().to_path_buf()),
+            false,
+        );
         request.runtime_auth = Some(RuntimeAuthMaterialization::new(
             RuntimeAuthKind::from_static("different-auth"),
             RuntimeAuthIdentity::new("test-principal").unwrap(),
@@ -736,7 +739,11 @@ mod tests {
     fn validates_and_maps_exact_staged_credentials_under_native_home() {
         let staging = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let mut request = sample_request(NetworkMode::On, Some(staging.path().to_path_buf()), true);
+        let mut request = sample_request(
+            NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+            Some(staging.path().to_path_buf()),
+            true,
+        );
         set_runtime_home_source(&mut request, home.path());
         let prepared = prepare_runtime_auth(&request).expect("prepared auth");
 
@@ -777,8 +784,11 @@ mod tests {
     fn rejects_projection_count_before_staged_validation_or_mountpoint_creation() {
         let staging = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let mut request =
-            sample_request(NetworkMode::On, Some(staging.path().to_path_buf()), false);
+        let mut request = sample_request(
+            NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+            Some(staging.path().to_path_buf()),
+            false,
+        );
         set_runtime_home_source(&mut request, home.path());
 
         let error = validate_projection(
@@ -817,8 +827,11 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let sizes = vec![MAX_RUNTIME_CREDENTIAL_BYTES; full_sized_count];
             write_sized_staged_credentials(staging.path(), &sizes);
-            let mut request =
-                sample_request(NetworkMode::On, Some(staging.path().to_path_buf()), false);
+            let mut request = sample_request(
+                NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+                Some(staging.path().to_path_buf()),
+                false,
+            );
             set_runtime_home_source(&mut request, home.path());
 
             let prepared = validate_projection(&request, numbered_projection(full_sized_count))
@@ -831,8 +844,11 @@ mod tests {
         let mut sizes = vec![MAX_RUNTIME_CREDENTIAL_BYTES; full_sized_count];
         sizes.push(1);
         write_sized_staged_credentials(staging.path(), &sizes);
-        let mut request =
-            sample_request(NetworkMode::On, Some(staging.path().to_path_buf()), false);
+        let mut request = sample_request(
+            NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+            Some(staging.path().to_path_buf()),
+            false,
+        );
         set_runtime_home_source(&mut request, home.path());
 
         let error = validate_projection(&request, numbered_projection(sizes.len()))
@@ -857,8 +873,11 @@ mod tests {
         let staging = tempfile::tempdir().unwrap();
         write_staged_credentials(staging.path(), &["credential"]);
 
-        let mut missing =
-            sample_request(NetworkMode::On, Some(staging.path().to_path_buf()), false);
+        let mut missing = sample_request(
+            NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+            Some(staging.path().to_path_buf()),
+            false,
+        );
         missing
             .plan
             .mounts
@@ -876,8 +895,11 @@ mod tests {
             .to_string()
             .contains("exactly one canonical '/runtime/home'"));
 
-        let mut duplicate =
-            sample_request(NetworkMode::On, Some(staging.path().to_path_buf()), false);
+        let mut duplicate = sample_request(
+            NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+            Some(staging.path().to_path_buf()),
+            false,
+        );
         duplicate.plan.mounts.push(MountSpec {
             source: "/tmp/other-home".into(),
             target: RUNTIME_HOME_MOUNT_TARGET.to_string(),
@@ -898,7 +920,11 @@ mod tests {
     fn rejects_overlapping_credential_and_nested_plan_targets() {
         let staging = tempfile::tempdir().unwrap();
         write_staged_credentials(staging.path(), &["first", "second"]);
-        let request = sample_request(NetworkMode::On, Some(staging.path().to_path_buf()), false);
+        let request = sample_request(
+            NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+            Some(staging.path().to_path_buf()),
+            false,
+        );
         let error = validate_projection(
             &request,
             projection(&[("first", ".agent"), ("second", ".agent/auth.json")]),
@@ -913,8 +939,11 @@ mod tests {
             "/runtime/home/.agent/auth.json/nested",
             "/runtime//home",
         ] {
-            let mut request =
-                sample_request(NetworkMode::On, Some(staging.path().to_path_buf()), false);
+            let mut request = sample_request(
+                NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+                Some(staging.path().to_path_buf()),
+                false,
+            );
             request.plan.mounts.push(MountSpec {
                 source: "/tmp/competing-mount".into(),
                 target: plan_target.to_string(),
@@ -927,8 +956,11 @@ mod tests {
         }
 
         let home = tempfile::tempdir().unwrap();
-        let mut disjoint =
-            sample_request(NetworkMode::On, Some(staging.path().to_path_buf()), false);
+        let mut disjoint = sample_request(
+            NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+            Some(staging.path().to_path_buf()),
+            false,
+        );
         set_runtime_home_source(&mut disjoint, home.path());
         disjoint.plan.mounts.push(MountSpec {
             source: "/tmp/disjoint-mount".into(),
@@ -951,7 +983,11 @@ mod tests {
             Vec::new(),
             vec![RuntimeCredentialProjection::new("credential", ".agent/auth.json").unwrap()],
         );
-        let request = sample_request(NetworkMode::On, Some(staging.path().to_path_buf()), false);
+        let request = sample_request(
+            NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+            Some(staging.path().to_path_buf()),
+            false,
+        );
         let err = validate_projection(&request, projection)
             .err()
             .expect("symlinked credential must fail");
@@ -995,8 +1031,11 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::create_dir(outside.path().join("home")).unwrap();
         symlink(outside.path(), parent.path().join("linked")).unwrap();
-        let mut request =
-            sample_request(NetworkMode::On, Some(staging.path().to_path_buf()), false);
+        let mut request = sample_request(
+            NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+            Some(staging.path().to_path_buf()),
+            false,
+        );
         set_runtime_home_source(&mut request, &parent.path().join("linked/home"));
         let error =
             validate_projection(&request, projection(&[("credential", ".agent/auth.json")]))
@@ -1053,9 +1092,13 @@ mod tests {
         let staging = parent.path().join("auth-staging");
         symlink(outside.path(), &staging).unwrap();
 
-        let err = prepare_runtime_auth(&sample_request(NetworkMode::On, Some(staging), false))
-            .err()
-            .expect("symlinked root must fail");
+        let err = prepare_runtime_auth(&sample_request(
+            NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
+            Some(staging),
+            false,
+        ))
+        .err()
+        .expect("symlinked root must fail");
 
         assert!(format!("{err:#}").contains("exact real directory"));
         assert!(!outside.path().join("credential").exists());

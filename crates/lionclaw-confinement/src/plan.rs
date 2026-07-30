@@ -7,7 +7,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
-pub use lionclaw_runtime_api::{NetworkMode, RuntimeAuthKind, RuntimeProgramSpec};
+pub use lionclaw_runtime_api::{Destination, NetworkGrant, RuntimeAuthKind, RuntimeProgramSpec};
 
 pub const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
 pub const RUNTIME_MOUNT_TARGET: &str = "/runtime";
@@ -79,10 +79,10 @@ fn strip_mount_prefix(requested: &Path, source: &Path) -> Option<PathBuf> {
 
 /// User-facing coarse execution preset compiled before a turn starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ExecutionPreset {
     pub workspace_access: WorkspaceAccess,
-    pub network_mode: NetworkMode,
+    pub network: NetworkGrant,
     #[serde(default)]
     pub install_policy: InstallPolicy,
     #[serde(default)]
@@ -95,7 +95,7 @@ impl Default for ExecutionPreset {
     fn default() -> Self {
         Self {
             workspace_access: WorkspaceAccess::ReadWrite,
-            network_mode: NetworkMode::On,
+            network: NetworkGrant::Deny,
             install_policy: InstallPolicy::User,
             mount_runtime_secrets: false,
             escape_classes: BTreeSet::new(),
@@ -278,7 +278,7 @@ pub struct EffectiveExecutionPlan {
     pub preset_name: String,
     pub confinement: ConfinementConfig,
     pub workspace_access: WorkspaceAccess,
-    pub network_mode: NetworkMode,
+    pub network: NetworkGrant,
     pub install_policy: InstallPolicy,
     pub root_in_userns: bool,
     pub working_dir: Option<String>,
@@ -298,7 +298,7 @@ impl fmt::Debug for EffectiveExecutionPlan {
             .field("preset_name", &self.preset_name)
             .field("confinement", &self.confinement)
             .field("workspace_access", &self.workspace_access)
-            .field("network_mode", &self.network_mode)
+            .field("network", &self.network)
             .field("install_policy", &self.install_policy)
             .field("root_in_userns", &self.root_in_userns)
             .field("working_dir", &self.working_dir)
@@ -319,14 +319,14 @@ mod tests {
 
     use super::{
         ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionLimits, ExecutionPreset,
-        InstallPolicy, NetworkMode, OciConfinementConfig, WorkspaceAccess,
+        InstallPolicy, NetworkGrant, OciConfinementConfig, WorkspaceAccess,
     };
 
     #[test]
     fn execution_preset_round_trips_without_embedded_name() {
         let preset = ExecutionPreset {
             workspace_access: WorkspaceAccess::ReadWrite,
-            network_mode: NetworkMode::On,
+            network: NetworkGrant::allow_single("api.openai.com", 443).unwrap(),
             install_policy: InstallPolicy::User,
             mount_runtime_secrets: true,
             escape_classes: [EscapeClass::SecretRequest].into_iter().collect(),
@@ -381,23 +381,23 @@ mod tests {
     }
 
     #[test]
-    fn execution_preset_rejects_allowlist_network_mode() {
+    fn execution_preset_rejects_legacy_network_mode() {
         let err = serde_json::from_value::<ExecutionPreset>(json!({
             "workspace-access": "read-write",
             "network-mode": "allowlist",
             "mount-runtime-secrets": false
         }))
-        .expect_err("allowlist network mode should be rejected");
+        .expect_err("legacy network mode field should be rejected");
 
-        assert!(err.to_string().contains("unknown variant"));
-        assert!(err.to_string().contains("allowlist"));
+        assert!(err.to_string().contains("unknown field"));
+        assert!(err.to_string().contains("network-mode"));
     }
 
     #[test]
     fn install_policy_defaults_to_user_and_uses_kebab_case_values() {
         let defaulted: ExecutionPreset = serde_json::from_value(json!({
             "workspace-access": "read-write",
-            "network-mode": "on",
+            "network": {"mode": "deny"},
             "mount-runtime-secrets": false
         }))
         .expect("deserialize preset without install policy");
@@ -410,7 +410,7 @@ mod tests {
         ] {
             let preset = ExecutionPreset {
                 workspace_access: WorkspaceAccess::ReadWrite,
-                network_mode: NetworkMode::On,
+                network: NetworkGrant::Deny,
                 mount_runtime_secrets: false,
                 escape_classes: Default::default(),
                 install_policy: expected,
@@ -428,7 +428,7 @@ mod tests {
 
         let err = serde_json::from_value::<ExecutionPreset>(json!({
             "workspace-access": "read-write",
-            "network-mode": "on",
+            "network": {"mode": "deny"},
             "install-policy": "global"
         }))
         .expect_err("invalid install policy should be rejected");
@@ -463,7 +463,7 @@ mod tests {
                 preset_name: "team-local".to_string(),
                 confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
                 workspace_access: WorkspaceAccess::ReadWrite,
-                network_mode: NetworkMode::On,
+                network: NetworkGrant::Deny,
                 install_policy: InstallPolicy::User,
                 root_in_userns: false,
                 working_dir: None,
