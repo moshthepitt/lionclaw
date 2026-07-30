@@ -1,18 +1,15 @@
 [mission-type]
-name = "metric-driven"
+name = "research"
 stop = "attested"
 image = "localhost/lionclaw-runtime-dev:v1"
 
 [team]
-planning-assignment = "metric-planner"
-gap-review-assignment = "gap-reviewer"
-requires-gap-review = true
+planning-assignment = "planner"
+requires-gap-review = false
 
 [ceilings]
 network = true
-install = true
 writes = true
-devices = ["/dev/dri"]
 
 [recovery]
 max-attempts = 3
@@ -21,6 +18,6 @@ max-attempts = 3
 default-timeout-secs = 1800
 max-task-time-secs = 3600
 extension-step-secs = 600
-effect-capacity = 4
+effect-capacity = 3
 auto-continue-candidate = false
 auto-continue-proof = false

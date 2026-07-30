@@ -68,13 +68,24 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         mission_types.sort();
-        assert_eq!(mission_types, ["metric-driven", "software-dev"]);
+        assert_eq!(
+            mission_types,
+            [
+                "design",
+                "optimization",
+                "research",
+                "review",
+                "software-dev"
+            ]
+        );
 
         let root = bundle.root().join("software-dev");
         assert!(root.join("mission.toml").is_file());
         assert!(root.join("skills/scrutiny-validator/SKILL.md").is_file());
-        let metric_root = bundle.root().join("metric-driven");
-        assert!(metric_root.join("mission.toml").is_file());
+        for name in ["design", "optimization", "research", "review"] {
+            assert!(bundle.root().join(name).join("mission.toml").is_file());
+        }
+        assert!(!bundle.root().join("metric-driven").exists());
 
         let playbook = std::fs::metadata(root.join("playbook.md")).unwrap();
         assert_eq!(playbook.permissions().mode() & 0o111, 0);

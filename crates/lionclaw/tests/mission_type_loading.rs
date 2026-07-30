@@ -52,10 +52,10 @@ fn software_dev_mission_type_loads() {
     );
     assert_eq!(
         mission_type.resource_ceilings.tmpfs,
-        ["/tmp:rw,size=2g".to_string()]
+        ["/tmp:rw,size=1g".to_string()]
     );
     let planner = &mission_type.default_team.planning_assignment;
-    assert_eq!(planner.as_str(), "strategist");
+    assert_eq!(planner.as_str(), "planner");
     assert_eq!(
         mission_type.default_team.roles[planner].output,
         lionclaw::model::OutputSemantics::ProposesPlan
@@ -63,22 +63,41 @@ fn software_dev_mission_type_loads() {
 }
 
 #[test]
-fn metric_driven_mission_type_loads() {
-    let mission_type = load_mission_type(
-        &repo_root().join("mission-types/metric-driven"),
-        &AuthorityCeiling::default(),
-    )
-    .expect("metric-driven mission type loads");
-    assert_eq!(mission_type.name, "metric-driven");
-    assert_eq!(mission_type.stop, StopBar::Attested);
-    assert!(mission_type.ceilings.devices.contains("/dev/dri"));
-    let planner = &mission_type.default_team.planning_assignment;
-    assert_eq!(planner.as_str(), "metric-planner");
+fn exactly_five_generic_mission_types_load() {
+    let root = repo_root().join("mission-types");
+    let mut names = std::fs::read_dir(&root)
+        .expect("mission-types directory")
+        .map(|entry| entry.expect("mission-type entry").file_name())
+        .collect::<Vec<_>>();
+    names.sort();
     assert_eq!(
-        mission_type.default_team.roles[planner].output,
-        lionclaw::model::OutputSemantics::ProposesPlan
+        names,
+        [
+            "design",
+            "optimization",
+            "research",
+            "review",
+            "software-dev"
+        ]
     );
-    assert!(mission_type.default_team.gap_review_assignment.is_some());
+
+    for name in ["design", "optimization", "research", "review"] {
+        let mission_type = load_mission_type(&root.join(name), &AuthorityCeiling::default())
+            .unwrap_or_else(|error| panic!("{name} mission type must load: {error:#}"));
+        assert_eq!(mission_type.name, name);
+        assert_eq!(mission_type.stop, StopBar::Attested);
+        assert!(
+            mission_type.default_team.roles.len() <= 4,
+            "{name} must keep a minimal default team"
+        );
+        let planner = &mission_type.default_team.planning_assignment;
+        assert_eq!(
+            mission_type.default_team.roles[planner].output,
+            lionclaw::model::OutputSemantics::ProposesPlan
+        );
+    }
+
+    assert!(!root.join("metric-driven").exists());
 }
 
 #[test]

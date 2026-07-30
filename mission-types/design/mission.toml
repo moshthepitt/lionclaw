@@ -1,0 +1,23 @@
+[mission-type]
+name = "design"
+stop = "attested"
+image = "localhost/lionclaw-runtime-dev:v1"
+
+[team]
+planning-assignment = "planner"
+requires-gap-review = false
+
+[ceilings]
+network = true
+writes = true
+
+[recovery]
+max-attempts = 3
+
+[execution]
+default-timeout-secs = 1800
+max-task-time-secs = 3600
+extension-step-secs = 600
+effect-capacity = 3
+auto-continue-candidate = false
+auto-continue-proof = false
