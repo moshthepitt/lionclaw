@@ -1,7 +1,8 @@
 //! The everyday LionClaw entrypoint: one confined native orchestrator UI over
 //! the repository and its event-sourced mission truth.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -36,11 +37,19 @@ use crate::store::MissionStore;
 const STANDARD_SKILL: &str = include_str!("../../../skills/lionclaw/SKILL.md");
 const STANDARD_SKILL_NAME: &str = "lionclaw";
 const RUNTIME_CONTEXT_FILE: &str = "AGENTS.generated.md";
+const CURRENT_MISSION_FILE: &str = "current-mission";
+const CURRENT_MISSION_LIMIT: usize = 64;
 const SCRATCH_MOUNT_TARGET: &str = "/scratch";
 pub const NONTERMINAL_EXIT_CODE: u8 = 2;
 
 #[async_trait]
 pub trait AttachedRuntimeExecutor: Send + Sync {
+    async fn resolve_image_compatibility_identity(
+        &self,
+        engine: &str,
+        image: &str,
+    ) -> Result<String>;
+
     async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionOutput>;
 }
 
@@ -49,6 +58,14 @@ pub struct ProductionAttachedRuntimeExecutor;
 
 #[async_trait]
 impl AttachedRuntimeExecutor for ProductionAttachedRuntimeExecutor {
+    async fn resolve_image_compatibility_identity(
+        &self,
+        engine: &str,
+        image: &str,
+    ) -> Result<String> {
+        lionclaw_confinement::resolve_oci_image_compatibility_identity(engine, image).await
+    }
+
     async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
         lionclaw_confinement::execute_attached(request).await
     }
@@ -62,6 +79,7 @@ pub struct EverydayRunRequest {
     pub drivers: Option<RuntimeDriverRegistry>,
     pub auth: Option<lionclaw_runtime_api::RuntimeAuthRegistry>,
     pub executor: Arc<dyn AttachedRuntimeExecutor>,
+    pub runtime_root: PathBuf,
 }
 
 #[derive(Debug)]
@@ -69,7 +87,16 @@ pub struct EverydayRunOutcome {
     pub runtime: String,
     pub runtime_status: String,
     pub mission: MissionOutcome,
-    pub crashed: bool,
+    pub runtime_termination: RuntimeTermination,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTermination {
+    Exited,
+    Failed,
+    Signaled,
+    LaunchFailed,
+    Unknown,
 }
 
 #[derive(Debug)]
@@ -83,7 +110,7 @@ pub enum MissionOutcome {
 
 impl EverydayRunOutcome {
     pub fn exit_code(&self) -> std::process::ExitCode {
-        if self.crashed {
+        if self.runtime_termination != RuntimeTermination::Exited {
             return std::process::ExitCode::FAILURE;
         }
         match self.mission {
@@ -98,7 +125,13 @@ impl EverydayRunOutcome {
     }
 
     pub fn print(&self) {
-        println!("runtime {} exited {}", self.runtime, self.runtime_status);
+        let verb = match self.runtime_termination {
+            RuntimeTermination::Exited | RuntimeTermination::Failed => "exited",
+            RuntimeTermination::Signaled => "was terminated with",
+            RuntimeTermination::LaunchFailed => "failed to launch:",
+            RuntimeTermination::Unknown => "ended with",
+        };
+        println!("runtime {} {verb} {}", self.runtime, self.runtime_status);
         match &self.mission {
             MissionOutcome::None => println!("mission state: no mission"),
             MissionOutcome::Ambiguous { live, total } => {
@@ -122,8 +155,18 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
         drivers,
         auth,
         executor,
+        runtime_root,
     } = request;
-    let profile = profiles.get(&runtime)?;
+    let judged_root = crate::authority::canonical_or_lexical(&repo);
+    let runtime_root = crate::authority::canonical_or_lexical(&runtime_root);
+    if crate::authority::paths_overlap(&runtime_root, &judged_root) {
+        bail!(
+            "writable everyday runtime state '{}' overlaps judged root '{}'",
+            runtime_root.display(),
+            judged_root.display()
+        );
+    }
+    let mut profile = profiles.get(&runtime)?;
     let runner = match (drivers, auth) {
         (Some(drivers), Some(auth)) => {
             OciRoleRunner::with_registries(profiles, AuthorityCeiling::default(), drivers, auth)
@@ -137,8 +180,18 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
     driver
         .validate_config(&config)
         .with_context(|| format!("runtime '{}' driver configuration is invalid", profile.name))?;
+    let oci = profile.confinement.oci();
+    let image_ref = oci
+        .image
+        .as_deref()
+        .context("everyday runtime profile has no confinement image")?;
+    let image_id = executor
+        .resolve_image_compatibility_identity(&oci.engine, image_ref)
+        .await
+        .with_context(|| format!("resolving image '{image_ref}'"))?;
+    profile.confinement.oci_mut().image = Some(image_id);
 
-    let dirs = EverydayDirs::new(store.lionclaw_dir());
+    let dirs = EverydayDirs::new(store.lionclaw_dir(), runtime_root);
     dirs.prepare().context("preparing everyday runtime state")?;
     let _guard = DriverGuard::try_acquire(dirs.driver_lock())?
         .context("another `lionclaw run` owns this repository")?;
@@ -176,12 +229,13 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
         operator_bridge.socket_path(),
     )?;
     let adapter = driver.create_adapter(config);
+    let mut mission_selector = EverydayMissionSelector::begin(&store, &dirs).await?;
     let maximum_attempts = RecoveryConfig::default().max_attempts;
     let mut runtime_status = "without an exit status".to_string();
-    let mut crashed = true;
+    let mut runtime_termination = RuntimeTermination::Unknown;
 
     for attempt_no in 1..=maximum_attempts {
-        let facts = load_facts(&store, &profile.name).await?;
+        let facts = mission_selector.load_facts(&store, &profile.name).await?;
         write_runtime_context(dirs.role_state().runtime(), &facts)?;
         let session_attempt = profile
             .native_resume
@@ -213,7 +267,7 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
         match execution {
             Ok(output) if output.success() => {
                 runtime_status = output.status_description();
-                crashed = false;
+                runtime_termination = RuntimeTermination::Exited;
                 if let Some(attempt) = session_attempt {
                     attempt.commit(if resume {
                         RuntimeNativeSessionObservation::Resumed
@@ -230,18 +284,36 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
                 if let Some(attempt) = session_attempt {
                     attempt.restore_previous()?;
                 }
+                if output.exit_signal.is_none() && output.exit_code.is_some() {
+                    runtime_termination = RuntimeTermination::Failed;
+                    break;
+                }
+                runtime_termination = if output.exit_signal.is_some() {
+                    RuntimeTermination::Signaled
+                } else {
+                    RuntimeTermination::Unknown
+                };
             }
             Err(error) => {
-                runtime_status = format!("with launch error: {error:#}");
+                runtime_status = format!("{error:#}");
                 if let Some(attempt) = session_attempt {
                     attempt.restore_previous()?;
                 }
+                runtime_termination = RuntimeTermination::LaunchFailed;
             }
         }
         if attempt_no < maximum_attempts {
             eprintln!(
-                "runtime {} crashed {}; restarting ({}/{})",
+                "runtime {} {} {}; restarting ({}/{})",
                 profile.name,
+                match runtime_termination {
+                    RuntimeTermination::Signaled => "was terminated with",
+                    RuntimeTermination::LaunchFailed => "failed to launch:",
+                    RuntimeTermination::Unknown => "ended with",
+                    RuntimeTermination::Exited | RuntimeTermination::Failed => {
+                        unreachable!("ordinary process exits are not retried")
+                    }
+                },
                 runtime_status,
                 attempt_no + 1,
                 maximum_attempts
@@ -253,13 +325,24 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
         .assess_runtime_retention_async()
         .await
         .context("retained everyday runtime state post-run check refused")?;
-    let facts = load_facts(&store, &profile.name).await?;
+    let facts = mission_selector.load_facts(&store, &profile.name).await?;
     Ok(EverydayRunOutcome {
         runtime: profile.name,
         runtime_status,
         mission: facts.outcome(),
-        crashed,
+        runtime_termination,
     })
+}
+
+pub(crate) fn runtime_root(repo: &Path) -> Result<PathBuf> {
+    let repo = repo
+        .canonicalize()
+        .with_context(|| format!("resolving everyday repository '{}'", repo.display()))?;
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(repo.as_os_str().as_encoded_bytes());
+    Ok(crate::mission_type::Home::from_env()?
+        .root()
+        .join("everyday")
+        .join(hex::encode(digest)))
 }
 
 fn everyday_plan(
@@ -272,7 +355,7 @@ fn everyday_plan(
     let role = RoleInstance {
         id: RoleInstanceId::new("orchestrator")?,
         purpose: "everyday orchestrator".to_string(),
-        output: OutputSemantics::ProducesArtifact,
+        output: OutputSemantics::ProducesReport,
         runtime: profile.name.clone(),
         instructions: String::new(),
         skills: vec![STANDARD_SKILL_NAME.to_string()],
@@ -280,7 +363,7 @@ fn everyday_plan(
         grants: AuthorityGrants {
             network: true,
             install: true,
-            writes: true,
+            writes: false,
             ..Default::default()
         },
         resources: ConfinementResources::default(),
@@ -386,51 +469,155 @@ impl EverydayFacts {
     }
 }
 
-async fn load_facts(store: &MissionStore, runtime: &str) -> Result<EverydayFacts> {
+struct EverydayMissionSelector {
+    files: lionclaw_durable_fs::RootedDirectory,
+    ignored_settled: BTreeSet<MissionId>,
+}
+
+impl EverydayMissionSelector {
+    async fn begin(store: &MissionStore, dirs: &EverydayDirs) -> Result<Self> {
+        let files = dirs.files()?;
+        let all = load_mission_states(store).await?;
+        let ignored_settled = all
+            .iter()
+            .filter(|(_, state)| state.is_terminal() && !has_apply_choice(state))
+            .map(|(id, _)| id.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(bound) = read_current_mission(&files)? {
+            let (_, state) = all
+                .iter()
+                .find(|(id, _)| id == &bound)
+                .with_context(|| format!("current everyday mission '{bound}' does not exist"))?;
+            if state.is_terminal() && !has_apply_choice(state) {
+                files.remove_file(OsStr::new(CURRENT_MISSION_FILE), "current everyday mission")?;
+            }
+        }
+        Ok(Self {
+            files,
+            ignored_settled,
+        })
+    }
+
+    async fn load_facts(&mut self, store: &MissionStore, runtime: &str) -> Result<EverydayFacts> {
+        let all = load_mission_states(store).await?;
+        let live = all
+            .iter()
+            .filter(|(_, state)| !state.is_terminal())
+            .cloned()
+            .collect::<Vec<_>>();
+        let bound = read_current_mission(&self.files)?;
+        let (selected, candidate_count) = if let Some(bound) = &bound {
+            (
+                Some(
+                    all.iter()
+                        .find(|(id, _)| id == bound)
+                        .cloned()
+                        .with_context(|| {
+                            format!("current everyday mission '{bound}' does not exist")
+                        })?,
+                ),
+                1,
+            )
+        } else {
+            let candidates = all
+                .iter()
+                .filter(|(id, state)| {
+                    !state.is_terminal()
+                        || has_apply_choice(state)
+                        || !self.ignored_settled.contains(id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (
+                match candidates.as_slice() {
+                    [only] => Some(only.clone()),
+                    _ => None,
+                },
+                candidates.len(),
+            )
+        };
+        if bound.is_none() {
+            if let Some((id, _)) = &selected {
+                self.files.write_private_atomic(
+                    OsStr::new(CURRENT_MISSION_FILE),
+                    id.as_str().as_bytes(),
+                    CURRENT_MISSION_LIMIT,
+                    "current everyday mission",
+                )?;
+            }
+        }
+        let (selection, mission) = match selected {
+            Some((id, state)) => (
+                MissionSelection::Unambiguous,
+                Some(SelectedMission {
+                    id,
+                    terminal: state.terminal.clone(),
+                    next: next(&state),
+                }),
+            ),
+            None if candidate_count == 0 => (MissionSelection::None, None),
+            None => (
+                MissionSelection::Ambiguous {
+                    live: live.len(),
+                    total: all.len(),
+                },
+                None,
+            ),
+        };
+        Ok(EverydayFacts {
+            repository: "/workspace",
+            runtime: runtime.to_string(),
+            selection,
+            mission,
+        })
+    }
+}
+
+async fn load_mission_states(
+    store: &MissionStore,
+) -> Result<Vec<(MissionId, crate::model::MissionState)>> {
     let mut all = Vec::new();
-    let mut live = Vec::new();
     for mission_id in store.list_missions().await? {
         let Some(state) = fold(store.load(&mission_id).await?) else {
             continue;
         };
-        if !state.is_terminal() {
-            live.push((mission_id.clone(), state.clone()));
-        }
         all.push((mission_id, state));
     }
-    let selected = match (live.as_slice(), all.as_slice()) {
-        ([only], _) => Some(only.clone()),
-        ([], [only]) => Some(only.clone()),
-        _ => None,
+    Ok(all)
+}
+
+fn has_apply_choice(state: &crate::model::MissionState) -> bool {
+    next(state)
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, crate::model::Choice::Apply { .. }))
+}
+
+fn read_current_mission(files: &lionclaw_durable_fs::RootedDirectory) -> Result<Option<MissionId>> {
+    let Some(raw) = files.read_private_bounded_with_metadata(
+        OsStr::new(CURRENT_MISSION_FILE),
+        CURRENT_MISSION_LIMIT,
+        "current everyday mission",
+    )?
+    else {
+        return Ok(None);
     };
-    let (selection, mission) = match selected {
-        Some((id, state)) => (
-            MissionSelection::Unambiguous,
-            Some(SelectedMission {
-                id,
-                terminal: state.terminal.clone(),
-                next: next(&state),
-            }),
-        ),
-        None if all.is_empty() => (MissionSelection::None, None),
-        None => (
-            MissionSelection::Ambiguous {
-                live: live.len(),
-                total: all.len(),
-            },
-            None,
-        ),
-    };
-    Ok(EverydayFacts {
-        repository: "/workspace",
-        runtime: runtime.to_string(),
-        selection,
-        mission,
-    })
+    let text = std::str::from_utf8(&raw.0).context("current everyday mission is not UTF-8")?;
+    Ok(Some(
+        MissionId::parse(text).context("current everyday mission identity is invalid")?,
+    ))
+}
+
+pub(crate) fn current_mission(store: &MissionStore) -> Result<Option<MissionId>> {
+    let files = lionclaw_durable_fs::RootedDirectory::new(
+        store.lionclaw_dir().to_path_buf(),
+        store.lionclaw_dir().join("everyday"),
+    )?;
+    read_current_mission(&files)
 }
 
 fn bootstrap_message() -> String {
-    "Use the installed LionClaw skill. Read /runtime/AGENTS.generated.md for current repository and mission facts before acting.".to_string()
+    "Use the installed LionClaw skill. Read /runtime/AGENTS.generated.md for current repository and mission facts before acting. The repository is read-only; use /scratch for transient files and bridge stdin for proposal JSON.".to_string()
 }
 
 fn write_runtime_context(runtime_dir: &Path, facts: &EverydayFacts) -> Result<()> {
@@ -490,7 +677,7 @@ mod tests {
             mission: MissionOutcome::Nonterminal {
                 id: MissionId::parse("m000000000000").unwrap(),
             },
-            crashed: false,
+            runtime_termination: RuntimeTermination::Exited,
         };
         assert_eq!(
             outcome.exit_code(),

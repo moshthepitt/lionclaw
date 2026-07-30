@@ -8,6 +8,7 @@
 use std::ffi::{OsStr, OsString};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use lionclaw_durable_fs::{
@@ -23,6 +24,7 @@ use crate::model::{EffectId, MissionId, RoleInstanceId, TaskId};
 pub(crate) struct EverydayDirs {
     state_dir: PathBuf,
     root: PathBuf,
+    runtime_root: PathBuf,
     role_state: RoleStateDirs,
     auth_staging: PathBuf,
     operator_skill: PathBuf,
@@ -30,28 +32,33 @@ pub(crate) struct EverydayDirs {
 }
 
 impl EverydayDirs {
-    pub(crate) fn new(state_dir: &Path) -> Self {
+    pub(crate) fn new(state_dir: &Path, runtime_root: PathBuf) -> Self {
         let root = state_dir.join("everyday");
         Self {
-            role_state: RoleStateDirs::new(state_dir.to_path_buf(), &root),
-            auth_staging: root.join("auth-staging"),
+            role_state: RoleStateDirs::new(runtime_root.clone(), &runtime_root),
+            auth_staging: runtime_root.join("auth-staging"),
             operator_skill: root.join("operator-skill").join("lionclaw"),
             driver_lock: root.join("driver.lock"),
             state_dir: state_dir.to_path_buf(),
             root,
+            runtime_root,
         }
     }
 
     pub(crate) fn prepare(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.runtime_root)?;
+        std::fs::set_permissions(&self.runtime_root, std::fs::Permissions::from_mode(0o700))?;
         self.role_state.prepare()?;
-        ensure_private_dirs_beneath(
-            &self.state_dir,
-            [&self.root, &self.auth_staging, &self.operator_skill],
-        )
+        ensure_private_dirs_beneath(&self.state_dir, [&self.root, &self.operator_skill])?;
+        ensure_private_dirs_beneath(&self.runtime_root, [&self.auth_staging])
     }
 
     pub(crate) fn role_state(&self) -> &RoleStateDirs {
         &self.role_state
+    }
+
+    pub(crate) fn files(&self) -> anyhow::Result<RootedDirectory> {
+        RootedDirectory::new(self.state_dir.clone(), self.root.clone())
     }
 
     pub(crate) fn auth_staging(&self) -> &Path {

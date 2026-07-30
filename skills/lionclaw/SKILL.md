@@ -65,9 +65,11 @@ When startup facts say no mission exists:
    proposal containing `plan`, `team`, and any `oracles`.
 
 The proposal is repository-specific. Its plan contains objective requirements,
-falsifiable assertions, and coherent artifact tasks. Its next team revision
-assigns every task and every reviewer-checkable assertion to roles with the
-right output contract and least authority. An oracle is structured data with
+falsifiable assertions, and coherent task outputs. Its next team revision
+assigns every task to a read-only report producer or writable artifact
+producer, as the outcome requires, and every reviewer-checkable assertion to
+roles with the right output contract and least authority. An oracle is
+structured data with
 `type: "command"`, an argument vector, workspace-relative `cwd`, environment,
 timeout, grants, and resources. Never use shell text as an oracle or copy
 repository commands into the generic method.
@@ -79,10 +81,12 @@ proof for genuinely executable claims and `reviewer_checkable` assertions for
 claims that require independent judgment. Record host-only acceptance and
 known limitations explicitly.
 
-Submit the complete JSON only if the current choice permits it:
+Draft transient proposal files only under `/scratch`; the repository is
+read-only to this orchestrator. Submit the complete JSON over bridge stdin only
+if the current choice permits it:
 
 ```text
-lionclaw mission plan propose --file PROPOSAL_FILE
+lionclaw mission plan propose --file - < /scratch/proposal.json
 ```
 
 ## Ratify and drive

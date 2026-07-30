@@ -480,7 +480,7 @@ pub(crate) fn canonical_or_lexical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn paths_overlap(a: &Path, b: &Path) -> bool {
+pub(crate) fn paths_overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 

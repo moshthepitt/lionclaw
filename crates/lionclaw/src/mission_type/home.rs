@@ -1,7 +1,8 @@
-//! The global install home: `~/.lionclaw`. Mission types are installed here
-//! (`~/.lionclaw/mission-types/<name>/`) and resolved by short name. Explicit
-//! path references remain available for bundles stored anywhere. Mission state
-//! stays repo-local; only the optional short-name catalog is global.
+//! The global LionClaw home: `~/.lionclaw`. Mission types are installed here
+//! (`~/.lionclaw/mission-types/<name>/`) and resolved by short name. Everyday
+//! native runtime state is keyed by repository identity here so its writable
+//! mount remains outside the judged repository. Event-sourced mission truth
+//! stays repo-local.
 
 use std::path::{Path, PathBuf};
 

@@ -47,6 +47,7 @@ pub struct MissionTransports {
     runtime: Option<(RuntimeDriverRegistry, RuntimeAuthRegistry)>,
     oracle: Option<Arc<dyn OracleRunner>>,
     attached_runtime: Option<Arc<dyn crate::everyday::AttachedRuntimeExecutor>>,
+    everyday_runtime_root: Option<PathBuf>,
 }
 
 impl MissionTransports {
@@ -56,6 +57,7 @@ impl MissionTransports {
             runtime: None,
             oracle: None,
             attached_runtime: None,
+            everyday_runtime_root: None,
         }
     }
 
@@ -70,6 +72,7 @@ impl MissionTransports {
             runtime: Some((drivers, auth)),
             oracle: Some(oracle),
             attached_runtime: None,
+            everyday_runtime_root: None,
         }
     }
 
@@ -78,6 +81,11 @@ impl MissionTransports {
         executor: Arc<dyn crate::everyday::AttachedRuntimeExecutor>,
     ) -> Self {
         self.attached_runtime = Some(executor);
+        self
+    }
+
+    pub fn with_everyday_runtime_root(mut self, root: PathBuf) -> Self {
+        self.everyday_runtime_root = Some(root);
         self
     }
 
@@ -90,7 +98,7 @@ impl MissionTransports {
 #[command(
     name = "lionclaw",
     about = "Run real agents under a small trusted core and explicit local boundary",
-    long_about = "Run real agents under a small trusted core and explicit local boundary.\n\nThe everyday path is `lionclaw run [runtime]`. It launches or resumes the selected real agent in the target repository while LionClaw retains durable mission truth, exact legal actions, confinement, receipts, and finish authority. A clean runtime exit returns 0 only for a done mission, 1 for a runtime crash or aborted mission, and 2 when work remains nonterminal."
+    long_about = "Run real agents under a small trusted core and explicit local boundary.\n\nThe everyday path is `lionclaw run [runtime]`. It launches or resumes the selected real agent in the target repository while LionClaw retains durable mission truth, exact legal actions, confinement, receipts, and finish authority. The command returns 0 only for a done mission, 1 for a runtime failure, crash, or aborted mission, and 2 when work remains nonterminal."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -101,7 +109,7 @@ pub struct Cli {
 pub enum Command {
     /// Launch or resume the everyday orchestrator in this repository.
     #[command(
-        long_about = "Launch or resume the selected real agent as the everyday LionClaw orchestrator in this repository.\n\nThe runtime keeps its native conversation. LionClaw projects the standard skill and folded mission facts, while the event log and current Next remain authoritative. A clean runtime exit returns 0 only for a done mission, 1 for a runtime crash or aborted mission, and 2 when no mission exists, selection is ambiguous, or work remains nonterminal."
+        long_about = "Launch or resume the selected real agent as the everyday LionClaw orchestrator in this repository.\n\nThe runtime keeps its native conversation. LionClaw projects the standard skill and folded mission facts, while the event log and current Next remain authoritative. The command returns 0 only for a done mission, 1 for a runtime failure, crash, or aborted mission, and 2 when no mission exists, selection is ambiguous, or work remains nonterminal."
     )]
     Run(RunArgs),
     /// Install the bundled mission types into `~/.lionclaw` (run once).
@@ -441,7 +449,7 @@ pub struct InboxArgs {
 #[derive(Args)]
 #[command(group(ArgGroup::new("recipients").required(true).args(["to", "all"])))]
 pub struct SendArgs {
-    /// Mission id (defaults to the only active mission in the repository).
+    /// Mission id (default: current everyday mission, then sole live mission).
     #[arg(long)]
     pub mission_id: Option<String>,
     /// Current role-instance id or an unambiguous current task name. Repeatable.
@@ -467,7 +475,7 @@ pub struct SendArgs {
 
 #[derive(Args)]
 pub struct PlanShowArgs {
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -499,7 +507,7 @@ pub struct DecideArgs {
 
 #[derive(Args)]
 pub struct AbortArgs {
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -511,7 +519,7 @@ pub struct AbortArgs {
 
 #[derive(Args)]
 pub struct FinishArgs {
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -523,7 +531,7 @@ pub struct FinishArgs {
 
 #[derive(Args)]
 pub struct PlanProposeArgs {
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -535,7 +543,7 @@ pub struct PlanProposeArgs {
 
 #[derive(Args)]
 pub struct AdvanceArgs {
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -598,7 +606,7 @@ pub struct ExtendArgs {
 
 #[derive(Args)]
 pub struct StatusArgs {
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -612,7 +620,7 @@ pub struct StatusArgs {
 
 #[derive(Args)]
 pub struct GuideArgs {
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -623,7 +631,7 @@ pub struct GuideArgs {
 
 #[derive(Args)]
 pub struct EnvironmentShowArgs {
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -636,7 +644,7 @@ pub struct EnvironmentShowArgs {
 pub struct EnvironmentUseArgs {
     /// Digest-pinned image ref: `sha256:<hex>` or `<name>@sha256:<hex>`.
     pub image: String,
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     #[arg(long)]
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
@@ -651,7 +659,7 @@ pub struct EnvironmentUseArgs {
 
 #[derive(Args)]
 pub struct ReportArgs {
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -665,7 +673,7 @@ pub struct ReportArgs {
 
 #[derive(Args)]
 pub struct ApplyArgs {
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -677,7 +685,7 @@ pub struct ApplyArgs {
 
 #[derive(Args)]
 pub struct LogArgs {
-    /// Mission id (default: the sole live mission in this repo).
+    /// Mission id (default: current everyday mission, then sole live mission).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -718,6 +726,10 @@ pub async fn run_with_transports(
 
 async fn cmd_run(args: RunArgs, transports: &MissionTransports) -> Result<std::process::ExitCode> {
     let (repo, store) = open_store(args.repo).await?;
+    let runtime_root = transports
+        .everyday_runtime_root
+        .clone()
+        .map_or_else(|| crate::everyday::runtime_root(&repo), Ok)?;
     let (drivers, auth) = transports
         .runtime
         .clone()
@@ -734,6 +746,7 @@ async fn cmd_run(args: RunArgs, transports: &MissionTransports) -> Result<std::p
         drivers,
         auth,
         executor,
+        runtime_root,
     })
     .await?;
     outcome.print();
@@ -1085,13 +1098,18 @@ async fn git_worktree_root() -> Result<PathBuf> {
     PathBuf::from(root).canonicalize().context("repo path")
 }
 
-/// Resolve a mission id: an explicit id is parsed; omitted ⇒ the sole live
-/// mission, or — once every mission has finished — the sole mission overall
-/// (so post-completion commands still default). Errors (never guesses) only
-/// when the choice is ambiguous: no mission, or more than one live.
+/// Resolve a mission id: an explicit id wins, then the everyday driver's
+/// durable current binding, then the sole live mission (or sole terminal
+/// mission for post-completion commands). Ambiguity always fails closed.
 async fn resolve_mission_id(store: &MissionStore, explicit: Option<&str>) -> Result<MissionId> {
     if let Some(id) = explicit {
         return MissionId::parse(id).map_err(Into::into);
+    }
+    if let Some(id) = crate::everyday::current_mission(store)? {
+        if fold(store.load(&id).await?).is_none() {
+            bail!("current everyday mission '{id}' does not exist");
+        }
+        return Ok(id);
     }
     let mut all = Vec::new();
     let mut live = Vec::new();
