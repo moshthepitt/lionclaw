@@ -2593,16 +2593,16 @@ fn decode_feedback(bytes: Vec<u8>, source: &str) -> Result<String> {
 }
 
 #[cfg(unix)]
-fn isolate_driver_process_group(command: &mut std::process::Command) {
+pub(crate) fn isolate_driver_process_group(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-fn isolate_driver_process_group(_command: &mut std::process::Command) {}
+pub(crate) fn isolate_driver_process_group(_command: &mut std::process::Command) {}
 
 #[cfg(unix)]
-fn terminate_driver_process_group(process: &mut std::process::Child) -> Result<()> {
+pub(crate) fn terminate_driver_process_group(process: &mut std::process::Child) -> Result<()> {
     let mut group_error = None;
     if let Some(pid) = rustix::process::Pid::from_raw(process.id() as i32) {
         match rustix::process::kill_process_group(pid, rustix::process::Signal::KILL) {
@@ -2613,13 +2613,13 @@ fn terminate_driver_process_group(process: &mut std::process::Child) -> Result<(
     let _ = process.kill();
     let _ = process.wait();
     match group_error {
-        Some(error) => Err(error).context("killing detached driver process group"),
+        Some(error) => Err(error).context("killing child process group"),
         None => Ok(()),
     }
 }
 
 #[cfg(not(unix))]
-fn terminate_driver_process_group(process: &mut std::process::Child) -> Result<()> {
+pub(crate) fn terminate_driver_process_group(process: &mut std::process::Child) -> Result<()> {
     let _ = process.kill();
     let _ = process.wait();
     Ok(())

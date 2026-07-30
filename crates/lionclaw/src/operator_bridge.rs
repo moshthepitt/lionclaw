@@ -10,7 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -92,7 +92,7 @@ impl OperatorBridge {
         let worker = std::thread::Builder::new()
             .name("lionclaw-operator-bridge".to_string())
             .spawn(move || {
-                serve(listener, &executable, &repo, &worker_token, &worker_stop);
+                serve(listener, &executable, &repo, &worker_token, worker_stop);
             })
             .context("starting the operator bridge")?;
 
@@ -164,8 +164,15 @@ impl Drop for OperatorBridge {
     }
 }
 
-fn serve(listener: UnixListener, executable: &Path, repo: &Path, token: &str, stop: &AtomicBool) {
+fn serve(
+    listener: UnixListener,
+    executable: &Path,
+    repo: &Path,
+    token: &str,
+    stop: Arc<AtomicBool>,
+) {
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handlers = Vec::new();
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _address)) => {
@@ -178,20 +185,41 @@ fn serve(listener: UnixListener, executable: &Path, repo: &Path, token: &str, st
                 let repo = repo.to_path_buf();
                 let token = token.to_string();
                 let request_active = Arc::clone(&active);
+                let request_stop = Arc::clone(&stop);
                 let spawned = std::thread::Builder::new()
                     .name("lionclaw-operator-command".to_string())
                     .spawn(move || {
                         let _active = ActiveRequest(request_active);
-                        let _ = handle_connection(stream, &executable, &repo, &token);
+                        let _ =
+                            handle_connection(stream, &executable, &repo, &token, &request_stop);
                     });
-                if spawned.is_err() {
-                    active.fetch_sub(1, Ordering::AcqRel);
+                match spawned {
+                    Ok(handler) => handlers.push(handler),
+                    Err(_) => {
+                        active.fetch_sub(1, Ordering::AcqRel);
+                    }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(_) => break,
+        }
+        reap_finished_handlers(&mut handlers);
+    }
+    for handler in handlers {
+        let _ = handler.join();
+    }
+}
+
+fn reap_finished_handlers(handlers: &mut Vec<JoinHandle<()>>) {
+    let mut index = 0;
+    while index < handlers.len() {
+        if handlers[index].is_finished() {
+            let handler = handlers.swap_remove(index);
+            let _ = handler.join();
+        } else {
+            index += 1;
         }
     }
 }
@@ -222,6 +250,7 @@ fn handle_connection(
     executable: &Path,
     repo: &Path,
     token: &str,
+    stop: &AtomicBool,
 ) -> Result<()> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -233,7 +262,7 @@ fn handle_connection(
         if request.token != token {
             bail!("operator bridge authentication refused");
         }
-        execute_request(executable, repo, request)
+        execute_request(executable, repo, request, stop)
     }) {
         Ok(response) => response,
         Err(error) => BridgeResponse {
@@ -262,37 +291,114 @@ fn execute_request(
     executable: &Path,
     repo: &Path,
     request: BridgeRequest,
+    stop: &AtomicBool,
 ) -> Result<BridgeResponse> {
     let args = validate_and_normalize_args(request.args)?;
-    let mut child = ProcessCommand::new(executable)
+    let mut command = ProcessCommand::new(executable);
+    command
         .args(&args)
         .current_dir(repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "launching host LionClaw executable '{}'",
-                executable.display()
-            )
-        })?;
-    if let Some(mut stdin) = child.stdin.take() {
+        .stderr(Stdio::piped());
+    crate::cli::isolate_driver_process_group(&mut command);
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "launching host LionClaw executable '{}'",
+            executable.display()
+        )
+    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .context("host LionClaw stdin is absent")?;
+    let stdin_bytes = request.stdin.into_bytes();
+    let stdin_writer = std::thread::spawn(move || -> Result<()> {
+        let mut stdin = stdin;
         stdin
-            .write_all(request.stdin.as_bytes())
-            .context("forwarding LionClaw command stdin")?;
+            .write_all(&stdin_bytes)
+            .context("forwarding LionClaw command stdin")
+    });
+    let stdout = child
+        .stdout
+        .take()
+        .context("host LionClaw stdout is absent")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("host LionClaw stderr is absent")?;
+    let (overflow_tx, overflow_rx) = mpsc::channel();
+    let stdout_reader = bounded_output_reader(stdout, "stdout", overflow_tx.clone());
+    let stderr_reader = bounded_output_reader(stderr, "stderr", overflow_tx);
+
+    let mut interruption = None;
+    let status = loop {
+        if stop.load(Ordering::Acquire) {
+            crate::cli::terminate_driver_process_group(&mut child)?;
+            interruption = Some("operator bridge stopped with a command in flight");
+            break None;
+        }
+        if let Ok(stream) = overflow_rx.try_recv() {
+            crate::cli::terminate_driver_process_group(&mut child)?;
+            interruption = Some(match stream {
+                "stdout" => "host LionClaw stdout exceeded its limit",
+                _ => "host LionClaw stderr exceeded its limit",
+            });
+            break None;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("waiting for host LionClaw command")?
+        {
+            break Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdin_result = stdin_writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("host LionClaw stdin writer panicked"))?;
+    let stdout = join_output_reader(stdout_reader, "stdout")?;
+    let stderr = join_output_reader(stderr_reader, "stderr")?;
+    if let Some(interruption) = interruption {
+        bail!("{interruption}");
     }
-    let output = child
-        .wait_with_output()
-        .context("waiting for host LionClaw command")?;
-    if output.stdout.len() > MAX_OUTPUT_BYTES || output.stderr.len() > MAX_OUTPUT_BYTES {
-        bail!("host LionClaw command output exceeded its limit");
-    }
+    stdin_result?;
+    let status = status.context("host LionClaw command ended without a status")?;
     Ok(BridgeResponse {
-        exit_code: output.status.code().unwrap_or(1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: status.code().unwrap_or(1),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })
+}
+
+fn bounded_output_reader(
+    mut stream: impl Read + Send + 'static,
+    label: &'static str,
+    overflow: mpsc::Sender<&'static str>,
+) -> JoinHandle<Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 8 * 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .with_context(|| format!("reading host LionClaw {label}"))?;
+            if read == 0 {
+                return Ok(output);
+            }
+            if output.len().saturating_add(read) > MAX_OUTPUT_BYTES {
+                let _ = overflow.send(label);
+                bail!("host LionClaw {label} exceeded its limit");
+            }
+            output.extend_from_slice(&buffer[..read]);
+        }
+    })
+}
+
+fn join_output_reader(reader: JoinHandle<Result<Vec<u8>>>, label: &str) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("host LionClaw {label} reader panicked"))?
 }
 
 fn validate_and_normalize_args(args: Vec<String>) -> Result<Vec<String>> {
@@ -402,7 +508,11 @@ fn validate_mission_command(command: &MissionCommand) -> Result<()> {
         }
         MissionCommand::Team(command) => validate_team_command(command),
         MissionCommand::Skill(MissionSkillCommand::Add(args)) => {
-            require_pinned_repo(args.repo.as_deref())
+            require_pinned_repo(args.repo.as_deref())?;
+            if args.git.is_some() {
+                bail!("the everyday bridge accepts only a repository-local --path skill source");
+            }
+            Ok(())
         }
         MissionCommand::Decide(args) => require_pinned_repo(args.repo.as_deref()),
         MissionCommand::Finish(args) => require_pinned_repo(args.repo.as_deref()),
@@ -518,6 +628,22 @@ mod tests {
     }
 
     #[test]
+    fn bridge_refuses_host_local_git_skill_sources() {
+        assert!(validate_and_normalize_args(vec![
+            "mission".into(),
+            "skill".into(),
+            "add".into(),
+            "--git".into(),
+            "file:///home/operator/private-skill".into(),
+            "--rev".into(),
+            "main".into(),
+        ])
+        .unwrap_err()
+        .to_string()
+        .contains("repository-local"));
+    }
+
+    #[test]
     fn private_socket_round_trip_forwards_argv_without_a_shell() {
         let repo = tempfile::tempdir().unwrap();
         let bridge =
@@ -540,6 +666,57 @@ mod tests {
         assert_eq!(response.exit_code, 0);
         assert_eq!(response.stdout, "mission type list --json\n");
         assert!(response.stderr.is_empty());
+    }
+
+    #[test]
+    fn dropping_bridge_kills_and_reaps_an_inflight_host_command() {
+        let repo = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let marker = fixture.path().join("pid");
+        let completed = fixture.path().join("completed");
+        let executable = fixture.path().join("slow-command");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nsleep 30\nprintf done > '{}'\n",
+                marker.display(),
+                completed.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bridge = OperatorBridge::start_with_executable(repo.path(), executable).unwrap();
+        let socket = bridge.socket_path().to_path_buf();
+        let token = bridge.token.clone();
+        let request = std::thread::spawn(move || {
+            let request = BridgeRequest {
+                token,
+                args: vec![
+                    "mission".into(),
+                    "type".into(),
+                    "list".into(),
+                    "--json".into(),
+                ],
+                stdin: String::new(),
+            };
+            let mut stream = UnixStream::connect(socket).unwrap();
+            serde_json::to_writer(&mut stream, &request).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            serde_json::from_reader::<_, BridgeResponse>(stream)
+        });
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pid = std::fs::read_to_string(&marker).expect("host command started");
+
+        drop(bridge);
+
+        request.join().unwrap().unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!completed.exists());
     }
 
     #[test]

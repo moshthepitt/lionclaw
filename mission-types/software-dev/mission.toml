@@ -1,8 +1,9 @@
 [mission-type]
 name = "software-dev"
 stop = "verified"
-# The confinement image every role and command oracle runs in. Must carry this
-# domain's toolchain (here: the pinned Rust toolchain + agent CLIs).
+# The confinement image every role and command oracle runs in. It carries the
+# supported language toolchains and agent CLIs; mission-local oracles select
+# only what the target repository actually uses.
 image = "localhost/lionclaw-runtime-dev:v1"
 
 [team]
