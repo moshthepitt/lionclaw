@@ -1387,7 +1387,7 @@ impl MissionState {
             return false;
         };
         match (role.output, task_id) {
-            (super::OutputSemantics::ProducesArtifact, Some(task_id)) => {
+            (output, Some(task_id)) if output.produces_task_output() => {
                 team.task_assignments.get(task_id) == Some(role_instance)
                     && self
                         .plan

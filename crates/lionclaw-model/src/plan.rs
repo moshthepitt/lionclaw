@@ -79,12 +79,11 @@ pub struct Requirement {
 /// How the drive loop consumes a role's handoff. The single closed axis the
 /// engine routes on — names never enter enforcement or routing.
 ///
-/// The execution kinds are `ProducesArtifact` (a writer), `EmitsVerdict` (a
-/// per-assertion judge), and `EmitsGapVerdict` (the engine-owned objective
-/// reviewer). The planning kinds are `ProducesReport` (research/draft/
-/// adversary — read-only prose) and `ProposesPlan` (the author, whose handoff
-/// carries a complete `Plan`); both are read-only and only ever run in the
-/// contract-free planning phase.
+/// The execution kinds are `ProducesArtifact` (a writer), `ProducesReport` (a
+/// read-only task or planning researcher), `EmitsVerdict` (a per-assertion
+/// judge), and `EmitsGapVerdict` (the engine-owned objective reviewer).
+/// `ProposesPlan` is the read-only author whose handoff carries a complete
+/// `Plan`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OutputSemantics {
@@ -105,6 +104,13 @@ pub enum RoleResourceLifetime {
 }
 
 impl OutputSemantics {
+    /// Whether this output may satisfy an assigned task. Report producers
+    /// carry their deliverable in the typed handoff; artifact producers also
+    /// receive a writable checkout whose resulting commit becomes lineage.
+    pub const fn produces_task_output(self) -> bool {
+        matches!(self, Self::ProducesReport | Self::ProducesArtifact)
+    }
+
     /// Whether lead messages may carry producer-controlled reference prose to
     /// this output boundary. Judgment outputs receive only engine-owned
     /// evidence assembled by their dedicated prompt paths.
@@ -176,6 +182,15 @@ mod output_semantics_tests {
         assert!(OutputSemantics::ProposesPlan.permits_message_references());
         assert!(!OutputSemantics::EmitsVerdict.permits_message_references());
         assert!(!OutputSemantics::EmitsGapVerdict.permits_message_references());
+    }
+
+    #[test]
+    fn task_output_policy_is_closed_and_write_independent() {
+        assert!(OutputSemantics::ProducesReport.produces_task_output());
+        assert!(OutputSemantics::ProducesArtifact.produces_task_output());
+        assert!(!OutputSemantics::ProposesPlan.produces_task_output());
+        assert!(!OutputSemantics::EmitsVerdict.produces_task_output());
+        assert!(!OutputSemantics::EmitsGapVerdict.produces_task_output());
     }
 }
 

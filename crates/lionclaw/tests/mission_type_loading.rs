@@ -111,14 +111,12 @@ fn review_method_can_produce_a_report_without_mutating_the_judged_product() {
         &mission_type.default_team.roles[&RoleInstanceId::new("investigator").unwrap()];
     assert_eq!(
         investigator.output,
-        lionclaw::model::OutputSemantics::ProducesArtifact
+        lionclaw::model::OutputSemantics::ProducesReport
     );
-    assert!(investigator.grants.writes);
-    assert!(mission_type.ceilings.writes);
+    assert!(!investigator.grants.writes);
+    assert!(!mission_type.ceilings.writes);
     assert!(investigator.instructions.contains("review report"));
-    assert!(investigator
-        .instructions
-        .contains("Do not modify the judged product"));
+    assert!(investigator.instructions.contains("read-only"));
 }
 
 #[test]

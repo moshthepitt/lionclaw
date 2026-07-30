@@ -1914,8 +1914,8 @@ impl Engine {
         Ok(render(context))
     }
 
-    /// Assemble a planning role's prompt. Threads the mission type's playbook
-    /// and the current mission shape through a separate assembler.
+    /// Assemble a report or planning role's prompt. Threads the mission type's
+    /// playbook and current mission shape through a separate assembler.
     fn assemble_planning_request(
         &self,
         state: &MissionState,
@@ -1923,8 +1923,20 @@ impl Engine {
         intent: &RoleDispatchIntent,
         dialogue: &[String],
     ) -> Result<String> {
-        let upstream_reports = Vec::new();
-        let mut task_feedback = Vec::new();
+        let (upstream_reports, mut task_feedback) =
+            if let (Some(plan), Some(task_id)) = (&state.plan, &intent.task_id) {
+                let task = plan
+                    .tasks
+                    .iter()
+                    .find(|task| &task.id == task_id)
+                    .context("dispatched report task not in plan")?;
+                (
+                    self.resolve_upstream_reports(state, &task.depends_on)?,
+                    self.resolve_task_feedback(state, task_id)?,
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
         task_feedback.extend_from_slice(dialogue);
         let planning_input = self.resolve_planning_prompt_input(state)?;
         let prompt = render(TurnContext::Planning(

@@ -133,6 +133,12 @@ async fn real_opencode_runtime_resumes_across_exact_effect_cleanup() {
     prove_real_runtime_continuity("opencode", Path::new(".local/share/opencode/auth.json")).await;
 }
 
+#[tokio::test]
+#[ignore = "requires explicit preserved root, real Hermes auth, network, and OCI image"]
+async fn real_hermes_runtime_resumes_across_exact_effect_cleanup() {
+    prove_real_runtime_continuity("hermes", Path::new(".hermes/config.yaml")).await;
+}
+
 async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

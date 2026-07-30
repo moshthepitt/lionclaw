@@ -806,16 +806,27 @@ fn check_shape(
         let Some(role_id) = team.task_assignments.get(&task.id) else {
             errors.push(err(
                 "missing_task_assignment",
-                format!("task '{}' has no writer assignment", task.id),
+                format!("task '{}' has no producer assignment", task.id),
             ));
             continue;
         };
         match team.roles.get(role_id) {
-            Some(role) if role.output == OutputSemantics::ProducesArtifact => {}
+            Some(role) if role.output.produces_task_output() => {
+                if role.output == OutputSemantics::ProducesReport && task.depends_on.len() > 1 {
+                    errors.push(err(
+                        "read_only_task_fan_in",
+                        format!(
+                            "read-only report task '{}' cannot integrate {} dependency candidates; assign a writable artifact producer to integrate them first",
+                            task.id,
+                            task.depends_on.len()
+                        ),
+                    ));
+                }
+            }
             Some(_) => errors.push(err(
                 "task_output_mismatch",
                 format!(
-                    "task '{}' assigns non-artifact role instance '{role_id}'",
+                    "task '{}' assigns role instance '{role_id}' whose output cannot satisfy a task",
                     task.id
                 ),
             )),
@@ -1105,5 +1116,50 @@ mod topology_tests {
             (TaskId::new("right").unwrap(), worker),
         ]));
         assert!(check_dispatch_topology(&serial, &team).is_empty());
+    }
+
+    #[test]
+    fn accepts_a_read_only_report_role_for_an_assigned_task() {
+        let plan = contract(vec![task("review", &[])]);
+        let reporter = role("reporter", OutputSemantics::ProducesReport);
+        let mut team = team(BTreeMap::from([(
+            TaskId::new("review").unwrap(),
+            reporter.id.clone(),
+        )]));
+        team.roles.insert(reporter.id.clone(), reporter);
+
+        assert!(
+            !check_shape(&plan, &team, &BTreeMap::new(), &MissionConfig::default())
+                .iter()
+                .any(|error| error.code == "task_output_mismatch")
+        );
+    }
+
+    #[test]
+    fn rejects_multiple_candidate_branches_at_a_read_only_report_task() {
+        let plan = contract(vec![
+            task("left", &[]),
+            task("right", &[]),
+            task("review", &["left", "right"]),
+        ]);
+        let reporter = role("reporter", OutputSemantics::ProducesReport);
+        let mut team = team(BTreeMap::from([
+            (
+                TaskId::new("left").unwrap(),
+                RoleInstanceId::new("worker").unwrap(),
+            ),
+            (
+                TaskId::new("right").unwrap(),
+                RoleInstanceId::new("integrator").unwrap(),
+            ),
+            (TaskId::new("review").unwrap(), reporter.id.clone()),
+        ]));
+        team.roles.insert(reporter.id.clone(), reporter);
+
+        assert!(
+            check_shape(&plan, &team, &BTreeMap::new(), &MissionConfig::default())
+                .iter()
+                .any(|error| error.code == "read_only_task_fan_in")
+        );
     }
 }

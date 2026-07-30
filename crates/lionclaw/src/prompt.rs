@@ -113,7 +113,8 @@ fn render_judgment(role: &RoleInstance, ctx: &JudgmentContext<'_>) -> String {
     prompt
 }
 
-/// Context for a planning role (research / draft / red-team / author). A
+/// Context for a report or planning role (research / draft / red-team /
+/// author). A
 /// **separate** assembler from `assemble_role_prompt` so a producer's prose can
 /// never structurally reach an execution judge: planning has no verdict roles,
 /// and execution judges are only ever built by `assemble_role_prompt`.
@@ -437,8 +438,8 @@ Your verdicts are advisory: they route work, they can never mark the mission
 verified.";
 
 const PRODUCES_REPORT_SKELETON: &str = "\
-You are a planning role in a mission. Read the workspace (mounted
-read-only at /workspace) and produce the report the task asks for — research,
+You are a read-only report role in a mission. Read the workspace (mounted
+read-only at /workspace) and produce the report the task asks for - research,
 a draft plan, or an adversarial critique. You do not modify anything.
 
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:
@@ -465,7 +466,8 @@ A proposal separates outcomes from proof:
 - each assertion has exactly one active task owner; dependencies express
   contribution and real ordering between tasks
 - the complete team revision owns role contracts, task assignments, independent
-  judgment panels, and the optional gap-review assignment
+  judgment panels, and the optional gap-review assignment; a task may use a
+  read-only `produces-report` role or a writable `produces-artifact` role
 - the complete oracle map owns every repository command used as proof
 
 Rules the engine enforces (an invalid proposal is rejected):
@@ -479,8 +481,11 @@ Rules the engine enforces (an invalid proposal is rejected):
   `confined_provable` and every named assertion must bind an oracle
 - the DAG is acyclic and every dependency resolves
 - the team is the complete next revision shown below, not a patch; every task
-  has one artifact-producing assignment and every assertion has the required
-  independent judgment assignments
+  has one `produces-report` or `produces-artifact` assignment and every
+  assertion has the required independent judgment assignments
+- use `produces-report` with writes=false when the typed report is the task
+  deliverable; use `produces-artifact` with writes=true only when the task must
+  change the product tree
 - role instances carry their complete output semantics, runtime, instructions,
   skills, environment, authority grants, and optional deadline
 - command oracles use structured argv with a non-shell executable and clean
@@ -511,11 +516,11 @@ When you are finished you MUST write /mission/handoff/handoff.json exactly like:
                                  \"depends_on\": []}]}},
       \"team\": {\"revision\": <current team revision plus one>,
                 \"roles\": {\"<role-id>\": {\"id\": \"<role-id>\",
-                  \"purpose\": \"...\", \"output\": \"produces-artifact\",
+                  \"purpose\": \"...\", \"output\": \"<produces-report-or-produces-artifact>\",
                   \"runtime\": \"<runtime>\", \"instructions\": \"...\",
-                  \"grants\": {\"writes\": true}}},
+                  \"grants\": {\"writes\": <true-only-for-produces-artifact>}}},
                 \"planning_assignment\": \"<planning-role-id>\",
-                \"task_assignments\": {\"change\": \"<artifact-role-id>\"},
+                \"task_assignments\": {\"change\": \"<task-producer-role-id>\"},
                 \"judgment_assignments\": {\"OUTCOME-HOLDS\": [\"<judge-role-id>\"]},
                 \"gap_review_assignment\": \"<gap-review-role-id>\"},
       \"oracles\": {\"outcome-check\": {\"type\": \"command\",

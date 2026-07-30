@@ -16,9 +16,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 70 promotes a validated plan, team, and complete oracle map as one
-/// prospective mission shape and binds proof state to oracle-spec digests.
-pub const REDUCER_VERSION: u32 = 70;
+/// Reducer 71 admits read-only report producers as assigned task outputs and
+/// folds their typed handoffs into task completion without minting a commit.
+pub const REDUCER_VERSION: u32 = 71;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -825,25 +825,15 @@ fn apply_success_handoff(
         }
         (super::OutputSemantics::ProducesArtifact, Some(Handoff::Work { .. })) => {
             if let Some(task_id) = &request.task_id {
-                if let Some(task) = state.tasks.get_mut(task_id) {
-                    task.status = TaskStatus::Cleared;
-                    task.consecutive_failures = 0;
-                    task.candidate_sha = Some(
-                        success
-                            .artifact
-                            .as_ref()
-                            .map(|artifact| artifact.head_sha.clone())
-                            .unwrap_or_else(|| request.base_sha.clone()),
-                    );
-                    task.pending_base_sha = None;
-                    task.last_outcome = Some(TaskAttemptOutcome::Accepted {
-                        effect_id: effect_id.clone(),
-                    });
-                }
+                let candidate_sha = success
+                    .artifact
+                    .as_ref()
+                    .map(|artifact| artifact.head_sha.clone())
+                    .unwrap_or_else(|| request.base_sha.clone());
+                clear_task_with_candidate(state, task_id, effect_id, candidate_sha);
                 if let Some(artifact) = &success.artifact {
                     state.reachable_commits.insert(artifact.head_sha.clone());
                 }
-                mark_downstream_stale(state, task_id);
             }
             retire_role_conversation(state, &request.role_instance);
         }
@@ -911,10 +901,31 @@ fn apply_success_handoff(
             retire_role_conversation(state, &request.role_instance);
         }
         (super::OutputSemantics::ProducesReport, Some(Handoff::Work { .. })) => {
+            if let Some(task_id) = &request.task_id {
+                clear_task_with_candidate(state, task_id, effect_id, request.base_sha.clone());
+            }
             retire_role_conversation(state, &request.role_instance);
         }
         _ => {}
     }
+}
+
+fn clear_task_with_candidate(
+    state: &mut MissionState,
+    task_id: &super::TaskId,
+    effect_id: &super::EffectId,
+    candidate_sha: String,
+) {
+    if let Some(task) = state.tasks.get_mut(task_id) {
+        task.status = TaskStatus::Cleared;
+        task.consecutive_failures = 0;
+        task.candidate_sha = Some(candidate_sha);
+        task.pending_base_sha = None;
+        task.last_outcome = Some(TaskAttemptOutcome::Accepted {
+            effect_id: effect_id.clone(),
+        });
+    }
+    mark_downstream_stale(state, task_id);
 }
 
 fn settle_role_failure(
