@@ -28,7 +28,7 @@ use crate::model::{
     OutputSemantics, RequirementDisposition, RoleInstance, RoleInstanceId, TaskId, TerminalState,
 };
 use crate::oracle::OciOracleRunner;
-use crate::ports::{Clock, OracleRunner, SystemClock};
+use crate::ports::{Clock, EffectCleaner, OracleRunner, RoleRunner, SystemClock};
 use crate::runner::OciRoleRunner;
 use crate::store::NewEvent;
 use crate::store::{BlobStore, MissionStore};
@@ -38,16 +38,20 @@ use lionclaw_runtime_api::{RuntimeAuthRegistry, RuntimeDriverRegistry};
 /// External transports used by the canonical mission-command dispatcher.
 ///
 /// The ordinary executable uses [`MissionTransports::production`]. Integration
-/// tests may replace only the native runtime/auth registries and oracle
-/// transport; engine, store, workspace, capture, cleanup, and fold behavior
+/// tests may replace transports that cross a process or runtime boundary;
+/// engine, store, workspace, capture, command validation, and fold behavior
 /// remain the production implementations selected below.
 #[derive(Clone)]
 pub struct MissionTransports {
     profiles: Option<RuntimeProfiles>,
     runtime: Option<(RuntimeDriverRegistry, RuntimeAuthRegistry)>,
     oracle: Option<Arc<dyn OracleRunner>>,
+    role: Option<Arc<dyn RoleRunner>>,
+    cleaner: Option<Arc<dyn EffectCleaner>>,
     attached_runtime: Option<Arc<dyn crate::everyday::AttachedRuntimeExecutor>>,
     everyday_runtime_root: Option<PathBuf>,
+    mission_types_root: Option<PathBuf>,
+    in_process_operator_bridge: bool,
 }
 
 impl MissionTransports {
@@ -56,8 +60,12 @@ impl MissionTransports {
             profiles: None,
             runtime: None,
             oracle: None,
+            role: None,
+            cleaner: None,
             attached_runtime: None,
             everyday_runtime_root: None,
+            mission_types_root: None,
+            in_process_operator_bridge: false,
         }
     }
 
@@ -71,8 +79,12 @@ impl MissionTransports {
             profiles: Some(profiles),
             runtime: Some((drivers, auth)),
             oracle: Some(oracle),
+            role: None,
+            cleaner: None,
             attached_runtime: None,
             everyday_runtime_root: None,
+            mission_types_root: None,
+            in_process_operator_bridge: false,
         }
     }
 
@@ -86,6 +98,26 @@ impl MissionTransports {
 
     pub fn with_everyday_runtime_root(mut self, root: PathBuf) -> Self {
         self.everyday_runtime_root = Some(root);
+        self
+    }
+
+    pub fn with_role_transport(
+        mut self,
+        role: Arc<dyn RoleRunner>,
+        cleaner: Arc<dyn EffectCleaner>,
+    ) -> Self {
+        self.role = Some(role);
+        self.cleaner = Some(cleaner);
+        self
+    }
+
+    pub fn with_mission_types_root(mut self, root: PathBuf) -> Self {
+        self.mission_types_root = Some(root);
+        self
+    }
+
+    pub fn with_in_process_operator_bridge(mut self) -> Self {
+        self.in_process_operator_bridge = true;
         self
     }
 
@@ -131,6 +163,9 @@ pub struct RunArgs {
     /// Runtime profile to launch.
     #[arg(default_value = "codex")]
     pub runtime: String,
+    /// Release the current completed result and select or start later work.
+    #[arg(long = "new")]
+    pub new_selection: bool,
     /// Target repository (default: the enclosing git worktree root).
     #[arg(long)]
     pub repo: Option<PathBuf>,
@@ -747,6 +782,10 @@ async fn cmd_run(args: RunArgs, transports: &MissionTransports) -> Result<std::p
         auth,
         executor,
         runtime_root,
+        new_selection: args.new_selection,
+        operator_transports: transports
+            .in_process_operator_bridge
+            .then(|| transports.clone()),
     })
     .await?;
     outcome.print();
@@ -970,15 +1009,19 @@ async fn assemble_engine(
     workspace::ensure_excluded(repo).await?;
     default_profile.confinement.oci_mut().image = Some(image_id.clone());
     let runtime_identities = profiles.instrument_identities();
-    let role_runner = Arc::new(match &transports.runtime {
-        Some((drivers, auth)) => {
-            OciRoleRunner::with_registries(profiles, ceiling, drivers.clone(), auth.clone())
-        }
-        None => OciRoleRunner::new(profiles, ceiling),
+    let role_runner: Arc<dyn RoleRunner> = transports.role.clone().unwrap_or_else(|| {
+        Arc::new(match &transports.runtime {
+            Some((drivers, auth)) => {
+                OciRoleRunner::with_registries(profiles, ceiling, drivers.clone(), auth.clone())
+            }
+            None => OciRoleRunner::new(profiles, ceiling),
+        })
     });
-    let effect_cleaner = Arc::new(crate::effect_cleanup::LocalEffectCleaner::new(
-        default_profile.confinement.oci().engine.clone(),
-    ));
+    let effect_cleaner: Arc<dyn EffectCleaner> = transports.cleaner.clone().unwrap_or_else(|| {
+        Arc::new(crate::effect_cleanup::LocalEffectCleaner::new(
+            default_profile.confinement.oci().engine.clone(),
+        ))
+    });
     let oracle_runner: Arc<dyn OracleRunner> = transports
         .oracle
         .clone()
@@ -1015,10 +1058,17 @@ async fn build_engine_for_start(
         validate_team_runtimes(&mission_type.default_team, runtime, &profiles, transports)?;
     let engine = default_profile.confinement.oci().engine.clone();
     let image_ref = start_image_ref(&mission_type.image, image_override);
-    let image_id =
-        lionclaw_confinement::resolve_oci_image_compatibility_identity(&engine, image_ref)
-            .await
-            .with_context(|| format!("resolving image '{image_ref}'"))?;
+    let image_id = match &transports.attached_runtime {
+        Some(resolver) => {
+            resolver
+                .resolve_image_compatibility_identity(&engine, image_ref)
+                .await
+        }
+        None => {
+            lionclaw_confinement::resolve_oci_image_compatibility_identity(&engine, image_ref).await
+        }
+    }
+    .with_context(|| format!("resolving image '{image_ref}'"))?;
     assemble_engine(
         store,
         repo,
@@ -1158,7 +1208,7 @@ async fn cmd_start(args: StartArgs, transports: &MissionTransports) -> Result<()
     let now_ms = clock.now_ms();
     let mission_id = MissionId::for_creation(&workspace_dir, &args.objective, now_ms);
     let mission_dir = store.mission_dir(&mission_id);
-    let source = resolve_mission_type(&args.mission_type)?;
+    let source = resolve_mission_type_for_transports(&args.mission_type, transports)?;
     create_mission_dir(&store, &mission_id)?;
     let result = async {
         let mission_type =
@@ -2824,6 +2874,12 @@ async fn cmd_advance(
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let initial = load_mission_view(&store, &mission_id).await?;
+    if transports.role.is_some() {
+        let engine = build_engine_for_mission(store, &repo, &mission_id, transports).await?;
+        let view = engine.advance(&mission_id).await?;
+        print_mission_view(&view, engine.store(), args.json).await?;
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
     let mut child = None;
     let mut startup = None;
     if !initial.driver_running && !initial.next.effects.is_empty() {
@@ -3171,6 +3227,19 @@ fn mission_type_directories(parent: &Path) -> Result<Vec<PathBuf>> {
 
 fn resolve_mission_type(raw: &str) -> Result<PathBuf> {
     MissionTypeLocator::parse(raw)?.resolve()
+}
+
+fn resolve_mission_type_for_transports(
+    raw: &str,
+    transports: &MissionTransports,
+) -> Result<PathBuf> {
+    match (
+        MissionTypeLocator::parse(raw)?,
+        &transports.mission_types_root,
+    ) {
+        (MissionTypeLocator::Named(name), Some(root)) => Ok(root.join(name)),
+        (locator, _) => locator.resolve(),
+    }
 }
 
 async fn cmd_skill(cmd: SkillCommand) -> Result<()> {

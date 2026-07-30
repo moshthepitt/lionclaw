@@ -318,6 +318,7 @@ async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) 
                 base_sha: base_sha.clone(),
                 environment_digest: image_id.clone(),
                 dependency_refs: Vec::new(),
+                report_refs: Vec::new(),
                 assignment_epoch,
                 workspace_preparation: crate::model::WorkspacePreparation::Preserve,
                 deadline_ms,

@@ -811,18 +811,7 @@ fn check_shape(
             continue;
         };
         match team.roles.get(role_id) {
-            Some(role) if role.output.produces_task_output() => {
-                if role.output == OutputSemantics::ProducesReport && task.depends_on.len() > 1 {
-                    errors.push(err(
-                        "read_only_task_fan_in",
-                        format!(
-                            "read-only report task '{}' cannot integrate {} dependency candidates; assign a writable artifact producer to integrate them first",
-                            task.id,
-                            task.depends_on.len()
-                        ),
-                    ));
-                }
-            }
+            Some(role) if role.output.produces_task_output() => {}
             Some(_) => errors.push(err(
                 "task_output_mismatch",
                 format!(
@@ -1136,7 +1125,7 @@ mod topology_tests {
     }
 
     #[test]
-    fn rejects_multiple_candidate_branches_at_a_read_only_report_task() {
+    fn accepts_report_synthesis_shape_with_multiple_dependencies() {
         let plan = contract(vec![
             task("left", &[]),
             task("right", &[]),
@@ -1157,7 +1146,7 @@ mod topology_tests {
         team.roles.insert(reporter.id.clone(), reporter);
 
         assert!(
-            check_shape(&plan, &team, &BTreeMap::new(), &MissionConfig::default())
+            !check_shape(&plan, &team, &BTreeMap::new(), &MissionConfig::default())
                 .iter()
                 .any(|error| error.code == "read_only_task_fan_in")
         );

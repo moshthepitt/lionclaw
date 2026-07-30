@@ -1,18 +1,19 @@
 mod common;
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
 use lionclaw::cli::{self, Cli, MissionTransports};
 use lionclaw::config::RuntimeProfiles;
 use lionclaw::everyday::AttachedRuntimeExecutor;
 use lionclaw::store::MissionStore;
-use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
+use lionclaw::testing::{MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 use lionclaw_confinement::{ExecutionRequest, MountAccess};
 use lionclaw_runtime_api::{
     ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthIdentity, RuntimeAuthKind,
@@ -48,7 +49,10 @@ impl RuntimeDriverProvider for FakeDriver {
     }
 
     fn validate_config(&self, config: &RuntimeDriverConfig) -> Result<()> {
-        assert_eq!(config.runtime_id, "fake");
+        assert!(matches!(
+            config.runtime_id.as_str(),
+            "fake" | "codex" | "opencode"
+        ));
         assert_eq!(config.executable, "real-agent");
         assert_eq!(config.auth, Some(RuntimeAuthKind::from_static("fake-auth")));
         self.observations.lock().unwrap().validations += 1;
@@ -139,7 +143,7 @@ impl RuntimeAuthProvider for FakeAuth {
         &self,
         input: RuntimeAuthPreparation<'_>,
     ) -> Result<RuntimeAuthMaterialization> {
-        assert_eq!(input.runtime_id, "fake");
+        assert!(matches!(input.runtime_id, "fake" | "codex" | "opencode"));
         assert!(input.auth_staging_root.is_some());
         self.observations.lock().unwrap().auth_preparations += 1;
         Ok(RuntimeAuthMaterialization::new(
@@ -228,11 +232,277 @@ impl AttachedRuntimeExecutor for FakeAttached {
     }
 }
 
+struct BridgeAttached {
+    observations: Arc<Mutex<Observations>>,
+    phase: Mutex<u8>,
+    proposal: String,
+    commands: Arc<Mutex<Vec<Vec<String>>>>,
+    mission_id: Arc<Mutex<Option<lionclaw::model::MissionId>>>,
+}
+
+impl BridgeAttached {
+    fn new(
+        observations: Arc<Mutex<Observations>>,
+        proposal: String,
+        commands: Arc<Mutex<Vec<Vec<String>>>>,
+        mission_id: Arc<Mutex<Option<lionclaw::model::MissionId>>>,
+    ) -> Self {
+        Self {
+            observations,
+            phase: Mutex::new(0),
+            proposal,
+            commands,
+            mission_id,
+        }
+    }
+
+    fn run_client(&self, request: &ExecutionRequest, args: &[String], stdin: &str) -> Result<()> {
+        let bridge_mount = request
+            .plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime/lionclaw/operator.sock")
+            .context("operator bridge socket mount")?;
+        let skill_mount = request
+            .plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime/home/.agents/skills/lionclaw")
+            .context("standard skill mount")?;
+        let client = std::fs::read_to_string(skill_mount.source.join("lionclaw"))?;
+        let mapped_client = client.replace(
+            &serde_json::to_string("/runtime/lionclaw/operator.sock")?,
+            &serde_json::to_string(&bridge_mount.source.to_string_lossy())?,
+        );
+        let mut script = tempfile::NamedTempFile::new()?;
+        script.write_all(mapped_client.as_bytes())?;
+        let mut child = std::process::Command::new("node")
+            .arg(script.path())
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("launching projected bridge client")?;
+        child
+            .stdin
+            .take()
+            .context("projected bridge client stdin")?
+            .write_all(stdin.as_bytes())?;
+        let output = child.wait_with_output()?;
+        self.commands.lock().unwrap().push(args.to_vec());
+        if !output.status.success() {
+            bail!(
+                "projected bridge command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AttachedRuntimeExecutor for BridgeAttached {
+    async fn resolve_image_compatibility_identity(
+        &self,
+        _engine: &str,
+        _image: &str,
+    ) -> Result<String> {
+        Ok(IMAGE_A.to_string())
+    }
+
+    async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
+        let runtime_mount = request
+            .plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime")
+            .context("runtime mount")?;
+        let context = std::fs::read_to_string(runtime_mount.source.join("AGENTS.generated.md"))?;
+        self.observations.lock().unwrap().context.push(context);
+        let repo = request
+            .plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/workspace")
+            .map(|mount| mount.source.clone())
+            .context("workspace mount")?;
+        let phase = {
+            let mut phase = self.phase.lock().unwrap();
+            let current = *phase;
+            *phase += 1;
+            current
+        };
+        match phase {
+            0 => {
+                self.run_client(
+                    &request,
+                    &[
+                        "mission".into(),
+                        "start".into(),
+                        "--type".into(),
+                        "software-dev".into(),
+                        "--objective".into(),
+                        "Exercise the attached everyday bridge end to end".into(),
+                        "--runtime".into(),
+                        "codex".into(),
+                        "--image".into(),
+                        IMAGE_A.into(),
+                        "--json".into(),
+                    ],
+                    "",
+                )?;
+                let store = MissionStore::open(&repo).await?;
+                let mission_id = store
+                    .list_missions()
+                    .await?
+                    .into_iter()
+                    .next()
+                    .context("bridge-created mission")?;
+                *self.mission_id.lock().unwrap() = Some(mission_id.clone());
+                self.run_client(
+                    &request,
+                    &[
+                        "mission".into(),
+                        "plan".into(),
+                        "propose".into(),
+                        mission_id.to_string(),
+                        "--file".into(),
+                        "-".into(),
+                    ],
+                    &self.proposal,
+                )?;
+                let state = store.require_state(&mission_id).await?;
+                let decision_id = lionclaw::model::next(&state)
+                    .choices
+                    .into_iter()
+                    .find_map(|choice| match choice {
+                        lionclaw::model::Choice::Decide {
+                            id,
+                            action: lionclaw::model::DecisionAction::Approve,
+                        } => Some(id),
+                        _ => None,
+                    })
+                    .context("plan approval choice")?;
+                self.run_client(
+                    &request,
+                    &[
+                        "mission".into(),
+                        "decide".into(),
+                        mission_id.to_string(),
+                        decision_id,
+                        "approve".into(),
+                        "--justification".into(),
+                        "deterministic attached bridge acceptance".into(),
+                    ],
+                    "",
+                )?;
+                for _ in 0..5 {
+                    if lionclaw::model::next(&store.require_state(&mission_id).await?)
+                        .choices
+                        .iter()
+                        .any(|choice| matches!(choice, lionclaw::model::Choice::Finish { .. }))
+                    {
+                        break;
+                    }
+                    self.run_client(
+                        &request,
+                        &[
+                            "mission".into(),
+                            "advance".into(),
+                            mission_id.to_string(),
+                            "--wait".into(),
+                            "--json".into(),
+                        ],
+                        "",
+                    )?;
+                }
+                let ready = store.require_state(&mission_id).await?;
+                assert!(lionclaw::model::next(&ready)
+                    .choices
+                    .iter()
+                    .any(|choice| matches!(choice, lionclaw::model::Choice::Finish { .. })));
+                Ok(signal(9))
+            }
+            1 => {
+                let mission_id = self
+                    .mission_id
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .context("bridge mission id survived attached restart")?;
+                self.run_client(
+                    &request,
+                    &[
+                        "mission".into(),
+                        "finish".into(),
+                        mission_id.to_string(),
+                        "--reason".into(),
+                        "attached bridge acceptance completed".into(),
+                    ],
+                    "",
+                )?;
+                self.run_client(
+                    &request,
+                    &[
+                        "mission".into(),
+                        "report".into(),
+                        mission_id.to_string(),
+                        "--json".into(),
+                    ],
+                    "",
+                )?;
+                self.run_client(
+                    &request,
+                    &["mission".into(), "apply".into(), mission_id.to_string()],
+                    "",
+                )?;
+                Ok(output(0))
+            }
+            _ => bail!("unexpected attached bridge execution phase {phase}"),
+        }
+    }
+}
+
 fn output(code: i32) -> ExecutionOutput {
     ExecutionOutput {
         exit_code: Some(code),
         ..Default::default()
     }
+}
+
+fn software_dev_proposal_json() -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap();
+    let mission_type = lionclaw::mission_type::load_mission_type(
+        &root.join("mission-types/software-dev"),
+        &lionclaw::authority::AuthorityCeiling::default(),
+    )
+    .unwrap();
+    let plan = common::simple_plan();
+    let mut team = mission_type.default_team.clone();
+    team.revision = 1;
+    team.task_assignments = std::collections::BTreeMap::from([(
+        plan.tasks[0].id.clone(),
+        lionclaw::model::RoleInstanceId::new("implementer").unwrap(),
+    )]);
+    team.judgment_assignments = std::collections::BTreeMap::from([(
+        plan.assertions[0].id.clone(),
+        vec![lionclaw::model::RoleInstanceId::new("reviewer").unwrap()],
+    )]);
+    serde_json::to_string(&lionclaw::model::MissionProposal {
+        team: Some(team),
+        plan: Some(lionclaw::model::PlanProposal {
+            base_revision: 0,
+            requirement_changes: Vec::new(),
+            assertion_supersessions: Vec::new(),
+            plan,
+        }),
+        oracles: Some(common::oracle_specs(&common::simple_plan())),
+    })
+    .unwrap()
 }
 
 fn signal(number: i32) -> ExecutionOutput {
@@ -251,6 +521,22 @@ fn profiles_with_image(home: &Path, image: &str) -> RuntimeProfiles {
         &format!(
             r#"
         [runtimes.fake]
+        driver = "fake-terminal"
+        command = "real-agent"
+        native-resume = true
+        auth = "fake-auth"
+        skills-dir = ".agents/skills"
+        confinement = {{ backend = "podman", image = "{image}", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=64m"] }}
+
+        [runtimes.codex]
+        driver = "fake-terminal"
+        command = "real-agent"
+        native-resume = true
+        auth = "fake-auth"
+        skills-dir = ".agents/skills"
+        confinement = {{ backend = "podman", image = "{image}", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=64m"] }}
+
+        [runtimes.opencode]
         driver = "fake-terminal"
         command = "real-agent"
         native-resume = true
@@ -308,6 +594,18 @@ fn transports_with_profiles(
 fn run_cli(repo: &Path) -> Cli {
     Cli::try_parse_from(["lionclaw", "run", "fake", "--repo", repo.to_str().unwrap()])
         .expect("lionclaw run fake parses")
+}
+
+fn new_run_cli(repo: &Path) -> Cli {
+    Cli::try_parse_from([
+        "lionclaw",
+        "run",
+        "fake",
+        "--new",
+        "--repo",
+        repo.to_str().unwrap(),
+    ])
+    .expect("lionclaw run fake --new parses")
 }
 
 fn guide_cli(repo: &Path) -> Cli {
@@ -393,6 +691,93 @@ async fn everyday_run_reaches_validated_profile_auth_and_confinement() {
     assert!(observations.context[0].contains("\"repository\": \"/workspace\""));
     assert!(observations.context[0].contains("\"runtime\": \"fake\""));
     assert!(observations.context[0].contains("\"mission\": null"));
+}
+
+#[tokio::test]
+async fn attached_runtime_drives_full_mission_lifecycle_through_the_projected_bridge() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    common::initialize_repository(temp.path());
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let mission_id = Arc::new(Mutex::new(None));
+    let attached = Arc::new(BridgeAttached::new(
+        Arc::clone(&observations),
+        software_dev_proposal_json(),
+        Arc::clone(&commands),
+        Arc::clone(&mission_id),
+    ));
+    let role_runner = Arc::new(MockRoleRunner::new(Box::new(|request| {
+        if request.role.output == lionclaw::model::OutputSemantics::EmitsGapVerdict {
+            return Ok(lionclaw::testing::review_verdict(request, true, Vec::new()));
+        }
+        Ok(lionclaw::ports::RoleTurnOutcome {
+            handoff: Some(lionclaw::model::Handoff::Work {
+                done: true,
+                report: lionclaw::model::PayloadRef::inline("bridge-created artifact"),
+                request_attention: false,
+            }),
+            artifact: Some(lionclaw::ports::CapturedArtifact::for_testing(
+                request.base_sha.clone(),
+                common::HEAD_SHA,
+            )),
+            prepared_inputs: Vec::new(),
+            runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
+            final_response: "bridge-created artifact".to_string(),
+        })
+    })));
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("mission-types");
+    let transports = MissionTransports::external(
+        profiles(temp.path()),
+        RuntimeDriverRegistry::new([Arc::new(FakeDriver {
+            observations: Arc::clone(&observations),
+        }) as Arc<dyn RuntimeDriverProvider>]),
+        RuntimeAuthRegistry::new([Arc::new(FakeAuth {
+            observations: Arc::clone(&observations),
+        }) as Arc<dyn RuntimeAuthProvider>]),
+        Arc::new(MockOracleRunner::exiting(0)),
+    )
+    .with_attached_runtime(attached)
+    .with_everyday_runtime_root(runtime.path().to_path_buf())
+    .with_role_transport(role_runner, Arc::new(NoopEffectCleaner))
+    .with_mission_types_root(source_root)
+    .with_in_process_operator_bridge();
+
+    let code = cli::run_with_transports(run_cli(temp.path()), transports)
+        .await
+        .expect("attached bridge lifecycle succeeds");
+
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
+    let mission_id = mission_id.lock().unwrap().clone().unwrap();
+    let state = MissionStore::open(temp.path())
+        .await
+        .unwrap()
+        .require_state(&mission_id)
+        .await
+        .unwrap();
+    assert!(state.is_terminal());
+    assert!(state.applied_result.is_some());
+    let observations = observations.lock().unwrap();
+    assert_eq!(observations.context.len(), 2);
+    assert!(observations.context[0].contains("\"mission\": null"));
+    assert!(observations.context[1].contains(mission_id.as_str()));
+    assert!(observations.context[1].contains("\"kind\": \"finish\""));
+    let commands = commands.lock().unwrap();
+    for command in [
+        "start", "propose", "decide", "advance", "finish", "report", "apply",
+    ] {
+        assert!(
+            commands
+                .iter()
+                .any(|args| args.iter().any(|argument| argument == command)),
+            "missing bridge command {command}: {commands:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -663,6 +1048,76 @@ async fn completed_binding_is_preserved_through_apply_then_released() {
     assert!(!observations.context[1].contains(later.as_str()));
     assert!(observations.context[2].contains(later.as_str()));
     assert!(!observations.context[2].contains(current.as_str()));
+}
+
+#[tokio::test]
+async fn new_selection_releases_an_unapplied_result_without_destroying_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let harness = common::harness(
+        temp.path(),
+        common::review_runner(Vec::new()),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let completed = harness
+        .engine
+        .create_mission(
+            temp.path().to_str().unwrap(),
+            "Finish this mission but retain its unapplied result",
+            common::BASE_SHA,
+        )
+        .await
+        .unwrap();
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    let transports = transports(
+        temp.path(),
+        runtime.path(),
+        Arc::clone(&observations),
+        [output(0), output(0)],
+    );
+    cli::run_with_transports(run_cli(temp.path()), transports.clone())
+        .await
+        .unwrap();
+    harness
+        .engine
+        .propose_plan(&completed, common::proposal(0, common::simple_plan()))
+        .await
+        .unwrap();
+    common::approve_plan(&harness.engine, &completed).await;
+    common::advance_to_finished(&harness.engine, &completed).await;
+    let later = harness
+        .engine
+        .create_mission(
+            temp.path().to_str().unwrap(),
+            "Start later everyday work",
+            common::BASE_SHA,
+        )
+        .await
+        .unwrap();
+
+    let code = cli::run_with_transports(new_run_cli(temp.path()), transports)
+        .await
+        .unwrap();
+
+    assert_eq!(code, std::process::ExitCode::from(NONTERMINAL_EXIT));
+    let completed_state = lionclaw::model::fold(
+        MissionStore::open(temp.path())
+            .await
+            .unwrap()
+            .load(&completed)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(completed_state.is_terminal());
+    assert!(lionclaw::model::next(&completed_state)
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, lionclaw::model::Choice::Apply { .. })));
+    let observations = observations.lock().unwrap();
+    assert!(observations.context[1].contains(later.as_str()));
+    assert!(!observations.context[1].contains(completed.as_str()));
 }
 
 #[tokio::test]

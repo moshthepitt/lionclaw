@@ -28,6 +28,12 @@ The human starts or resumes this session with:
 lionclaw run [runtime]
 ```
 
+After a mission finishes, the completed mission remains current so its report
+and apply choice stay obvious. To leave an unapplied result intact and begin or
+select later work, the human explicitly runs `lionclaw run [runtime] --new`.
+The old result remains available by mission id, including
+`lionclaw mission apply <mission-id>` while its apply choice remains legal.
+
 Read `/runtime/AGENTS.generated.md` first. It contains neutral startup facts:
 the repository, selected runtime, an unambiguous mission when one exists,
 terminal truth, and the exact folded `mission.next`. After every LionClaw

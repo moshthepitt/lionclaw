@@ -134,6 +134,7 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
             .role_instrument_identity_for_revision(&role_instance, 1)
             .expect("role instrument identity"),
         dependency_refs: vec![],
+        report_refs: vec![],
         assignment_epoch: 1,
         message_boundary: head,
         presented_messages: vec![],

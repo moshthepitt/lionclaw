@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use super::digest::CanonicalDigest;
 use super::event::{
     EffectResource, EnvironmentAssignment, MissionConfig, MissionTypeRef, PayloadRef,
-    PreparedInputRef, RoleInstrumentIdentity, RoleProofFreshness, RuntimeConfigurationEvidence,
-    RuntimeInstrumentIdentity, SkillInstrumentIdentity, TaskCandidateRef,
+    PreparedInputRef, ReportEvidenceRef, RoleInstrumentIdentity, RoleProofFreshness,
+    RuntimeConfigurationEvidence, RuntimeInstrumentIdentity, SkillInstrumentIdentity,
+    TaskCandidateRef,
 };
 use super::ids::{AssertionId, MissionId, OracleName, RoleInstanceId, TaskId};
 use super::plan::{Assertion, OutputSemantics, Plan};
@@ -269,6 +270,7 @@ pub struct RoleTurnProvenance {
     pub environment_digest: String,
     pub instrument_identity: RoleInstrumentIdentity,
     pub dependency_refs: Vec<TaskCandidateRef>,
+    pub report_refs: Vec<ReportEvidenceRef>,
     pub workspace_preparation: super::WorkspacePreparation,
     pub message_boundary: u64,
     pub presented_messages: Vec<u64>,
@@ -734,6 +736,7 @@ pub enum InflightEffect {
         instrument_identity: Box<RoleInstrumentIdentity>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         dependency_refs: Vec<TaskCandidateRef>,
+        report_refs: Vec<ReportEvidenceRef>,
         assignment_epoch: u32,
         message_boundary: u64,
         presented_messages: Vec<u64>,
@@ -799,6 +802,7 @@ impl InflightEffect {
             environment_digest,
             instrument_identity,
             dependency_refs,
+            report_refs,
             assignment_epoch,
             message_boundary,
             presented_messages,
@@ -821,6 +825,7 @@ impl InflightEffect {
             environment_digest: environment_digest.clone(),
             instrument_identity: instrument_identity.as_ref().clone(),
             dependency_refs: dependency_refs.clone(),
+            report_refs: report_refs.clone(),
             workspace_preparation: workspace_preparation.clone(),
             message_boundary: *message_boundary,
             presented_messages: presented_messages.clone(),
@@ -882,6 +887,7 @@ impl InflightEffect {
                 environment_digest,
                 instrument_identity,
                 dependency_refs,
+                report_refs,
                 assignment_epoch,
                 message_boundary,
                 presented_messages,
@@ -907,6 +913,7 @@ impl InflightEffect {
                         environment_digest: environment_digest.clone(),
                         instrument_identity: Box::new(instrument_identity.clone()),
                         dependency_refs: dependency_refs.clone(),
+                        report_refs: report_refs.clone(),
                         assignment_epoch: *assignment_epoch,
                         message_boundary: *message_boundary,
                         presented_messages: presented_messages.clone(),
@@ -1336,7 +1343,15 @@ impl MissionState {
             request,
             plan_revision,
         } = &receipt.source;
-        *plan_revision == self.revision && request.is_fresh_at(self)
+        *plan_revision == self.revision
+            && request.is_fresh_at(self)
+            && self.role_report_refs_match(
+                &request.role_instance,
+                request.team_revision,
+                request.task_id.as_ref(),
+                &request.assertion_ids,
+                &request.report_refs,
+            )
     }
 
     pub(crate) fn taskless_assignment_failure(
@@ -1725,6 +1740,62 @@ impl MissionState {
                     })
             })
             .collect()
+    }
+
+    /// Current report deliverables relevant to one judgment assignment, in
+    /// plan-authored task order. Only cleared report-producing tasks enter the
+    /// set; their exact accepted payload digest and effect identity are bound.
+    pub fn judgment_report_refs(
+        &self,
+        assertion_ids: &[AssertionId],
+    ) -> Option<Vec<ReportEvidenceRef>> {
+        let plan = self.plan.as_ref()?;
+        let team = self.team.as_ref()?;
+        plan.tasks
+            .iter()
+            .filter(|task| {
+                task.targets
+                    .iter()
+                    .any(|target| assertion_ids.contains(target))
+            })
+            .filter(|task| {
+                team.task_assignments
+                    .get(&task.id)
+                    .and_then(|role_id| team.role(role_id))
+                    .is_some_and(|role| role.output == super::OutputSemantics::ProducesReport)
+            })
+            .map(|task| {
+                let outcome = self.tasks.get(&task.id)?.cleared_outcome()?;
+                let receipt = self.role_attempt_receipts.get(outcome.effect_id())?;
+                let report = receipt.accepted_report()?;
+                Some(ReportEvidenceRef {
+                    task_id: task.id.clone(),
+                    effect_id: outcome.effect_id().clone(),
+                    report_sha256: report.content_sha256()?,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn role_report_refs_match(
+        &self,
+        role_instance: &RoleInstanceId,
+        team_revision: u32,
+        task_id: Option<&TaskId>,
+        assertion_ids: &[AssertionId],
+        report_refs: &[ReportEvidenceRef],
+    ) -> bool {
+        let Some(role) = self
+            .team_history
+            .get(&team_revision)
+            .and_then(|team| team.role(role_instance))
+        else {
+            return false;
+        };
+        if role.output == super::OutputSemantics::EmitsVerdict && task_id.is_none() {
+            return self.judgment_report_refs(assertion_ids).as_deref() == Some(report_refs);
+        }
+        report_refs.is_empty()
     }
 
     pub fn task_required_base(&self, task_id: &TaskId) -> Option<String> {

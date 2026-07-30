@@ -16,9 +16,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 71 admits read-only report producers as assigned task outputs and
-/// folds their typed handoffs into task completion without minting a commit.
-pub const REDUCER_VERSION: u32 = 71;
+/// Reducer 72 binds judgment receipts to the current report deliverables and
+/// invalidates proof when any producing effect or report digest changes.
+pub const REDUCER_VERSION: u32 = 72;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -489,6 +489,7 @@ fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
         environment_digest,
         instrument_identity,
         dependency_refs,
+        report_refs,
         assignment_epoch,
         message_boundary,
         presented_messages,
@@ -514,7 +515,8 @@ fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
             *assignment_epoch,
             prompt_hash,
         )
-        && *prompt_template == super::role_prompt_template(role.output)
+        && *prompt_template
+            == super::role_assignment_prompt_template(role.output, task_id.is_some())
         && environment_digest == state.environment_digest()
         && state.role_instrument_identity_for_revision(role_instance, *team_revision)
             == Some(instrument_identity.clone())
@@ -523,6 +525,13 @@ fn apply_role_request(state: &mut MissionState, envelope: &EventEnvelope) {
             *team_revision,
             task_id.as_ref(),
             assertion_ids,
+        )
+        && state.role_report_refs_match(
+            role_instance,
+            *team_revision,
+            task_id.as_ref(),
+            assertion_ids,
+            report_refs,
         )
         && task_id.as_ref().is_none_or(|task_id| {
             state.task_lineage_request_matches(task_id, base_sha, dependency_refs)

@@ -47,6 +47,8 @@ pub struct RoleDispatchIntent {
     pub targets: Vec<AssertionId>,
     pub base_sha: String,
     pub dependency_refs: Vec<super::TaskCandidateRef>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub report_refs: Vec<super::ReportEvidenceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -803,6 +805,11 @@ fn role_intent(
 ) -> Option<RoleDispatchIntent> {
     let team = state.team.as_ref()?;
     let role = team.role(role_instance)?;
+    let report_refs = if role.output == super::OutputSemantics::EmitsVerdict && task_id.is_none() {
+        state.judgment_report_refs(&targets)?
+    } else {
+        Vec::new()
+    };
     Some(RoleDispatchIntent {
         role_instance: role_instance.clone(),
         team_revision: team.revision,
@@ -813,5 +820,6 @@ fn role_intent(
         targets,
         base_sha,
         dependency_refs,
+        report_refs,
     })
 }

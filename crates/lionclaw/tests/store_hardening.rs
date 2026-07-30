@@ -83,6 +83,7 @@ fn role_request(
             .role_instrument_identity_for_revision(&role_instance, team.revision)
             .expect("role instrument identity"),
         dependency_refs: assignment.dependency_refs,
+        report_refs: Vec::new(),
         assignment_epoch: assignment.generation,
         message_boundary: state.head,
         presented_messages,
@@ -438,7 +439,7 @@ async fn active_writer_snapshot_cannot_forge_a_missing_preparation_event() {
     let requested = h.engine.load_state(&mission_id).await.expect("requested");
     h.engine
         .store()
-        .rebuild_cursors(&mission_id, 71)
+        .rebuild_cursors(&mission_id, i64::from(REDUCER_VERSION))
         .await
         .expect("snapshot request");
     mutate_snapshot_state(dir.path(), &mission_id, |snapshot| {

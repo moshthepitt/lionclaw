@@ -6,6 +6,7 @@ Developer and CI helpers — not the everyday path. For real use:
 lionclaw install && lionclaw doctor
 lionclaw run               # defaults to the Codex runtime
 lionclaw run opencode      # or select another configured runtime
+lionclaw run --new         # leave a completed result unapplied and select later work
 ```
 
 The real agent session selects a generic method, proposes repository-specific

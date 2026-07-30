@@ -37,6 +37,7 @@ fn role_request(state: &MissionState) -> (EffectId, MissionEvent) {
                 .role_instrument_identity_for_revision(&role, 1)
                 .expect("role instrument identity"),
             dependency_refs: vec![],
+            report_refs: vec![],
             assignment_epoch: 1,
             message_boundary: state.head,
             presented_messages: vec![],

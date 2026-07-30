@@ -370,6 +370,7 @@ fn sunset_wire_shapes_have_no_planning_or_role_bridges() {
         environment_digest: BASE_ENVIRONMENT_DIGEST.into(),
         instrument_identity: role_instrument_for_revision(1, &instance("engineer")),
         dependency_refs: Vec::new(),
+        report_refs: Vec::new(),
         assignment_epoch: 1,
         message_boundary: 0,
         presented_messages: Vec::new(),
@@ -807,6 +808,7 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
             environment_digest: BASE_ENVIRONMENT_DIGEST.into(),
             instrument_identity,
             dependency_refs: Vec::new(),
+            report_refs: Vec::new(),
             assignment_epoch: 1,
             message_boundary: 5,
             presented_messages: Vec::new(),
@@ -943,6 +945,7 @@ fn reviewer_request(
                     .role_instrument_identity_for_revision(&role, 1)
                     .unwrap(),
                 dependency_refs: Vec::new(),
+                report_refs: Vec::new(),
                 assignment_epoch: 1,
                 message_boundary: sequence_no - 1,
                 presented_messages: Vec::new(),

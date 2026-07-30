@@ -59,14 +59,32 @@ pub(crate) struct OperatorBridge {
     worker: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+enum CommandBackend {
+    Process(PathBuf),
+    InProcess(crate::cli::MissionTransports),
+}
+
 impl OperatorBridge {
-    pub(crate) fn start(repo: &Path) -> Result<Self> {
-        let executable =
-            std::env::current_exe().context("resolving the host LionClaw executable")?;
-        Self::start_with_executable(repo, executable)
+    pub(crate) fn start(
+        repo: &Path,
+        transports: Option<crate::cli::MissionTransports>,
+    ) -> Result<Self> {
+        let backend = match transports {
+            Some(transports) => CommandBackend::InProcess(transports),
+            None => CommandBackend::Process(
+                std::env::current_exe().context("resolving the host LionClaw executable")?,
+            ),
+        };
+        Self::start_with_backend(repo, backend)
     }
 
+    #[cfg(test)]
     fn start_with_executable(repo: &Path, executable: PathBuf) -> Result<Self> {
+        Self::start_with_backend(repo, CommandBackend::Process(executable))
+    }
+
+    fn start_with_backend(repo: &Path, backend: CommandBackend) -> Result<Self> {
         let repo = repo
             .canonicalize()
             .with_context(|| format!("resolving bridge repository '{}'", repo.display()))?;
@@ -92,7 +110,7 @@ impl OperatorBridge {
         let worker = std::thread::Builder::new()
             .name("lionclaw-operator-bridge".to_string())
             .spawn(move || {
-                serve(listener, &executable, &repo, &worker_token, worker_stop);
+                serve(listener, backend, &repo, &worker_token, worker_stop);
             })
             .context("starting the operator bridge")?;
 
@@ -166,7 +184,7 @@ impl Drop for OperatorBridge {
 
 fn serve(
     listener: UnixListener,
-    executable: &Path,
+    backend: CommandBackend,
     repo: &Path,
     token: &str,
     stop: Arc<AtomicBool>,
@@ -181,7 +199,7 @@ fn serve(
                     let _ = refuse_busy(stream);
                     continue;
                 }
-                let executable = executable.to_path_buf();
+                let backend = backend.clone();
                 let repo = repo.to_path_buf();
                 let token = token.to_string();
                 let request_active = Arc::clone(&active);
@@ -190,8 +208,7 @@ fn serve(
                     .name("lionclaw-operator-command".to_string())
                     .spawn(move || {
                         let _active = ActiveRequest(request_active);
-                        let _ =
-                            handle_connection(stream, &executable, &repo, &token, &request_stop);
+                        let _ = handle_connection(stream, &backend, &repo, &token, &request_stop);
                     });
                 match spawned {
                     Ok(handler) => handlers.push(handler),
@@ -247,7 +264,7 @@ fn refuse_busy(mut stream: UnixStream) -> Result<()> {
 
 fn handle_connection(
     mut stream: UnixStream,
-    executable: &Path,
+    backend: &CommandBackend,
     repo: &Path,
     token: &str,
     stop: &AtomicBool,
@@ -262,7 +279,7 @@ fn handle_connection(
         if request.token != token {
             bail!("operator bridge authentication refused");
         }
-        execute_request(executable, repo, request, stop)
+        execute_request(backend, repo, request, stop)
     }) {
         Ok(response) => response,
         Err(error) => BridgeResponse {
@@ -288,12 +305,29 @@ fn read_request(stream: &UnixStream) -> Result<BridgeRequest> {
 }
 
 fn execute_request(
-    executable: &Path,
+    backend: &CommandBackend,
     repo: &Path,
     request: BridgeRequest,
     stop: &AtomicBool,
 ) -> Result<BridgeResponse> {
     let args = validate_and_normalize_args(request.args)?;
+    match backend {
+        CommandBackend::Process(executable) => {
+            execute_process_request(executable, repo, args, request.stdin, stop)
+        }
+        CommandBackend::InProcess(transports) => {
+            execute_in_process_request(repo, args, request.stdin, transports.clone(), stop)
+        }
+    }
+}
+
+fn execute_process_request(
+    executable: &Path,
+    repo: &Path,
+    args: Vec<String>,
+    stdin_text: String,
+    stop: &AtomicBool,
+) -> Result<BridgeResponse> {
     let mut command = ProcessCommand::new(executable);
     command
         .args(&args)
@@ -312,7 +346,7 @@ fn execute_request(
         .stdin
         .take()
         .context("host LionClaw stdin is absent")?;
-    let stdin_bytes = request.stdin.into_bytes();
+    let stdin_bytes = stdin_text.into_bytes();
     let stdin_writer = std::thread::spawn(move || -> Result<()> {
         let mut stdin = stdin;
         stdin
@@ -368,6 +402,57 @@ fn execute_request(
         exit_code: status.code().unwrap_or(1),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+fn execute_in_process_request(
+    repo: &Path,
+    mut args: Vec<String>,
+    stdin: String,
+    transports: crate::cli::MissionTransports,
+    stop: &AtomicBool,
+) -> Result<BridgeResponse> {
+    if stop.load(Ordering::Acquire) {
+        bail!("operator bridge stopped with a command in flight");
+    }
+    let mut stdin_file = None;
+    for index in 1..args.len() {
+        if args[index - 1] == "--file" && args[index] == "-" {
+            let mut file =
+                tempfile::NamedTempFile::new().context("creating in-process bridge stdin file")?;
+            file.write_all(stdin.as_bytes())
+                .context("writing in-process bridge stdin")?;
+            args[index] = file.path().to_string_lossy().into_owned();
+            stdin_file = Some(file);
+            break;
+        }
+    }
+    if args.first().is_some_and(|command| command == "mission")
+        && args.get(1).is_none_or(|command| command != "type")
+    {
+        args.push("--repo".to_string());
+        args.push(repo.to_string_lossy().into_owned());
+    }
+    let cli =
+        Cli::try_parse_from(std::iter::once("lionclaw").chain(args.iter().map(String::as_str)))
+            .context("parsing validated in-process bridge command")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building in-process bridge runtime")?;
+    let exit = runtime.block_on(crate::cli::run_with_transports(cli, transports))?;
+    drop(stdin_file);
+    let exit_code = if exit == std::process::ExitCode::SUCCESS {
+        0
+    } else if exit == std::process::ExitCode::FAILURE {
+        1
+    } else {
+        i32::from(crate::everyday::NONTERMINAL_EXIT_CODE)
+    };
+    Ok(BridgeResponse {
+        exit_code,
+        stdout: String::new(),
+        stderr: String::new(),
     })
 }
 

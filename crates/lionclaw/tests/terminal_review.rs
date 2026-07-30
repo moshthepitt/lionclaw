@@ -276,6 +276,7 @@ fn orphaned_gap_review_request(
             .role_instrument_identity_for_revision(&role_instance, team_revision)
             .expect("role instrument identity"),
         dependency_refs: vec![],
+        report_refs: vec![],
         assignment_epoch,
         message_boundary: state.head,
         presented_messages: vec![],

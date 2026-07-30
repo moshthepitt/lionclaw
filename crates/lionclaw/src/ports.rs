@@ -16,8 +16,8 @@ use tokio::sync::watch;
 use crate::mission_type::{PreparedInput, SkillPackage};
 use crate::model::{
     CommandOracle, ConfinementResources, EffectId, EffectResource, Handoff, MissionId, OracleName,
-    PreparedInputRef, RoleInstance, RuntimeConfigurationEvidence, RuntimeUsage, TaskCandidateRef,
-    TaskId,
+    PreparedInputRef, ReportEvidenceRef, RoleInstance, RuntimeConfigurationEvidence, RuntimeUsage,
+    TaskCandidateRef, TaskId,
 };
 pub use crate::workspace::{ArtifactCapture, CapturedArtifact};
 
@@ -57,6 +57,8 @@ pub struct RoleTurnRequest {
     pub environment_digest: String,
     /// Exact upstream task candidates this turn must incorporate.
     pub dependency_refs: Vec<TaskCandidateRef>,
+    /// Exact report deliverables this judgment turn must assess.
+    pub report_refs: Vec<ReportEvidenceRef>,
     pub assignment_epoch: u32,
     pub workspace_preparation: crate::model::WorkspacePreparation,
     pub deadline_ms: i64,

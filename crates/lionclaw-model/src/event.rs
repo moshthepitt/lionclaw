@@ -21,9 +21,9 @@ use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailureEvidence};
 
-/// Version 35 records mission-local command-oracle specifications and binds
-/// every request and outcome to the canonical digest of the executed spec.
-pub const SCHEMA_VERSION: u32 = 35;
+/// Version 36 binds judgment requests to the exact report deliverables they
+/// assess, including each report's content digest and producing effect.
+pub const SCHEMA_VERSION: u32 = 36;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -58,6 +58,19 @@ pub const fn role_prompt_template(output: OutputSemantics) -> RolePromptTemplate
         }
         OutputSemantics::EmitsVerdict => RolePromptTemplate::Judgment,
         OutputSemantics::EmitsGapVerdict => RolePromptTemplate::GapReview,
+    }
+}
+
+/// The renderer branch for one concrete assignment. A report role is a normal
+/// execution producer when it owns a task; only taskless report turns use the
+/// complete planning context.
+pub const fn role_assignment_prompt_template(
+    output: OutputSemantics,
+    has_task: bool,
+) -> RolePromptTemplate {
+    match (output, has_task) {
+        (OutputSemantics::ProducesReport, true) => RolePromptTemplate::Execution,
+        _ => role_prompt_template(output),
     }
 }
 
@@ -488,6 +501,17 @@ pub struct TaskCandidateRef {
     pub sha: String,
 }
 
+/// Exact report deliverable identity presented to a judgment role. Report
+/// bytes remain in their producer receipt; the request binds their digest and
+/// producer effect so replay and proof freshness cannot substitute content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportEvidenceRef {
+    pub task_id: TaskId,
+    pub effect_id: super::EffectId,
+    pub report_sha256: String,
+}
+
 /// Validate the parts of a role success that are authoritative at the effect
 /// boundary. Writers may legitimately report no artifact when the requested
 /// work was already satisfied, but only writers may return one and its base
@@ -665,6 +689,8 @@ pub enum MissionEvent {
         /// order. Empty for root tasks and taskless turns.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         dependency_refs: Vec<TaskCandidateRef>,
+        /// Exact untrusted report deliverables presented to a judgment turn.
+        report_refs: Vec<ReportEvidenceRef>,
         /// Monotonic identity for a fresh task assignment. Retries and
         /// continues retain the epoch and workspace.
         assignment_epoch: u32,

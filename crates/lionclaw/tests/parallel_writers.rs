@@ -410,6 +410,75 @@ async fn parallel_writers_run_concurrently_and_integrate_at_the_deliverable_head
 }
 
 #[tokio::test]
+async fn divergent_artifact_lineage_is_rejected_before_a_read_only_synthesizer_runs() {
+    let dir = TempDir::new().expect("tempdir");
+    initialize_repository(dir.path());
+    let runner = Arc::new(ParallelRoleRunner::new(IntegrationBehavior::Complete));
+    let runner_log = runner.log();
+    let engine = Engine::new(
+        MissionStore::open(dir.path()).await.expect("open store"),
+        mission_type(),
+        "localhost/lionclaw-runtime-dev:v1".to_string(),
+        EngineServices::new(
+            runner,
+            Arc::new(ScriptedOracleRunner::passing()),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    );
+    let plan = parallel_plan(false);
+    let mission_id = engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "synthesize divergent writer reports",
+            BASE_SHA,
+        )
+        .await
+        .expect("create");
+    engine
+        .propose_plan(
+            &mission_id,
+            MissionProposal {
+                team: Some(report_synthesis_team(1, &plan)),
+                oracles: Some(common::oracle_specs(&plan)),
+                plan: Some(PlanProposal {
+                    base_revision: 0,
+                    requirement_changes: Vec::new(),
+                    assertion_supersessions: Vec::new(),
+                    plan,
+                }),
+            },
+        )
+        .await
+        .expect("report synthesis shape is legal");
+    approve_plan(&engine, &mission_id).await;
+
+    engine.advance(&mission_id).await.expect("writers complete");
+    let failed = engine
+        .advance(&mission_id)
+        .await
+        .expect("read-only synthesis fails durably");
+
+    assert_eq!(
+        failed.state.tasks[&MERGE.parse_task()].status,
+        lionclaw::model::TaskStatus::Failed
+    );
+    assert_eq!(
+        failed
+            .state
+            .task_last_failure(&MERGE.parse_task())
+            .and_then(|failure| failure.evidence().code.as_deref()),
+        Some("task.divergent_read_only_lineage")
+    );
+    assert!(runner_log
+        .calls
+        .lock()
+        .expect("lock")
+        .iter()
+        .all(|call| call.task != MERGE));
+}
+
+#[tokio::test]
 async fn oracle_batches_run_concurrently_after_writer_fan_in() {
     let dir = TempDir::new().expect("tempdir");
     initialize_repository(dir.path());
@@ -1113,6 +1182,17 @@ fn assigned_team(revision: u32, plan: &Plan) -> TeamRevision {
     }
 }
 
+fn report_synthesis_team(revision: u32, plan: &Plan) -> TeamRevision {
+    let mut team = assigned_team(revision, plan);
+    let reporter = role("report-synthesizer", OutputSemantics::ProducesReport, false);
+    team.roles.insert(reporter.id.clone(), reporter);
+    team.task_assignments.insert(
+        MERGE.parse_task(),
+        RoleInstanceId::new("report-synthesizer").unwrap(),
+    );
+    team
+}
+
 fn roles() -> BTreeMap<RoleInstanceId, RoleInstance> {
     [
         role("strategist", OutputSemantics::ProposesPlan, false),
@@ -1480,6 +1560,7 @@ fn role_request(
                 .role_instrument_identity_for_revision(&role_instance, team_revision)
                 .expect("role instrument identity"),
             dependency_refs,
+            report_refs: Vec::new(),
             assignment_epoch: 1,
             message_boundary: sequence_no - 1,
             presented_messages: vec![],

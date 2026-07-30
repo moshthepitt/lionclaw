@@ -519,6 +519,7 @@ fn same_role_proof_identity(
         && left.environment_digest == right.environment_digest
         && left.instrument_identity == right.instrument_identity
         && left.dependency_refs == right.dependency_refs
+        && left.report_refs == right.report_refs
         && left.workspace_preparation == right.workspace_preparation
 }
 

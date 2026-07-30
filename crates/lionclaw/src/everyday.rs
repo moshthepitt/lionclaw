@@ -80,6 +80,8 @@ pub struct EverydayRunRequest {
     pub auth: Option<lionclaw_runtime_api::RuntimeAuthRegistry>,
     pub executor: Arc<dyn AttachedRuntimeExecutor>,
     pub runtime_root: PathBuf,
+    pub new_selection: bool,
+    pub operator_transports: Option<crate::cli::MissionTransports>,
 }
 
 #[derive(Debug)]
@@ -156,6 +158,8 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
         auth,
         executor,
         runtime_root,
+        new_selection,
+        operator_transports,
     } = request;
     let judged_root = crate::authority::canonical_or_lexical(&repo);
     let runtime_root = crate::authority::canonical_or_lexical(&runtime_root);
@@ -195,7 +199,7 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
     dirs.prepare().context("preparing everyday runtime state")?;
     let _guard = DriverGuard::try_acquire(dirs.driver_lock())?
         .context("another `lionclaw run` owns this repository")?;
-    let operator_bridge = OperatorBridge::start(&repo)?;
+    let operator_bridge = OperatorBridge::start(&repo, operator_transports)?;
     prepare_standard_skill(
         dirs.operator_skill(),
         operator_bridge.client_script()?.as_bytes(),
@@ -229,7 +233,7 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
         operator_bridge.socket_path(),
     )?;
     let adapter = driver.create_adapter(config);
-    let mut mission_selector = EverydayMissionSelector::begin(&store, &dirs).await?;
+    let mut mission_selector = EverydayMissionSelector::begin(&store, &dirs, new_selection).await?;
     let maximum_attempts = RecoveryConfig::default().max_attempts;
     let mut runtime_status = "without an exit status".to_string();
     let mut runtime_termination = RuntimeTermination::Unknown;
@@ -475,12 +479,12 @@ struct EverydayMissionSelector {
 }
 
 impl EverydayMissionSelector {
-    async fn begin(store: &MissionStore, dirs: &EverydayDirs) -> Result<Self> {
+    async fn begin(store: &MissionStore, dirs: &EverydayDirs, new_selection: bool) -> Result<Self> {
         let files = dirs.files()?;
         let all = load_mission_states(store).await?;
         let ignored_settled = all
             .iter()
-            .filter(|(_, state)| state.is_terminal() && !has_apply_choice(state))
+            .filter(|(_, state)| state.is_terminal())
             .map(|(id, _)| id.clone())
             .collect::<BTreeSet<_>>();
         if let Some(bound) = read_current_mission(&files)? {
@@ -488,9 +492,18 @@ impl EverydayMissionSelector {
                 .iter()
                 .find(|(id, _)| id == &bound)
                 .with_context(|| format!("current everyday mission '{bound}' does not exist"))?;
-            if state.is_terminal() && !has_apply_choice(state) {
+            if new_selection {
+                if !state.is_terminal() {
+                    bail!(
+                        "current everyday mission '{bound}' is still live; finish or abort it before using `lionclaw run --new`"
+                    );
+                }
+                files.remove_file(OsStr::new(CURRENT_MISSION_FILE), "current everyday mission")?;
+            } else if state.is_terminal() && !has_apply_choice(state) {
                 files.remove_file(OsStr::new(CURRENT_MISSION_FILE), "current everyday mission")?;
             }
+        } else if new_selection {
+            bail!("`lionclaw run --new` requires a current completed mission");
         }
         Ok(Self {
             files,
@@ -521,11 +534,7 @@ impl EverydayMissionSelector {
         } else {
             let candidates = all
                 .iter()
-                .filter(|(id, state)| {
-                    !state.is_terminal()
-                        || has_apply_choice(state)
-                        || !self.ignored_settled.contains(id)
-                })
+                .filter(|(id, state)| !state.is_terminal() || !self.ignored_settled.contains(id))
                 .cloned()
                 .collect::<Vec<_>>();
             (

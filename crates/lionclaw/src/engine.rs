@@ -30,8 +30,8 @@ use crate::ports::{
     OracleRunRequest, OracleRunner, RoleRunner, RoleTurnRequest,
 };
 use crate::prompt::{
-    render, ExecutionContext, GapReviewPromptContext, JudgmentContext, PlanningPromptContext,
-    PlanningPromptInput, PlanningPromptRefinement, TurnContext,
+    render, ExecutionContext, GapReviewPromptContext, JudgmentContext, JudgmentReportDeliverable,
+    PlanningPromptContext, PlanningPromptInput, PlanningPromptRefinement, TurnContext,
 };
 use crate::resources::MissionDirs;
 use crate::store::{AppendError, MissionStore, NewEvent};
@@ -318,6 +318,7 @@ impl Engine {
             expected_hash,
             base_sha,
             dependency_refs,
+            report_refs,
             message_boundary,
         ) = match &request.event {
             MissionEvent::RoleTurnRequested {
@@ -330,6 +331,7 @@ impl Engine {
                 prompt_hash,
                 base_sha,
                 dependency_refs,
+                report_refs,
                 message_boundary,
                 ..
             } => (
@@ -342,6 +344,7 @@ impl Engine {
                 prompt_hash.clone(),
                 base_sha.clone(),
                 dependency_refs.clone(),
+                report_refs.clone(),
                 *message_boundary,
             ),
             _ => unreachable!(),
@@ -370,7 +373,8 @@ impl Engine {
                     && intent.targets == assertion_ids
                     && intent.attempt_no == attempt_no
                     && intent.base_sha == base_sha
-                    && intent.dependency_refs == dependency_refs)
+                    && intent.dependency_refs == dependency_refs
+                    && intent.report_refs == report_refs)
                     .then_some(intent)
             })
             .context("role request prefix no longer reconstructs its dispatch")?;
@@ -382,7 +386,8 @@ impl Engine {
         let dialogue =
             materialize_conversation_messages(self, &state, &role_instance, state.head).await?;
         let prompt = self.assemble_role_request(&state, role, &intent, &dialogue)?;
-        let actual_template = crate::model::role_prompt_template(role.output);
+        let actual_template =
+            crate::model::role_assignment_prompt_template(role.output, task_id.is_some());
         let actual_hash = hex::encode(Sha256::digest(prompt.as_bytes()));
         if template != actual_template || expected_hash != actual_hash {
             bail!("canonical role prompt drift")
@@ -1457,6 +1462,7 @@ impl Engine {
             environment_digest,
             instrument_identity,
             dependency_refs,
+            report_refs,
             assignment_epoch,
             workspace_preparation,
             ..
@@ -1493,6 +1499,19 @@ impl Engine {
             return Ok(completed(Err(TypedFailure::permanent(
                 "role.output_contract",
                 "the pinned mission role no longer matches the effect output contract",
+            ))));
+        }
+        if *output == crate::model::OutputSemantics::ProducesReport
+            && dependency_refs
+                .iter()
+                .map(|reference| &reference.sha)
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1
+        {
+            return Ok(completed(Err(TypedFailure::permanent(
+                "task.divergent_read_only_lineage",
+                "a read-only report task cannot collapse divergent artifact candidates; add a writable integration task before report synthesis",
             ))));
         }
         if let Some(detail) = self.runtime_identity_mismatch(role, &instrument_identity.runtime) {
@@ -1560,6 +1579,7 @@ impl Engine {
             base_sha: base_sha.to_string(),
             environment_digest: environment_digest.clone(),
             dependency_refs: dependency_refs.clone(),
+            report_refs: report_refs.clone(),
             assignment_epoch: *assignment_epoch,
             workspace_preparation: workspace_preparation.clone(),
             deadline_ms: effect.deadline_ms(),
@@ -1865,6 +1885,42 @@ impl Engine {
         Ok(feedback)
     }
 
+    fn resolve_judgment_reports(
+        &self,
+        state: &MissionState,
+        report_refs: &[crate::model::ReportEvidenceRef],
+    ) -> Result<Vec<String>> {
+        const MAX_JUDGMENT_REPORT_BYTES: usize = 16 * MAX_ROLE_REPORT_BYTES;
+        let mut remaining = MAX_JUDGMENT_REPORT_BYTES;
+        let mut reports = Vec::with_capacity(report_refs.len());
+        for reference in report_refs {
+            let receipt = state
+                .role_attempt_receipts
+                .get(&reference.effect_id)
+                .with_context(|| {
+                    format!(
+                        "judgment report task '{}' points to a missing producer receipt",
+                        reference.task_id
+                    )
+                })?;
+            let report = receipt
+                .accepted_report()
+                .context("judgment report producer has no accepted report")?;
+            ensure!(
+                report.content_sha256().as_deref() == Some(&reference.report_sha256),
+                "judgment report digest differs from its durable request identity"
+            );
+            let resolved = self
+                .store
+                .blobs()
+                .resolve_bounded(report, remaining)
+                .context("judgment reports exceeded their aggregate prompt budget")?;
+            remaining -= resolved.len();
+            reports.push(resolved);
+        }
+        Ok(reports)
+    }
+
     /// Assemble an execution role's prompt.
     fn assemble_execution_request(
         &self,
@@ -1988,15 +2044,28 @@ impl Engine {
             crate::model::OutputSemantics::ProducesArtifact => {
                 self.assemble_execution_request(state, role, intent, dialogue)
             }
-            crate::model::OutputSemantics::EmitsVerdict => Ok(render(TurnContext::Judgment(
-                role,
-                JudgmentContext {
-                    objective: &state.objective,
-                    task_body: &intent.body,
-                    targets: &targets,
-                    feedback: dialogue,
-                },
-            ))),
+            crate::model::OutputSemantics::EmitsVerdict => {
+                let reports = self.resolve_judgment_reports(state, &intent.report_refs)?;
+                let deliverables = intent
+                    .report_refs
+                    .iter()
+                    .zip(&reports)
+                    .map(|(evidence, content)| JudgmentReportDeliverable { evidence, content })
+                    .collect::<Vec<_>>();
+                Ok(render(TurnContext::Judgment(
+                    role,
+                    JudgmentContext {
+                        objective: &state.objective,
+                        task_body: &intent.body,
+                        targets: &targets,
+                        feedback: dialogue,
+                        report_deliverables: &deliverables,
+                    },
+                )))
+            }
+            crate::model::OutputSemantics::ProducesReport if intent.task_id.is_some() => {
+                self.assemble_execution_request(state, role, intent, dialogue)
+            }
             crate::model::OutputSemantics::ProducesReport
             | crate::model::OutputSemantics::ProposesPlan => {
                 self.assemble_planning_request(state, role, intent, dialogue)
@@ -2181,7 +2250,8 @@ impl Engine {
         if let Some(detail) = self.runtime_identity_mismatch(role, &instrument_identity.runtime) {
             bail!("{detail}");
         }
-        let prompt_template = crate::model::role_prompt_template(intent.output);
+        let prompt_template =
+            crate::model::role_assignment_prompt_template(intent.output, intent.task_id.is_some());
         let effect_id = EffectId::for_role_turn(
             &state.mission_id,
             &intent.role_instance,
@@ -2215,6 +2285,7 @@ impl Engine {
             environment_digest: state.environment_digest().to_string(),
             instrument_identity,
             dependency_refs,
+            report_refs: intent.report_refs.clone(),
             assignment_epoch,
             message_boundary,
             presented_messages,
