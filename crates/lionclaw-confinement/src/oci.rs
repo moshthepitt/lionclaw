@@ -77,6 +77,7 @@ const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 const LIONCLAW_METADATA_DIR: &str = ".lionclaw";
 const WORKSPACE_LIONCLAW_METADATA_TMPFS: &str = "/workspace/.lionclaw:size=1m,mode=700,notmpcopyup";
 const NETWORK_PROXY_ALIAS: &str = "lionclaw-proxy";
+const NETWORK_PROXY_EGRESS_NETWORK: &str = "bridge";
 const NETWORK_PROXY_HTTP_PORT: u16 = 3128;
 const NETWORK_PROXY_SOCKS_PORT: u16 = 3129;
 const NETWORK_PROXY_BINARY_TARGET: &str = "/lionclaw/network-proxy";
@@ -1075,7 +1076,7 @@ fn build_network_proxy_invocation(
         "--network".to_string(),
         format!("{network_name}:alias={NETWORK_PROXY_ALIAS}"),
         "--network".to_string(),
-        "private".to_string(),
+        NETWORK_PROXY_EGRESS_NETWORK.to_string(),
         mount_flag.to_string(),
         mount_spec,
         image.to_string(),
@@ -2017,6 +2018,10 @@ mod tests {
             ]
         }));
         assert!(proxy
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--network".to_string(), "bridge".to_string()]));
+        assert!(!proxy
             .args
             .windows(2)
             .any(|pair| pair == ["--network".to_string(), "private".to_string()]));
