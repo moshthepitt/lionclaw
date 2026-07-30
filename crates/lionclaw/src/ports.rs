@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use lionclaw_runtime_api::TypedFailure;
@@ -15,9 +16,9 @@ use tokio::sync::watch;
 
 use crate::mission_type::{PreparedInput, SkillPackage};
 use crate::model::{
-    CommandOracle, ConfinementResources, EffectId, EffectResource, Handoff, MissionId, OracleName,
-    PreparedInputRef, ReportEvidenceRef, RoleInstance, RuntimeConfigurationEvidence, RuntimeUsage,
-    TaskCandidateRef, TaskId,
+    ConfinementResources, EffectId, EffectResource, ExternalOracleDriverId, Handoff, MissionId,
+    OracleName, OracleSpec, PreparedInputRef, ReportEvidenceRef, RoleInstance,
+    RuntimeConfigurationEvidence, RuntimeUsage, TaskCandidateRef, TaskId,
 };
 pub use crate::workspace::{ArtifactCapture, CapturedArtifact};
 
@@ -105,7 +106,19 @@ impl RoleTurnOutcome {
 /// An engine-run, worker-independent, reproducible check. Exit 0 = pass.
 #[async_trait]
 pub trait OracleRunner: Send + Sync {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure>;
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleRunStatus, TypedFailure>;
+}
+
+#[derive(Debug, Clone)]
+pub enum OracleRunStatus {
+    Complete(OracleOutcome),
+    Pending { next_poll_after_ms: i64 },
+}
+
+impl From<OracleOutcome> for OracleRunStatus {
+    fn from(outcome: OracleOutcome) -> Self {
+        Self::Complete(outcome)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,17 +127,137 @@ pub struct OracleRunRequest {
     pub effect_id: EffectId,
     pub oracle: OracleName,
     pub spec_digest: String,
-    /// Complete structured command resolved from mission state.
-    pub command: CommandOracle,
+    /// Complete structured oracle spec resolved from mission state.
+    pub spec: OracleSpec,
     pub judged_sha: String,
     /// Resolved immutable environment digest this effect is authorized under.
     pub environment_digest: String,
+    pub attempt_no: u32,
+    pub now_ms: i64,
     pub workspace_dir: PathBuf,
     pub state_dir: PathBuf,
     pub prepared_inputs: Vec<PreparedInput>,
     pub resource_ceilings: ConfinementResources,
     pub deadline_ms: i64,
     pub control: watch::Receiver<ExecutionControl>,
+}
+
+#[async_trait]
+pub trait ExternalOracleDriver: Send + Sync {
+    async fn submit(
+        &self,
+        request: ExternalOracleSubmitRequest,
+    ) -> Result<ExternalOracleSubmission, TypedFailure>;
+
+    async fn poll(
+        &self,
+        request: ExternalOraclePollRequest,
+    ) -> Result<ExternalOraclePoll, TypedFailure>;
+}
+
+#[derive(Clone, Default)]
+pub struct ExternalOracleDriverRegistry {
+    drivers: BTreeMap<ExternalOracleDriverId, Arc<dyn ExternalOracleDriver>>,
+}
+
+impl ExternalOracleDriverRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_driver(
+        mut self,
+        driver: ExternalOracleDriverId,
+        implementation: Arc<dyn ExternalOracleDriver>,
+    ) -> Self {
+        self.drivers.insert(driver, implementation);
+        self
+    }
+
+    pub fn get(&self, driver: &ExternalOracleDriverId) -> Option<Arc<dyn ExternalOracleDriver>> {
+        self.drivers.get(driver).cloned()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalOracleSubmitRequest {
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub oracle: OracleName,
+    pub driver: ExternalOracleDriverId,
+    pub spec_digest: String,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub request: BTreeMap<String, String>,
+    pub judged_sha: String,
+    pub environment_digest: String,
+    pub attempt_no: u32,
+    pub deadline_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalOracleSubmission {
+    pub driver: ExternalOracleDriverId,
+    pub idempotency_key: String,
+    pub spec_digest: String,
+    pub request_digest: String,
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalOraclePollRequest {
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub oracle: OracleName,
+    pub driver: ExternalOracleDriverId,
+    pub spec_digest: String,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub job_id: String,
+    pub judged_sha: String,
+    pub environment_digest: String,
+    pub attempt_no: u32,
+    pub deadline_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalOraclePoll {
+    Pending {
+        retry_after_ms: Option<u64>,
+    },
+    Passed {
+        proof: ExternalOracleProof,
+    },
+    Failed {
+        proof: ExternalOracleProof,
+        detail: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalOracleProof {
+    pub driver: ExternalOracleDriverId,
+    pub idempotency_key: String,
+    pub spec_digest: String,
+    pub request_digest: String,
+    pub job_id: String,
+    pub artifact_digest: Option<String>,
+    pub summary: String,
+}
+
+impl ExternalOracleProof {
+    #[cfg(any(test, feature = "testing"))]
+    pub fn empty_for_testing() -> Self {
+        Self {
+            driver: ExternalOracleDriverId::new("local-ci").expect("driver id"),
+            idempotency_key: String::new(),
+            spec_digest: String::new(),
+            request_digest: String::new(),
+            job_id: String::new(),
+            artifact_digest: None,
+            summary: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

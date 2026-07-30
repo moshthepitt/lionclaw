@@ -19,7 +19,7 @@ use lionclaw::model::{
 };
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, OracleOutcome,
-    OracleRunRequest, OracleRunner, RoleRunner, RoleTurnOutcome, RoleTurnRequest,
+    OracleRunRequest, OracleRunStatus, OracleRunner, RoleRunner, RoleTurnOutcome, RoleTurnRequest,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{
@@ -278,16 +278,16 @@ struct AbortOracleRunner {
 
 #[async_trait]
 impl OracleRunner for AbortOracleRunner {
-    async fn run(&self, mut request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+    async fn run(&self, mut request: OracleRunRequest) -> Result<OracleRunStatus, TypedFailure> {
         if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-            return Ok(OracleOutcome {
+            return Ok(OracleRunStatus::Complete(OracleOutcome {
                 exit_code: 1,
                 exit_signal: None,
                 stdout: Vec::new(),
                 stderr: b"first oracle failed".to_vec(),
                 prepared_inputs: Vec::new(),
                 duration_ms: 1,
-            });
+            }));
         }
 
         self.blocked_started.notify_one();

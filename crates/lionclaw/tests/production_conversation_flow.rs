@@ -22,7 +22,7 @@ use lionclaw::model::{
     RoleInstance, RoleInstanceId, Task, TaskId, TaskStatus, TeamRevision, TerminalState,
     REDUCER_VERSION, SCHEMA_VERSION,
 };
-use lionclaw::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
+use lionclaw::ports::{OracleOutcome, OracleRunRequest, OracleRunStatus, OracleRunner};
 use lionclaw::store::MissionStore;
 use lionclaw::{cli, workspace};
 use lionclaw_runtime_api::{
@@ -942,17 +942,17 @@ struct ReferenceIsolationOracleTransport {
 
 #[async_trait]
 impl OracleRunner for ReferenceIsolationOracleTransport {
-    async fn run(&self, _request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+    async fn run(&self, _request: OracleRunRequest) -> Result<OracleRunStatus, TypedFailure> {
         let mut attempts = self.attempts.lock().unwrap();
         *attempts += 1;
-        Ok(OracleOutcome {
+        Ok(OracleRunStatus::Complete(OracleOutcome {
             exit_code: i32::from(*attempts == 1),
             exit_signal: None,
             stdout: b"TERMINAL-RECEIPT-PROSE\n".to_vec(),
             stderr: Vec::new(),
             prepared_inputs: Vec::new(),
             duration_ms: 1,
-        })
+        }))
     }
 }
 
@@ -970,40 +970,40 @@ struct FailingOracleTransport;
 
 #[async_trait]
 impl OracleRunner for FailingOracleTransport {
-    async fn run(&self, _request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+    async fn run(&self, _request: OracleRunRequest) -> Result<OracleRunStatus, TypedFailure> {
         let mut stdout = b"AUTHORITATIVE-RECEIPT-CONTENT\n".to_vec();
         stdout.extend(std::iter::repeat_n(b'R', 10 * 1024));
         // A non-UTF-8 byte forces the production store to retain this genuine
         // receipt payload in the content-addressed blob store.
         stdout.push(0xff);
-        Ok(OracleOutcome {
+        Ok(OracleRunStatus::Complete(OracleOutcome {
             exit_code: 1,
             exit_signal: None,
             stdout,
             stderr: Vec::new(),
             prepared_inputs: Vec::new(),
             duration_ms: 1,
-        })
+        }))
     }
 }
 
 #[async_trait]
 impl OracleRunner for ExternalOracleTransport {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleRunStatus, TypedFailure> {
         assert!(request.workspace_dir.join(".git").exists());
         let (exit_code, stdout, duration_ms) = scripted_oracle_outcome(request.oracle.as_str());
         self.calls
             .lock()
             .unwrap()
             .push((request.oracle.to_string(), request.judged_sha));
-        Ok(OracleOutcome {
+        Ok(OracleRunStatus::Complete(OracleOutcome {
             exit_code,
             exit_signal: None,
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
             prepared_inputs: Vec::new(),
             duration_ms,
-        })
+        }))
     }
 }
 
@@ -1447,7 +1447,7 @@ confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
 
 #[tokio::test]
 async fn production_validator_and_park_compose_with_exact_awaiting_writer() {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (37, 73));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (38, 74));
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let base = initialize_repo(&repo).await;

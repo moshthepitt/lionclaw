@@ -182,6 +182,13 @@ fn command(argv: &[&str]) -> OracleSpec {
     })
 }
 
+fn command_mut(spec: &mut OracleSpec) -> &mut CommandOracle {
+    match spec {
+        OracleSpec::Command(command) => command,
+        OracleSpec::External(_) => panic!("test helper expected a command oracle"),
+    }
+}
+
 #[test]
 fn joint_proposal_validates_plan_against_new_oracle_map() {
     let proposal = MissionProposal {
@@ -263,8 +270,8 @@ fn command_oracles_may_request_only_destination_scoped_network() {
         ..Default::default()
     };
     let mut spec = command(&["curl", "https://api.example.com/health"]);
-    let OracleSpec::Command(command) = &mut spec;
-    command.grants.network = NetworkGrant::allow_single("api.example.com", 443).unwrap();
+    command_mut(&mut spec).grants.network =
+        NetworkGrant::allow_single("api.example.com", 443).unwrap();
 
     spec.validate(
         &ceilings,
@@ -279,8 +286,7 @@ fn command_oracles_may_request_only_destination_scoped_network() {
         |grants: &mut AuthorityGrants| grants.writes = true,
     ] {
         let mut forbidden = spec.clone();
-        let OracleSpec::Command(command) = &mut forbidden;
-        mutate(&mut command.grants);
+        mutate(&mut command_mut(&mut forbidden).grants);
         assert!(matches!(
             forbidden.validate(
                 &ceilings,
@@ -489,29 +495,31 @@ fn command_digest_covers_behavior_and_authority() {
     variants.push(command(&["cargo", "test", "--all-targets"]));
 
     let mut cwd = command(&["cargo", "test"]);
-    let OracleSpec::Command(spec) = &mut cwd;
-    spec.cwd = WorkspaceRelativeDir::new("crates/kernel").unwrap();
+    command_mut(&mut cwd).cwd = WorkspaceRelativeDir::new("crates/kernel").unwrap();
     variants.push(cwd);
 
     let mut environment = command(&["cargo", "test"]);
-    let OracleSpec::Command(spec) = &mut environment;
-    spec.environment
+    command_mut(&mut environment)
+        .environment
         .insert("RUSTFLAGS".into(), "-Dwarnings".into());
     variants.push(environment);
 
     let mut timeout = command(&["cargo", "test"]);
-    let OracleSpec::Command(spec) = &mut timeout;
-    spec.timeout_secs += 1;
+    command_mut(&mut timeout).timeout_secs += 1;
     variants.push(timeout);
 
     let mut grants = command(&["cargo", "test"]);
-    let OracleSpec::Command(spec) = &mut grants;
-    spec.grants.devices.insert("nvidia.com/gpu=all".to_string());
+    command_mut(&mut grants)
+        .grants
+        .devices
+        .insert("nvidia.com/gpu=all".to_string());
     variants.push(grants);
 
     let mut resources = command(&["cargo", "test"]);
-    let OracleSpec::Command(spec) = &mut resources;
-    spec.resources.tmpfs.push("/tmp:rw,size=1g".to_string());
+    command_mut(&mut resources)
+        .resources
+        .tmpfs
+        .push("/tmp:rw,size=1g".to_string());
     variants.push(resources);
 
     for variant in variants {
@@ -519,11 +527,10 @@ fn command_digest_covers_behavior_and_authority() {
     }
 
     let mut resources = command(&["cargo", "test"]);
-    let OracleSpec::Command(spec) = &mut resources;
-    spec.resources.tmpfs = vec!["/tmp:rw,size=1g".into(), "/cache:rw,size=2g".into()];
+    command_mut(&mut resources).resources.tmpfs =
+        vec!["/tmp:rw,size=1g".into(), "/cache:rw,size=2g".into()];
     let mut reordered = resources.clone();
-    let OracleSpec::Command(spec) = &mut reordered;
-    spec.resources.tmpfs.reverse();
+    command_mut(&mut reordered).resources.tmpfs.reverse();
     assert_eq!(
         resources.digest(),
         reordered.digest(),
@@ -799,26 +806,24 @@ fn old_spec_requests_and_outcomes_are_inert_and_spec_changes_stale_receipts() {
 
     let mut variants = vec![old_spec];
     let mut cwd = current_spec.clone();
-    let OracleSpec::Command(command) = &mut cwd;
-    command.cwd = WorkspaceRelativeDir::new("crates/lionclaw").unwrap();
+    command_mut(&mut cwd).cwd = WorkspaceRelativeDir::new("crates/lionclaw").unwrap();
     variants.push(cwd);
     let mut environment = current_spec.clone();
-    let OracleSpec::Command(command) = &mut environment;
-    command
+    command_mut(&mut environment)
         .environment
         .insert("RUSTFLAGS".into(), "-Dwarnings".into());
     variants.push(environment);
     let mut timeout = current_spec.clone();
-    let OracleSpec::Command(command) = &mut timeout;
-    command.timeout_secs += 1;
+    command_mut(&mut timeout).timeout_secs += 1;
     variants.push(timeout);
     let mut grants = current_spec.clone();
-    let OracleSpec::Command(command) = &mut grants;
-    command.grants.devices.insert("gpu".into());
+    command_mut(&mut grants).grants.devices.insert("gpu".into());
     variants.push(grants);
     let mut resources = current_spec.clone();
-    let OracleSpec::Command(command) = &mut resources;
-    command.resources.tmpfs.push("/tmp:rw,size=1g".into());
+    command_mut(&mut resources)
+        .resources
+        .tmpfs
+        .push("/tmp:rw,size=1g".into());
     variants.push(resources);
 
     for variant in variants {

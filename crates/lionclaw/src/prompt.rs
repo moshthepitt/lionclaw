@@ -239,8 +239,8 @@ fn render_planning(role: &RoleInstance, ctx: &PlanningPromptContext<'_>) -> Stri
         &serde_json::to_string_pretty(ctx.resource_ceilings).expect("resource ceilings serialize"),
     );
     prompt.push_str("\n```\n");
-    prompt.push_str("\n\n## Current command oracles\n\n");
-    prompt.push_str("Return one complete `oracles` map alongside every plan revision. Preserve a current oracle by reproducing its exact spec. Add or replace checks using structured argv only: the first item is a non-shell executable and every later item is one literal argument. Shell syntax is data and is never evaluated. `cwd` is `.` or a clean workspace-relative directory. Command oracles are read-only proof: they can request network only as explicit DNS host:port destinations within the immutable ceilings, and can never request secrets, installs, or writes. Inputs, devices, environment, timeouts, and tmpfs resources must stay within the immutable ceilings below.\n\n");
+    prompt.push_str("\n\n## Current oracles\n\n");
+    prompt.push_str("Return one complete `oracles` map alongside every plan revision. Preserve a current oracle by reproducing its exact spec. Command oracles use structured argv only: the first item is a non-shell executable and every later item is one literal argument. Shell syntax is data and is never evaluated. `cwd` is `.` or a clean workspace-relative directory. Command oracles are read-only proof: they can request network only as explicit DNS host:port destinations within the immutable ceilings, and can never request secrets, installs, or writes. Inputs, devices, environment, timeouts, and tmpfs resources must stay within the immutable ceilings below. External oracles name only an operator-installed driver identity and a bounded request field map; they never name executable paths, shell commands, credentials, or benchmark adapters. External results are polled by the kernel and do not finish the mission automatically.\n\n");
     prompt.push_str("Current accepted oracle set:\n\n```json\n");
     prompt.push_str(&serde_json::to_string_pretty(ctx.current_oracles).expect("oracles serialize"));
     prompt.push_str("\n```\n\nAuthority ceilings:\n\n```json\n");
@@ -494,14 +494,14 @@ A proposal separates outcomes from proof:
 - the complete team revision owns role contracts, task assignments, independent
   judgment panels, and the optional gap-review assignment; a task may use a
   read-only `produces-report` role or a writable `produces-artifact` role
-- the complete oracle map owns every repository command used as proof
+- the complete oracle map owns every command or external proof driver used as proof
 
 Rules the engine enforces (an invalid proposal is rejected):
 - assertion ids match ^[A-Z][A-Z0-9-]+$ ; task ids match ^[A-Za-z][A-Za-z0-9_-]*$
 - requirement ids follow the assertion-id format; every assertion covers at
   least one requirement
 - each assertion is covered by exactly one task (via its `targets`)
-- an assertion an oracle can check should bind a command oracle from the same
+- an assertion an oracle can check should bind an oracle from the same
   proposal by name; under a
   `verified` mission type every proof-bearing requirement must be
   `confined_provable` and every named assertion must bind an oracle
@@ -517,9 +517,12 @@ Rules the engine enforces (an invalid proposal is rejected):
 - command oracles use structured argv with a non-shell executable and clean
   workspace-relative cwd, stay read-only and secret-free, and remain within the displayed timeout,
   authority, input, device, and resource ceilings
+- external oracles name an installed driver identity plus bounded request
+  fields only; do not put paths, shell commands, credentials, tokens, passwords,
+  API keys, or benchmark adapters in the mission proposal
 
 Choose stable oracle names that describe the proof they run. Preserve contracts
-and command specs from the current mission unless the objective requires a
+and oracle specs from the current mission unless the objective requires a
 deliberate change. Angle-bracketed values below are placeholders.
 
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:

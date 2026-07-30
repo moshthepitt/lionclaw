@@ -18,7 +18,8 @@ use lionclaw::model::{
     TeamRevision, VersionStamps, WorkspacePreparation, SCHEMA_VERSION,
 };
 use lionclaw::ports::{
-    OracleOutcome, OracleRunRequest, OracleRunner, RoleRunner, RoleTurnOutcome, RoleTurnRequest,
+    OracleOutcome, OracleRunRequest, OracleRunStatus, OracleRunner, RoleRunner, RoleTurnOutcome,
+    RoleTurnRequest,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, NoopEffectCleaner};
@@ -250,7 +251,7 @@ impl ScriptedOracleRunner {
 
 #[async_trait]
 impl OracleRunner for ScriptedOracleRunner {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleRunStatus, TypedFailure> {
         self.calls
             .lock()
             .expect("lock")
@@ -263,14 +264,14 @@ impl OracleRunner for ScriptedOracleRunner {
             0
         };
         *attempt += 1;
-        Ok(OracleOutcome {
+        Ok(OracleRunStatus::Complete(OracleOutcome {
             exit_code,
             exit_signal: None,
             stdout: format!("oracle {exit_code} at {}", request.judged_sha).into_bytes(),
             stderr: Vec::new(),
             prepared_inputs: Vec::new(),
             duration_ms: 1,
-        })
+        }))
     }
 }
 
@@ -290,20 +291,20 @@ impl ConcurrentOracleRunner {
 
 #[async_trait]
 impl OracleRunner for ConcurrentOracleRunner {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleRunStatus, TypedFailure> {
         self.calls
             .lock()
             .expect("lock")
             .push(request.oracle.to_string());
         self.barrier.wait().await;
-        Ok(OracleOutcome {
+        Ok(OracleRunStatus::Complete(OracleOutcome {
             exit_code: 0,
             exit_signal: None,
             stdout: format!("oracle pass at {}", request.judged_sha).into_bytes(),
             stderr: Vec::new(),
             prepared_inputs: Vec::new(),
             duration_ms: 1,
-        })
+        }))
     }
 }
 

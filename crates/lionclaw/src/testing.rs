@@ -13,7 +13,8 @@ use lionclaw_runtime_api::TypedFailure;
 use crate::model::{Gap, Handoff, PayloadRef, TaskId};
 use crate::ports::{
     CapturedArtifact, Clock, EffectCleaner, EffectCleanupFailure, EffectCleanupRequest,
-    OracleOutcome, OracleRunRequest, OracleRunner, RoleRunner, RoleTurnOutcome, RoleTurnRequest,
+    OracleOutcome, OracleRunRequest, OracleRunStatus, OracleRunner, RoleRunner, RoleTurnOutcome,
+    RoleTurnRequest,
 };
 
 #[derive(Default)]
@@ -219,16 +220,24 @@ impl RoleRunner for MockRoleRunner {
     }
 }
 
-type OracleScript =
+type OracleStatusScript =
+    Box<dyn Fn(&OracleRunRequest) -> Result<OracleRunStatus, TypedFailure> + Send + Sync>;
+type OracleOutcomeScript =
     Box<dyn Fn(&OracleRunRequest) -> Result<OracleOutcome, TypedFailure> + Send + Sync>;
 
 pub struct MockOracleRunner {
-    script: OracleScript,
+    script: OracleStatusScript,
     pub calls: Mutex<Vec<(String, String)>>,
 }
 
 impl MockOracleRunner {
-    pub fn new(script: OracleScript) -> Self {
+    pub fn new(script: OracleOutcomeScript) -> Self {
+        Self::new_status(Box::new(move |request| {
+            script(request).map(OracleRunStatus::Complete)
+        }))
+    }
+
+    pub fn new_status(script: OracleStatusScript) -> Self {
         Self {
             script,
             calls: Mutex::new(Vec::new()),
@@ -252,7 +261,7 @@ impl MockOracleRunner {
 
 #[async_trait]
 impl OracleRunner for MockOracleRunner {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleRunStatus, TypedFailure> {
         self.calls
             .lock()
             .expect("lock")

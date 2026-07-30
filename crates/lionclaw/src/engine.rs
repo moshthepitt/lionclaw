@@ -27,7 +27,7 @@ use crate::model::{
 };
 use crate::ports::{
     ArtifactCapture, Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl,
-    OracleRunRequest, OracleRunner, RoleRunner, RoleTurnRequest,
+    OracleRunRequest, OracleRunStatus, OracleRunner, RoleRunner, RoleTurnRequest,
 };
 use crate::prompt::{
     render, ExecutionContext, GapReviewPromptContext, JudgmentContext, JudgmentReportDeliverable,
@@ -59,6 +59,11 @@ pub struct EngineServices {
 enum EffectCleanupDisposition {
     Complete(Option<TypedFailure>),
     Blocked,
+}
+
+enum EffectExecution {
+    Complete(Box<NewEvent>),
+    Pending,
 }
 
 struct ActivityReporter {
@@ -883,14 +888,29 @@ impl Engine {
             }
             if !resolve_effects.is_empty() {
                 // A fresh dispatch is driven directly from its carried IDs.
-                // Anything projected here predates this driver invocation.
+                // Local effects projected here predate this driver invocation.
+                // External oracle effects are resumable because their driver
+                // protocol is idempotent and the submission handle is durable.
+                let current = self.load_state(mission_id).await?;
+                let mut resumable_external = Vec::new();
                 for effect_id in resolve_effects {
-                    if !self
+                    if self.effect_is_resumable_external_oracle(&current, &effect_id) {
+                        resumable_external.push(effect_id);
+                    } else if !self
                         .recover_interrupted_effect(mission_id, &effect_id)
                         .await?
                     {
                         return Ok(());
                     }
+                }
+                if !resumable_external.is_empty() {
+                    let active = self.load_state(mission_id).await?;
+                    if Box::pin(self.drive_active(&active, resumable_external, activity.clone()))
+                        .await?
+                    {
+                        continue;
+                    }
+                    return Ok(());
                 }
                 continue;
             }
@@ -976,6 +996,28 @@ impl Engine {
             .append_outcome(&current.mission_id, effect_id, outcome, true)
             .await?
             .is_some())
+    }
+
+    fn effect_is_resumable_external_oracle(
+        &self,
+        state: &MissionState,
+        effect_id: &EffectId,
+    ) -> bool {
+        let Some(InflightEffect::OracleRun {
+            oracle,
+            spec_digest,
+            ..
+        }) = state.inflight.get(effect_id)
+        else {
+            return false;
+        };
+        matches!(
+            state
+                .oracles
+                .get(oracle)
+                .filter(|spec| spec.digest() == *spec_digest),
+            Some(crate::model::OracleSpec::External(_))
+        )
     }
 
     async fn drive_active(
@@ -1102,10 +1144,10 @@ impl Engine {
             tokio::sync::watch::channel(ExecutionControl::RunUntil(effect.deadline_ms()));
         let execution = async {
             match &effect {
-                InflightEffect::RoleTurn { .. } => {
-                    self.execute_role_turn(state, &effect_id, &effect, control_rx, activity.clone())
-                        .await
-                }
+                InflightEffect::RoleTurn { .. } => self
+                    .execute_role_turn(state, &effect_id, &effect, control_rx, activity.clone())
+                    .await
+                    .map(|event| EffectExecution::Complete(Box::new(event))),
                 InflightEffect::OracleRun { .. } => {
                     self.execute_oracle_run(state, &effect_id, &effect, control_rx)
                         .await
@@ -1116,7 +1158,7 @@ impl Engine {
         // the sum once on the heap instead of embedding its largest variant
         // in the driver thread's stack frame.
         let mut execution = Box::pin(execution);
-        let mut outcome = loop {
+        let outcome = loop {
             tokio::select! {
                 outcome = &mut execution => break outcome?,
                 () = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -1188,6 +1230,10 @@ impl Engine {
                 }
             }
         };
+        let EffectExecution::Complete(outcome) = outcome else {
+            return Ok(false);
+        };
+        let mut outcome = *outcome;
         let mut discard_artifact = !matches!(
             outcome.event,
             MissionEvent::RoleTurnCompleted { outcome: Ok(_), .. }
@@ -1718,7 +1764,7 @@ impl Engine {
         effect_id: &EffectId,
         effect: &InflightEffect,
         control: tokio::sync::watch::Receiver<ExecutionControl>,
-    ) -> Result<NewEvent> {
+    ) -> Result<EffectExecution> {
         let InflightEffect::OracleRun {
             assertion_ids,
             oracle,
@@ -1748,21 +1794,24 @@ impl Engine {
             .get(oracle)
             .filter(|spec| spec.digest() == *spec_digest)
         else {
-            return Ok(completed(Err(TypedFailure::permanent(
-                "oracle.spec_stale",
-                format!("oracle '{oracle}' no longer matches the recorded command spec"),
-            ))));
+            return Ok(EffectExecution::Complete(Box::new(completed(Err(
+                TypedFailure::permanent(
+                    "oracle.spec_stale",
+                    format!("oracle '{oracle}' no longer matches the recorded oracle spec"),
+                ),
+            )))));
         };
-        let command = spec.as_command().clone();
         let request = OracleRunRequest {
             mission_id: state.mission_id.clone(),
             effect_id: effect_id.clone(),
             oracle: oracle.clone(),
             spec_digest: spec_digest.clone(),
-            prepared_inputs: prepared_inputs_for_grants(&command.grants, &self.mission_type.inputs),
-            command,
+            prepared_inputs: prepared_inputs_for_oracle(spec, &self.mission_type.inputs),
+            spec: spec.clone(),
             judged_sha: judged_sha.to_string(),
             environment_digest: environment_digest.clone(),
+            attempt_no,
+            now_ms: self.clock.now_ms(),
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
             resource_ceilings: state.config.resource_ceilings.clone(),
@@ -1770,22 +1819,25 @@ impl Engine {
             control,
         };
         match self.oracle_runner.run(request).await {
-            Ok(outcome) => {
+            Ok(OracleRunStatus::Complete(outcome)) => {
                 let settlement_evidence = lionclaw_runtime_api::TypedFailureEvidence {
                     exit_code: Some(outcome.exit_code),
                     stderr: String::from_utf8_lossy(&outcome.stderr).into_owned(),
                     ..Default::default()
                 };
-                Ok(completed(Ok(OracleRunSuccess {
-                    exit_code: outcome.exit_code,
-                    exit_signal: outcome.exit_signal,
-                    stdout: self.store.blobs().payload_from_bytes(&outcome.stdout)?,
-                    stderr: self.store.blobs().payload_from_bytes(&outcome.stderr)?,
-                    prepared_inputs: outcome.prepared_inputs,
-                    duration_ms: outcome.duration_ms,
-                }))
-                .with_settlement_evidence(settlement_evidence))
+                Ok(EffectExecution::Complete(Box::new(
+                    completed(Ok(OracleRunSuccess {
+                        exit_code: outcome.exit_code,
+                        exit_signal: outcome.exit_signal,
+                        stdout: self.store.blobs().payload_from_bytes(&outcome.stdout)?,
+                        stderr: self.store.blobs().payload_from_bytes(&outcome.stderr)?,
+                        prepared_inputs: outcome.prepared_inputs,
+                        duration_ms: outcome.duration_ms,
+                    }))
+                    .with_settlement_evidence(settlement_evidence),
+                )))
             }
+            Ok(OracleRunStatus::Pending { .. }) => Ok(EffectExecution::Pending),
             Err(mut failure) => {
                 if failure.is_transient() {
                     let delay_ms = transient_backoff_ms(attempt_no, failure.retry_after_ms());
@@ -1793,7 +1845,9 @@ impl Engine {
                         self.clock.now_ms().saturating_add(delay_ms as i64),
                     );
                 }
-                Ok(completed(Err(failure.projected())))
+                Ok(EffectExecution::Complete(Box::new(completed(Err(
+                    failure.projected()
+                )))))
             }
         }
     }
@@ -2355,10 +2409,7 @@ impl Engine {
                         attempt_no: intent.attempt_no,
                         effect_id,
                         requested_at_ms,
-                        deadline_ms: resolved_deadline(
-                            not_before_ms,
-                            spec.as_command().timeout_secs,
-                        )?,
+                        deadline_ms: resolved_deadline(not_before_ms, spec.timeout_secs())?,
                     }),
                 ))
             })
@@ -2491,6 +2542,21 @@ fn prepared_inputs_for_grants(
         .iter()
         .filter_map(|name| available.get(name).cloned())
         .collect()
+}
+
+fn prepared_inputs_for_oracle(
+    spec: &crate::model::OracleSpec,
+    available: &std::collections::BTreeMap<
+        crate::model::InputName,
+        crate::mission_type::PreparedInput,
+    >,
+) -> Vec<crate::mission_type::PreparedInput> {
+    match spec {
+        crate::model::OracleSpec::Command(command) => {
+            prepared_inputs_for_grants(&command.grants, available)
+        }
+        crate::model::OracleSpec::External(_) => Vec::new(),
+    }
 }
 
 #[cfg(test)]

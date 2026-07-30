@@ -75,20 +75,15 @@ impl From<Destination> for UncheckedDestination {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum NetworkGrant {
+    #[default]
     Deny,
     Allow {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         destinations: BTreeSet<Destination>,
     },
-}
-
-impl Default for NetworkGrant {
-    fn default() -> Self {
-        Self::Deny
-    }
 }
 
 impl NetworkGrant {

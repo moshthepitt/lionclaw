@@ -399,8 +399,12 @@ pub fn proposal_with_oracle_timeout(
         .expect("test proposal declares its complete oracle map")
         .values_mut()
     {
-        let OracleSpec::Command(command) = spec;
-        command.timeout_secs = timeout_secs;
+        match spec {
+            OracleSpec::Command(command) => command.timeout_secs = timeout_secs,
+            OracleSpec::External(_) => {
+                panic!("proposal_with_oracle_timeout only supports command oracle fixtures")
+            }
+        }
     }
     proposal
 }

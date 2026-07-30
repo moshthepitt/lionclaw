@@ -16,9 +16,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 72 binds judgment receipts to the current report deliverables and
-/// invalidates proof when any producing effect or report digest changes.
-pub const REDUCER_VERSION: u32 = 73;
+/// Reducer 74 admits external oracle specs while keeping oracle effects in the
+/// existing request/outcome fold.
+pub const REDUCER_VERSION: u32 = 74;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -178,11 +178,8 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 && !state.authoritative_receipts.contains_key(effect_id)
                 && spec
                     .and_then(|spec| {
-                        super::resolve_execution_deadline_ms(
-                            not_before_ms,
-                            spec.as_command().timeout_secs,
-                        )
-                        .ok()
+                        super::resolve_execution_deadline_ms(not_before_ms, spec.timeout_secs())
+                            .ok()
                     })
                     == Some(*deadline_ms);
             if canonical && !state.inflight.contains_key(effect_id) {

@@ -15,8 +15,14 @@ pub const MAX_ORACLE_ARGV_BYTES: usize = 64 * 1024;
 pub const MAX_ORACLE_CWD_BYTES: usize = 4 * 1024;
 pub const MAX_ORACLE_ENVIRONMENT_ENTRIES: usize = 128;
 pub const MAX_ORACLE_ENVIRONMENT_BYTES: usize = 64 * 1024;
+pub const MAX_EXTERNAL_ORACLE_DRIVER_ID_BYTES: usize = 128;
+pub const MAX_EXTERNAL_ORACLE_REQUEST_FIELDS: usize = 64;
+pub const MAX_EXTERNAL_ORACLE_REQUEST_KEY_BYTES: usize = 128;
+pub const MAX_EXTERNAL_ORACLE_REQUEST_VALUE_BYTES: usize = 8 * 1024;
+pub const MAX_EXTERNAL_ORACLE_REQUEST_BYTES: usize = 64 * 1024;
 
 const SHELL_EXECUTABLES: &[&str] = &["ash", "bash", "dash", "fish", "ksh", "sh", "zsh"];
+const DEFAULT_EXTERNAL_POLL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -76,10 +82,69 @@ pub struct CommandOracle {
     pub resources: ConfinementResources,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ExternalOracleDriverId(String);
+
+impl ExternalOracleDriverId {
+    pub fn new(raw: impl Into<String>) -> Result<Self, OracleSpecError> {
+        let raw = raw.into();
+        let mut chars = raw.chars();
+        let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
+        if !first_ok
+            || raw.len() > MAX_EXTERNAL_ORACLE_DRIVER_ID_BYTES
+            || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            return Err(OracleSpecError::InvalidExternalDriverId(raw));
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ExternalOracleDriverId {
+    type Error = OracleSpecError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::new(raw)
+    }
+}
+
+impl From<ExternalOracleDriverId> for String {
+    fn from(driver: ExternalOracleDriverId) -> Self {
+        driver.0
+    }
+}
+
+impl core::fmt::Display for ExternalOracleDriverId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalOracle {
+    pub driver: ExternalOracleDriverId,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub request: BTreeMap<String, String>,
+    pub timeout_secs: u64,
+    #[serde(default = "default_external_poll_secs")]
+    pub poll_secs: u64,
+}
+
+const fn default_external_poll_secs() -> u64 {
+    DEFAULT_EXTERNAL_POLL_SECS
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OracleSpec {
     Command(CommandOracle),
+    External(ExternalOracle),
 }
 
 impl OracleSpec {
@@ -106,8 +171,25 @@ impl OracleSpec {
                 );
                 digest.set("resources.tmpfs", command.resources.tmpfs.iter());
             }
+            Self::External(external) => {
+                digest.str("type", "external");
+                digest.str("driver", external.driver.as_str());
+                digest.map("request", external.request.iter());
+                digest.u64("timeout_secs", external.timeout_secs);
+                digest.u64("poll_secs", external.poll_secs);
+            }
         }
         digest.finish()
+    }
+
+    pub fn request_digest(&self) -> Option<String> {
+        let Self::External(external) = self else {
+            return None;
+        };
+        let mut digest = CanonicalDigest::new("lionclaw.external-oracle-request.v1");
+        digest.str("driver", external.driver.as_str());
+        digest.map("request", external.request.iter());
+        Some(digest.finish())
     }
 
     pub fn validate(
@@ -118,12 +200,21 @@ impl OracleSpec {
     ) -> Result<(), OracleSpecError> {
         match self {
             Self::Command(command) => command.validate(ceilings, resource_ceilings, execution),
+            Self::External(external) => external.validate(execution),
+        }
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        match self {
+            Self::Command(command) => command.timeout_secs,
+            Self::External(external) => external.timeout_secs,
         }
     }
 
     pub fn as_command(&self) -> &CommandOracle {
         match self {
             Self::Command(command) => command,
+            Self::External(_) => panic!("external oracle is not a command oracle"),
         }
     }
 }
@@ -194,6 +285,80 @@ impl CommandOracle {
     }
 }
 
+impl ExternalOracle {
+    fn validate(&self, execution: &ExecutionPolicy) -> Result<(), OracleSpecError> {
+        if self.timeout_secs == 0 || self.timeout_secs > execution.max_task_time_secs {
+            return Err(OracleSpecError::InvalidTimeout {
+                requested: self.timeout_secs,
+                maximum: execution.max_task_time_secs,
+            });
+        }
+        if self.poll_secs == 0 || self.poll_secs > self.timeout_secs {
+            return Err(OracleSpecError::InvalidExternalPoll {
+                requested: self.poll_secs,
+                timeout: self.timeout_secs,
+            });
+        }
+        validate_external_request(&self.request)
+    }
+}
+
+fn validate_external_request(request: &BTreeMap<String, String>) -> Result<(), OracleSpecError> {
+    if request.len() > MAX_EXTERNAL_ORACLE_REQUEST_FIELDS {
+        return Err(OracleSpecError::TooManyExternalRequestFields(request.len()));
+    }
+    let mut total = 0usize;
+    for (key, value) in request {
+        if !valid_external_request_key(key) {
+            return Err(OracleSpecError::InvalidExternalRequestKey(key.clone()));
+        }
+        if credential_like_key(key) {
+            return Err(OracleSpecError::ExternalRequestContainsCredential(
+                key.clone(),
+            ));
+        }
+        if value.contains('\0') {
+            return Err(OracleSpecError::ExternalRequestValueContainsNul(
+                key.clone(),
+            ));
+        }
+        if value.len() > MAX_EXTERNAL_ORACLE_REQUEST_VALUE_BYTES {
+            return Err(OracleSpecError::ExternalRequestFieldTooLarge(key.clone()));
+        }
+        total = total.saturating_add(key.len()).saturating_add(value.len());
+    }
+    if total > MAX_EXTERNAL_ORACLE_REQUEST_BYTES {
+        return Err(OracleSpecError::ExternalRequestTooLarge(total));
+    }
+    Ok(())
+}
+
+fn valid_external_request_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
+    first_ok
+        && key.len() <= MAX_EXTERNAL_ORACLE_REQUEST_KEY_BYTES
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+fn credential_like_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
+    normalized == "secret"
+        || normalized == "secrets"
+        || normalized == "credential"
+        || normalized == "credentials"
+        || normalized == "password"
+        || normalized == "api_key"
+        || normalized == "apikey"
+        || normalized == "bearer"
+        || normalized == "auth_token"
+        || normalized == "access_token"
+        || normalized == "refresh_token"
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("_token")
+        || normalized.ends_with("_password")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OracleSpecError {
     #[error("oracle working directory '{0}' must be a clean workspace-relative directory")]
@@ -228,4 +393,24 @@ pub enum OracleSpecError {
     AuthorityViolatesProofFloor,
     #[error("oracle resources exceed mission ceilings: {0}")]
     ResourcesExceedCeilings(String),
+    #[error("external oracle driver id '{0}' must be an installed driver identity, not a path or command")]
+    InvalidExternalDriverId(String),
+    #[error("external oracle request contains {0} fields; the limit is {MAX_EXTERNAL_ORACLE_REQUEST_FIELDS}")]
+    TooManyExternalRequestFields(usize),
+    #[error("external oracle request key '{0}' is invalid")]
+    InvalidExternalRequestKey(String),
+    #[error("external oracle request key '{0}' names credential material")]
+    ExternalRequestContainsCredential(String),
+    #[error("external oracle request value for '{0}' contains NUL")]
+    ExternalRequestValueContainsNul(String),
+    #[error("external oracle request field '{0}' exceeds {MAX_EXTERNAL_ORACLE_REQUEST_VALUE_BYTES} bytes")]
+    ExternalRequestFieldTooLarge(String),
+    #[error(
+        "external oracle request is {0} bytes; the limit is {MAX_EXTERNAL_ORACLE_REQUEST_BYTES}"
+    )]
+    ExternalRequestTooLarge(usize),
+    #[error(
+        "external oracle poll interval {requested}s must be between 1s and timeout {timeout}s"
+    )]
+    InvalidExternalPoll { requested: u64, timeout: u64 },
 }

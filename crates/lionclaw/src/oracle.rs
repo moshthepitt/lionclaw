@@ -3,19 +3,27 @@
 //! pass — this path is the only source of `OracleRunCompleted`, and it runs
 //! against a complete Git checkout of the judged commit mounted read-only.
 
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
 use lionclaw_runtime_api::{RuntimeProgramExecutor, TypedFailure, TypedFailureEvidence};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::authority::{
     compile_role_plan, oracle_authority_with_network, MissionMounts, RolePlanRequest,
 };
 use crate::config::MissionRuntimeProfile;
-use crate::ports::{ExecutionControl, OracleOutcome, OracleRunRequest, OracleRunner};
+use crate::ports::{
+    ExecutionControl, ExternalOracleDriverRegistry, ExternalOraclePoll, ExternalOraclePollRequest,
+    ExternalOracleProof, ExternalOracleSubmission, ExternalOracleSubmitRequest, OracleOutcome,
+    OracleRunRequest, OracleRunStatus, OracleRunner,
+};
 use crate::resources::MissionDirs;
 use crate::runner::{
     await_controlled, prepare_inputs, MissionProgramExecutor, PreparedInputs, SCRATCH_MOUNT_TARGET,
@@ -24,6 +32,7 @@ use crate::workspace;
 
 pub struct OciOracleRunner {
     profile: MissionRuntimeProfile,
+    external_drivers: ExternalOracleDriverRegistry,
     repo_lock: Arc<Mutex<()>>,
     input_lock: Arc<Mutex<()>>,
 }
@@ -32,9 +41,15 @@ impl OciOracleRunner {
     pub fn new(profile: MissionRuntimeProfile) -> Self {
         Self {
             profile,
+            external_drivers: ExternalOracleDriverRegistry::new(),
             repo_lock: Arc::new(Mutex::new(())),
             input_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub fn with_external_drivers(mut self, external_drivers: ExternalOracleDriverRegistry) -> Self {
+        self.external_drivers = external_drivers;
+        self
     }
 
     fn profile_for(&self, environment_digest: &str) -> MissionRuntimeProfile {
@@ -42,6 +57,20 @@ impl OciOracleRunner {
         profile.confinement.oci_mut().image = Some(environment_digest.to_string());
         profile
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalOracleState {
+    driver: crate::model::ExternalOracleDriverId,
+    oracle: crate::model::OracleName,
+    spec_digest: String,
+    request_digest: String,
+    idempotency_key: String,
+    job_id: String,
+    submitted_at_ms: i64,
+    next_poll_after_ms: i64,
+    poll_count: u32,
 }
 
 fn fail(detail: impl Into<String>) -> TypedFailure {
@@ -93,17 +122,35 @@ fn control_failure(control: &ExecutionControl) -> Option<TypedFailure> {
 
 #[async_trait]
 impl OracleRunner for OciOracleRunner {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleRunStatus, TypedFailure> {
         if let Some(failure) = control_failure(&request.control.borrow().clone()) {
             return Err(failure);
         }
-        let actual_digest = crate::model::OracleSpec::Command(request.command.clone()).digest();
+        let actual_digest = request.spec.digest();
         if actual_digest != request.spec_digest {
             return Err(TypedFailure::permanent(
                 "oracle.spec_mismatch",
-                "resolved command does not match the recorded oracle spec digest",
+                "resolved oracle spec does not match the recorded oracle spec digest",
             ));
         }
+        match request.spec.clone() {
+            crate::model::OracleSpec::Command(command) => self
+                .run_command(request, command)
+                .await
+                .map(OracleRunStatus::Complete),
+            crate::model::OracleSpec::External(external) => {
+                self.run_external(request, external).await
+            }
+        }
+    }
+}
+
+impl OciOracleRunner {
+    async fn run_command(
+        &self,
+        request: OracleRunRequest,
+        command: crate::model::CommandOracle,
+    ) -> Result<OracleOutcome, TypedFailure> {
         let dirs = MissionDirs::new(&request.state_dir, &request.mission_id)
             .effect(&request.effect_id)
             .oracle();
@@ -151,8 +198,8 @@ impl OracleRunner for OciOracleRunner {
 
             let authority = oracle_authority_with_network(
                 request.oracle.as_str(),
-                request.command.grants.devices.clone(),
-                request.command.grants.network.clone(),
+                command.grants.devices.clone(),
+                command.grants.network.clone(),
             );
             let mut extras = vec![MountSpec {
                 source: dirs.scratch().to_path_buf(),
@@ -160,23 +207,22 @@ impl OracleRunner for OciOracleRunner {
                 access: MountAccess::ReadWrite,
             }];
             extras.extend(prepared.mounts);
-            let environment =
-                oracle_environment(&request.command.environment, prepared.environment);
-            let working_dir = if request.command.cwd.as_str() == "." {
+            let environment = oracle_environment(&command.environment, prepared.environment);
+            let working_dir = if command.cwd.as_str() == "." {
                 checkout.clone()
             } else {
-                checkout.join(request.command.cwd.as_str())
+                checkout.join(command.cwd.as_str())
             };
             let metadata = tokio::fs::metadata(&working_dir).await.map_err(|error| {
                 fail(format!(
                     "oracle working directory '{}' is unavailable: {error}",
-                    request.command.cwd.as_str()
+                    command.cwd.as_str()
                 ))
             })?;
             if !metadata.is_dir() {
                 return Err(fail(format!(
                     "oracle working directory '{}' is not a directory",
-                    request.command.cwd.as_str()
+                    command.cwd.as_str()
                 )));
             }
             let judged_roots = [crate::authority::canonical_or_lexical(&checkout)];
@@ -191,13 +237,13 @@ impl OracleRunner for OciOracleRunner {
                 working_dir,
                 judged_roots: &judged_roots,
                 environment,
-                resources: request.command.resources.clone(),
+                resources: command.resources.clone(),
                 resource_ceilings: &request.resource_ceilings,
                 runtime_network: crate::model::NetworkGrant::Deny,
             })
             .map_err(|e| fail(format!("oracle plan refused to compile (moat): {e}")))?;
 
-            let program = command_program(&request.command)?;
+            let program = command_program(&command)?;
             let mut executor = MissionProgramExecutor::new(
                 compiled.plan().clone(),
                 None,
@@ -227,6 +273,386 @@ impl OracleRunner for OciOracleRunner {
         };
         await_controlled(Box::pin(result), request.control.clone(), control_failure).await
     }
+
+    async fn run_external(
+        &self,
+        request: OracleRunRequest,
+        external: crate::model::ExternalOracle,
+    ) -> Result<OracleRunStatus, TypedFailure> {
+        let driver = self.external_drivers.get(&external.driver).ok_or_else(|| {
+            TypedFailure::permanent(
+                "oracle.external_driver_missing",
+                format!(
+                    "external oracle driver '{}' is not installed in the runtime profile",
+                    external.driver
+                ),
+            )
+        })?;
+        let request_digest = request.spec.request_digest().ok_or_else(|| {
+            TypedFailure::permanent(
+                "oracle.external_spec",
+                "external oracle request digest is unavailable for a command spec",
+            )
+        })?;
+        let idempotency_key = external_idempotency_key(&request, &external, &request_digest);
+        let dirs = MissionDirs::new(&request.state_dir, &request.mission_id)
+            .effect(&request.effect_id)
+            .oracle();
+        dirs.prepare()
+            .map_err(|error| fail(format!("failed to prepare oracle dirs: {error}")))?;
+        let state_path = dirs.root().join("external-oracle-submission.json");
+        let mut state = match read_external_state(&state_path).await? {
+            Some(state) => {
+                validate_external_state(
+                    &state,
+                    &request,
+                    &external,
+                    &request_digest,
+                    &idempotency_key,
+                )?;
+                state
+            }
+            None => {
+                let submit = ExternalOracleSubmitRequest {
+                    mission_id: request.mission_id.clone(),
+                    effect_id: request.effect_id.clone(),
+                    oracle: request.oracle.clone(),
+                    driver: external.driver.clone(),
+                    spec_digest: request.spec_digest.clone(),
+                    request_digest: request_digest.clone(),
+                    idempotency_key: idempotency_key.clone(),
+                    request: external.request.clone(),
+                    judged_sha: request.judged_sha.clone(),
+                    environment_digest: request.environment_digest.clone(),
+                    attempt_no: request.attempt_no,
+                    deadline_ms: request.deadline_ms,
+                };
+                let submission = driver.submit(submit).await?;
+                validate_external_submission(
+                    &submission,
+                    &request,
+                    &external,
+                    &request_digest,
+                    &idempotency_key,
+                )?;
+                let state = ExternalOracleState {
+                    driver: submission.driver,
+                    oracle: request.oracle.clone(),
+                    spec_digest: submission.spec_digest,
+                    request_digest: submission.request_digest,
+                    idempotency_key: submission.idempotency_key,
+                    job_id: submission.job_id,
+                    submitted_at_ms: request.now_ms,
+                    next_poll_after_ms: request.now_ms,
+                    poll_count: 0,
+                };
+                write_external_state(&state_path, &state).await?;
+                state
+            }
+        };
+
+        if request.now_ms < state.next_poll_after_ms {
+            return Ok(OracleRunStatus::Pending {
+                next_poll_after_ms: state.next_poll_after_ms,
+            });
+        }
+        if state.poll_count >= external_max_polls(&external) {
+            return Ok(OracleRunStatus::Complete(external_outcome(
+                1,
+                None,
+                "external oracle polling exceeded its bounded attempt budget",
+            )?));
+        }
+
+        let poll = ExternalOraclePollRequest {
+            mission_id: request.mission_id.clone(),
+            effect_id: request.effect_id.clone(),
+            oracle: request.oracle.clone(),
+            driver: external.driver.clone(),
+            spec_digest: request.spec_digest.clone(),
+            request_digest: request_digest.clone(),
+            idempotency_key: idempotency_key.clone(),
+            job_id: state.job_id.clone(),
+            judged_sha: request.judged_sha.clone(),
+            environment_digest: request.environment_digest.clone(),
+            attempt_no: request.attempt_no,
+            deadline_ms: request.deadline_ms,
+        };
+        match driver.poll(poll).await? {
+            ExternalOraclePoll::Pending { retry_after_ms } => {
+                state.poll_count = state.poll_count.saturating_add(1);
+                state.next_poll_after_ms =
+                    next_external_poll_after_ms(&request, &external, retry_after_ms);
+                write_external_state(&state_path, &state).await?;
+                Ok(OracleRunStatus::Pending {
+                    next_poll_after_ms: state.next_poll_after_ms,
+                })
+            }
+            ExternalOraclePoll::Passed { proof } => {
+                validate_external_proof(&proof, &state)?;
+                Ok(OracleRunStatus::Complete(external_outcome(
+                    0,
+                    Some(&proof),
+                    "external oracle passed",
+                )?))
+            }
+            ExternalOraclePoll::Failed { proof, detail } => {
+                validate_external_proof(&proof, &state)?;
+                Ok(OracleRunStatus::Complete(external_outcome(
+                    1,
+                    Some(&proof),
+                    &detail,
+                )?))
+            }
+        }
+    }
+}
+
+fn external_idempotency_key(
+    request: &OracleRunRequest,
+    external: &crate::model::ExternalOracle,
+    request_digest: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    feed_digest_field(
+        &mut digest,
+        "domain",
+        "lionclaw.external-oracle.idempotency.v1",
+    );
+    feed_digest_field(&mut digest, "mission_id", request.mission_id.as_str());
+    feed_digest_field(&mut digest, "effect_id", request.effect_id.as_str());
+    feed_digest_field(&mut digest, "oracle", request.oracle.as_str());
+    feed_digest_field(&mut digest, "driver", external.driver.as_str());
+    feed_digest_field(&mut digest, "spec_digest", &request.spec_digest);
+    feed_digest_field(&mut digest, "request_digest", request_digest);
+    feed_digest_field(&mut digest, "judged_sha", &request.judged_sha);
+    feed_digest_field(
+        &mut digest,
+        "environment_digest",
+        &request.environment_digest,
+    );
+    feed_digest_field(&mut digest, "attempt_no", &request.attempt_no.to_string());
+    feed_digest_field(&mut digest, "deadline_ms", &request.deadline_ms.to_string());
+    hex::encode(digest.finalize())
+}
+
+fn feed_digest_field(digest: &mut Sha256, label: &str, value: &str) {
+    digest.update((label.len() as u64).to_be_bytes());
+    digest.update(label.as_bytes());
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value.as_bytes());
+}
+
+async fn read_external_state(path: &Path) -> Result<Option<ExternalOracleState>, TypedFailure> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+            TypedFailure::permanent(
+                "oracle.external_state",
+                format!("external oracle submission state is malformed: {error}"),
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(TypedFailure::permanent(
+            "oracle.external_state",
+            format!("failed to read external oracle submission state: {error}"),
+        )),
+    }
+}
+
+async fn write_external_state(
+    path: &Path,
+    state: &ExternalOracleState,
+) -> Result<(), TypedFailure> {
+    let path = path.to_path_buf();
+    let bytes = serde_json::to_vec(state).map_err(|error| {
+        TypedFailure::permanent(
+            "oracle.external_state",
+            format!("failed to encode external oracle submission state: {error}"),
+        )
+    })?;
+    tokio::task::spawn_blocking(move || write_external_state_sync(&path, &bytes))
+        .await
+        .map_err(|error| {
+            TypedFailure::permanent(
+                "oracle.external_state",
+                format!("external oracle state writer panicked: {error}"),
+            )
+        })?
+        .map_err(|error| {
+            TypedFailure::permanent(
+                "oracle.external_state",
+                format!("failed to durably record external oracle submission: {error}"),
+            )
+        })
+}
+
+fn write_external_state_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "external oracle state path has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn validate_external_state(
+    state: &ExternalOracleState,
+    request: &OracleRunRequest,
+    external: &crate::model::ExternalOracle,
+    request_digest: &str,
+    idempotency_key: &str,
+) -> Result<(), TypedFailure> {
+    if state.driver != external.driver
+        || state.oracle != request.oracle
+        || state.spec_digest != request.spec_digest
+        || state.request_digest != request_digest
+        || state.idempotency_key != idempotency_key
+        || !valid_external_job_id(&state.job_id)
+    {
+        return Err(TypedFailure::permanent(
+            "oracle.external_state",
+            "external oracle submission state does not match the active effect",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_submission(
+    submission: &ExternalOracleSubmission,
+    request: &OracleRunRequest,
+    external: &crate::model::ExternalOracle,
+    request_digest: &str,
+    idempotency_key: &str,
+) -> Result<(), TypedFailure> {
+    if submission.driver != external.driver
+        || submission.spec_digest != request.spec_digest
+        || submission.request_digest != request_digest
+        || submission.idempotency_key != idempotency_key
+        || !valid_external_job_id(&submission.job_id)
+    {
+        return Err(TypedFailure::permanent(
+            "oracle.external_result",
+            "external oracle driver returned a submission for a different request",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_proof(
+    proof: &ExternalOracleProof,
+    state: &ExternalOracleState,
+) -> Result<(), TypedFailure> {
+    if proof.driver != state.driver
+        || proof.spec_digest != state.spec_digest
+        || proof.request_digest != state.request_digest
+        || proof.idempotency_key != state.idempotency_key
+        || proof.job_id != state.job_id
+    {
+        return Err(TypedFailure::permanent(
+            "oracle.external_result",
+            "external oracle driver returned proof for a different submission",
+        ));
+    }
+    if let Some(artifact_digest) = &proof.artifact_digest {
+        if !valid_artifact_digest(artifact_digest) {
+            return Err(TypedFailure::permanent(
+                "oracle.external_result",
+                "external oracle driver returned an invalid artifact digest",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_external_job_id(job_id: &str) -> bool {
+    !job_id.is_empty()
+        && job_id.len() <= 256
+        && job_id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'/' && byte != b'\\')
+}
+
+fn valid_artifact_digest(digest: &str) -> bool {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn external_max_polls(external: &crate::model::ExternalOracle) -> u32 {
+    let polls = external
+        .timeout_secs
+        .saturating_add(external.poll_secs.saturating_sub(1))
+        / external.poll_secs.max(1);
+    polls.saturating_add(2).min(u64::from(u32::MAX)) as u32
+}
+
+fn next_external_poll_after_ms(
+    request: &OracleRunRequest,
+    external: &crate::model::ExternalOracle,
+    retry_after_ms: Option<u64>,
+) -> i64 {
+    let default_ms = external.poll_secs.saturating_mul(1_000);
+    let requested_ms = retry_after_ms.unwrap_or(default_ms);
+    let timeout_ms = external.timeout_secs.saturating_mul(1_000);
+    let remaining_ms = request.deadline_ms.saturating_sub(request.now_ms).max(0) as u64;
+    let delay_ms = requested_ms
+        .min(default_ms.saturating_mul(8))
+        .min(timeout_ms)
+        .min(remaining_ms);
+    request
+        .now_ms
+        .saturating_add(delay_ms.min(i64::MAX as u64) as i64)
+}
+
+fn external_outcome(
+    exit_code: i32,
+    proof: Option<&ExternalOracleProof>,
+    detail: &str,
+) -> Result<OracleOutcome, TypedFailure> {
+    let stdout = match proof {
+        Some(proof) => serde_json::to_vec(&serde_json::json!({
+            "driver": proof.driver.as_str(),
+            "idempotency_key": proof.idempotency_key,
+            "spec_digest": proof.spec_digest,
+            "request_digest": proof.request_digest,
+            "job_id": proof.job_id,
+            "artifact_digest": proof.artifact_digest,
+            "summary": lionclaw_runtime_api::bounded_text(&proof.summary),
+        }))
+        .map_err(|error| {
+            TypedFailure::permanent(
+                "oracle.external_result",
+                format!("failed to encode external oracle proof: {error}"),
+            )
+        })?,
+        None => Vec::new(),
+    };
+    Ok(OracleOutcome {
+        exit_code,
+        exit_signal: None,
+        stdout,
+        stderr: if exit_code == 0 {
+            Vec::new()
+        } else {
+            lionclaw_runtime_api::bounded_text(detail).into_bytes()
+        },
+        prepared_inputs: Vec::new(),
+        duration_ms: 0,
+    })
 }
 
 /// Kernel-owned execution coordinates for an oracle. Prepared inputs are the
@@ -265,7 +691,8 @@ mod tests {
     use super::*;
     use crate::config::RuntimeProfiles;
     use crate::model::{
-        AuthorityGrants, CommandOracle, EffectId, MissionId, OracleName, WorkspaceRelativeDir,
+        AuthorityGrants, CommandOracle, EffectId, MissionId, OracleName, OracleSpec,
+        WorkspaceRelativeDir,
     };
     use std::collections::BTreeMap;
 
@@ -319,22 +746,25 @@ mod tests {
         let runner = OciOracleRunner::new(profile);
         let (_control_tx, control) =
             tokio::sync::watch::channel(ExecutionControl::Stop("operator stop".into()));
+        let spec = OracleSpec::Command(CommandOracle {
+            argv: vec!["true".into()],
+            cwd: WorkspaceRelativeDir::new(".").unwrap(),
+            environment: BTreeMap::new(),
+            timeout_secs: 30,
+            grants: AuthorityGrants::default(),
+            resources: Default::default(),
+        });
         let result = runner
             .run(OracleRunRequest {
                 mission_id: MissionId::parse("m123456789abc").unwrap(),
                 effect_id: EffectId::for_parts(&["oracle", "pre-start-stop"]),
                 oracle: OracleName::new("checks").unwrap(),
-                spec_digest: "spec".to_string(),
-                command: CommandOracle {
-                    argv: vec!["true".into()],
-                    cwd: WorkspaceRelativeDir::new(".").unwrap(),
-                    environment: BTreeMap::new(),
-                    timeout_secs: 30,
-                    grants: AuthorityGrants::default(),
-                    resources: Default::default(),
-                },
+                spec_digest: spec.digest(),
+                spec,
                 judged_sha: "must-not-be-resolved".into(),
                 environment_digest: "sha256:oracle-test".into(),
+                attempt_no: 1,
+                now_ms: 0,
                 workspace_dir: temp.path().join("must-not-be-cloned"),
                 state_dir: temp.path().join("state"),
                 prepared_inputs: Vec::new(),

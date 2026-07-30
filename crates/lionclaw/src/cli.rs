@@ -309,7 +309,7 @@ pub enum EnvironmentCommand {
 #[derive(Subcommand)]
 pub enum TeamCommand {
     Show(TeamShowArgs),
-    Add(TeamAddArgs),
+    Add(Box<TeamAddArgs>),
     Reassign(TeamReassignArgs),
     Retire(TeamRoleArgs),
     SetRuntime(TeamSetRuntimeArgs),
@@ -1580,6 +1580,7 @@ async fn cmd_team(command: TeamCommand, transports: &MissionTransports) -> Resul
             }
         }
         TeamCommand::Add(args) => {
+            let args = *args;
             let (mission_id, engine) =
                 mission_engine(args.repo, args.mission_id.as_deref(), transports).await?;
             let state = engine.load_state(&mission_id).await?;

@@ -35,7 +35,8 @@ use crate::model::{
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, OracleOutcome,
-    OracleRunRequest, OracleRunner, RoleRunner, RoleTurnOutcome, RoleTurnRequest, SystemClock,
+    OracleRunRequest, OracleRunStatus, OracleRunner, RoleRunner, RoleTurnOutcome, RoleTurnRequest,
+    SystemClock,
 };
 use crate::resources::MissionDirs;
 use crate::runner::MissionProgramExecutor;
@@ -155,15 +156,15 @@ struct FixedOracleRunner(i32);
 
 #[async_trait]
 impl OracleRunner for FixedOracleRunner {
-    async fn run(&self, _request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
-        Ok(OracleOutcome {
+    async fn run(&self, _request: OracleRunRequest) -> Result<OracleRunStatus, TypedFailure> {
+        Ok(OracleRunStatus::Complete(OracleOutcome {
             exit_code: self.0,
             exit_signal: None,
             stdout: format!("self-test oracle exit {}", self.0).into_bytes(),
             stderr: Vec::new(),
             prepared_inputs: Vec::new(),
             duration_ms: 1,
-        })
+        }))
     }
 }
 
@@ -176,7 +177,7 @@ struct CountingOracleRunner {
 
 #[async_trait]
 impl OracleRunner for CountingOracleRunner {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleRunStatus, TypedFailure> {
         self.count.fetch_add(1, Ordering::SeqCst);
         self.inner.run(request).await
     }
@@ -1026,7 +1027,8 @@ async fn run_dynamic_oracle_fixture(
         grants: AuthorityGrants::default(),
         resources: Default::default(),
     };
-    let spec_digest = OracleSpec::Command(command.clone()).digest();
+    let spec = OracleSpec::Command(command);
+    let spec_digest = spec.digest();
     let mission_id = MissionId::for_creation(
         &repo.path().to_string_lossy(),
         &format!("dynamic oracle {name}"),
@@ -1040,9 +1042,11 @@ async fn run_dynamic_oracle_fixture(
             effect_id,
             oracle: OracleName::new(name)?,
             spec_digest,
-            command,
+            spec,
             judged_sha,
             environment_digest: RUNTIME_IMAGE.to_string(),
+            attempt_no: 1,
+            now_ms: 0,
             workspace_dir: repo.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
             prepared_inputs: Vec::new(),
@@ -1052,6 +1056,9 @@ async fn run_dynamic_oracle_fixture(
         })
         .await
         .map_err(|failure| anyhow::anyhow!("{name} oracle infrastructure failure: {failure}"))?;
+    let OracleRunStatus::Complete(outcome) = outcome else {
+        anyhow::bail!("dynamic oracle remained pending in self-test");
+    };
     if outcome.exit_code != 0 {
         anyhow::bail!(
             "{name} oracle exited {}: {}",
