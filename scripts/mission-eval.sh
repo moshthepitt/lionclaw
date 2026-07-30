@@ -4,7 +4,7 @@
 # refusal) are covered by `cargo test --test eval_deterministic`.
 #
 # Usage: scripts/mission-eval.sh [runs]   (default 3 runs per agentic scenario)
-set -uo pipefail
+set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/debug/lionclaw"
@@ -30,7 +30,7 @@ materialize() {
     git_quiet -C "$2" commit -q -m "fixture base"
 }
 
-mission_json() { "$BIN" mission "$@" --json 2>/dev/null; }
+mission_json() { "$BIN" mission "$@" --json; }
 
 # --- Scenario 1: fixes the interval-bug and reaches a verified finish -------
 scenario_fix_bug() {
@@ -42,7 +42,7 @@ scenario_fix_bug() {
         local mid; mid="$(mission_json start --type software-dev --repo "$repo" \
             --objective "Fix the off-by-one in overlaps() so all tests pass. Do not weaken any test." \
             | python3 -c 'import sys,json;print(json.load(sys.stdin)["mission_id"])')"
-        mission_json team show "$mid" --repo "$repo" > "$repo/team.json"
+        mission_json team show --mission-id "$mid" --repo "$repo" > "$repo/team.json"
         python3 - "$repo/team.json" "$repo/plan.json" <<'PY'
 import json, sys
 team = json.load(open(sys.argv[1]))["team"]
@@ -93,10 +93,10 @@ proposal = {
 }
 json.dump(proposal, open(sys.argv[2], "w"))
 PY
-        "$BIN" mission plan propose "$mid" --repo "$repo" --file "$repo/plan.json" >/dev/null 2>&1
+        "$BIN" mission plan propose "$mid" --repo "$repo" --file "$repo/plan.json" >/dev/null
         "$BIN" mission decide "$mid" plan_proposal:mission approve --repo "$repo" \
-            --justification "eval approves the fixture plan" >/dev/null 2>&1
-        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" >/dev/null 2>&1
+            --justification "eval approves the fixture plan" >/dev/null
+        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" --wait >/dev/null
         local status; status="$(mission_json status "$mid" --repo "$repo")"
         local finish head; finish="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("finish"))')"
         head="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("current_sha"))')"
@@ -107,7 +107,12 @@ PY
         fi
     done
     echo "scenario 1 (fix bug): $pass/$RUNS verified"
-    [ "$pass" -ge 2 ] && echo "  => SCENARIO 1 PASS" || echo "  => SCENARIO 1 FAIL"
+    if [ "$pass" -ge 2 ]; then
+        echo "  => SCENARIO 1 PASS"
+    else
+        echo "  => SCENARIO 1 FAIL"
+        return 1
+    fi
 }
 
 # NOTE: the former "reviewer catches a planted regression" scenario was removed.
@@ -133,15 +138,11 @@ scenario_planning() {
             --objective "Fix the off-by-one in overlaps() so all tests pass. Do not weaken any test." \
             | python3 -c 'import sys,json;print(json.load(sys.stdin)["mission_id"])')"
         # Drive planning; it must park on the engine-authored proposal.
-        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" >/dev/null 2>&1
-        local phase; phase="$(mission_json status "$mid" --repo "$repo" \
-            | python3 -c 'import sys,json;print(json.load(sys.stdin).get("phase"))')"
+        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" --wait >/dev/null
         # Approve the proposal (seeds the contract), then execute to a verdict.
-        local item; item="$(mission_json status "$mid" --repo "$repo" \
-            | python3 -c 'import sys,json;print(json.load(sys.stdin)["attention"][0]["id"])')"
-        "$BIN" mission decide "$mid" "$item" approve --repo "$repo" \
-            --justification "eval approves the generated plan" >/dev/null 2>&1
-        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" >/dev/null 2>&1
+        "$BIN" mission decide "$mid" plan_proposal:mission approve --repo "$repo" \
+            --justification "eval approves the generated plan" >/dev/null
+        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" --wait >/dev/null
         local status; status="$(mission_json status "$mid" --repo "$repo")"
         local finish head
         finish="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("finish"))')"
@@ -149,15 +150,22 @@ scenario_planning() {
         if [ "$finish" = "verified" ] && [ "$head" != "$base" ]; then
             echo "  run $i: PASS (planned, approved, verified; head $head)"; pass=$((pass+1))
         else
-            echo "  run $i: FAIL (phase-after-plan=$phase, finish=$finish, head=$head, base=$base)"
+            echo "  run $i: FAIL (finish=$finish, head=$head, base=$base)"
         fi
     done
     echo "scenario 2 (planning -> approve -> verified): $pass/$RUNS verified"
-    [ "$pass" -ge 2 ] && echo "  => SCENARIO 2 PASS" || echo "  => SCENARIO 2 FAIL"
+    if [ "$pass" -ge 2 ]; then
+        echo "  => SCENARIO 2 PASS"
+    else
+        echo "  => SCENARIO 2 FAIL"
+        return 1
+    fi
 }
 
+failures=0
 echo "== Slice 6 agentic eval ($RUNS runs each) =="
 echo "[1] fixes the bug -> verified"
-scenario_fix_bug
+scenario_fix_bug || failures=1
 echo "[2] planning -> approve -> verified"
-scenario_planning
+scenario_planning || failures=1
+exit "$failures"
