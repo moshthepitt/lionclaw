@@ -10,11 +10,26 @@ use crate::{adapter::RuntimeAdapter, auth::RuntimeAuthKind};
 pub struct RuntimeTerminalConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_arg: Option<String>,
 }
 
 impl RuntimeTerminalConfig {
     pub fn is_empty(&self) -> bool {
-        self.args.is_empty()
+        self.args.is_empty() && self.resume_args.is_empty() && self.message_arg.is_none()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .message_arg
+            .as_ref()
+            .is_some_and(|argument| argument.trim().is_empty())
+        {
+            anyhow::bail!("runtime terminal message argument must not be empty");
+        }
+        Ok(())
     }
 }
 
@@ -102,5 +117,24 @@ mod tests {
 
         assert!(registry.get("declared-protocol").is_some());
         assert!(registry.get("unregistered-product").is_none());
+    }
+
+    #[test]
+    fn terminal_message_argument_must_be_explicit_and_nonempty() {
+        RuntimeTerminalConfig {
+            args: vec!["--tui".to_string()],
+            resume_args: vec!["--continue".to_string()],
+            message_arg: Some("--prompt".to_string()),
+        }
+        .validate()
+        .unwrap();
+
+        let error = RuntimeTerminalConfig {
+            message_arg: Some(" ".to_string()),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(error.to_string().contains("must not be empty"));
     }
 }

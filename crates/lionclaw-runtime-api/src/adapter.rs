@@ -98,6 +98,8 @@ pub enum RuntimeNativeReopenRecovery {
 pub struct RuntimeTerminalProgramInput {
     pub session_id: Uuid,
     pub runtime_state: RuntimeStateDir,
+    pub resume: bool,
+    pub bootstrap_message: String,
 }
 
 #[derive(Debug, Clone)]

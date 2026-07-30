@@ -18,6 +18,55 @@ use rustix::io::Errno;
 
 use crate::model::{EffectId, MissionId, RoleInstanceId, TaskId};
 
+/// Repository-scoped resources for the one everyday orchestrator session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EverydayDirs {
+    state_dir: PathBuf,
+    root: PathBuf,
+    role_state: RoleStateDirs,
+    auth_staging: PathBuf,
+    operator_skill: PathBuf,
+    driver_lock: PathBuf,
+}
+
+impl EverydayDirs {
+    pub(crate) fn new(state_dir: &Path) -> Self {
+        let root = state_dir.join("everyday");
+        Self {
+            role_state: RoleStateDirs::new(state_dir.to_path_buf(), &root),
+            auth_staging: root.join("auth-staging"),
+            operator_skill: root.join("operator-skill").join("lionclaw"),
+            driver_lock: root.join("driver.lock"),
+            state_dir: state_dir.to_path_buf(),
+            root,
+        }
+    }
+
+    pub(crate) fn prepare(&self) -> std::io::Result<()> {
+        self.role_state.prepare()?;
+        ensure_private_dirs_beneath(
+            &self.state_dir,
+            [&self.root, &self.auth_staging, &self.operator_skill],
+        )
+    }
+
+    pub(crate) fn role_state(&self) -> &RoleStateDirs {
+        &self.role_state
+    }
+
+    pub(crate) fn auth_staging(&self) -> &Path {
+        &self.auth_staging
+    }
+
+    pub(crate) fn operator_skill(&self) -> &Path {
+        &self.operator_skill
+    }
+
+    pub(crate) fn driver_lock(&self) -> &Path {
+        &self.driver_lock
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MissionDirs {
     state_dir: PathBuf,

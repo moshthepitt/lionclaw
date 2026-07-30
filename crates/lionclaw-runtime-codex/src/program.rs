@@ -1,4 +1,4 @@
-use lionclaw_runtime_api::{RuntimeMcpServerSpec, RuntimeProgramSpec};
+use lionclaw_runtime_api::{RuntimeMcpServerSpec, RuntimeProgramSpec, RuntimeTerminalProgramInput};
 
 use crate::driver::{codex_runtime_auth_kind, CodexRuntimeConfig};
 
@@ -23,7 +23,10 @@ pub(crate) fn build_codex_app_server_program(
     }
 }
 
-pub(crate) fn build_codex_terminal_program(config: &CodexRuntimeConfig) -> RuntimeProgramSpec {
+pub(crate) fn build_codex_terminal_program(
+    config: &CodexRuntimeConfig,
+    input: &RuntimeTerminalProgramInput,
+) -> RuntimeProgramSpec {
     let mut args = vec![
         "--sandbox".to_string(),
         "danger-full-access".to_string(),
@@ -35,6 +38,11 @@ pub(crate) fn build_codex_terminal_program(config: &CodexRuntimeConfig) -> Runti
         args.push("--model".to_string());
         args.push(model.clone());
     }
+    if input.resume {
+        args.push("resume".to_string());
+        args.push("--last".to_string());
+    }
+    args.push(input.bootstrap_message.clone());
 
     RuntimeProgramSpec {
         executable: config.executable.clone(),

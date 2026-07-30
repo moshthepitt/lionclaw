@@ -399,9 +399,9 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
     fn build_terminal_program(
         &self,
-        _input: RuntimeTerminalProgramInput,
+        input: RuntimeTerminalProgramInput,
     ) -> Result<RuntimeProgramSpec> {
-        Ok(build_codex_terminal_program(&self.config))
+        Ok(build_codex_terminal_program(&self.config, &input))
     }
 
     async fn cancel(

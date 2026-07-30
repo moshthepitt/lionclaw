@@ -53,9 +53,9 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
 
     fn build_terminal_program(
         &self,
-        _input: RuntimeTerminalProgramInput,
+        input: RuntimeTerminalProgramInput,
     ) -> Result<RuntimeProgramSpec> {
-        Ok(build_acp_terminal_program(&self.config))
+        Ok(build_acp_terminal_program(&self.config, &input))
     }
 
     fn native_reopen_recovery(&self) -> RuntimeNativeReopenRecovery {

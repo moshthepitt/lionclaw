@@ -39,7 +39,7 @@ fn opencode_acp_config(model: Option<String>, mode: Option<String>) -> AcpRuntim
         model,
         mode,
         auth: None,
-        terminal: RuntimeTerminalConfig { args: Vec::new() },
+        terminal: RuntimeTerminalConfig::default(),
         session_id_state_file: ACP_SESSION_ID_STATE_FILE.to_string(),
         default_working_dir: "/workspace".to_string(),
     }
@@ -1515,6 +1515,11 @@ async fn acp_turn_projects_runtime_mcp_servers() {
 async fn acp_terminal_program_uses_native_command_without_protocol_args() {
     let mut config = opencode_acp_config(None, None);
     config.auth = Some(RuntimeAuthKind::from_static("test-acp-auth"));
+    config.terminal = RuntimeTerminalConfig {
+        args: vec!["--mini".to_string()],
+        resume_args: vec!["--continue".to_string()],
+        message_arg: Some("--prompt".to_string()),
+    };
     let adapter = AcpRuntimeAdapter::new(config);
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
@@ -1524,11 +1529,17 @@ async fn acp_terminal_program_uses_native_command_without_protocol_args() {
         .build_terminal_program(RuntimeTerminalProgramInput {
             session_id: Uuid::new_v4(),
             runtime_state: runtime_state(runtime_state_root),
+            resume: true,
+            bootstrap_message: "current facts".to_string(),
         })
         .expect("terminal program");
 
     assert_eq!(program.executable, "opencode");
-    assert!(program.args.is_empty());
+    assert_eq!(
+        program.args,
+        ["--mini", "--continue", "--prompt", "current facts"]
+    );
+    assert!(!program.args.iter().any(|arg| arg == "acp"));
     assert_eq!(
         program.environment,
         vec![("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string())]

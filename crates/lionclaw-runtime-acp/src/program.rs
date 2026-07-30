@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use lionclaw_runtime_api::{RuntimeMcpServerSpec, RuntimeProgramSpec};
+use lionclaw_runtime_api::{RuntimeMcpServerSpec, RuntimeProgramSpec, RuntimeTerminalProgramInput};
 
 use crate::driver::AcpRuntimeConfig;
 
@@ -14,10 +14,21 @@ pub(crate) fn build_acp_program(config: &AcpRuntimeConfig) -> RuntimeProgramSpec
     }
 }
 
-pub(crate) fn build_acp_terminal_program(config: &AcpRuntimeConfig) -> RuntimeProgramSpec {
+pub(crate) fn build_acp_terminal_program(
+    config: &AcpRuntimeConfig,
+    input: &RuntimeTerminalProgramInput,
+) -> RuntimeProgramSpec {
+    let mut args = config.terminal.args.clone();
+    if input.resume {
+        args.extend(config.terminal.resume_args.clone());
+    }
+    if let Some(argument) = &config.terminal.message_arg {
+        args.push(argument.clone());
+        args.push(input.bootstrap_message.clone());
+    }
     RuntimeProgramSpec {
         executable: config.executable.clone(),
-        args: config.terminal.args.clone(),
+        args,
         environment: config.environment.clone(),
         stdin: String::new(),
         auth: config.auth.clone(),

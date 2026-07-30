@@ -48,16 +48,24 @@ pub struct OciRoleRunner {
 }
 
 #[derive(Clone)]
-struct RuntimeTurnAuth {
+pub(crate) struct RuntimeTurnAuth {
     materialization: Option<RuntimeAuthMaterialization>,
     staging_root: PathBuf,
 }
 
 impl RuntimeTurnAuth {
-    fn identity(&self) -> Option<&str> {
+    pub(crate) fn identity(&self) -> Option<&str> {
         self.materialization
             .as_ref()
             .map(|auth| auth.identity().as_str())
+    }
+
+    pub(crate) fn materialization(&self) -> Option<RuntimeAuthMaterialization> {
+        self.materialization.clone()
+    }
+
+    pub(crate) fn staging_root(&self) -> &std::path::Path {
+        &self.staging_root
     }
 }
 
@@ -107,7 +115,7 @@ impl OciRoleRunner {
         Ok(profile)
     }
 
-    fn driver(
+    pub(crate) fn driver(
         &self,
         profile: &MissionRuntimeProfile,
     ) -> anyhow::Result<Arc<dyn RuntimeDriverProvider>> {
@@ -120,7 +128,7 @@ impl OciRoleRunner {
         })
     }
 
-    fn auth_registry(
+    pub(crate) fn auth_registry(
         &self,
         profile: &MissionRuntimeProfile,
     ) -> anyhow::Result<RuntimeAuthRegistry> {
@@ -147,7 +155,7 @@ impl OciRoleRunner {
         }
     }
 
-    async fn materialize_runtime_auth(
+    pub(crate) async fn materialize_runtime_auth(
         &self,
         profile: &MissionRuntimeProfile,
         network_mode: lionclaw_runtime_api::NetworkMode,
@@ -189,7 +197,9 @@ impl OciRoleRunner {
         })
     }
 
-    fn driver_config(profile: &MissionRuntimeProfile) -> anyhow::Result<RuntimeDriverConfig> {
+    pub(crate) fn driver_config(
+        profile: &MissionRuntimeProfile,
+    ) -> anyhow::Result<RuntimeDriverConfig> {
         let auth = profile
             .auth
             .as_ref()
@@ -204,7 +214,7 @@ impl OciRoleRunner {
             model: profile.model.clone(),
             mode: profile.mode.clone(),
             auth,
-            terminal: Default::default(),
+            terminal: profile.terminal.clone(),
         })
     }
 

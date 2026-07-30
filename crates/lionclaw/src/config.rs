@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use lionclaw_confinement::{ConfinementConfig, ExecutionLimits, OciConfinementConfig};
-use lionclaw_runtime_api::MAX_RUNTIME_CREDENTIAL_PROJECTIONS;
+use lionclaw_runtime_api::{RuntimeTerminalConfig, MAX_RUNTIME_CREDENTIAL_PROJECTIONS};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -21,29 +21,32 @@ command = "codex"
 native-resume = true
 auth = "codex"
 skills-dir = ".agents/skills"
-confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
+confinement = { backend = "podman", image = "localhost/lionclaw-runtime-dev:v1", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 
 [runtimes.opencode]
 driver = "acp"
 command = "opencode"
 args = ["acp"]
 native-resume = true
+terminal = { resume-args = ["--continue"], message-arg = "--prompt" }
 environment = { OPENCODE_DISABLE_AUTOUPDATE = "1", OPENCODE_CONFIG_CONTENT = '{"permission":{"*":"allow"}}' }
 model = "opencode/big-pickle"
 mode = "build"
 auth = { kind = "native-home", source = "~/.local/share/opencode", target = ".local/share/opencode", required-files = ["auth.json"] }
 skills-dir = ".agents/skills"
-confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
+confinement = { backend = "podman", image = "localhost/lionclaw-runtime-dev:v1", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 
 [runtimes.hermes]
 driver = "acp"
 command = "hermes"
 args = ["acp"]
+native-resume = true
+terminal = { args = ["--tui", "--skills", "lionclaw"], resume-args = ["--continue"] }
 environment = { HERMES_HOME = "/runtime/home/.hermes" }
 mode = "dont_ask"
 auth = { kind = "native-home", source = "~/.hermes", target = ".hermes", required-files = ["config.yaml"], optional-files = [".env", "auth.json", ".anthropic_oauth.json"] }
 skills-dir = ".hermes/skills"
-confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
+confinement = { backend = "podman", image = "localhost/lionclaw-runtime-dev:v1", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 "#;
 
 #[derive(Debug, Clone)]
@@ -57,6 +60,7 @@ pub struct MissionRuntimeProfile {
     pub mode: Option<String>,
     pub auth: Option<RuntimeAuthConfig>,
     pub skills_dir: Option<RuntimeSkillsDir>,
+    pub terminal: RuntimeTerminalConfig,
     /// Whether this profile can retain and reopen a native conversation.
     pub native_resume: bool,
     pub confinement: ConfinementConfig,
@@ -89,6 +93,17 @@ impl MissionRuntimeProfile {
             ),
             None => digest_field(&mut digest, b"skills-dir", b"<none>"),
         }
+        for arg in &self.terminal.args {
+            digest_field(&mut digest, b"terminal-arg", arg.as_bytes());
+        }
+        for arg in &self.terminal.resume_args {
+            digest_field(&mut digest, b"terminal-resume-arg", arg.as_bytes());
+        }
+        digest_optional(
+            &mut digest,
+            b"terminal-message-arg",
+            self.terminal.message_arg.as_deref(),
+        );
         digest_field(
             &mut digest,
             b"native-resume",
@@ -303,6 +318,8 @@ struct RuntimeProfileFile {
     #[serde(default)]
     skills_dir: Option<PathBuf>,
     #[serde(default)]
+    terminal: RuntimeTerminalConfig,
+    #[serde(default)]
     native_resume: bool,
     #[serde(default = "default_confinement")]
     confinement: ConfinementConfig,
@@ -345,6 +362,7 @@ impl RuntimeProfileFile {
             .map(|config| config.apply(user_home))
             .transpose()?;
         let skills_dir = self.skills_dir.map(RuntimeSkillsDir::new).transpose()?;
+        self.terminal.validate()?;
         self.confinement.oci_mut().tmpfs = self
             .confinement
             .oci()
@@ -371,6 +389,7 @@ impl RuntimeProfileFile {
             mode: self.mode,
             auth,
             skills_dir,
+            terminal: self.terminal,
             native_resume: self.native_resume,
             confinement: self.confinement,
         })
@@ -707,11 +726,16 @@ mod tests {
         let hermes = profiles.get("hermes").unwrap();
         assert_eq!(hermes.driver, "acp");
         assert_eq!(hermes.mode.as_deref(), Some("dont_ask"));
+        assert!(hermes.native_resume);
+        assert_eq!(hermes.terminal.args, ["--tui", "--skills", "lionclaw"]);
+        assert_eq!(hermes.terminal.resume_args, ["--continue"]);
         let opencode = profiles.get("opencode").unwrap();
         assert_eq!(opencode.driver, "acp");
         assert_eq!(opencode.model.as_deref(), Some("opencode/big-pickle"));
         assert_eq!(opencode.mode.as_deref(), Some("build"));
         assert!(opencode.native_resume);
+        assert_eq!(opencode.terminal.resume_args, ["--continue"]);
+        assert_eq!(opencode.terminal.message_arg.as_deref(), Some("--prompt"));
         assert!(opencode.environment.contains(&(
             "OPENCODE_CONFIG_CONTENT".to_string(),
             r#"{"permission":{"*":"allow"}}"#.to_string(),

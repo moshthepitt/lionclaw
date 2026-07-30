@@ -46,6 +46,7 @@ pub struct MissionTransports {
     profiles: Option<RuntimeProfiles>,
     runtime: Option<(RuntimeDriverRegistry, RuntimeAuthRegistry)>,
     oracle: Option<Arc<dyn OracleRunner>>,
+    attached_runtime: Option<Arc<dyn crate::everyday::AttachedRuntimeExecutor>>,
 }
 
 impl MissionTransports {
@@ -54,6 +55,7 @@ impl MissionTransports {
             profiles: None,
             runtime: None,
             oracle: None,
+            attached_runtime: None,
         }
     }
 
@@ -67,7 +69,16 @@ impl MissionTransports {
             profiles: Some(profiles),
             runtime: Some((drivers, auth)),
             oracle: Some(oracle),
+            attached_runtime: None,
         }
+    }
+
+    pub fn with_attached_runtime(
+        mut self,
+        executor: Arc<dyn crate::everyday::AttachedRuntimeExecutor>,
+    ) -> Self {
+        self.attached_runtime = Some(executor);
+        self
     }
 
     fn profiles(&self) -> Result<RuntimeProfiles> {
@@ -84,6 +95,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Launch or resume the everyday orchestrator in this repository.
+    Run(RunArgs),
     /// Install the bundled mission types into `~/.lionclaw` (run once).
     Install(InstallArgs),
     /// Check the install: podman, git, and each installed mission type + image.
@@ -96,6 +109,16 @@ pub enum Command {
     Mission(MissionCommand),
     /// Render the lionclaw(1) manual page to stdout.
     Man,
+}
+
+#[derive(Args)]
+pub struct RunArgs {
+    /// Runtime profile to launch.
+    #[arg(default_value = "codex")]
+    pub runtime: String,
+    /// Target repository (default: the enclosing git worktree root).
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -674,6 +697,7 @@ pub async fn run_with_transports(
 ) -> Result<std::process::ExitCode> {
     use std::process::ExitCode;
     match cli.command {
+        Command::Run(args) => cmd_run(args, &transports).await,
         Command::Install(args) => cmd_install(args).await.map(|()| ExitCode::SUCCESS),
         Command::Doctor => cmd_doctor().await,
         Command::Skill(cmd) => cmd_skill(cmd).await.map(|()| ExitCode::SUCCESS),
@@ -683,6 +707,30 @@ pub async fn run_with_transports(
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+async fn cmd_run(args: RunArgs, transports: &MissionTransports) -> Result<std::process::ExitCode> {
+    let (repo, store) = open_store(args.repo).await?;
+    let (drivers, auth) = transports
+        .runtime
+        .clone()
+        .map_or((None, None), |(drivers, auth)| (Some(drivers), Some(auth)));
+    let executor = transports
+        .attached_runtime
+        .clone()
+        .unwrap_or_else(|| Arc::new(crate::everyday::ProductionAttachedRuntimeExecutor));
+    let outcome = crate::everyday::run(crate::everyday::EverydayRunRequest {
+        repo,
+        runtime: args.runtime,
+        store,
+        profiles: transports.profiles()?,
+        drivers,
+        auth,
+        executor,
+    })
+    .await?;
+    outcome.print();
+    Ok(outcome.exit_code())
 }
 
 async fn run_mission(

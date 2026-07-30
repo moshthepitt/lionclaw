@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::Result;
 use lionclaw_runtime_api::{
     RuntimeAdapter, RuntimeAuthKind, RuntimeDriverConfig, RuntimeDriverProvider,
     RuntimeTerminalConfig,
@@ -41,6 +42,10 @@ pub struct AcpRuntimeDriver;
 impl RuntimeDriverProvider for AcpRuntimeDriver {
     fn driver(&self) -> &'static str {
         ACP_PROTOCOL_NAME
+    }
+
+    fn validate_config(&self, config: &RuntimeDriverConfig) -> Result<()> {
+        config.terminal.validate()
     }
 
     fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {

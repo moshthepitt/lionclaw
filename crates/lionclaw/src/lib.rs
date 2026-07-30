@@ -14,6 +14,7 @@ mod driver_lock;
 mod effect_cleanup;
 pub use effect_cleanup::LocalEffectCleaner;
 pub mod engine;
+pub mod everyday;
 pub mod evidence;
 pub mod mission_type;
 pub use lionclaw_model as model;

@@ -355,10 +355,19 @@ fn codex_driver_requires_profile_auth() {
 
 #[test]
 fn codex_terminal_program_uses_lionclaw_context_and_outer_boundary() {
-    let program = build_codex_terminal_program(&CodexRuntimeConfig {
-        executable: "codex".to_string(),
-        model: Some("gpt-5.5".to_string()),
-    });
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let program = build_codex_terminal_program(
+        &CodexRuntimeConfig {
+            executable: "codex".to_string(),
+            model: Some("gpt-5.5".to_string()),
+        },
+        &RuntimeTerminalProgramInput {
+            session_id: Uuid::new_v4(),
+            runtime_state: runtime_state(temp_dir.path().join("runtime-state")),
+            resume: false,
+            bootstrap_message: "current facts".to_string(),
+        },
+    );
 
     assert_eq!(program.executable, "codex");
     assert_eq!(
@@ -376,6 +385,7 @@ fn codex_terminal_program_uses_lionclaw_context_and_outer_boundary() {
             "model_instructions_file=\"/runtime/AGENTS.generated.md\"".to_string(),
             "--model".to_string(),
             "gpt-5.5".to_string(),
+            "current facts".to_string(),
         ]
     );
     assert_eq!(program.auth, Some(codex_runtime_auth_kind()));
@@ -384,7 +394,7 @@ fn codex_terminal_program_uses_lionclaw_context_and_outer_boundary() {
 }
 
 #[test]
-fn codex_terminal_program_uses_global_options_without_saved_thread_resume() {
+fn codex_terminal_program_resumes_the_native_cli_without_using_protocol_thread_ids() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
     std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
@@ -399,6 +409,8 @@ fn codex_terminal_program_uses_global_options_without_saved_thread_resume() {
         .build_terminal_program(RuntimeTerminalProgramInput {
             session_id: Uuid::new_v4(),
             runtime_state,
+            resume: true,
+            bootstrap_message: "updated facts".to_string(),
         })
         .expect("terminal program");
 
@@ -417,9 +429,12 @@ fn codex_terminal_program_uses_global_options_without_saved_thread_resume() {
             "model_instructions_file=\"/runtime/AGENTS.generated.md\"".to_string(),
             "--model".to_string(),
             "gpt-5.5".to_string(),
+            "resume".to_string(),
+            "--last".to_string(),
+            "updated facts".to_string(),
         ]
     );
-    assert!(!program.args.iter().any(|arg| arg == "resume"));
+    assert!(program.args.iter().any(|arg| arg == "resume"));
     assert!(!program.args.iter().any(|arg| arg == "thr_saved"));
 }
 
