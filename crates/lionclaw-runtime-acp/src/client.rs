@@ -7,8 +7,9 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use lionclaw_runtime_api::{
-    AppliedRuntimeConfiguration, ExecutionOutput, RuntimeEvent, RuntimeMcpServerSpec,
-    RuntimeProgramSession, RuntimeTurnJournalSender, RuntimeUsage, TurnEvent, TypedFailure,
+    AppliedRuntimeConfiguration, ExecutionOutput, RuntimeConfigurationConfirmation, RuntimeEvent,
+    RuntimeMcpServerSpec, RuntimeProgramSession, RuntimeTurnJournalSender, RuntimeUsage, TurnEvent,
+    TypedFailure,
 };
 
 use crate::driver::AcpRuntimeConfig;
@@ -37,6 +38,73 @@ pub(crate) struct AcpClient {
 enum AcpRequestFailure {
     ProviderRejected(AcpProviderRejection),
     Other(anyhow::Error),
+}
+
+#[derive(Clone, Copy)]
+enum AcpSelectionKind {
+    Model,
+    Mode,
+}
+
+impl AcpSelectionKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Mode => "mode",
+        }
+    }
+
+    fn setter(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Model => ("session/set_model", "modelId"),
+            Self::Mode => ("session/set_mode", "modeId"),
+        }
+    }
+
+    fn observed_value(self, configuration: &AppliedRuntimeConfiguration) -> Option<String> {
+        match self {
+            Self::Model => configuration.applied_model.clone(),
+            Self::Mode => configuration.applied_mode.clone(),
+        }
+    }
+
+    fn clear_observation(self, configuration: &mut AppliedRuntimeConfiguration) {
+        match self {
+            Self::Model => {
+                configuration.applied_model = None;
+                configuration.model_confirmation = None;
+            }
+            Self::Mode => {
+                configuration.applied_mode = None;
+                configuration.mode_confirmation = None;
+            }
+        }
+    }
+
+    fn restore_observation(
+        self,
+        prior: &AppliedRuntimeConfiguration,
+        configuration: &mut AppliedRuntimeConfiguration,
+    ) {
+        if self.observed_value(configuration).is_some() {
+            return;
+        }
+        match self {
+            Self::Model => {
+                configuration.applied_model.clone_from(&prior.applied_model);
+                configuration.model_confirmation = prior.model_confirmation;
+            }
+            Self::Mode => {
+                configuration.applied_mode.clone_from(&prior.applied_mode);
+                configuration.mode_confirmation = prior.mode_confirmation;
+            }
+        }
+    }
+}
+
+struct AppliedSelection {
+    value: String,
+    confirmation: RuntimeConfigurationConfirmation,
 }
 
 impl AcpRequestFailure {
@@ -222,30 +290,28 @@ impl AcpClient {
             let selected = self
                 .apply_selection(
                     session_id,
-                    "model",
+                    AcpSelectionKind::Model,
                     model,
                     selections.models.as_ref(),
                     selections,
                 )
                 .await?;
-            applied.applied_model = Some(selected);
-            applied.model_confirmation =
-                Some(lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed);
+            applied.applied_model = Some(selected.value);
+            applied.model_confirmation = Some(selected.confirmation);
         }
 
         if let Some(mode) = config.mode.as_deref() {
             let selected = self
                 .apply_selection(
                     session_id,
-                    "mode",
+                    AcpSelectionKind::Mode,
                     mode,
                     selections.modes.as_ref(),
                     selections,
                 )
                 .await?;
-            applied.applied_mode = Some(selected);
-            applied.mode_confirmation =
-                Some(lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed);
+            applied.applied_mode = Some(selected.value);
+            applied.mode_confirmation = Some(selected.confirmation);
         }
 
         Ok(applied)
@@ -254,11 +320,12 @@ impl AcpClient {
     async fn apply_selection(
         &mut self,
         session_id: &str,
-        kind: &str,
+        kind: AcpSelectionKind,
         requested: &str,
         first_class: Option<&AcpSelectionSet>,
         selections: &AcpSessionSelections,
-    ) -> Result<String> {
+    ) -> Result<AppliedSelection> {
+        let label = kind.label();
         if let Some(first_class) = first_class {
             let matches = first_class
                 .values
@@ -269,52 +336,62 @@ impl AcpClient {
                 [selected] => selected.id.clone(),
                 [] => {
                     return Err(anyhow!(
-                        "ACP runtime does not advertise requested {kind} '{requested}'"
+                        "ACP runtime does not advertise requested {label} '{requested}'"
                     ))
                 }
-                _ => return Err(anyhow!("ACP requested {kind} '{requested}' is ambiguous")),
+                _ => return Err(anyhow!("ACP requested {label} '{requested}' is ambiguous")),
             };
-            let (method, id_key) = match kind {
-                "model" => ("session/set_model", "modelId"),
-                "mode" => ("session/set_mode", "modeId"),
-                _ => return Err(anyhow!("unsupported ACP selection kind '{kind}'")),
-            };
+            let (method, id_key) = kind.setter();
+            let prior_observation = self.observed_configuration.clone();
+            kind.clear_observation(&mut self.observed_configuration);
             let response = self
                 .request(
                     method,
                     json!({"sessionId": session_id, (id_key): selected}),
                     None,
                 )
-                .await?;
-            let observed = AcpSessionSelections::from_session_result(&response.result)
-                .observed_configuration();
-            self.observed_configuration.merge_observed(&observed);
-            let observed =
-                observed_value_for_kind(&self.observed_configuration, kind).ok_or_else(|| {
-                    anyhow!("ACP runtime did not observe applied {kind} '{requested}'")
-                })?;
-            if observed != selected {
-                return Err(anyhow!(
-                    "ACP runtime applied {kind} '{observed}' instead of requested '{requested}'"
-                ));
+                .await;
+            if response.is_err() {
+                kind.restore_observation(&prior_observation, &mut self.observed_configuration);
             }
-            return Ok(observed);
+            let response = response?;
+            let response_observation = AcpSessionSelections::from_session_result(&response.result)
+                .observed_configuration();
+            self.observed_configuration
+                .merge_observed(&response_observation);
+            let observed = kind.observed_value(&self.observed_configuration);
+            if let Some(observed) = observed {
+                if observed != selected {
+                    return Err(anyhow!(
+                        "ACP runtime applied {label} '{observed}' instead of requested '{requested}'"
+                    ));
+                }
+                return Ok(AppliedSelection {
+                    value: observed,
+                    confirmation: RuntimeConfigurationConfirmation::Observed,
+                });
+            }
+
+            return Ok(AppliedSelection {
+                value: selected,
+                confirmation: RuntimeConfigurationConfirmation::Acknowledged,
+            });
         }
 
         let option = selections
             .config_options
             .iter()
-            .find(|option| option.id == kind)
-            .ok_or_else(|| anyhow!("ACP runtime cannot apply requested {kind} '{requested}'"))?;
+            .find(|option| option.id == label)
+            .ok_or_else(|| anyhow!("ACP runtime cannot apply requested {label} '{requested}'"))?;
         if !option.values.is_empty() && !option.values.iter().any(|value| value == requested) {
             return Err(anyhow!(
-                "ACP runtime does not advertise requested {kind} '{requested}'"
+                "ACP runtime does not advertise requested {label} '{requested}'"
             ));
         }
         let response = self
             .request(
                 "session/set_config_option",
-                json!({"sessionId": session_id, "configId": kind, "value": requested}),
+                json!({"sessionId": session_id, "configId": label, "value": requested}),
                 None,
             )
             .await?;
@@ -322,17 +399,20 @@ impl AcpClient {
         let observed = response_selections
             .config_options
             .iter()
-            .find(|candidate| candidate.id == kind)
+            .find(|candidate| candidate.id == label)
             .and_then(|candidate| candidate.current.clone())
-            .ok_or_else(|| anyhow!("ACP runtime did not observe applied {kind} '{requested}'"))?;
+            .ok_or_else(|| anyhow!("ACP runtime did not observe applied {label} '{requested}'"))?;
         self.observed_configuration
             .merge_observed(&response_selections.observed_configuration());
         if observed != requested {
             return Err(anyhow!(
-                "ACP runtime applied {kind} '{observed}' instead of requested '{requested}'"
+                "ACP runtime applied {label} '{observed}' instead of requested '{requested}'"
             ));
         }
-        Ok(observed)
+        Ok(AppliedSelection {
+            value: observed,
+            confirmation: RuntimeConfigurationConfirmation::Observed,
+        })
     }
 
     pub(crate) async fn prompt(
@@ -610,17 +690,6 @@ impl AcpClient {
         let id = self.next_id;
         self.next_id += 1;
         id
-    }
-}
-
-fn observed_value_for_kind(
-    configuration: &AppliedRuntimeConfiguration,
-    kind: &str,
-) -> Option<String> {
-    match kind {
-        "model" => configuration.applied_model.clone(),
-        "mode" => configuration.applied_mode.clone(),
-        _ => None,
     }
 }
 

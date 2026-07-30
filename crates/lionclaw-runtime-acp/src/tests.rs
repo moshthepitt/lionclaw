@@ -853,6 +853,106 @@ async fn advertised_first_class_model_and_mode_are_applied_by_typed_methods() {
 }
 
 #[tokio::test]
+async fn empty_first_class_setter_result_is_acknowledged_without_stale_selection() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, Some("dont_ask".into())));
+    let handle = adapter
+        .session_start(RuntimeSessionStartInput {
+            session_id: Uuid::new_v4(),
+            working_dir: None,
+            environment: Vec::new(),
+            resume: RuntimeResume::Native {
+                state: runtime_state(runtime_state_root.clone()),
+                ready: runtime_not_ready(),
+            },
+        })
+        .expect("start");
+    let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+    let executor = FakeAcpProgramExecutor {
+        inbound: VecDeque::from([
+            opencode_initialize_response(1),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_mode","modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"dont_ask","name":"Don't Ask"}]}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
+        ]),
+        expected_auth: None,
+        state: Arc::clone(&fake_state),
+    };
+    let (journal_tx, _journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+
+    let result = adapter
+        .turn(
+            TurnExecution {
+                input: TurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "hello".to_string(),
+                },
+                context: acp_driver_context(runtime_state_root),
+                executor: Box::new(executor),
+            },
+            journal_tx,
+        )
+        .await
+        .expect("empty first-class setter result is a successful acknowledgement");
+
+    assert_eq!(
+        result.configuration.requested_mode.as_deref(),
+        Some("dont_ask")
+    );
+    assert_eq!(
+        result.configuration.applied_mode.as_deref(),
+        Some("dont_ask")
+    );
+    assert_eq!(
+        result.configuration.mode_confirmation,
+        Some(RuntimeConfigurationConfirmation::Acknowledged)
+    );
+    let sent = fake_state.lock().expect("fake ACP state").sent.clone();
+    assert_eq!(sent[2]["method"], "session/set_mode");
+    assert_eq!(sent[2]["params"]["modeId"], "dont_ask");
+}
+
+#[tokio::test]
+async fn first_class_setter_preserves_intervening_observed_selection() {
+    let state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+    let session = FakeAcpProgramSession {
+        inbound: VecDeque::from([
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"current_mode_update","currentModeId":"dont_ask"}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string(),
+        ]),
+        output: ExecutionOutput::default(),
+        state,
+    };
+    let mut client = AcpClient::new(Box::new(session));
+    let selections = AcpSessionSelections::from_session_result(&json!({
+        "modes": {
+            "currentModeId": "default",
+            "availableModes": [
+                {"id": "default", "name": "Default"},
+                {"id": "dont_ask", "name": "Don't Ask"}
+            ]
+        }
+    }));
+
+    let applied = client
+        .configure_session(
+            &opencode_acp_config(None, Some("dont_ask".into())),
+            "session-1",
+            &selections,
+        )
+        .await
+        .expect("intervening current-mode update is retained");
+
+    assert_eq!(applied.applied_mode.as_deref(), Some("dont_ask"));
+    assert_eq!(
+        applied.mode_confirmation,
+        Some(RuntimeConfigurationConfirmation::Observed)
+    );
+}
+
+#[tokio::test]
 async fn advertised_current_model_is_recorded_without_requested_model() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let runtime_state_root = temp_dir.path().join("runtime-state");
@@ -1139,7 +1239,7 @@ async fn partial_configuration_failure_preserves_requested_and_observed_evidence
 }
 
 #[tokio::test]
-async fn unadvertised_or_unconfirmed_configuration_is_rejected() {
+async fn unadvertised_or_unconfirmed_config_option_is_rejected() {
     let selections = AcpSessionSelections::from_session_result(&json!({
         "configOptions": [{
             "id": "model",
