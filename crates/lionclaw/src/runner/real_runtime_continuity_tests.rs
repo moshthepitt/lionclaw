@@ -262,7 +262,12 @@ async fn prove_real_runtime_continuity(runtime: &str, credential_target: &Path) 
             root.display()
         )
     });
-    let profiles = RuntimeProfiles::built_in().expect("load built-in runtime profiles");
+    let mut profile = RuntimeProfiles::built_in()
+        .expect("load built-in runtime profiles")
+        .get(runtime)
+        .unwrap_or_else(|error| panic!("load built-in {runtime} profile: {error:#}"));
+    profile.confinement.oci_mut().image = Some(image_id.clone());
+    let profiles = RuntimeProfiles::single(profile);
     let first_runner = OciRoleRunner::new(profiles.clone(), AuthorityCeiling::default());
 
     let mission_id = MissionId::for_creation(
