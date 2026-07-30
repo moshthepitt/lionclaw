@@ -39,6 +39,9 @@ RUN npm install -g "opencode-ai@${OPENCODE_VERSION}"
 ARG HERMES_AGENT_VERSION=0.18.2
 RUN python3 -m venv /opt/hermes-agent \
     && /opt/hermes-agent/bin/pip install --no-cache-dir "hermes-agent[acp]==${HERMES_AGENT_VERSION}" \
+    && hermes_site="$("/opt/hermes-agent/bin/python" -c 'import site; print(site.getsitepackages()[0])')" \
+    && test -f "${hermes_site}/hermes_cli/tui_dist/entry.js" \
+    && ln -s "${hermes_site}/hermes_cli/tui_dist" "${hermes_site}/ui-tui" \
     && ln -s /opt/hermes-agent/bin/hermes /usr/local/bin/hermes
 
 RUN npm ls -g @openai/codex opencode-ai --depth=0 --json \
