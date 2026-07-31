@@ -165,6 +165,7 @@ fn default_runtime_identities() -> BTreeMap<String, RuntimeInstrumentIdentity> {
                     runtime: runtime.to_string(),
                     model: None,
                     mode: None,
+                    model_network: crate::model::NetworkGrant::Deny,
                 },
             )
         })

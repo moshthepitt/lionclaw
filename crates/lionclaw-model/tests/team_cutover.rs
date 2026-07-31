@@ -76,6 +76,7 @@ fn runtime_identities(team: &TeamRevision) -> BTreeMap<RoleInstanceId, RuntimeIn
                     runtime: role.runtime.clone(),
                     model: None,
                     mode: None,
+                    model_network: lionclaw_model::NetworkGrant::Deny,
                 },
             )
         })

@@ -11,8 +11,8 @@ use lionclaw::model::{
 };
 use lionclaw::oracle::OciOracleRunner;
 use lionclaw::ports::{
-    ExternalOracleDriver, ExternalOracleDriverRegistry, ExternalOraclePoll,
-    ExternalOraclePollRequest, ExternalOracleProof, ExternalOracleSubmission,
+    ExternalOracleDriver, ExternalOracleDriverContext, ExternalOracleDriverRegistry,
+    ExternalOraclePoll, ExternalOraclePollRequest, ExternalOracleProof, ExternalOracleSubmission,
     ExternalOracleSubmitRequest, OracleOutcome, OracleRunRequest, OracleRunStatus, OracleRunner,
 };
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -132,6 +132,7 @@ impl ExternalOracleDriver for LocalExternalDriver {
     async fn submit(
         &self,
         request: ExternalOracleSubmitRequest,
+        _context: ExternalOracleDriverContext,
     ) -> Result<ExternalOracleSubmission, TypedFailure> {
         let job_id = format!("job-{}", &request.idempotency_key[..16]);
         self.submissions.lock().unwrap().push(request.clone());
@@ -147,6 +148,7 @@ impl ExternalOracleDriver for LocalExternalDriver {
     async fn poll(
         &self,
         request: ExternalOraclePollRequest,
+        _context: ExternalOracleDriverContext,
     ) -> Result<ExternalOraclePoll, TypedFailure> {
         self.polls.lock().unwrap().push(request.clone());
         let Some(mut poll) = self.polls_to_return.lock().unwrap().pop_front() else {
@@ -162,12 +164,14 @@ impl ExternalOracleDriver for LocalExternalDriver {
                 && proof.spec_digest.is_empty()
                 && proof.request_digest.is_empty()
                 && proof.job_id.is_empty()
+                && proof.artifact_digest.is_empty()
             {
                 proof.driver = request.driver;
                 proof.idempotency_key = request.idempotency_key;
                 proof.spec_digest = request.spec_digest;
                 proof.request_digest = request.request_digest;
                 proof.job_id = request.job_id;
+                proof.artifact_digest = request.artifact_digest;
             }
         }
         Ok(poll)
@@ -329,7 +333,7 @@ async fn external_driver_result_must_carry_a_valid_artifact_digest() {
     let driver = Arc::new(LocalExternalDriver::with_polls(vec![
         ExternalOraclePoll::Passed {
             proof: ExternalOracleProof {
-                artifact_digest: Some("sha256:not-lowercase-hex".to_string()),
+                artifact_digest: "sha256:not-lowercase-hex".to_string(),
                 ..ExternalOracleProof::empty_for_testing()
             },
         },

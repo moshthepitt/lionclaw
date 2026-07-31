@@ -18,7 +18,7 @@ use crate::{TypedFailure, TypedFailureEvidence};
 
 /// Reducer 74 admits external oracle specs while keeping oracle effects in the
 /// existing request/outcome fold.
-pub const REDUCER_VERSION: u32 = 74;
+pub const REDUCER_VERSION: u32 = 75;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;

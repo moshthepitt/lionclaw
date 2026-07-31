@@ -63,6 +63,14 @@ impl EffectCleaner for LocalEffectCleaner {
         {
             failures.push((EffectResource::Network, error.to_string()));
         }
+        if let Err(error) = lionclaw_confinement::remove_oci_network(
+            &self.oci_engine,
+            &format!("{resource_name}-egress"),
+        )
+        .await
+        {
+            failures.push((EffectResource::Network, error.to_string()));
+        }
         if let Err(error) = effect_dir.remove().await {
             failures.push((EffectResource::EffectDirectory, error.to_string()));
         }
@@ -91,5 +99,54 @@ impl EffectCleaner for LocalEffectCleaner {
                 .join("; ")
         };
         Err(EffectCleanupFailure { resource, detail })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn cleanup_removes_internal_and_egress_networks() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = temp.path().join("fake-oci");
+        let log = temp.path().join("oci.log");
+        std::fs::write(
+            &engine,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mission_id = crate::model::MissionId::parse("m123456789abc").unwrap();
+        let effect_id = crate::model::EffectId::for_parts(&["oracle", "cleanup-egress"]);
+        crate::resources::MissionDirs::new(temp.path(), &mission_id)
+            .effect(&effect_id)
+            .oracle()
+            .prepare()
+            .unwrap();
+
+        LocalEffectCleaner::new(engine.to_string_lossy().into_owned())
+            .cleanup(EffectCleanupRequest {
+                mission_id,
+                effect_id: effect_id.clone(),
+                workspace_dir: temp.path().join("workspace"),
+                state_dir: temp.path().to_path_buf(),
+                discard_artifact: false,
+            })
+            .await
+            .expect("cleanup");
+
+        let log = std::fs::read_to_string(log).unwrap();
+        let resource_name = effect_id.resource_name();
+        assert!(
+            log.contains(&format!("network rm --force {resource_name}-net")),
+            "missing internal network cleanup in {log}"
+        );
+        assert!(
+            log.contains(&format!("network rm --force {resource_name}-egress")),
+            "missing egress network cleanup in {log}"
+        );
     }
 }

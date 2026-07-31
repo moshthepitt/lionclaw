@@ -190,6 +190,7 @@ fn assert_decisions_change_authority(state: &lionclaw::model::MissionState) -> b
                                         runtime: role.runtime.clone(),
                                         model: None,
                                         mode: None,
+                                        model_network: lionclaw::model::NetworkGrant::Deny,
                                     },
                                 )
                             })

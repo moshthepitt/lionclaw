@@ -1515,6 +1515,7 @@ fn team_runtime_identities(
                     runtime: role.runtime.clone(),
                     model: None,
                     mode: None,
+                    model_network: lionclaw::model::NetworkGrant::Deny,
                 },
             )
         })

@@ -3,6 +3,7 @@
 //! pass — this path is the only source of `OracleRunCompleted`, and it runs
 //! against a complete Git checkout of the judged commit mounted read-only.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
 use lionclaw_runtime_api::{RuntimeProgramExecutor, TypedFailure, TypedFailureEvidence};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -20,7 +22,8 @@ use crate::authority::{
 };
 use crate::config::MissionRuntimeProfile;
 use crate::ports::{
-    ExecutionControl, ExternalOracleDriverRegistry, ExternalOraclePoll, ExternalOraclePollRequest,
+    ExecutionControl, ExternalOracleDriver, ExternalOracleDriverContext,
+    ExternalOracleDriverRegistry, ExternalOraclePoll, ExternalOraclePollRequest,
     ExternalOracleProof, ExternalOracleSubmission, ExternalOracleSubmitRequest, OracleOutcome,
     OracleRunRequest, OracleRunStatus, OracleRunner,
 };
@@ -39,9 +42,21 @@ pub struct OciOracleRunner {
 
 impl OciOracleRunner {
     pub fn new(profile: MissionRuntimeProfile) -> Self {
+        let external_drivers = profile.external_oracle_drivers.iter().fold(
+            ExternalOracleDriverRegistry::new(),
+            |registry, (id, driver)| {
+                registry.with_driver(
+                    id.clone(),
+                    Arc::new(ProfileExternalOracleDriver {
+                        profile: profile.clone(),
+                        driver: driver.clone(),
+                    }),
+                )
+            },
+        );
         Self {
             profile,
-            external_drivers: ExternalOracleDriverRegistry::new(),
+            external_drivers,
             repo_lock: Arc::new(Mutex::new(())),
             input_lock: Arc::new(Mutex::new(())),
         }
@@ -59,6 +74,14 @@ impl OciOracleRunner {
     }
 }
 
+const EXTERNAL_ORACLE_DRIVER_EXECUTABLE: &str = "lionclaw-external-oracle-driver";
+
+#[derive(Clone)]
+struct ProfileExternalOracleDriver {
+    profile: MissionRuntimeProfile,
+    driver: crate::config::ExternalOracleDriverProfile,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExternalOracleState {
@@ -67,6 +90,7 @@ struct ExternalOracleState {
     spec_digest: String,
     request_digest: String,
     idempotency_key: String,
+    artifact_digest: String,
     job_id: String,
     submitted_at_ms: i64,
     next_poll_after_ms: i64,
@@ -118,6 +142,144 @@ fn control_failure(control: &ExecutionControl) -> Option<TypedFailure> {
             evidence: Box::new(evidence),
         },
     })
+}
+
+#[async_trait]
+impl ExternalOracleDriver for ProfileExternalOracleDriver {
+    async fn submit(
+        &self,
+        request: ExternalOracleSubmitRequest,
+        context: ExternalOracleDriverContext,
+    ) -> Result<ExternalOracleSubmission, TypedFailure> {
+        self.run_driver("submit", request, &context).await
+    }
+
+    async fn poll(
+        &self,
+        request: ExternalOraclePollRequest,
+        context: ExternalOracleDriverContext,
+    ) -> Result<ExternalOraclePoll, TypedFailure> {
+        self.run_driver("poll", request, &context).await
+    }
+}
+
+impl ProfileExternalOracleDriver {
+    async fn run_driver<I, O>(
+        &self,
+        operation: &str,
+        request: I,
+        context: &ExternalOracleDriverContext,
+    ) -> Result<O, TypedFailure>
+    where
+        I: Serialize + DriverRequestIdentity + Send + 'static,
+        O: DeserializeOwned + Send + 'static,
+    {
+        let mission_id = request.mission_id().clone();
+        let effect_id = request.effect_id().clone();
+        let environment_digest = request.environment_digest().to_string();
+        let dirs = MissionDirs::new(&context.state_dir, &mission_id)
+            .effect(&effect_id)
+            .oracle();
+        dirs.prepare()
+            .map_err(|error| fail(format!("failed to prepare external oracle dirs: {error}")))?;
+
+        let mut profile = self.profile.clone();
+        profile.confinement.oci_mut().image = Some(environment_digest);
+        let authority = oracle_authority_with_network(
+            &format!("external-driver:{}", self.driver.id),
+            BTreeSet::new(),
+            self.driver.network.clone(),
+        );
+        let compiled = compile_role_plan(RolePlanRequest {
+            authority: &authority,
+            runtime_id: profile.name.clone(),
+            confinement: profile.confinement,
+            mounts: MissionMounts {
+                workspace: dirs.scratch().to_path_buf(),
+                extras: Vec::new(),
+            },
+            working_dir: dirs.scratch().to_path_buf(),
+            judged_roots: &[],
+            environment: external_driver_environment(),
+            resources: Default::default(),
+            resource_ceilings: &context.resource_ceilings,
+            runtime_network: crate::model::NetworkGrant::Deny,
+        })
+        .map_err(|error| {
+            fail(format!(
+                "external oracle driver plan refused to compile: {error}"
+            ))
+        })?;
+
+        let stdin = serde_json::to_string(&request).map_err(|error| {
+            TypedFailure::permanent(
+                "oracle.external_driver",
+                format!("failed to encode external oracle driver request: {error}"),
+            )
+        })?;
+        let program = RuntimeProgramSpec {
+            executable: EXTERNAL_ORACLE_DRIVER_EXECUTABLE.to_string(),
+            args: vec![self.driver.id.as_str().to_string(), operation.to_string()],
+            environment: Vec::new(),
+            stdin,
+            auth: None,
+        };
+        let mut executor =
+            MissionProgramExecutor::new(compiled.plan().clone(), None, &effect_id, None);
+        let run = async move {
+            let output = executor
+                .execute_captured(program)
+                .await
+                .map_err(|error| fail(format!("external oracle driver failed to run: {error}")))?;
+            if output.exit_code != Some(0) || output.exit_signal.is_some() {
+                return Err(TypedFailure::permanent(
+                    "oracle.external_driver",
+                    "external oracle driver exited without a successful result",
+                ));
+            }
+            serde_json::from_slice(&output.stdout).map_err(|error| {
+                TypedFailure::permanent(
+                    "oracle.external_result",
+                    format!("external oracle driver returned malformed JSON: {error}"),
+                )
+            })
+        };
+        await_controlled(Box::pin(run), context.control.clone(), control_failure).await
+    }
+}
+
+trait DriverRequestIdentity {
+    fn mission_id(&self) -> &crate::model::MissionId;
+    fn effect_id(&self) -> &crate::model::EffectId;
+    fn environment_digest(&self) -> &str;
+}
+
+impl DriverRequestIdentity for ExternalOracleSubmitRequest {
+    fn mission_id(&self) -> &crate::model::MissionId {
+        &self.mission_id
+    }
+
+    fn effect_id(&self) -> &crate::model::EffectId {
+        &self.effect_id
+    }
+
+    fn environment_digest(&self) -> &str {
+        &self.environment_digest
+    }
+}
+
+impl DriverRequestIdentity for ExternalOraclePollRequest {
+    fn mission_id(&self) -> &crate::model::MissionId {
+        &self.mission_id
+    }
+
+    fn effect_id(&self) -> &crate::model::EffectId {
+        &self.effect_id
+    }
+
+    fn environment_digest(&self) -> &str {
+        &self.environment_digest
+    }
 }
 
 #[async_trait]
@@ -295,6 +457,12 @@ impl OciOracleRunner {
             )
         })?;
         let idempotency_key = external_idempotency_key(&request, &external, &request_digest);
+        let artifact_digest = external_artifact_digest(&request.judged_sha);
+        let driver_context = ExternalOracleDriverContext {
+            state_dir: request.state_dir.clone(),
+            resource_ceilings: request.resource_ceilings.clone(),
+            control: request.control.clone(),
+        };
         let dirs = MissionDirs::new(&request.state_dir, &request.mission_id)
             .effect(&request.effect_id)
             .oracle();
@@ -321,13 +489,14 @@ impl OciOracleRunner {
                     spec_digest: request.spec_digest.clone(),
                     request_digest: request_digest.clone(),
                     idempotency_key: idempotency_key.clone(),
+                    artifact_digest: artifact_digest.clone(),
                     request: external.request.clone(),
                     judged_sha: request.judged_sha.clone(),
                     environment_digest: request.environment_digest.clone(),
                     attempt_no: request.attempt_no,
                     deadline_ms: request.deadline_ms,
                 };
-                let submission = driver.submit(submit).await?;
+                let submission = driver.submit(submit, driver_context.clone()).await?;
                 validate_external_submission(
                     &submission,
                     &request,
@@ -341,6 +510,7 @@ impl OciOracleRunner {
                     spec_digest: submission.spec_digest,
                     request_digest: submission.request_digest,
                     idempotency_key: submission.idempotency_key,
+                    artifact_digest: artifact_digest.clone(),
                     job_id: submission.job_id,
                     submitted_at_ms: request.now_ms,
                     next_poll_after_ms: request.now_ms,
@@ -372,13 +542,14 @@ impl OciOracleRunner {
             spec_digest: request.spec_digest.clone(),
             request_digest: request_digest.clone(),
             idempotency_key: idempotency_key.clone(),
+            artifact_digest,
             job_id: state.job_id.clone(),
             judged_sha: request.judged_sha.clone(),
             environment_digest: request.environment_digest.clone(),
             attempt_no: request.attempt_no,
             deadline_ms: request.deadline_ms,
         };
-        match driver.poll(poll).await? {
+        match driver.poll(poll, driver_context).await? {
             ExternalOraclePoll::Pending { retry_after_ms } => {
                 state.poll_count = state.poll_count.saturating_add(1);
                 state.next_poll_after_ms =
@@ -434,6 +605,17 @@ fn external_idempotency_key(
     feed_digest_field(&mut digest, "attempt_no", &request.attempt_no.to_string());
     feed_digest_field(&mut digest, "deadline_ms", &request.deadline_ms.to_string());
     hex::encode(digest.finalize())
+}
+
+fn external_artifact_digest(judged_sha: &str) -> String {
+    let mut digest = Sha256::new();
+    feed_digest_field(
+        &mut digest,
+        "domain",
+        "lionclaw.external-oracle-artifact.v1",
+    );
+    feed_digest_field(&mut digest, "judged_sha", judged_sha);
+    format!("sha256:{}", hex::encode(digest.finalize()))
 }
 
 fn feed_digest_field(digest: &mut Sha256, label: &str, value: &str) {
@@ -517,6 +699,7 @@ fn validate_external_state(
         || state.spec_digest != request.spec_digest
         || state.request_digest != request_digest
         || state.idempotency_key != idempotency_key
+        || state.artifact_digest != external_artifact_digest(&request.judged_sha)
         || !valid_external_job_id(&state.job_id)
     {
         return Err(TypedFailure::permanent(
@@ -557,19 +740,18 @@ fn validate_external_proof(
         || proof.request_digest != state.request_digest
         || proof.idempotency_key != state.idempotency_key
         || proof.job_id != state.job_id
+        || proof.artifact_digest != state.artifact_digest
     {
         return Err(TypedFailure::permanent(
             "oracle.external_result",
             "external oracle driver returned proof for a different submission",
         ));
     }
-    if let Some(artifact_digest) = &proof.artifact_digest {
-        if !valid_artifact_digest(artifact_digest) {
-            return Err(TypedFailure::permanent(
-                "oracle.external_result",
-                "external oracle driver returned an invalid artifact digest",
-            ));
-        }
+    if !valid_artifact_digest(&proof.artifact_digest) {
+        return Err(TypedFailure::permanent(
+            "oracle.external_result",
+            "external oracle driver returned an invalid artifact digest",
+        ));
     }
     Ok(())
 }
@@ -655,6 +837,14 @@ fn external_outcome(
     })
 }
 
+fn external_driver_environment() -> Vec<(String, String)> {
+    vec![
+        ("HOME".to_string(), "/tmp".to_string()),
+        ("TMPDIR".to_string(), "/tmp".to_string()),
+        ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+    ]
+}
+
 /// Kernel-owned execution coordinates for an oracle. Prepared inputs are the
 /// final explicit overlay because they may publish a content-addressed cache.
 fn oracle_environment(
@@ -731,6 +921,49 @@ mod tests {
             program.args,
             vec!["$(touch /workspace/escaped)", "a; echo b"]
         );
+    }
+
+    #[test]
+    fn external_proof_requires_exact_judged_artifact_digest() {
+        let state = ExternalOracleState {
+            driver: crate::model::ExternalOracleDriverId::new("local-ci").unwrap(),
+            oracle: OracleName::new("ci").unwrap(),
+            spec_digest: "spec-digest".to_string(),
+            request_digest: "request-digest".to_string(),
+            idempotency_key: "idem".to_string(),
+            artifact_digest: external_artifact_digest("judged-sha"),
+            job_id: "job-1".to_string(),
+            submitted_at_ms: 0,
+            next_poll_after_ms: 0,
+            poll_count: 0,
+        };
+        let mut proof = ExternalOracleProof {
+            driver: state.driver.clone(),
+            idempotency_key: state.idempotency_key.clone(),
+            spec_digest: state.spec_digest.clone(),
+            request_digest: state.request_digest.clone(),
+            job_id: state.job_id.clone(),
+            artifact_digest: String::new(),
+            summary: String::new(),
+        };
+
+        let missing =
+            validate_external_proof(&proof, &state).expect_err("missing artifact digest must fail");
+        assert_eq!(
+            missing.evidence().code.as_deref(),
+            Some("oracle.external_result")
+        );
+
+        proof.artifact_digest = format!("sha256:{}", "0".repeat(64));
+        let wrong = validate_external_proof(&proof, &state)
+            .expect_err("digest for a different judged artifact must fail");
+        assert_eq!(
+            wrong.evidence().code.as_deref(),
+            Some("oracle.external_result")
+        );
+
+        proof.artifact_digest = state.artifact_digest.clone();
+        validate_external_proof(&proof, &state).expect("matching proof");
     }
 
     #[tokio::test]

@@ -105,6 +105,7 @@ fn runtime_identities(codex_model: &str) -> BTreeMap<String, RuntimeInstrumentId
             runtime: "codex".to_string(),
             model: Some(codex_model.to_string()),
             mode: None,
+            model_network: lionclaw::model::NetworkGrant::Deny,
         },
     );
     identities

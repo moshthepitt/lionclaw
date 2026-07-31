@@ -13,7 +13,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::mission_type::Home;
-use crate::model::NetworkGrant;
+use crate::model::{ExternalOracleDriverId, NetworkGrant};
 
 const DEFAULT_RUNTIMES_TOML: &str = r#"
 [runtimes.codex]
@@ -80,9 +80,16 @@ pub struct MissionRuntimeProfile {
     pub skills_dir: Option<RuntimeSkillsDir>,
     pub terminal: RuntimeTerminalConfig,
     pub model_network: NetworkGrant,
+    pub external_oracle_drivers: BTreeMap<ExternalOracleDriverId, ExternalOracleDriverProfile>,
     /// Whether this profile can retain and reopen a native conversation.
     pub native_resume: bool,
     pub confinement: ConfinementConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalOracleDriverProfile {
+    pub id: ExternalOracleDriverId,
+    pub network: NetworkGrant,
 }
 
 impl MissionRuntimeProfile {
@@ -322,6 +329,7 @@ impl RuntimeProfiles {
                         runtime: profile.name.clone(),
                         model: profile.model.clone(),
                         mode: profile.mode.clone(),
+                        model_network: profile.model_network.clone(),
                     },
                 )
             })
@@ -358,8 +366,17 @@ struct RuntimeProfileFile {
     native_resume: bool,
     #[serde(default, rename = "model-network")]
     model_network: NetworkGrant,
+    #[serde(default, rename = "external-oracle-drivers")]
+    external_oracle_drivers: BTreeMap<ExternalOracleDriverId, ExternalOracleDriverFile>,
     #[serde(default = "default_confinement")]
     confinement: ConfinementConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct ExternalOracleDriverFile {
+    #[serde(default)]
+    network: NetworkGrant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -428,6 +445,17 @@ impl RuntimeProfileFile {
             skills_dir,
             terminal: self.terminal,
             model_network: self.model_network,
+            external_oracle_drivers: self
+                .external_oracle_drivers
+                .into_iter()
+                .map(|(id, config)| {
+                    let profile = ExternalOracleDriverProfile {
+                        id: id.clone(),
+                        network: config.network,
+                    };
+                    (id, profile)
+                })
+                .collect(),
             native_resume: self.native_resume,
             confinement: self.confinement,
         })
@@ -673,6 +701,59 @@ mod tests {
         )
         .expect_err("IP literal destination must fail");
         assert!(format!("{error:#}").contains("IP literal"));
+    }
+
+    #[test]
+    fn runtime_model_network_is_part_of_durable_instrument_identity() {
+        let profiles = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.codex]
+            driver = "codex"
+            command = "codex"
+            model-network = { mode = "allow", destinations = [
+              { host = "api.openai.com", ports = [443] }
+            ] }
+            "#,
+            Path::new("/home/alice"),
+        )
+        .expect("profile");
+
+        let identity = profiles
+            .instrument_identities()
+            .remove("codex")
+            .expect("runtime identity");
+        let identity = serde_json::to_value(identity).expect("identity JSON");
+
+        assert_eq!(
+            identity["model_network"]["destinations"][0]["host"],
+            "api.openai.com"
+        );
+    }
+
+    #[test]
+    fn external_oracle_drivers_are_profile_installed_and_network_scoped() {
+        let profiles = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.codex]
+            driver = "codex"
+            command = "codex"
+
+            [runtimes.codex.external-oracle-drivers.local-ci]
+            network = { mode = "allow", destinations = [
+              { host = "ci.example.com", ports = [443] }
+            ] }
+            "#,
+            Path::new("/home/alice"),
+        )
+        .expect("profile");
+
+        let profile = profiles.get("codex").expect("runtime");
+        assert_eq!(profile.external_oracle_drivers.len(), 1);
+        let driver = profile
+            .external_oracle_drivers
+            .get(&crate::model::ExternalOracleDriverId::new("local-ci").unwrap())
+            .expect("installed driver");
+        assert!(driver.network.allows("ci.example.com", 443));
     }
 
     #[test]

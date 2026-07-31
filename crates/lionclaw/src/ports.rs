@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lionclaw_runtime_api::TypedFailure;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::mission_type::{PreparedInput, SkillPackage};
@@ -147,12 +148,21 @@ pub trait ExternalOracleDriver: Send + Sync {
     async fn submit(
         &self,
         request: ExternalOracleSubmitRequest,
+        context: ExternalOracleDriverContext,
     ) -> Result<ExternalOracleSubmission, TypedFailure>;
 
     async fn poll(
         &self,
         request: ExternalOraclePollRequest,
+        context: ExternalOracleDriverContext,
     ) -> Result<ExternalOraclePoll, TypedFailure>;
+}
+
+#[derive(Clone)]
+pub struct ExternalOracleDriverContext {
+    pub state_dir: PathBuf,
+    pub resource_ceilings: ConfinementResources,
+    pub control: watch::Receiver<ExecutionControl>,
 }
 
 #[derive(Clone, Default)]
@@ -179,7 +189,7 @@ impl ExternalOracleDriverRegistry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalOracleSubmitRequest {
     pub mission_id: MissionId,
     pub effect_id: EffectId,
@@ -188,6 +198,7 @@ pub struct ExternalOracleSubmitRequest {
     pub spec_digest: String,
     pub request_digest: String,
     pub idempotency_key: String,
+    pub artifact_digest: String,
     pub request: BTreeMap<String, String>,
     pub judged_sha: String,
     pub environment_digest: String,
@@ -195,7 +206,7 @@ pub struct ExternalOracleSubmitRequest {
     pub deadline_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalOracleSubmission {
     pub driver: ExternalOracleDriverId,
     pub idempotency_key: String,
@@ -204,7 +215,7 @@ pub struct ExternalOracleSubmission {
     pub job_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalOraclePollRequest {
     pub mission_id: MissionId,
     pub effect_id: EffectId,
@@ -213,6 +224,7 @@ pub struct ExternalOraclePollRequest {
     pub spec_digest: String,
     pub request_digest: String,
     pub idempotency_key: String,
+    pub artifact_digest: String,
     pub job_id: String,
     pub judged_sha: String,
     pub environment_digest: String,
@@ -220,7 +232,8 @@ pub struct ExternalOraclePollRequest {
     pub deadline_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExternalOraclePoll {
     Pending {
         retry_after_ms: Option<u64>,
@@ -234,14 +247,14 @@ pub enum ExternalOraclePoll {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalOracleProof {
     pub driver: ExternalOracleDriverId,
     pub idempotency_key: String,
     pub spec_digest: String,
     pub request_digest: String,
     pub job_id: String,
-    pub artifact_digest: Option<String>,
+    pub artifact_digest: String,
     pub summary: String,
 }
 
@@ -254,7 +267,7 @@ impl ExternalOracleProof {
             spec_digest: String::new(),
             request_digest: String::new(),
             job_id: String::new(),
-            artifact_digest: None,
+            artifact_digest: String::new(),
             summary: String::new(),
         }
     }

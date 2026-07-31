@@ -19,11 +19,13 @@ use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleInstanceId, 
 use super::plan::{OutputSemantics, PlanProposal};
 use super::verdict::FinishClass;
 use crate::prelude::*;
-use crate::{AppliedRuntimeConfiguration, RuntimeUsage, TypedFailure, TypedFailureEvidence};
+use crate::{
+    AppliedRuntimeConfiguration, NetworkGrant, RuntimeUsage, TypedFailure, TypedFailureEvidence,
+};
 
-/// Version 36 binds judgment requests to the exact report deliverables they
-/// assess, including each report's content digest and producing effect.
-pub const SCHEMA_VERSION: u32 = 38;
+/// Version 39 records runtime-profile model network authority in durable proof
+/// identity so changed provider destinations invalidate old role proofs.
+pub const SCHEMA_VERSION: u32 = 39;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -82,6 +84,8 @@ pub struct RuntimeInstrumentIdentity {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "NetworkGrant::is_denied")]
+    pub model_network: NetworkGrant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

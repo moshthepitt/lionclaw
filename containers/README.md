@@ -11,9 +11,12 @@ used for destination-scoped network proxying.
 
 The image pins the tested `@openai/codex` and `opencode-ai` package versions in
 the Containerfile and fails the build if the installed global packages do not
-match those pins. The build also verifies `lionclaw __network-proxy` so role
-containers can stay on an internal effect network while the proxy container owns
-the only egress attachment.
+match those pins. The build also verifies `lionclaw __network-proxy` and
+`lionclaw __network-proxy-health` so role containers can stay on an internal
+effect network while the proxy container owns the only egress attachment. At
+runtime LionClaw probes the health command inside the proxy container before
+launching the workload, so a running proxy process is not treated as ready until
+its HTTP and SOCKS listeners are bound.
 
 ```bash
 podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
@@ -53,3 +56,24 @@ A mission type declares the image it runs under in its `mission.toml`
 (`image = "localhost/lionclaw-runtime-dev:v1"`); build the image under that tag,
 or override per mission with `lionclaw mission start --image <ref>`. The tag is
 resolved to a content id once at `start` and pinned for the mission's life.
+
+## External Oracle Drivers
+
+External oracle drivers are operator-installed programs in the pinned runtime
+image. The fixed launcher name is `lionclaw-external-oracle-driver`; missions
+may name only a configured driver id and bounded typed request data, never an
+executable path, shell command, adapter name, or credential bytes.
+
+Declare installed drivers in the runtime profile and scope their own network
+authority there:
+
+```toml
+[runtimes.codex.external-oracle-drivers.local-ci]
+network = { mode = "allow", destinations = [
+  { host = "ci.example.com", ports = [443] }
+] }
+```
+
+LionClaw invokes the launcher with JSON submit/poll requests on stdin. Driver
+credentials stay outside mission data and are supplied by operator/runtime
+configuration only.

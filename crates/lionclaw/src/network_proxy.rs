@@ -1,9 +1,10 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::{
     io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    time::timeout,
 };
 use tracing::debug;
 
@@ -29,6 +30,16 @@ pub async fn run(http: String, socks: String, allow: Vec<String>) -> Result<()> 
         result = serve_http(http, Arc::clone(&destinations)) => result,
         result = serve_socks(socks, destinations) => result,
     }
+}
+
+pub async fn health(http: String, socks: String) -> Result<()> {
+    for address in [http, socks] {
+        timeout(Duration::from_secs(1), TcpStream::connect(&address))
+            .await
+            .with_context(|| format!("timed out connecting to proxy listener {address}"))?
+            .with_context(|| format!("connecting to proxy listener {address}"))?;
+    }
+    Ok(())
 }
 
 fn parse_allowlist(raw: Vec<String>) -> Result<NetworkGrant> {
@@ -68,14 +79,14 @@ async fn serve_http(listener: TcpListener, destinations: Arc<NetworkGrant>) -> R
 }
 
 async fn handle_http(mut client: TcpStream, destinations: Arc<NetworkGrant>) -> Result<()> {
-    let header = match read_http_header(&mut client).await {
-        Ok(header) => header,
+    let request = match read_http_request_head(&mut client).await {
+        Ok(request) => request,
         Err(error) => {
             write_http_status(&mut client, 400, "Bad Request").await;
             return Err(error);
         }
     };
-    let (first_line, rest) = split_http_first_line(&header)?;
+    let (first_line, rest) = split_http_first_line(&request.header)?;
     let mut fields = first_line.split_whitespace();
     let method = fields
         .next()
@@ -110,6 +121,12 @@ async fn handle_http(mut client: TcpStream, destinations: Arc<NetworkGrant>) -> 
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
             .context("writing CONNECT success")?;
+        if !request.buffered_body.is_empty() {
+            upstream
+                .write_all(&request.buffered_body)
+                .await
+                .context("forwarding buffered CONNECT payload")?;
+        }
         let _ = copy_bidirectional(&mut client, &mut upstream).await;
         return Ok(());
     }
@@ -136,11 +153,22 @@ async fn handle_http(mut client: TcpStream, destinations: Arc<NetworkGrant>) -> 
         .write_all(rest)
         .await
         .context("forwarding HTTP headers")?;
+    if !request.buffered_body.is_empty() {
+        upstream
+            .write_all(&request.buffered_body)
+            .await
+            .context("forwarding buffered HTTP request body")?;
+    }
     let _ = copy_bidirectional(&mut client, &mut upstream).await;
     Ok(())
 }
 
-async fn read_http_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
+struct BufferedHttpRequest {
+    header: Vec<u8>,
+    buffered_body: Vec<u8>,
+}
+
+async fn read_http_request_head(stream: &mut TcpStream) -> Result<BufferedHttpRequest> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
     loop {
@@ -153,8 +181,12 @@ async fn read_http_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
         }
         buffer.extend_from_slice(&chunk[..read]);
         if let Some(position) = find_header_end(&buffer) {
-            buffer.truncate(position + 4);
-            return Ok(buffer);
+            let body_start = position + 4;
+            let buffered_body = buffer.split_off(body_start);
+            return Ok(BufferedHttpRequest {
+                header: buffer,
+                buffered_body,
+            });
         }
         if buffer.len() > MAX_HTTP_HEADER_BYTES {
             bail!("HTTP proxy request headers exceed {MAX_HTTP_HEADER_BYTES} bytes");
@@ -447,9 +479,45 @@ mod tests {
         proxy.task.abort();
     }
 
+    #[tokio::test]
+    async fn http_proxy_preserves_body_bytes_buffered_with_headers() {
+        let upstream = spawn_body_capture_server(11).await;
+        let proxy =
+            spawn_http_proxy(NetworkGrant::allow_single("localhost", upstream.port).unwrap()).await;
+
+        let mut client = TcpStream::connect(proxy.addr).await.expect("proxy");
+        client
+            .write_all(
+                format!(
+                    "POST http://localhost:{}/upload HTTP/1.1\r\nHost: localhost:{}\r\nContent-Length: 11\r\n\r\nhello world",
+                    upstream.port, upstream.port
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("post request");
+        let response = read_proxy_response(&mut client).await;
+        assert!(response.starts_with("HTTP/1.1 200"));
+
+        let body = upstream
+            .body
+            .await
+            .expect("body captured by upstream server");
+        assert_eq!(body, b"hello world");
+
+        proxy.task.abort();
+        upstream.task.abort();
+    }
+
     struct Server {
         port: u16,
         task: JoinHandle<()>,
+    }
+
+    struct BodyCaptureServer {
+        port: u16,
+        task: JoinHandle<()>,
+        body: tokio::sync::oneshot::Receiver<Vec<u8>>,
     }
 
     struct Proxy {
@@ -473,6 +541,50 @@ mod tests {
             }
         });
         Server { port, task }
+    }
+
+    async fn spawn_body_capture_server(expected_len: usize) -> BodyCaptureServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let port = listener.local_addr().expect("server addr").port();
+        let (body_tx, body) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept server");
+            let mut buffer = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            let body = loop {
+                let read = timeout(Duration::from_millis(200), stream.read(&mut chunk))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(0);
+                if read == 0 {
+                    break Vec::new();
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(position) = find_header_end(&buffer) {
+                    let mut body = buffer[(position + 4)..].to_vec();
+                    while body.len() < expected_len {
+                        let read = timeout(Duration::from_millis(200), stream.read(&mut chunk))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&chunk[..read]);
+                    }
+                    body.truncate(expected_len);
+                    break body;
+                }
+            };
+            let _ = body_tx.send(body);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .ok();
+        });
+        BodyCaptureServer { port, task, body }
     }
 
     async fn spawn_http_proxy(grant: NetworkGrant) -> Proxy {

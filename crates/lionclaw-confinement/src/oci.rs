@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, fs, path::Path, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -6,7 +11,10 @@ use async_trait::async_trait;
 use rustix::process::{getgid, getuid};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
-use tokio::{runtime::Handle, time::timeout};
+use tokio::{
+    runtime::Handle,
+    time::{sleep, timeout},
+};
 use tracing::warn;
 
 use super::{
@@ -818,21 +826,47 @@ impl OciNetworkSession {
     }
 
     async fn ensure_proxy_running(&self) -> Result<()> {
-        let output = run_oci_preflight_command(
-            &build_container_running_inspect_invocation(&self.engine, &self.proxy_name),
-            &format!("inspect OCI network proxy '{}'", self.proxy_name),
-            OCI_PREFLIGHT_TIMEOUT,
-        )
-        .await?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if output.success() && stdout == "true" {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let ready_by = Instant::now() + OCI_PREFLIGHT_TIMEOUT;
+        let probe = loop {
+            let output = run_oci_preflight_command(
+                &build_container_running_inspect_invocation(&self.engine, &self.proxy_name),
+                &format!("inspect OCI network proxy '{}'", self.proxy_name),
+                OCI_PREFLIGHT_TIMEOUT,
+            )
+            .await?;
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !(output.success() && stdout == "true") {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                bail!(
+                    "OCI network proxy '{}' exited before readiness (inspect {}): stdout='{}' stderr='{}'",
+                    self.proxy_name,
+                    output.status_description(),
+                    stdout,
+                    stderr
+                )
+            }
+
+            let probe = run_oci_preflight_command(
+                &build_proxy_listener_probe_invocation(&self.engine, &self.proxy_name),
+                &format!("probe OCI network proxy '{}'", self.proxy_name),
+                OCI_PREFLIGHT_TIMEOUT,
+            )
+            .await?;
+            if probe.success() {
+                return Ok(());
+            }
+            if Instant::now() >= ready_by {
+                break probe;
+            }
+            sleep(Duration::from_millis(50)).await;
+        };
+
+        let stdout = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&probe.stderr).trim().to_string();
         bail!(
-            "OCI network proxy '{}' exited before readiness (inspect {}): stdout='{}' stderr='{}'",
+            "OCI network proxy '{}' did not bind proxy listeners before readiness (probe {}): stdout='{}' stderr='{}'",
             self.proxy_name,
-            output.status_description(),
+            probe.status_description(),
             stdout,
             stderr
         )
@@ -1150,6 +1184,25 @@ fn build_container_running_inspect_invocation(
             "--format".to_string(),
             "{{.State.Running}}".to_string(),
             container_name.to_string(),
+        ],
+        working_dir: None,
+        environment: Vec::new(),
+        input: String::new(),
+    }
+}
+
+fn build_proxy_listener_probe_invocation(engine: &str, container_name: &str) -> ProcessInvocation {
+    ProcessInvocation {
+        executable: engine.to_string(),
+        args: vec![
+            "exec".to_string(),
+            container_name.to_string(),
+            NETWORK_PROXY_BINARY.to_string(),
+            "__network-proxy-health".to_string(),
+            "--http".to_string(),
+            format!("127.0.0.1:{NETWORK_PROXY_HTTP_PORT}"),
+            "--socks".to_string(),
+            format!("127.0.0.1:{NETWORK_PROXY_SOCKS_PORT}"),
         ],
         working_dir: None,
         environment: Vec::new(),
@@ -2051,6 +2104,18 @@ mod tests {
                 "effect-proxy".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn proxy_readiness_probes_http_and_socks_listeners() {
+        let probe = super::build_proxy_listener_probe_invocation("podman", "effect-proxy");
+
+        assert_eq!(probe.executable, "podman");
+        assert_eq!(probe.args[0], "exec");
+        assert!(probe.args.contains(&"effect-proxy".to_string()));
+        assert!(probe.args.contains(&"__network-proxy-health".to_string()));
+        assert!(probe.args.contains(&"127.0.0.1:3128".to_string()));
+        assert!(probe.args.contains(&"127.0.0.1:3129".to_string()));
     }
 
     #[test]

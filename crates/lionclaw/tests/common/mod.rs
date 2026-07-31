@@ -519,6 +519,7 @@ pub fn default_runtime_identities() -> BTreeMap<String, RuntimeInstrumentIdentit
                 runtime: "codex".to_string(),
                 model: None,
                 mode: None,
+                model_network: lionclaw::model::NetworkGrant::Deny,
             },
         ),
         (
@@ -527,6 +528,7 @@ pub fn default_runtime_identities() -> BTreeMap<String, RuntimeInstrumentIdentit
                 runtime: "opencode".to_string(),
                 model: None,
                 mode: None,
+                model_network: lionclaw::model::NetworkGrant::Deny,
             },
         ),
     ])

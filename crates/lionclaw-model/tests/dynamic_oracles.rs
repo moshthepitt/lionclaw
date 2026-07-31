@@ -79,6 +79,7 @@ fn bootstrap_events() -> Vec<EventEnvelope> {
                     runtime: role.runtime.clone(),
                     model: None,
                     mode: None,
+                    model_network: NetworkGrant::Deny,
                 },
             )
         })
@@ -646,6 +647,7 @@ fn invalid_team_identity_keeps_the_whole_proposal_pending() {
                 runtime: "wrong-runtime".to_string(),
                 model: None,
                 mode: None,
+                model_network: NetworkGrant::Deny,
             },
         )]),
     ];

@@ -74,6 +74,7 @@ RUN npm ls -g @openai/codex opencode-ai --depth=0 --json \
 
 COPY --from=lionclaw-bin /src/lionclaw/target/release/lionclaw /usr/local/bin/lionclaw
 RUN lionclaw __network-proxy --help >/dev/null
+RUN lionclaw __network-proxy-health --help >/dev/null
 
 RUN useradd --create-home --shell /bin/bash lionclaw
 

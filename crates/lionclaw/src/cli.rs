@@ -159,6 +159,8 @@ pub enum Command {
     Man,
     #[command(name = "__network-proxy", hide = true)]
     NetworkProxy(NetworkProxyArgs),
+    #[command(name = "__network-proxy-health", hide = true)]
+    NetworkProxyHealth(NetworkProxyHealthArgs),
 }
 
 #[derive(Args)]
@@ -191,6 +193,14 @@ pub struct NetworkProxyArgs {
     pub socks: String,
     #[arg(long = "allow", value_name = "HOST:PORT")]
     pub allow: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct NetworkProxyHealthArgs {
+    #[arg(long)]
+    pub http: String,
+    #[arg(long)]
+    pub socks: String,
 }
 
 #[derive(Subcommand)]
@@ -770,6 +780,9 @@ pub async fn run_with_transports(
             Ok(ExitCode::SUCCESS)
         }
         Command::NetworkProxy(args) => crate::network_proxy::run(args.http, args.socks, args.allow)
+            .await
+            .map(|()| ExitCode::SUCCESS),
+        Command::NetworkProxyHealth(args) => crate::network_proxy::health(args.http, args.socks)
             .await
             .map(|()| ExitCode::SUCCESS),
     }

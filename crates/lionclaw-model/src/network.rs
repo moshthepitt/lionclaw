@@ -75,7 +75,7 @@ impl From<Destination> for UncheckedDestination {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum NetworkGrant {
     #[default]
@@ -84,6 +84,38 @@ pub enum NetworkGrant {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         destinations: BTreeSet<Destination>,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
+enum UncheckedNetworkGrant {
+    Deny,
+    Allow {
+        #[serde(default)]
+        destinations: BTreeSet<Destination>,
+    },
+}
+
+impl<'de> Deserialize<'de> for NetworkGrant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        UncheckedNetworkGrant::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl TryFrom<UncheckedNetworkGrant> for NetworkGrant {
+    type Error = NetworkGrantError;
+
+    fn try_from(value: UncheckedNetworkGrant) -> Result<Self, Self::Error> {
+        match value {
+            UncheckedNetworkGrant::Deny => Ok(NetworkGrant::Deny),
+            UncheckedNetworkGrant::Allow { destinations } => NetworkGrant::allow(destinations),
+        }
+    }
 }
 
 impl NetworkGrant {
@@ -292,5 +324,22 @@ mod tests {
         assert!(granted.allows("example.com", 443));
         assert!(!granted.allows("example.com", 80));
         assert!(!granted.allows("127.0.0.1", 443));
+    }
+
+    #[test]
+    fn grant_deserialization_uses_constructor_validation() {
+        let empty_allow = r#"{"mode":"allow","destinations":[]}"#;
+        let err = serde_json::from_str::<NetworkGrant>(empty_allow)
+            .expect_err("empty allowlist must not deserialize");
+        assert!(err.to_string().contains("at least one destination"));
+
+        let destinations = (0..=MAX_NETWORK_DESTINATIONS)
+            .map(|index| format!(r#"{{"host":"host-{index}.example.com","ports":[443]}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let too_many = format!(r#"{{"mode":"allow","destinations":[{destinations}]}}"#);
+        let err = serde_json::from_str::<NetworkGrant>(&too_many)
+            .expect_err("oversized allowlist must not deserialize");
+        assert!(err.to_string().contains("limit"));
     }
 }
