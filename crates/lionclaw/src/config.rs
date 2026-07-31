@@ -61,7 +61,8 @@ skills-dir = ".hermes/skills"
 model-network = { mode = "allow", destinations = [
   { host = "api.anthropic.com", ports = [443] },
   { host = "api.openai.com", ports = [443] },
-  { host = "auth.openai.com", ports = [443] }
+  { host = "auth.openai.com", ports = [443] },
+  { host = "chatgpt.com", ports = [443] }
 ] }
 confinement = { backend = "podman", image = "localhost/lionclaw-runtime-dev:v1", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 "#;
@@ -806,6 +807,10 @@ mod tests {
         assert!(hermes.native_resume);
         assert_eq!(hermes.terminal.args, ["--tui", "--skills", "lionclaw"]);
         assert_eq!(hermes.terminal.resume_args, ["--continue"]);
+        assert!(hermes.model_network.allows("api.anthropic.com", 443));
+        assert!(hermes.model_network.allows("api.openai.com", 443));
+        assert!(hermes.model_network.allows("auth.openai.com", 443));
+        assert!(hermes.model_network.allows("chatgpt.com", 443));
         let opencode = profiles.get("opencode").unwrap();
         assert_eq!(opencode.driver, "acp");
         assert_eq!(opencode.model.as_deref(), Some("opencode/big-pickle"));
