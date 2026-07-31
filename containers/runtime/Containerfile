@@ -1,3 +1,22 @@
+ARG RUST_IMAGE=docker.io/library/rust:1.96.1-bookworm
+
+FROM ${RUST_IMAGE} AS lionclaw-bin
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libsqlite3-dev \
+        libssl-dev \
+        pkg-config \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src/lionclaw
+COPY Cargo.toml Cargo.lock clippy.toml rust-toolchain.toml ./
+COPY crates ./crates
+COPY mission-types ./mission-types
+COPY skills ./skills
+RUN cargo build --locked --release -p lionclaw
+
 FROM node:22-bookworm-slim
 
 # Pin exact, current CLI versions instead of mutable `latest`/`stable` tags so
@@ -52,6 +71,9 @@ RUN npm ls -g @openai/codex opencode-ai --depth=0 --json \
         >/dev/null \
     && hermes --version \
     && hermes acp --check
+
+COPY --from=lionclaw-bin /src/lionclaw/target/release/lionclaw /usr/local/bin/lionclaw
+RUN lionclaw __network-proxy --help >/dev/null
 
 RUN useradd --create-home --shell /bin/bash lionclaw
 

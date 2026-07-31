@@ -1,9 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{collections::BTreeSet, fs, path::Path, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -79,7 +74,7 @@ const WORKSPACE_LIONCLAW_METADATA_TMPFS: &str = "/workspace/.lionclaw:size=1m,mo
 const NETWORK_PROXY_ALIAS: &str = "lionclaw-proxy";
 const NETWORK_PROXY_HTTP_PORT: u16 = 3128;
 const NETWORK_PROXY_SOCKS_PORT: u16 = 3129;
-const NETWORK_PROXY_BINARY_TARGET: &str = "/lionclaw/network-proxy";
+const NETWORK_PROXY_BINARY: &str = "/usr/local/bin/lionclaw";
 
 #[derive(Debug, Clone)]
 struct PreparedOciProcessLaunch {
@@ -102,7 +97,6 @@ enum PreparedOciNetwork {
         internal_network_name: String,
         egress_network_name: String,
         proxy_name: String,
-        proxy_binary: PathBuf,
     },
 }
 
@@ -478,46 +472,12 @@ fn prepare_oci_network(
     validate_oci_resource_name(&internal_network_name)?;
     validate_oci_resource_name(&egress_network_name)?;
     validate_oci_resource_name(&proxy_name)?;
-    let proxy_binary = resolve_network_proxy_binary()?;
     Ok(PreparedOciNetwork::Proxy {
         destinations: destinations.clone(),
         internal_network_name,
         egress_network_name,
         proxy_name,
-        proxy_binary,
     })
-}
-
-fn resolve_network_proxy_binary() -> Result<PathBuf> {
-    let current = std::env::current_exe()
-        .context("resolving current LionClaw executable for network proxy")?;
-    Ok(network_proxy_binary_for_current(&current))
-}
-
-fn network_proxy_binary_for_current(current: &Path) -> PathBuf {
-    if !looks_like_cargo_lionclaw_test_harness(current) {
-        return current.to_path_buf();
-    }
-    let Some(target_dir) = current.parent().and_then(Path::parent) else {
-        return current.to_path_buf();
-    };
-    let candidate = target_dir.join(format!("lionclaw{}", std::env::consts::EXE_SUFFIX));
-    if candidate.is_file() {
-        return candidate;
-    }
-    current.to_path_buf()
-}
-
-fn looks_like_cargo_lionclaw_test_harness(current: &Path) -> bool {
-    current
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        == Some("deps")
-        && current
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("lionclaw-"))
 }
 
 fn append_bind_mount_identity_args(args: &mut Vec<String>, root_in_userns: bool) {
@@ -762,7 +722,6 @@ async fn ensure_oci_network_registered(
         internal_network_name,
         egress_network_name,
         proxy_name,
-        proxy_binary,
     } = &prepared.network
     else {
         return Ok(None);
@@ -781,9 +740,7 @@ async fn ensure_oci_network_registered(
         }),
     };
     network.create_networks().await?;
-    let start_result = network
-        .start_proxy(&prepared.image, proxy_binary, destinations)
-        .await;
+    let start_result = network.start_proxy(&prepared.image, destinations).await;
     if let Err(error) = start_result {
         if let Err(cleanup_error) = network.shutdown().await {
             warn!(
@@ -833,7 +790,6 @@ impl OciNetworkSession {
     async fn start_proxy(
         &self,
         image: &str,
-        proxy_binary: &Path,
         destinations: &BTreeSet<lionclaw_runtime_api::Destination>,
     ) -> Result<()> {
         let output = run_oci_preflight_command(
@@ -843,7 +799,6 @@ impl OciNetworkSession {
                 &self.egress_network_name,
                 &self.proxy_name,
                 image,
-                proxy_binary,
                 destinations,
             )?,
             &format!("start OCI network proxy '{}'", self.proxy_name),
@@ -1148,16 +1103,8 @@ fn build_network_proxy_invocation(
     egress_network_name: &str,
     proxy_name: &str,
     image: &str,
-    proxy_binary: &Path,
     destinations: &BTreeSet<lionclaw_runtime_api::Destination>,
 ) -> Result<ProcessInvocation> {
-    let proxy_mount = MountSpec {
-        source: proxy_binary.to_path_buf(),
-        target: NETWORK_PROXY_BINARY_TARGET.to_string(),
-        access: MountAccess::ReadOnly,
-    };
-    let (mount_flag, mount_spec) =
-        format_bind_mount_arg_with_relabel(&proxy_mount, BindMountRelabel::Private)?;
     let mut args = vec![
         "run".to_string(),
         "--detach".to_string(),
@@ -1169,10 +1116,8 @@ fn build_network_proxy_invocation(
         format!("{internal_network_name}:alias={NETWORK_PROXY_ALIAS}"),
         "--network".to_string(),
         egress_network_name.to_string(),
-        mount_flag.to_string(),
-        mount_spec,
         image.to_string(),
-        NETWORK_PROXY_BINARY_TARGET.to_string(),
+        NETWORK_PROXY_BINARY.to_string(),
         "__network-proxy".to_string(),
         "--http".to_string(),
         format!("0.0.0.0:{NETWORK_PROXY_HTTP_PORT}"),
@@ -1462,7 +1407,7 @@ fn network_proxy_environment(network: &PreparedOciNetwork) -> Vec<(String, Strin
 mod tests {
     #[cfg(unix)]
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
-    use std::{collections::BTreeSet, fs, path::Path};
+    use std::{collections::BTreeSet, fs};
 
     use super::{
         build_oci_attached_process_invocation, build_oci_process_invocation,
@@ -2093,27 +2038,6 @@ mod tests {
     }
 
     #[test]
-    fn network_proxy_binary_prefers_cargo_built_cli_over_libtest_harness() {
-        let temp = tempdir().unwrap();
-        let debug = temp.path().join("target/debug");
-        let deps = debug.join("deps");
-        fs::create_dir_all(&deps).unwrap();
-        let harness = deps.join("lionclaw-abc123");
-        fs::File::create(&harness).unwrap();
-        let binary = debug.join(format!("lionclaw{}", std::env::consts::EXE_SUFFIX));
-        fs::File::create(&binary).unwrap();
-
-        assert_eq!(super::network_proxy_binary_for_current(&harness), binary);
-    }
-
-    #[test]
-    fn network_proxy_binary_keeps_non_harness_current_exe() {
-        let current = Path::new("/opt/lionclaw/bin/lionclaw");
-
-        assert_eq!(super::network_proxy_binary_for_current(current), current);
-    }
-
-    #[test]
     fn proxy_readiness_inspects_container_running_state() {
         let inspect = super::build_container_running_inspect_invocation("podman", "effect-proxy");
 
@@ -2164,7 +2088,6 @@ mod tests {
             "effect-egress",
             "effect-proxy",
             "localhost/lionclaw-runtime:v1",
-            Path::new("/usr/local/bin/lionclaw"),
             &destinations,
         )
         .expect("proxy invocation");
@@ -2183,10 +2106,7 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| pair == ["--network".to_string(), "private".to_string()]));
-        assert!(proxy.args.iter().any(|arg| {
-            arg.contains("/usr/local/bin/lionclaw:/lionclaw/network-proxy:ro")
-                || arg.contains("src=/usr/local/bin/lionclaw,target=/lionclaw/network-proxy")
-        }));
+        assert!(!proxy.args.iter().any(|arg| arg == "--mount"));
         let image = proxy
             .args
             .iter()
@@ -2196,7 +2116,7 @@ mod tests {
             &proxy.args[image..image + 8],
             &[
                 "localhost/lionclaw-runtime:v1".to_string(),
-                "/lionclaw/network-proxy".to_string(),
+                "/usr/local/bin/lionclaw".to_string(),
                 "__network-proxy".to_string(),
                 "--http".to_string(),
                 "0.0.0.0:3128".to_string(),

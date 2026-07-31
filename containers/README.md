@@ -6,11 +6,14 @@ images.
 ## Runtime Image
 
 `containers/runtime/Containerfile` is the product runtime image. It contains the
-agent CLIs and common assistant tools a mission's roles and oracles run under.
+agent CLIs, common assistant tools, and the image-compatible `lionclaw` binary
+used for destination-scoped network proxying.
 
 The image pins the tested `@openai/codex` and `opencode-ai` package versions in
 the Containerfile and fails the build if the installed global packages do not
-match those pins.
+match those pins. The build also verifies `lionclaw __network-proxy` so role
+containers can stay on an internal effect network while the proxy container owns
+the only egress attachment.
 
 ```bash
 podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
