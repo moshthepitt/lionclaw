@@ -30,6 +30,25 @@ The child crash/replay scenarios were then expressed in
 `crates/lionclaw/tests/everyday_run.rs` before their production paths were
 completed.
 
+Post-review hardening also followed RED -> GREEN. Before changing production
+code, the new focused tests demonstrated:
+
+- a durable parent stop followed by a successful child receipt replayed as a
+  cleared task instead of `control.stopped_before_settlement` (`7 passed; 2
+  failed` in the model child suite with the retry-reservation RED below);
+- a three-attempt leaf child was admitted under a two-descendant parent limit;
+- an active child role did not observe a live parent stop within two seconds,
+  and required the test to abort the child for bounded cleanup;
+- a folded child failure reached the parent only as generic
+  `child_mission.failed`, losing its original code, detail, and response; and
+- ordinary `lionclaw mission advance <child-id> --json` exited 1 because it
+  looked for a nonexistent child-local mission-type snapshot.
+
+The retry test was extended past projection to create and settle the second
+durable child. Stop, deadline, and abort are exercised against a live child;
+pre-creation cancellation, terminal-before-receipt replay, and real CLI reopen
+are separate regression cases.
+
 ## Implementation
 
 - `TaskAssignment` is now a closed tagged enum with `role` and
@@ -48,8 +67,12 @@ completed.
   marker; the child event log remains available as evidence.
 - Successful artifact and report outputs clear an ordinary parent task.
   Failure and abort enter the existing failure, anti-thrash, retry, and replan
-  choices. A changed explicit retry advances the attempt and therefore derives
-  a new child id.
+  choices while preserving the bounded folded child task/oracle failure. A
+  changed explicit retry advances the attempt and therefore derives and
+  actually creates a new child id.
+- Ordinary CLI opening walks and verifies the durable kernel-owned lineage,
+  then reuses the immutable root mission-type snapshot. The loaded snapshot's
+  digest is still checked against the child mission before execution.
 - The attached everyday launcher can author, approve, execute, report, finish,
   and apply a typed child assignment through normal `lionclaw run fake`
   orchestration.
@@ -64,10 +87,15 @@ completed.
   local and child work uses one shared capacity calculation, so recursion
   cannot multiply concurrency.
 - Depth and descendant limits are checked both in proposal admission and at
-  creation against kernel-owned stored lineage. Stored parent links are walked
-  with cycle detection; request-provided ancestry does not exist.
-- Parent abort, effect stop, and deadline expiry durably abort the bound child
-  and drive its ordinary cleanup until it is terminal and has no active effect.
+  creation against kernel-owned stored lineage. Admission reserves every legal
+  parent task attempt, so durable retry children cannot exhaust a budget that
+  the plan was allowed to underdeclare. Stored parent links are walked with
+  cycle detection; request-provided ancestry does not exist.
+- Parent abort, effect stop, and deadline expiry use the same live control
+  refresh and durable settlement predicate as ordinary effects. They abort and
+  drain a bound active child; cancellation before creation creates only the
+  deterministic terminal child needed for receipt truth and never leaves an
+  active orphan.
 - Secret capability is a boolean authority only. Secret values are not fields
   of child assignments, requests, lineage, events, outputs, receipts, prompts,
   argv, or environment. Runtime credential projection remains owned by the
@@ -96,11 +124,15 @@ This is an intentional typed wire-contract change:
 - `lionclaw team assign` continues to author the `role` variant. Child
   assignments are authored atomically through the orchestrator's complete
   proposal contract; no hidden CLI mutation was added.
+- The post-review correction adds no event variants, serialized fields, CLI
+  mutation, or SQL shape. It changes admission semantics, ordinary CLI child
+  snapshot resolution, and folded settlement behavior only.
 
 ## Schema And Reducer
 
 - Event schema: `41` (was `40`).
-- Reducer: `77` (was `76`).
+- Reducer: `78` (was `76`; `77` introduced the child events and `78` makes
+  durable parent cancellation dominate child settlement).
 - SQL storage shape is unchanged because child state is represented by ordinary
   versioned event payloads in the existing event store. No SQL migration is
   required.
@@ -122,18 +154,22 @@ Passed after the final source change:
   - every runnable workspace test passed;
   - all nine named Podman mission self-tests passed.
 - `git diff --check`
-- model child suite: 7 passed;
-- engine child suite: 5 passed;
+- model child suite: 9 passed;
+- engine child suite: 8 passed;
 - everyday `lionclaw run` child acceptance passed as part of the 12-test suite;
 - runtime product-boundary tests: 2 passed.
 
-CodeIntel diagnostics covered all 33 changed Rust files and reported no errors:
-37 known macro-input `None` false-positive warnings plus three inactive-`cfg`
-hints. Cargo and Clippy reported no warnings.
+CodeIntel diagnostics covered all eight Rust files changed by the hardening
+commit and reported no errors: 26 known macro-input `None` false-positive
+warnings plus three inactive-`cfg` hints. Cargo and Clippy reported no
+warnings.
 
-Tracked product grep for `FrontierSWE` and `Harbor` returned no matches. The
-secret sentinel leak probe returned no production, event, prompt, report, argv,
-environment, or receipt match outside its source test.
+The product-surface grep, restricted to implementation, mission types, skills,
+scripts, containers, manifests, and the README, returned no prohibited
+benchmark-name match. This audit note necessarily quotes the reviewed names and
+is not a product surface. The secret sentinel leak probe returned no
+production, event, prompt, report, argv, environment, or receipt match outside
+its defining source test.
 
 The exact base commit has a valid signature from
 `Kelvin Jayanoris <kelvin@jayanoris.com>`, and the chunk branch was confirmed to
@@ -141,25 +177,27 @@ start at that exact commit before its first signed commit.
 
 The implementation is signed commit
 `899a11aa8d8e648bce325d0f7d8f58783b3481e8`, a direct descendant of the
-accepted base.
+accepted base. The post-review production and regression fixes are signed
+forward-only commit `596a6d64d72447868826938ee8767326ae489a44`.
 
 The three authenticated native-session continuity tests passed from that clean
 signed source against `localhost/lionclaw-runtime:v1`, resolved before launch
 to immutable image identity
 `e1541b6609e7209de4087aac38b08151ad5feb9dd901cf464e088b41b32ba05d`:
 
-- Codex: `1 passed; 0 failed`, 31.23 seconds. Preserved root:
-  `/tmp/lionclaw-chunk7-live-codex-20260731-170311`. Receipt SHA-256:
-  `021b003c3efa8a1805728934efaa30b1d28cca2c7749adf42a300c1c35e70cce`.
-- OpenCode: `1 passed; 0 failed`, 21.79 seconds. Preserved root:
-  `/tmp/lionclaw-chunk7-live-opencode-20260731-170311`. Receipt SHA-256:
-  `d392ee65bb79651a038941e6a69e2daaec89132afabf3366ae925617c4ed4a2d`.
-- Hermes: `1 passed; 0 failed`, 38.21 seconds. Preserved root:
-  `/tmp/lionclaw-chunk7-live-hermes-20260731-170311`. Receipt SHA-256:
-  `a5bfe909566804efdd451d5a45fb5cfc1b830692db197df213eeec5706de86d0`.
+- Codex: `1 passed; 0 failed`, 29.37 seconds. Preserved root:
+  `/tmp/lionclaw-chunk7-fix-codex-20260731-191853`. Receipt SHA-256:
+  `cebff30c621c6000b77944af8a614b5e4d3b8e7510f8e027abb4106624de831d`.
+- OpenCode: `1 passed; 0 failed`, 22.38 seconds. Preserved root:
+  `/tmp/lionclaw-chunk7-fix-opencode-20260731-191853`. Receipt SHA-256:
+  `8ccae04dbe470aa552aa0b2068ffbcbbdacb5fda365bc4eb8fee7a9fca78c5fd`.
+- Hermes: `1 passed; 0 failed`, 36.72 seconds. Preserved root:
+  `/tmp/lionclaw-chunk7-fix-hermes-20260731-191853`. Receipt SHA-256:
+  `3f5ce3a4f022fd94c2ad31729f3e116913123516f2d5301adb64bd4d0be16d66`.
 
 Each `lionclaw.runtime-continuity-proof.v2` receipt records the signed source
-head, immutable image identity, first observation `Reconstructed`, second
+head `596a6d64d72447868826938ee8767326ae489a44`, immutable image identity,
+first observation `Reconstructed`, second
 observation `Resumed`, distinct effect ids, exact effect cleanup, retained
 native home and runtime state, removed credential projection, and a second
 response digest equal to the hidden token digest.
