@@ -523,19 +523,9 @@ fn assert_secret_absent_from_tree(root: &std::path::Path, secret: &str) {
 }
 
 #[tokio::test]
+#[ignore = "requires Podman, the runtime image, and delegated CPU/memory cgroup controllers"]
 async fn production_external_driver_uses_kernel_broker_without_container_credentials() {
-    const BASE_IMAGE: &str = "localhost/lionclaw-runtime-dev:v1";
     const SECRET: &str = "effect-scoped-test-secret";
-    if !Command::new("podman")
-        .args(["image", "exists", BASE_IMAGE])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-    {
-        return;
-    }
-
     let service = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = service.local_addr().unwrap().port();
     let service_task = tokio::spawn(serve_authenticated_requests(service, 2, SECRET));

@@ -10,6 +10,7 @@
 pub mod authority;
 pub mod cli;
 pub mod config;
+mod credential_file;
 mod driver_lock;
 mod effect_cleanup;
 mod external_oracle_broker;

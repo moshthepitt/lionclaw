@@ -301,8 +301,8 @@ fn compile_external_driver_plan(
             tmpfs: vec!["/tmp:rw,size=64m".to_string()],
             additional_mounts: Vec::new(),
             limits: ExecutionLimits {
-                memory_limit: None,
-                cpu_limit: None,
+                memory_limit: Some("1g".to_string()),
+                cpu_limit: Some("1".to_string()),
                 pids_limit: Some(128),
             },
         }),
@@ -1085,8 +1085,8 @@ mod tests {
         assert!(confinement.read_only_rootfs);
         assert_eq!(confinement.tmpfs, ["/tmp:rw,size=64m"]);
         assert!(confinement.additional_mounts.is_empty());
-        assert!(confinement.limits.memory_limit.is_none());
-        assert!(confinement.limits.cpu_limit.is_none());
+        assert_eq!(confinement.limits.memory_limit.as_deref(), Some("1g"));
+        assert_eq!(confinement.limits.cpu_limit.as_deref(), Some("1"));
         assert_eq!(confinement.limits.pids_limit, Some(128));
         assert!(compiled
             .plan()

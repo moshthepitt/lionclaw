@@ -16,7 +16,10 @@ mission state.
 ## Available scripts
 
 - `ci.sh` — the local CI gate mirroring the GitHub Actions `ci` workflow
-  (fmt, clippy, doc, Rust tests, and the podman-gated mission self-test).
+  (fmt, clippy, doc, Rust tests, and Podman-gated runtime tests).
+- `external-oracle-oci.sh` — the required authenticated external-driver OCI
+  acceptance test. It fails unless the runtime image and delegated CPU/memory
+  cgroup controllers are available.
 - `mission-eval.sh` — the agentic multi-run eval (needs podman + a codex auth).
 - `mission-fixture.sh` — fixture helpers for the eval.
 

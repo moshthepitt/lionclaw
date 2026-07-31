@@ -69,8 +69,10 @@ authority there. The selected runtime image digest, driver id, network grant,
 and non-secret auth configuration identity are resolved into mission state when
 the plan is admitted, so later runtime profile edits cannot silently change an
 inflight oracle's authority. External drivers always run under kernel-owned
-confinement: the pinned image, a read-only root, bounded `/tmp`, a process cap,
-no profile-supplied mounts, and the durable destination grant.
+confinement: the pinned image, a read-only root, bounded `/tmp`, one CPU, 1 GiB
+of memory, a 128-process cap, no profile-supplied mounts, and the durable
+destination grant. Launch fails closed when the host cannot enforce those
+resource limits.
 
 ```toml
 [runtimes.codex.external-oracle-drivers.local-ci]
@@ -101,3 +103,5 @@ disables redirects, and injects the configured credential header. `header`
 defaults to `authorization` and `prefix` defaults to `Bearer `; both can be
 set explicitly for services using another header scheme. Credentialed HTTP is
 accepted only for `localhost`; all other broker destinations require HTTPS.
+Each effect-scoped broker accepts at most 16 requests across all connections.
+The existing bounded polling lifecycle limits broker recreation.

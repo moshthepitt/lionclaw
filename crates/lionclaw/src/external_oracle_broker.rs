@@ -1,21 +1,20 @@
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Url};
-use rustix::fs::{open, FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use crate::config::ExternalOracleDriverAuthConfig;
+use crate::credential_file::read_absolute_regular_file_bounded;
 use crate::model::{EffectId, NetworkGrant};
 
 pub(crate) const EXTERNAL_ORACLE_BROKER_MOUNT_TARGET: &str =
@@ -24,7 +23,7 @@ pub(crate) const EXTERNAL_ORACLE_BROKER_ENV: &str = "LIONCLAW_EXTERNAL_ORACLE_BR
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_REQUESTS_PER_CONNECTION: usize = 16;
+const MAX_REQUESTS_PER_BROKER: usize = 16;
 const MAX_HEADERS: usize = 64;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
@@ -104,6 +103,7 @@ impl ExternalOracleBroker {
             auth_value,
             credential,
             client,
+            remaining_requests: AtomicUsize::new(MAX_REQUESTS_PER_BROKER),
         });
         let task = tokio::spawn(serve(listener, state));
         Ok(Self { socket_path, task })
@@ -123,6 +123,7 @@ struct BrokerState {
     auth_value: HeaderValue,
     credential: String,
     client: reqwest::Client,
+    remaining_requests: AtomicUsize,
 }
 
 async fn serve(listener: UnixListener, state: Arc<BrokerState>) {
@@ -134,7 +135,7 @@ async fn serve(listener: UnixListener, state: Arc<BrokerState>) {
 async fn serve_connection(stream: UnixStream, state: &BrokerState) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    for _ in 0..MAX_REQUESTS_PER_CONNECTION {
+    loop {
         let mut line = Vec::new();
         let read = (&mut reader)
             .take((MAX_REQUEST_BYTES + 1) as u64)
@@ -144,7 +145,18 @@ async fn serve_connection(stream: UnixStream, state: &BrokerState) -> Result<()>
         if read == 0 {
             return Ok(());
         }
-        let response = if line.len() > MAX_REQUEST_BYTES {
+        let response = if state
+            .remaining_requests
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_err()
+        {
+            rejected(
+                "request_limit",
+                "credential broker request limit is exhausted",
+            )
+        } else if line.len() > MAX_REQUEST_BYTES {
             let response = rejected("request_too_large", "broker request exceeds its size limit");
             write_response(&mut writer, &response).await?;
             return Ok(());
@@ -159,7 +171,6 @@ async fn serve_connection(stream: UnixStream, state: &BrokerState) -> Result<()>
         };
         write_response(&mut writer, &response).await?;
     }
-    Ok(())
 }
 
 async fn write_response(
@@ -314,34 +325,11 @@ async fn read_credential(path: &Path) -> Result<String> {
 }
 
 fn read_credential_file(path: &Path) -> Result<Vec<u8>> {
-    let descriptor = open(
+    read_absolute_regular_file_bounded(
         path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        Mode::empty(),
+        MAX_CREDENTIAL_BYTES,
+        "external oracle credential source",
     )
-    .with_context(|| {
-        format!(
-            "external oracle credential source '{}' must be an exact regular file, not a symlink",
-            path.display()
-        )
-    })?;
-    let stat = rustix::fs::fstat(&descriptor)
-        .with_context(|| format!("inspecting external oracle credential {}", path.display()))?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        bail!(
-            "external oracle credential source '{}' must be a regular file, not a symlink",
-            path.display()
-        );
-    }
-    let mut bytes = Vec::new();
-    File::from(descriptor)
-        .take((MAX_CREDENTIAL_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading external oracle credential {}", path.display()))?;
-    if bytes.len() > MAX_CREDENTIAL_BYTES {
-        bail!("external oracle credential exceeds its size limit");
-    }
-    Ok(bytes)
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -547,6 +535,74 @@ mod tests {
         )
         .await
         .expect_err("symlink credential must be rejected");
-        assert!(error.to_string().contains("regular file"));
+        assert!(error.to_string().contains("symlink"), "got {error:#}");
+    }
+
+    #[tokio::test]
+    async fn broker_request_limit_is_shared_across_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let credential = temp.path().join("credential");
+        std::fs::write(&credential, "secret").unwrap();
+        let socket = temp.path().join("broker.sock");
+        let _broker = ExternalOracleBroker::start(
+            &ExternalOracleDriverAuthConfig {
+                source: credential,
+                header: "authorization".to_string(),
+                prefix: "Bearer ".to_string(),
+            },
+            NetworkGrant::Deny,
+            socket.clone(),
+        )
+        .await
+        .unwrap();
+
+        for index in 0..=MAX_REQUESTS_PER_BROKER {
+            let (response, _) = broker_call(
+                &socket,
+                ExternalOracleBrokerRequest {
+                    method: "POST".to_string(),
+                    url: "http://localhost:1/submit".to_string(),
+                    headers: BTreeMap::new(),
+                    body: "{}".to_string(),
+                },
+            )
+            .await;
+            match response {
+                ExternalOracleBrokerResponse::Rejected { code, .. }
+                    if index == MAX_REQUESTS_PER_BROKER =>
+                {
+                    assert_eq!(code, "request_limit");
+                }
+                ExternalOracleBrokerResponse::Rejected { code, .. } => {
+                    assert_eq!(code, "request_rejected");
+                }
+                ExternalOracleBrokerResponse::Complete { .. } => {
+                    panic!("denied broker request unexpectedly completed");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn broker_rejects_symlinked_credential_ancestors() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_parent = temp.path().join("real");
+        let alias_parent = temp.path().join("alias");
+        std::fs::create_dir(&real_parent).unwrap();
+        std::fs::write(real_parent.join("credential"), "secret").unwrap();
+        std::os::unix::fs::symlink(&real_parent, &alias_parent).unwrap();
+
+        let error = ExternalOracleBroker::start(
+            &ExternalOracleDriverAuthConfig {
+                source: alias_parent.join("credential"),
+                header: "authorization".to_string(),
+                prefix: "Bearer ".to_string(),
+            },
+            NetworkGrant::Deny,
+            temp.path().join("broker.sock"),
+        )
+        .await
+        .expect_err("symlinked credential ancestor must be rejected");
+        assert!(error.to_string().contains("symlink"), "got {error:#}");
     }
 }

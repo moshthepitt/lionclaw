@@ -10,12 +10,18 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test --workspace
 
-# Runtime invariant guard: the mission self-test drives the real stack (real
-# podman confinement + real engine-run oracle). Model-auth-free, but it needs
-# podman and the runtime image. Skip cleanly where either is absent.
-if command -v podman >/dev/null 2>&1 \
-    && podman image exists localhost/lionclaw-runtime-dev:v1 2>/dev/null; then
+# Runtime invariant guards need Podman and the runtime image. The external
+# driver additionally needs delegated CPU and memory controllers because its
+# kernel-owned limits fail closed when the host cannot enforce them.
+if command -v podman >/dev/null 2>&1 &&
+    podman image exists localhost/lionclaw-runtime-dev:v1 2>/dev/null; then
+    controllers=" $(podman info --format '{{range .Host.CgroupControllers}}{{.}} {{end}}' 2>/dev/null || true)"
+    if [[ "$controllers" == *" cpu "* && "$controllers" == *" memory "* ]]; then
+        bash ./scripts/external-oracle-oci.sh
+    else
+        echo "skipping external oracle OCI test (CPU/memory cgroup controllers unavailable)"
+    fi
     cargo run -q -p lionclaw -- mission self-test
 else
-    echo "skipping mission self-test (podman or runtime image unavailable)"
+    echo "skipping Podman tests (podman or runtime image unavailable)"
 fi

@@ -1,9 +1,7 @@
 use std::{
     ffi::OsStr,
-    fs::File,
-    io::Read,
     os::unix::ffi::OsStrExt,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,13 +12,12 @@ use lionclaw_runtime_api::{
     RuntimeAuthProjection, RuntimeAuthProvider, RuntimeCredentialProjection,
     MAX_RUNTIME_CREDENTIAL_AGGREGATE_BYTES, MAX_RUNTIME_CREDENTIAL_BYTES,
 };
-use rustix::{
-    fs::{open, openat, FileType, Mode, OFlags},
-    io::Errno,
-};
 use sha2::{Digest, Sha256};
 
-use crate::config::NativeHomeAuthConfig;
+use crate::{
+    config::NativeHomeAuthConfig,
+    credential_file::{open_regular_file_beneath, read_open_file_bounded},
+};
 
 pub(crate) const NATIVE_HOME_AUTH_KIND: &str = "native-home";
 
@@ -88,7 +85,13 @@ fn materialize_native_home(
             );
             digest_field(&mut digest, b"path", relative.as_os_str().as_bytes());
             let staged_name = format!("native-home-credential-{index:04}");
-            let Some(source) = open_source_file(&config.source, relative, *required)? else {
+            let Some(source) = open_regular_file_beneath(
+                &config.source,
+                relative,
+                *required,
+                "native-home credential",
+            )?
+            else {
                 digest_field(&mut digest, b"presence", b"absent");
                 staged_files.remove_file(
                     OsStr::new(&staged_name),
@@ -96,7 +99,12 @@ fn materialize_native_home(
                 )?;
                 continue;
             };
-            let contents = read_open_file_bounded(source, &config.source.join(relative))?;
+            let contents = read_open_file_bounded(
+                source,
+                &config.source.join(relative),
+                MAX_RUNTIME_CREDENTIAL_BYTES,
+                "native-home credential",
+            )?;
             aggregate_bytes = aggregate_bytes
                 .checked_add(contents.len())
                 .ok_or_else(|| anyhow!("native-home credential aggregate size overflow"))?;
@@ -182,154 +190,6 @@ fn digest_field(digest: &mut Sha256, label: &[u8], value: &[u8]) {
     digest.update(label);
     digest.update(value.len().to_be_bytes());
     digest.update(value);
-}
-
-fn open_source_file(root: &Path, relative: &Path, required: bool) -> Result<Option<File>> {
-    validate_relative_path(relative)?;
-    let mut directory = open(root, directory_flags(), Mode::empty()).map_err(|error| {
-        anyhow!(
-            "native home '{}' must be an exact real directory: {error}",
-            root.display()
-        )
-    })?;
-    let components = relative.components().collect::<Vec<_>>();
-    let mut display = root.to_path_buf();
-    for (index, component) in components.iter().enumerate() {
-        let Component::Normal(name) = component else {
-            unreachable!("native-home path was validated");
-        };
-        display.push(name);
-        let is_leaf = index + 1 == components.len();
-        let flags = if is_leaf {
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK
-        } else {
-            directory_flags()
-        };
-        let descriptor = match openat(&directory, *name, flags, Mode::empty()) {
-            Ok(descriptor) => descriptor,
-            Err(Errno::NOENT) if !required => return Ok(None),
-            Err(Errno::LOOP | Errno::NOTDIR) => {
-                bail!(
-                    "native-home file path '{}' contains symlink or invalid directory '{}'",
-                    relative.display(),
-                    display.display()
-                )
-            }
-            Err(error) => {
-                return Err(anyhow!(
-                    "failed to open native-home file '{}': {error}",
-                    display.display()
-                ))
-            }
-        };
-        if is_leaf {
-            let stat = rustix::fs::fstat(&descriptor)
-                .with_context(|| format!("failed to inspect '{}'", display.display()))?;
-            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-                bail!(
-                    "native-home file '{}' must be a regular file",
-                    display.display()
-                );
-            }
-            return Ok(Some(File::from(descriptor)));
-        }
-        directory = descriptor;
-    }
-    unreachable!("relative path validation requires a component")
-}
-
-fn validate_relative_path(path: &Path) -> Result<()> {
-    if path.as_os_str().is_empty()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        bail!(
-            "native-home file '{}' must be a clean relative path",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn directory_flags() -> OFlags {
-    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK
-}
-
-fn read_open_file_bounded(mut source: File, source_path: &Path) -> Result<Vec<u8>> {
-    let mut contents = Vec::new();
-    consume_open_file_bounded(&mut source, source_path, |chunk| {
-        contents.extend_from_slice(chunk);
-    })?;
-    Ok(contents)
-}
-
-fn consume_open_file_bounded(
-    source: &mut File,
-    source_path: &Path,
-    mut consume: impl FnMut(&[u8]),
-) -> Result<()> {
-    let before = rustix::fs::fstat(&source).with_context(|| {
-        format!(
-            "failed to inspect native-home file '{}'",
-            source_path.display()
-        )
-    })?;
-    if before.st_size > MAX_RUNTIME_CREDENTIAL_BYTES as i64 {
-        bail!(
-            "native-home credential '{}' exceeds the {} byte limit",
-            source_path.display(),
-            MAX_RUNTIME_CREDENTIAL_BYTES
-        );
-    }
-    let mut total = 0;
-    let mut buffer = [0_u8; 8 * 1024];
-    let mut bounded = source.take((MAX_RUNTIME_CREDENTIAL_BYTES + 1) as u64);
-    loop {
-        let read = bounded.read(&mut buffer).with_context(|| {
-            format!(
-                "failed to read native-home credential '{}'",
-                source_path.display()
-            )
-        })?;
-        if read == 0 {
-            break;
-        }
-        total += read;
-        if total > MAX_RUNTIME_CREDENTIAL_BYTES {
-            bail!(
-                "native-home credential '{}' exceeds the {} byte limit",
-                source_path.display(),
-                MAX_RUNTIME_CREDENTIAL_BYTES
-            );
-        }
-        consume(&buffer[..read]);
-    }
-    let after = rustix::fs::fstat(source).with_context(|| {
-        format!(
-            "failed to reinspect native-home file '{}'",
-            source_path.display()
-        )
-    })?;
-    if source_identity(&before) != source_identity(&after) {
-        bail!(
-            "native-home credential '{}' changed while it was read",
-            source_path.display()
-        );
-    }
-    Ok(())
-}
-
-fn source_identity(stat: &rustix::fs::Stat) -> (u64, u64, i64, i64, u64, i64, u64) {
-    (
-        stat.st_dev,
-        stat.st_ino,
-        stat.st_size,
-        stat.st_mtime,
-        stat.st_mtime_nsec,
-        stat.st_ctime,
-        stat.st_ctime_nsec,
-    )
 }
 
 #[cfg(test)]
