@@ -167,6 +167,21 @@ async fn pending_external_oracle_stays_in_resolve_effect_until_polled_complete()
         .finish(&mission_id, "must not finish while external job is pending")
         .await
         .is_err());
+    let effect_id = pending
+        .state
+        .inflight
+        .keys()
+        .next()
+        .expect("pending external effect")
+        .clone();
+    let authority_dir = dir
+        .path()
+        .join(".lionclaw/missions")
+        .join(mission_id.as_str())
+        .join("external-oracle-request-budgets")
+        .join(effect_id.as_str());
+    std::fs::create_dir_all(&authority_dir).unwrap();
+    std::fs::write(authority_dir.join("sentinel"), "durable authority").unwrap();
 
     let ready = h.engine.advance(&mission_id).await.unwrap();
     assert_eq!(*calls.lock().unwrap(), 2);
@@ -179,6 +194,10 @@ async fn pending_external_oracle_stays_in_resolve_effect_until_polled_complete()
     assert!(
         ready.state.terminal.is_none(),
         "external pass never auto-finishes"
+    );
+    assert!(
+        !authority_dir.exists(),
+        "durable request authority must retire after outcome append"
     );
 }
 
@@ -250,6 +269,7 @@ struct LocalExternalDriver {
     submissions: Mutex<Vec<ExternalOracleSubmitRequest>>,
     polls: Mutex<Vec<ExternalOraclePollRequest>>,
     polls_to_return: Mutex<VecDeque<ExternalOraclePoll>>,
+    max_driver_invocations: Mutex<Vec<u32>>,
 }
 
 impl LocalExternalDriver {
@@ -266,8 +286,12 @@ impl ExternalOracleDriver for LocalExternalDriver {
     async fn submit(
         &self,
         request: ExternalOracleSubmitRequest,
-        _context: ExternalOracleDriverContext,
+        context: ExternalOracleDriverContext,
     ) -> Result<ExternalOracleSubmission, TypedFailure> {
+        self.max_driver_invocations
+            .lock()
+            .unwrap()
+            .push(context.max_driver_invocations);
         let job_id = format!("job-{}", &request.idempotency_key[..16]);
         self.submissions.lock().unwrap().push(request.clone());
         Ok(ExternalOracleSubmission {
@@ -282,8 +306,12 @@ impl ExternalOracleDriver for LocalExternalDriver {
     async fn poll(
         &self,
         request: ExternalOraclePollRequest,
-        _context: ExternalOracleDriverContext,
+        context: ExternalOracleDriverContext,
     ) -> Result<ExternalOraclePoll, TypedFailure> {
+        self.max_driver_invocations
+            .lock()
+            .unwrap()
+            .push(context.max_driver_invocations);
         self.polls.lock().unwrap().push(request.clone());
         let Some(mut poll) = self.polls_to_return.lock().unwrap().pop_front() else {
             return Ok(ExternalOraclePoll::Pending {
@@ -653,6 +681,41 @@ async fn external_submission_record_survives_crash_after_recording() {
     ));
     assert_eq!(driver.submissions.lock().unwrap().len(), 1);
     assert_eq!(driver.polls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn admitted_polling_lifecycle_has_request_capacity_through_its_last_poll() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut polls = (0..25)
+        .map(|_| ExternalOraclePoll::Pending {
+            retry_after_ms: Some(5_000),
+        })
+        .collect::<Vec<_>>();
+    polls.push(ExternalOraclePoll::Passed {
+        proof: ExternalOracleProof::empty_for_testing(),
+    });
+    let driver = Arc::new(LocalExternalDriver::with_polls(polls));
+    let runner = runner(driver.clone());
+    let mut request = external_request(&temp, external_spec("local-ci"));
+
+    for poll_index in 0..26 {
+        request.now_ms = 1_000_000 + i64::from(poll_index) * 5_000;
+        let status = runner.run(request.clone()).await.unwrap();
+        if poll_index < 25 {
+            assert!(matches!(status, OracleRunStatus::Pending { .. }));
+        } else {
+            assert!(matches!(
+                status,
+                OracleRunStatus::Complete(outcome) if outcome.exit_code == 0
+            ));
+        }
+    }
+
+    assert_eq!(driver.submissions.lock().unwrap().len(), 1);
+    assert_eq!(driver.polls.lock().unwrap().len(), 26);
+    let limits = driver.max_driver_invocations.lock().unwrap();
+    assert_eq!(limits.len(), 27);
+    assert!(limits.iter().all(|limit| *limit == 27));
 }
 
 #[tokio::test]

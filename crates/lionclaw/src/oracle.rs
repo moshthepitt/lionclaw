@@ -181,9 +181,8 @@ impl ProfileExternalOracleDriver {
     {
         let mission_id = request.mission_id().clone();
         let effect_id = request.effect_id().clone();
-        let dirs = MissionDirs::new(&context.state_dir, &mission_id)
-            .effect(&effect_id)
-            .oracle();
+        let mission_dirs = MissionDirs::new(&context.state_dir, &mission_id);
+        let dirs = mission_dirs.effect(&effect_id).oracle();
         dirs.prepare()
             .map_err(|error| fail(format!("failed to prepare external oracle dirs: {error}")))?;
 
@@ -201,16 +200,23 @@ impl ProfileExternalOracleDriver {
         let broker_socket = external_oracle_broker_socket_path(&effect_id);
         let broker = match &self.driver.auth {
             Some(auth) => {
+                let budget_dirs = mission_dirs.external_oracle_request_budget(&effect_id);
+                budget_dirs.prepare().map_err(|error| {
+                    fail(format!(
+                        "failed to prepare external oracle request budget: {error}"
+                    ))
+                })?;
                 let request_budget = ExternalOracleRequestBudget::new(
-                    dirs.files().map_err(|error| {
+                    budget_dirs.files().map_err(|error| {
                         fail(format!(
-                            "failed to open external oracle effect state: {error:#}"
+                            "failed to open external oracle request budget: {error:#}"
                         ))
                     })?,
                     mission_id,
                     effect_id.clone(),
                     driver_identity.clone(),
                     request.idempotency_key().to_string(),
+                    context.max_driver_invocations,
                 );
                 Some(
                     ExternalOracleBroker::start(auth, broker_socket.clone(), request_budget)
@@ -567,6 +573,7 @@ impl OciOracleRunner {
         let driver_context = ExternalOracleDriverContext {
             state_dir: request.state_dir.clone(),
             resource_ceilings: request.resource_ceilings.clone(),
+            max_driver_invocations: external_max_driver_invocations(&external),
             control: request.control.clone(),
         };
         let dirs = MissionDirs::new(&request.state_dir, &request.mission_id)
@@ -888,6 +895,10 @@ fn external_max_polls(external: &crate::model::ExternalOracle) -> u32 {
         .saturating_add(external.poll_secs.saturating_sub(1))
         / external.poll_secs.max(1);
     polls.saturating_add(2).min(u64::from(u32::MAX)) as u32
+}
+
+fn external_max_driver_invocations(external: &crate::model::ExternalOracle) -> u32 {
+    external_max_polls(external).saturating_add(1)
 }
 
 fn next_external_poll_after_ms(

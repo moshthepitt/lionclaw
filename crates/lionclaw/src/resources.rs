@@ -130,6 +130,18 @@ impl MissionDirs {
             self.root.join("effects").join(effect_id.as_str()),
         )
     }
+
+    pub(crate) fn external_oracle_request_budget(
+        &self,
+        effect_id: &EffectId,
+    ) -> ExternalOracleRequestBudgetDirs {
+        ExternalOracleRequestBudgetDirs::new(
+            self.state_dir.clone(),
+            self.root
+                .join("external-oracle-request-budgets")
+                .join(effect_id.as_str()),
+        )
+    }
 }
 
 /// Durable resources for one exact folded conversation generation.
@@ -473,8 +485,42 @@ impl RuntimeProfileDirs {
     }
 }
 
-/// Disposable resources for one effect. No retained conversation work or
-/// native runtime state belongs in this tree.
+/// Durable network-authority accounting for one external oracle effect.
+/// This survives disposable effect cleanup until the outcome is recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalOracleRequestBudgetDirs {
+    state_dir: PathBuf,
+    root: PathBuf,
+}
+
+impl ExternalOracleRequestBudgetDirs {
+    fn new(state_dir: PathBuf, root: PathBuf) -> Self {
+        Self { state_dir, root }
+    }
+
+    pub(crate) fn prepare(&self) -> std::io::Result<()> {
+        ensure_private_dirs_beneath(&self.state_dir, [&self.root])
+    }
+
+    pub(crate) fn files(&self) -> anyhow::Result<RootedDirectory> {
+        RootedDirectory::new(self.state_dir.clone(), self.root.clone())
+    }
+
+    pub(crate) async fn remove(&self) -> std::io::Result<()> {
+        let state_dir = self.state_dir.clone();
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || remove_tree_beneath(&state_dir, &root))
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "external oracle request budget cleanup task failed: {error}"
+                ))
+            })?
+    }
+}
+
+/// Disposable resources for one effect. No retained conversation work,
+/// native runtime state, or durable authority accounting belongs in this tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EffectDirs {
     state_dir: PathBuf,
@@ -570,10 +616,6 @@ impl OracleEffectDirs {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
-    }
-
-    pub(crate) fn files(&self) -> anyhow::Result<RootedDirectory> {
-        RootedDirectory::new(self.state_dir.clone(), self.root.clone())
     }
 
     pub(crate) fn scratch(&self) -> &Path {

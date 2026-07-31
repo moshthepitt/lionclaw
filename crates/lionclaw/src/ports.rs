@@ -162,6 +162,8 @@ pub trait ExternalOracleDriver: Send + Sync {
 pub struct ExternalOracleDriverContext {
     pub state_dir: PathBuf,
     pub resource_ceilings: ConfinementResources,
+    /// Submit plus the admitted maximum poll invocations for this effect.
+    pub max_driver_invocations: u32,
     pub control: watch::Receiver<ExecutionControl>,
 }
 

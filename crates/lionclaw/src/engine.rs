@@ -1389,6 +1389,21 @@ impl Engine {
         }
     }
 
+    async fn retire_external_oracle_request_budget(
+        &self,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+    ) -> Result<()> {
+        self.store
+            .mission_dirs(mission_id)
+            .external_oracle_request_budget(effect_id)
+            .remove()
+            .await
+            .with_context(|| {
+                format!("retiring external oracle request budget for effect '{effect_id}'")
+            })
+    }
+
     async fn record_cleanup_failure(
         &self,
         state: &MissionState,
@@ -1442,7 +1457,11 @@ impl Engine {
                 )
                 .await
             {
-                Ok(_) => return Ok(Some(outcome)),
+                Ok(_) => {
+                    self.retire_external_oracle_request_budget(mission_id, effect_id)
+                        .await?;
+                    return Ok(Some(outcome));
+                }
                 Err(AppendError::Duplicate {
                     effect_id: duplicate,
                 }) => {
@@ -1450,6 +1469,8 @@ impl Engine {
                         .duplicate_effects_applied(mission_id, std::slice::from_ref(&outcome))
                         .await?
                     {
+                        self.retire_external_oracle_request_budget(mission_id, effect_id)
+                            .await?;
                         return Ok(Some(outcome));
                     }
                     bail!(

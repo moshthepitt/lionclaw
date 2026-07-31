@@ -103,6 +103,8 @@ disables redirects, and injects the configured credential header. `header`
 defaults to `authorization` and `prefix` defaults to `Bearer `; both can be
 set explicitly for services using another header scheme. Credentialed HTTP is
 accepted only for `localhost`; all other broker destinations require HTTPS.
-Each effect accepts at most 16 authenticated requests across all connections,
-submit/poll invocations, process restarts, and crash recovery. LionClaw
-durably reserves each request before forwarding it.
+Each submit or poll invocation accepts at most 16 authenticated requests across
+all of its connections. The effect-lifetime ceiling is derived from that cap
+and the admitted submit/poll lifecycle. LionClaw durably reserves each request
+before forwarding it; reservations survive disposable-resource cleanup and
+crash recovery, then retire only after the effect outcome is recorded.
