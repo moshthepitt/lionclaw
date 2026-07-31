@@ -77,6 +77,7 @@ fn runtime_identities(team: &TeamRevision) -> BTreeMap<RoleInstanceId, RuntimeIn
                     model: None,
                     mode: None,
                     model_network: lionclaw_model::NetworkGrant::Deny,
+                    external_oracle_drivers: BTreeMap::new(),
                 },
             )
         })

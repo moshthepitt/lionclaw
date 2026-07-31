@@ -19,11 +19,12 @@ use sha2::{Digest, Sha256};
 use crate::driver_lock::DriverGuard;
 use crate::mission_type::MissionType;
 use crate::model::{
-    next, validate_mission_proposal, Choice, EffectEventClass, EffectId, EffectIntent, Handoff,
-    InflightEffect, MissionEvent, MissionId, MissionProposal, MissionState, Next,
-    OracleDispatchIntent, OracleRunSuccess, PayloadRef, ProposalError, RoleDispatchIntent,
-    RoleInstance, RoleInstanceId, RoleTurnSuccess, RuntimeInstrumentIdentity, TaskId,
-    TerminalState, MAX_ROLE_REPORT_BYTES,
+    next, validate_mission_proposal, Choice, EffectEventClass, EffectId, EffectIntent,
+    ExternalOracleDriverId, ExternalOracleDriverIdentity, Handoff, InflightEffect, MissionEvent,
+    MissionId, MissionProposal, MissionState, Next, OracleDispatchIntent, OracleRunSuccess,
+    PayloadRef, PlanValidationError, ProposalError, RoleDispatchIntent, RoleInstance,
+    RoleInstanceId, RoleTurnSuccess, RuntimeInstrumentIdentity, TaskId, TerminalState,
+    MAX_ROLE_REPORT_BYTES,
 };
 use crate::ports::{
     ArtifactCapture, Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl,
@@ -46,6 +47,8 @@ pub struct Engine {
     effect_cleaner: Arc<dyn EffectCleaner>,
     clock: Arc<dyn Clock>,
     runtime_identities: BTreeMap<String, RuntimeInstrumentIdentity>,
+    external_oracle_driver_identities:
+        BTreeMap<ExternalOracleDriverId, ExternalOracleDriverIdentity>,
 }
 
 pub struct EngineServices {
@@ -54,6 +57,8 @@ pub struct EngineServices {
     effect_cleaner: Arc<dyn EffectCleaner>,
     clock: Arc<dyn Clock>,
     runtime_identities: BTreeMap<String, RuntimeInstrumentIdentity>,
+    external_oracle_driver_identities:
+        BTreeMap<ExternalOracleDriverId, ExternalOracleDriverIdentity>,
 }
 
 enum EffectCleanupDisposition {
@@ -143,6 +148,7 @@ impl EngineServices {
             effect_cleaner,
             clock,
             runtime_identities: default_runtime_identities(),
+            external_oracle_driver_identities: BTreeMap::new(),
         }
     }
 
@@ -151,6 +157,14 @@ impl EngineServices {
         identities: BTreeMap<String, RuntimeInstrumentIdentity>,
     ) -> Self {
         self.runtime_identities = identities;
+        self
+    }
+
+    pub fn with_external_oracle_driver_identities(
+        mut self,
+        identities: BTreeMap<ExternalOracleDriverId, ExternalOracleDriverIdentity>,
+    ) -> Self {
+        self.external_oracle_driver_identities = identities;
         self
     }
 }
@@ -166,10 +180,18 @@ fn default_runtime_identities() -> BTreeMap<String, RuntimeInstrumentIdentity> {
                     model: None,
                     mode: None,
                     model_network: crate::model::NetworkGrant::Deny,
+                    external_oracle_drivers: BTreeMap::new(),
                 },
             )
         })
         .collect()
+}
+
+fn plan_error(code: &'static str, detail: impl Into<String>) -> PlanValidationError {
+    PlanValidationError {
+        code,
+        detail: detail.into(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +479,7 @@ impl Engine {
             effect_cleaner: services.effect_cleaner,
             clock: services.clock,
             runtime_identities: services.runtime_identities,
+            external_oracle_driver_identities: services.external_oracle_driver_identities,
         }
     }
 
@@ -545,6 +568,52 @@ impl Engine {
         Ok(())
     }
 
+    fn resolve_external_oracle_proposal(
+        &self,
+        _state: &MissionState,
+        mut proposal: MissionProposal,
+    ) -> Result<MissionProposal, ProposalError> {
+        let Some(oracles) = proposal.oracles.as_mut() else {
+            return Ok(proposal);
+        };
+        let mut errors = Vec::new();
+        for (name, spec) in oracles {
+            let crate::model::OracleSpec::External(external) = spec else {
+                continue;
+            };
+            let Some(identity) = self
+                .external_oracle_driver_identities
+                .get(&external.driver)
+                .cloned()
+            else {
+                errors.push(plan_error(
+                    "invalid_oracle",
+                    format!(
+                        "oracle '{name}' names external driver '{}' that is not installed in the selected runtime profile",
+                        external.driver
+                    ),
+                ));
+                continue;
+            };
+            match &external.driver_identity {
+                Some(existing) if existing != &identity => errors.push(plan_error(
+                    "invalid_oracle",
+                    format!(
+                        "oracle '{name}' carries stale external driver authority for '{}'",
+                        external.driver
+                    ),
+                )),
+                Some(_) => {}
+                None => external.driver_identity = Some(identity),
+            }
+        }
+        if errors.is_empty() {
+            Ok(proposal)
+        } else {
+            Err(ProposalError::Invalid(errors))
+        }
+    }
+
     /// Create a mission. `base_sha` is the target repo's HEAD, observed by
     /// the caller (git stays out of the engine core). The mission type digest,
     /// runtime, and pinned image id are recorded from the engine's own config.
@@ -618,6 +687,7 @@ impl Engine {
                 "mission '{mission_id}' does not currently allow plan proposals"
             )));
         }
+        let proposal = self.resolve_external_oracle_proposal(&state, proposal)?;
         validate_mission_proposal(&state, &proposal)?;
         let proposal_json = serde_json::to_string(&proposal).map_err(anyhow::Error::from)?;
         let proposal_hash = hex::encode(Sha256::digest(proposal_json.as_bytes()));
@@ -1647,7 +1717,7 @@ impl Engine {
             .map_err(TypedFailure::projected)
         {
             Ok(outcome) => {
-                let outcome = match validated_role_success(
+                let mut outcome = match validated_role_success(
                     outcome,
                     *output,
                     base_sha,
@@ -1669,22 +1739,34 @@ impl Engine {
                     done: true,
                     proposal,
                     ..
-                }) = &outcome.handoff
+                }) = &mut outcome.handoff
                 {
-                    let Some(proposal) = proposal else {
+                    let Some(candidate) = proposal.as_ref() else {
                         return Ok(completed(Err(invalid_role_outcome(
                             "plan.missing",
                             "planning author reported done but proposed no plan",
                             &outcome,
                         ))));
                     };
-                    if let Err(error) = validate_mission_proposal(state, proposal) {
+                    let resolved =
+                        match self.resolve_external_oracle_proposal(state, (**candidate).clone()) {
+                            Ok(proposal) => proposal,
+                            Err(error) => {
+                                return Ok(completed(Err(invalid_role_outcome(
+                                    "plan.invalid",
+                                    format!("proposed plan is invalid: {error}"),
+                                    &outcome,
+                                ))))
+                            }
+                        };
+                    if let Err(error) = validate_mission_proposal(state, &resolved) {
                         return Ok(completed(Err(invalid_role_outcome(
                             "plan.invalid",
                             format!("proposed plan is invalid: {error}"),
                             &outcome,
                         ))));
                     }
+                    *proposal = Some(Box::new(resolved));
                 }
                 if matches!(&outcome.handoff, Some(Handoff::Review { done: false, .. })) {
                     return Ok(completed(Err(invalid_role_outcome(

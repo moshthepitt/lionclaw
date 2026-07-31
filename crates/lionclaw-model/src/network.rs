@@ -174,7 +174,7 @@ impl NetworkGrant {
         if destinations.is_empty() {
             return Ok(Self::Deny);
         }
-        Self::allow(merge_destinations(destinations))
+        Self::allow(merge_destinations(destinations)?)
     }
 
     pub(crate) fn feed_digest(&self, digest: &mut CanonicalDigest, prefix: &str) {
@@ -190,7 +190,9 @@ impl NetworkGrant {
     }
 }
 
-fn merge_destinations(destinations: BTreeSet<Destination>) -> BTreeSet<Destination> {
+fn merge_destinations(
+    destinations: BTreeSet<Destination>,
+) -> Result<BTreeSet<Destination>, NetworkGrantError> {
     let mut by_host = BTreeMap::<String, BTreeSet<u16>>::new();
     for destination in destinations {
         by_host
@@ -200,7 +202,7 @@ fn merge_destinations(destinations: BTreeSet<Destination>) -> BTreeSet<Destinati
     }
     by_host
         .into_iter()
-        .map(|(host, ports)| Destination { host, ports })
+        .map(|(host, ports)| Destination::new(host, ports))
         .collect()
 }
 
@@ -210,6 +212,10 @@ fn validate_destinations(destinations: &BTreeSet<Destination>) -> Result<(), Net
     }
     if destinations.len() > MAX_NETWORK_DESTINATIONS {
         return Err(NetworkGrantError::TooManyDestinations(destinations.len()));
+    }
+    for destination in destinations {
+        canonical_host(destination.host.clone())?;
+        validate_ports(&destination.ports)?;
     }
     Ok(())
 }
@@ -341,5 +347,26 @@ mod tests {
         let err = serde_json::from_str::<NetworkGrant>(&too_many)
             .expect_err("oversized allowlist must not deserialize");
         assert!(err.to_string().contains("limit"));
+    }
+
+    #[test]
+    fn union_revalidates_merged_destination_ports() {
+        let first = NetworkGrant::allow(BTreeSet::from([Destination::new(
+            "ci.example.com",
+            (1..=MAX_DESTINATION_PORTS as u16).collect(),
+        )
+        .unwrap()]))
+        .unwrap();
+        let second = NetworkGrant::allow(BTreeSet::from([Destination::new(
+            "ci.example.com",
+            ((MAX_DESTINATION_PORTS as u16 + 1)..=(MAX_DESTINATION_PORTS as u16 * 2)).collect(),
+        )
+        .unwrap()]))
+        .unwrap();
+
+        assert!(matches!(
+            first.union(&second),
+            Err(NetworkGrantError::TooManyPorts(ports)) if ports == MAX_DESTINATION_PORTS * 2
+        ));
     }
 }

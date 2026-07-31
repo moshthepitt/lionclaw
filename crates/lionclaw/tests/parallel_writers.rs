@@ -1516,6 +1516,7 @@ fn team_runtime_identities(
                     model: None,
                     mode: None,
                     model_network: lionclaw::model::NetworkGrant::Deny,
+                    external_oracle_drivers: BTreeMap::new(),
                 },
             )
         })

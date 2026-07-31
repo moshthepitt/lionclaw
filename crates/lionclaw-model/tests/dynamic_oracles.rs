@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use lionclaw_model::{
     apply, fold, next, validate_mission_proposal, Assertion, AssertionId, AuthorityCeilings,
     AuthorityGrants, Choice, CommandOracle, ConfinementResources, DecisionAction, EffectId,
-    EffectIntent, EventEnvelope, MissionConfig, MissionEvent, MissionProposal, MissionTypeRef,
+    EffectIntent, EventEnvelope, ExternalOracle, ExternalOracleDriverId,
+    ExternalOracleDriverIdentity, MissionConfig, MissionEvent, MissionProposal, MissionTypeRef,
     NetworkGrant, OracleName, OracleRunSuccess, OracleSpec, OutputSemantics, PayloadRef, Plan,
     PlanProposal, Requirement, RequirementDisposition, RequirementId, RequirementKind,
     RoleInstance, RoleInstanceId, RuntimeInstrumentIdentity, StopBar, Task, TaskId, TaskStatus,
@@ -80,6 +81,7 @@ fn bootstrap_events() -> Vec<EventEnvelope> {
                     model: None,
                     mode: None,
                     model_network: NetworkGrant::Deny,
+                    external_oracle_drivers: BTreeMap::new(),
                 },
             )
         })
@@ -190,6 +192,21 @@ fn command_mut(spec: &mut OracleSpec) -> &mut CommandOracle {
     }
 }
 
+fn external_oracle() -> OracleSpec {
+    OracleSpec::External(ExternalOracle {
+        driver: ExternalOracleDriverId::new("local-ci").unwrap(),
+        driver_identity: Some(ExternalOracleDriverIdentity {
+            driver: ExternalOracleDriverId::new("local-ci").unwrap(),
+            image_id: "image".to_string(),
+            network: NetworkGrant::Deny,
+            auth: None,
+        }),
+        request: BTreeMap::from([("suite".to_string(), "cargo-test".to_string())]),
+        timeout_secs: 300,
+        poll_secs: 5,
+    })
+}
+
 #[test]
 fn joint_proposal_validates_plan_against_new_oracle_map() {
     let proposal = MissionProposal {
@@ -226,6 +243,50 @@ fn oracle_replacement_requires_plan_proposal_for_revision_guard() {
     assert!(error
         .to_string()
         .contains("oracle change requires a plan proposal"));
+}
+
+#[test]
+fn pending_external_oracle_does_not_advertise_deadline_extension() {
+    let spec = external_oracle();
+    let spec_digest = spec.digest();
+    let mut events = accepted_events(spec);
+    let oracle = OracleName::new("tests").unwrap();
+    let effect_id = EffectId::for_oracle_request(
+        &lionclaw_model::MissionId::parse("mabc123abc123").unwrap(),
+        &oracle,
+        &spec_digest,
+        "base",
+        1,
+    );
+    events.push(event(
+        5,
+        MissionEvent::OracleRunRequested {
+            assertion_ids: vec![AssertionId::new("TESTS-PASS").unwrap()],
+            oracle,
+            spec_digest,
+            judged_sha: "base".to_string(),
+            environment_digest: "image".to_string(),
+            attempt_no: 1,
+            effect_id,
+            requested_at_ms: 5,
+            deadline_ms: lionclaw_model::resolve_execution_deadline_ms(5, 300).unwrap(),
+        },
+    ));
+    let state = fold(events).expect("pending external oracle state");
+    let choices = next(&state).choices;
+
+    assert!(
+        choices
+            .iter()
+            .any(|choice| matches!(choice, Choice::Stop { .. })),
+        "pending external oracle can still be stopped"
+    );
+    assert!(
+        !choices
+            .iter()
+            .any(|choice| matches!(choice, Choice::ExtendDeadline { .. })),
+        "external oracle idempotency identity has an immutable deadline"
+    );
 }
 
 #[test]
@@ -648,6 +709,7 @@ fn invalid_team_identity_keeps_the_whole_proposal_pending() {
                 model: None,
                 mode: None,
                 model_network: NetworkGrant::Deny,
+                external_oracle_drivers: BTreeMap::new(),
             },
         )]),
     ];

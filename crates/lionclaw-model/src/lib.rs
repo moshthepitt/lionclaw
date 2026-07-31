@@ -67,8 +67,9 @@ pub use network::{
     MAX_DESTINATION_PORTS, MAX_NETWORK_DESTINATIONS,
 };
 pub use oracle::{
-    CommandOracle, ExternalOracle, ExternalOracleDriverId, OracleSpec, OracleSpecError,
-    WorkspaceRelativeDir, MAX_EXTERNAL_ORACLE_DRIVER_ID_BYTES, MAX_EXTERNAL_ORACLE_REQUEST_BYTES,
+    CommandOracle, ExternalOracle, ExternalOracleDriverAuthIdentity, ExternalOracleDriverId,
+    ExternalOracleDriverIdentity, OracleSpec, OracleSpecError, WorkspaceRelativeDir,
+    MAX_EXTERNAL_ORACLE_DRIVER_ID_BYTES, MAX_EXTERNAL_ORACLE_REQUEST_BYTES,
     MAX_EXTERNAL_ORACLE_REQUEST_FIELDS, MAX_EXTERNAL_ORACLE_REQUEST_KEY_BYTES,
     MAX_EXTERNAL_ORACLE_REQUEST_VALUE_BYTES, MAX_ORACLE_ARGV_BYTES, MAX_ORACLE_ARG_BYTES,
     MAX_ORACLE_ARG_COUNT, MAX_ORACLE_CWD_BYTES, MAX_ORACLE_ENVIRONMENT_BYTES,

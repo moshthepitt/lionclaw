@@ -16,9 +16,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 74 admits external oracle specs while keeping oracle effects in the
-/// existing request/outcome fold.
-pub const REDUCER_VERSION: u32 = 75;
+/// Reducer 76 keeps external oracle deadline identity immutable and requires
+/// resolved driver authority in durable oracle specs.
+pub const REDUCER_VERSION: u32 = 76;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;

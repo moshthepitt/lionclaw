@@ -1037,7 +1037,12 @@ async fn assemble_engine(
 ) -> Result<Engine> {
     workspace::ensure_excluded(repo).await?;
     default_profile.confinement.oci_mut().image = Some(image_id.clone());
-    let runtime_identities = profiles.instrument_identities();
+    let runtime_identities = profiles.instrument_identities(&image_id);
+    let external_oracle_driver_identities = default_profile
+        .external_oracle_drivers
+        .iter()
+        .map(|(id, driver)| (id.clone(), driver.identity(&image_id)))
+        .collect();
     let role_runner: Arc<dyn RoleRunner> = transports.role.clone().unwrap_or_else(|| {
         Arc::new(match &transports.runtime {
             Some((drivers, auth)) => {
@@ -1055,18 +1060,15 @@ async fn assemble_engine(
         .oracle
         .clone()
         .unwrap_or_else(|| Arc::new(OciOracleRunner::new(default_profile)));
-    Ok(Engine::new(
-        store,
-        mission_type,
-        image_id,
-        EngineServices::new(
-            role_runner,
-            oracle_runner,
-            effect_cleaner,
-            Arc::new(SystemClock),
-        )
-        .with_runtime_identities(runtime_identities),
-    ))
+    let services = EngineServices::new(
+        role_runner,
+        oracle_runner,
+        effect_cleaner,
+        Arc::new(SystemClock),
+    )
+    .with_runtime_identities(runtime_identities)
+    .with_external_oracle_driver_identities(external_oracle_driver_identities);
+    Ok(Engine::new(store, mission_type, image_id, services))
 }
 
 /// Build an engine to create a mission from its validated snapshot.

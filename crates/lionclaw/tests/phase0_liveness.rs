@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+
 use common::{
     approve_plan, harness, proposal, proposal_from_plan, review_runner, simple_plan, BASE_SHA,
 };
@@ -191,6 +193,7 @@ fn assert_decisions_change_authority(state: &lionclaw::model::MissionState) -> b
                                         model: None,
                                         mode: None,
                                         model_network: lionclaw::model::NetworkGrant::Deny,
+                                        external_oracle_drivers: BTreeMap::new(),
                                     },
                                 )
                             })

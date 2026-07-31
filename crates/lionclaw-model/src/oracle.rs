@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::digest::CanonicalDigest;
 use super::{
     validate_environment_entry, AuthorityCeilings, AuthorityGrants, ConfinementResources,
-    ExecutionPolicy,
+    ExecutionPolicy, NetworkGrant,
 };
 use crate::prelude::*;
 
@@ -127,8 +127,28 @@ impl core::fmt::Display for ExternalOracleDriverId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ExternalOracleDriverAuthIdentity {
+    pub kind: String,
+    pub config_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalOracleDriverIdentity {
+    pub driver: ExternalOracleDriverId,
+    pub image_id: String,
+    #[serde(default, skip_serializing_if = "NetworkGrant::is_denied")]
+    pub network: NetworkGrant,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ExternalOracleDriverAuthIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalOracle {
     pub driver: ExternalOracleDriverId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_identity: Option<ExternalOracleDriverIdentity>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub request: BTreeMap<String, String>,
     pub timeout_secs: u64,
@@ -174,6 +194,11 @@ impl OracleSpec {
             Self::External(external) => {
                 digest.str("type", "external");
                 digest.str("driver", external.driver.as_str());
+                feed_external_driver_identity(
+                    &mut digest,
+                    "driver_identity",
+                    external.driver_identity.as_ref(),
+                );
                 digest.map("request", external.request.iter());
                 digest.u64("timeout_secs", external.timeout_secs);
                 digest.u64("poll_secs", external.poll_secs);
@@ -188,6 +213,11 @@ impl OracleSpec {
         };
         let mut digest = CanonicalDigest::new("lionclaw.external-oracle-request.v1");
         digest.str("driver", external.driver.as_str());
+        feed_external_driver_identity(
+            &mut digest,
+            "driver_identity",
+            external.driver_identity.as_ref(),
+        );
         digest.map("request", external.request.iter());
         Some(digest.finish())
     }
@@ -200,7 +230,7 @@ impl OracleSpec {
     ) -> Result<(), OracleSpecError> {
         match self {
             Self::Command(command) => command.validate(ceilings, resource_ceilings, execution),
-            Self::External(external) => external.validate(execution),
+            Self::External(external) => external.validate(ceilings, execution),
         }
     }
 
@@ -285,8 +315,37 @@ impl CommandOracle {
     }
 }
 
+fn feed_external_driver_identity(
+    digest: &mut CanonicalDigest,
+    prefix: &str,
+    identity: Option<&ExternalOracleDriverIdentity>,
+) {
+    let Some(identity) = identity else {
+        digest.str(&format!("{prefix}.state"), "unresolved");
+        return;
+    };
+    digest.str(&format!("{prefix}.state"), "resolved");
+    digest.str(&format!("{prefix}.driver"), identity.driver.as_str());
+    digest.str(&format!("{prefix}.image_id"), &identity.image_id);
+    identity
+        .network
+        .feed_digest(digest, &format!("{prefix}.network"));
+    match &identity.auth {
+        Some(auth) => {
+            digest.str(&format!("{prefix}.auth.state"), "configured");
+            digest.str(&format!("{prefix}.auth.kind"), &auth.kind);
+            digest.str(&format!("{prefix}.auth.config_digest"), &auth.config_digest);
+        }
+        None => digest.str(&format!("{prefix}.auth.state"), "none"),
+    }
+}
+
 impl ExternalOracle {
-    fn validate(&self, execution: &ExecutionPolicy) -> Result<(), OracleSpecError> {
+    fn validate(
+        &self,
+        ceilings: &AuthorityCeilings,
+        execution: &ExecutionPolicy,
+    ) -> Result<(), OracleSpecError> {
         if self.timeout_secs == 0 || self.timeout_secs > execution.max_task_time_secs {
             return Err(OracleSpecError::InvalidTimeout {
                 requested: self.timeout_secs,
@@ -299,8 +358,47 @@ impl ExternalOracle {
                 timeout: self.timeout_secs,
             });
         }
+        self.validate_driver_identity(ceilings)?;
         validate_external_request(&self.request)
     }
+
+    fn validate_driver_identity(
+        &self,
+        ceilings: &AuthorityCeilings,
+    ) -> Result<(), OracleSpecError> {
+        let identity = self
+            .driver_identity
+            .as_ref()
+            .ok_or(OracleSpecError::UnresolvedExternalDriverAuthority)?;
+        if identity.driver != self.driver {
+            return Err(OracleSpecError::ExternalDriverAuthorityMismatch);
+        }
+        if !valid_external_driver_content_id(&identity.image_id) {
+            return Err(OracleSpecError::InvalidExternalDriverContentIdentity);
+        }
+        if !identity.network.within(&ceilings.network) {
+            return Err(OracleSpecError::AuthorityExceedsCeilings);
+        }
+        if let Some(auth) = &identity.auth {
+            if !valid_external_request_key(&auth.kind)
+                || !valid_external_driver_auth_digest(&auth.config_digest)
+            {
+                return Err(OracleSpecError::InvalidExternalDriverAuthIdentity);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_external_driver_content_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.contains('\0') && value.trim() == value
+}
+
+fn valid_external_driver_auth_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn validate_external_request(request: &BTreeMap<String, String>) -> Result<(), OracleSpecError> {
@@ -395,6 +493,14 @@ pub enum OracleSpecError {
     ResourcesExceedCeilings(String),
     #[error("external oracle driver id '{0}' must be an installed driver identity, not a path or command")]
     InvalidExternalDriverId(String),
+    #[error("external oracle driver authority was not resolved at mission admission")]
+    UnresolvedExternalDriverAuthority,
+    #[error("external oracle resolved driver authority does not match the requested driver")]
+    ExternalDriverAuthorityMismatch,
+    #[error("external oracle resolved driver content identity is invalid")]
+    InvalidExternalDriverContentIdentity,
+    #[error("external oracle resolved driver auth identity is invalid")]
+    InvalidExternalDriverAuthIdentity,
     #[error("external oracle request contains {0} fields; the limit is {MAX_EXTERNAL_ORACLE_REQUEST_FIELDS}")]
     TooManyExternalRequestFields(usize),
     #[error("external oracle request key '{0}' is invalid")]

@@ -20,12 +20,13 @@ use super::plan::{OutputSemantics, PlanProposal};
 use super::verdict::FinishClass;
 use crate::prelude::*;
 use crate::{
-    AppliedRuntimeConfiguration, NetworkGrant, RuntimeUsage, TypedFailure, TypedFailureEvidence,
+    AppliedRuntimeConfiguration, ExternalOracleDriverId, ExternalOracleDriverIdentity,
+    NetworkGrant, RuntimeUsage, TypedFailure, TypedFailureEvidence,
 };
 
-/// Version 39 records runtime-profile model network authority in durable proof
-/// identity so changed provider destinations invalidate old role proofs.
-pub const SCHEMA_VERSION: u32 = 39;
+/// Version 40 records runtime-profile external oracle driver authority in
+/// durable proof identity so changed driver grants invalidate old proof.
+pub const SCHEMA_VERSION: u32 = 40;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -86,6 +87,8 @@ pub struct RuntimeInstrumentIdentity {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "NetworkGrant::is_denied")]
     pub model_network: NetworkGrant,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub external_oracle_drivers: BTreeMap<ExternalOracleDriverId, ExternalOracleDriverIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

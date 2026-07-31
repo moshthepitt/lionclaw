@@ -65,15 +65,21 @@ may name only a configured driver id and bounded typed request data, never an
 executable path, shell command, adapter name, or credential bytes.
 
 Declare installed drivers in the runtime profile and scope their own network
-authority there:
+authority there. The selected runtime image digest, driver id, network grant,
+and non-secret auth configuration identity are resolved into mission state when
+the plan is admitted, so later runtime profile edits cannot silently change an
+inflight oracle's authority.
 
 ```toml
 [runtimes.codex.external-oracle-drivers.local-ci]
 network = { mode = "allow", destinations = [
   { host = "ci.example.com", ports = [443] }
 ] }
+auth = { kind = "native-home", source = "/home/operator/.ci-token" }
 ```
 
 LionClaw invokes the launcher with JSON submit/poll requests on stdin. Driver
-credentials stay outside mission data and are supplied by operator/runtime
+credentials stay in kernel-owned auth staging, scoped to the effect, and are
+never placed in mission requests, argv, environment variables, events, blobs,
+reports, or logs. External drivers currently accept `native-home` auth
 configuration only.

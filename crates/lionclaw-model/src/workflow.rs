@@ -280,10 +280,12 @@ fn active_control_choices(state: &MissionState) -> Vec<Choice> {
         choices.push(Choice::Stop {
             effect_id: effect_id.clone(),
         });
-        choices.push(Choice::ExtendDeadline {
-            effect_id: effect_id.clone(),
-            old_deadline_ms: effect.deadline_ms(),
-        });
+        if effect.budget_deadline_ms().is_some() {
+            choices.push(Choice::ExtendDeadline {
+                effect_id: effect_id.clone(),
+                old_deadline_ms: effect.deadline_ms(),
+            });
+        }
     }
     choices
 }

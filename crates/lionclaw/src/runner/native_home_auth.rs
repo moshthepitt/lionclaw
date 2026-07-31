@@ -22,15 +22,15 @@ use sha2::{Digest, Sha256};
 
 use crate::config::NativeHomeAuthConfig;
 
-pub(super) const NATIVE_HOME_AUTH_KIND: &str = "native-home";
+pub(crate) const NATIVE_HOME_AUTH_KIND: &str = "native-home";
 
 #[derive(Debug, Clone)]
-pub(super) struct NativeHomeAuthProvider {
+pub(crate) struct NativeHomeAuthProvider {
     config: NativeHomeAuthConfig,
 }
 
 impl NativeHomeAuthProvider {
-    pub(super) fn new(config: NativeHomeAuthConfig) -> Self {
+    pub(crate) fn new(config: NativeHomeAuthConfig) -> Self {
         Self { config }
     }
 

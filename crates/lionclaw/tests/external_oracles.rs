@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use lionclaw::config::RuntimeProfiles;
 use lionclaw::model::{
-    Choice, EffectId, ExternalOracle, ExternalOracleDriverId, MissionId, MissionProposal,
-    OracleName, OracleSpec,
+    Choice, EffectId, ExternalOracle, ExternalOracleDriverId, ExternalOracleDriverIdentity,
+    MissionId, MissionProposal, NetworkGrant, OracleName, OracleSpec,
 };
 use lionclaw::oracle::OciOracleRunner;
 use lionclaw::ports::{
@@ -23,6 +23,25 @@ use common::{approve_plan, proposal, simple_plan, BASE_SHA, HEAD_SHA};
 fn external_spec(driver: &str) -> OracleSpec {
     OracleSpec::External(ExternalOracle {
         driver: ExternalOracleDriverId::new(driver).unwrap(),
+        driver_identity: Some(ExternalOracleDriverIdentity {
+            driver: ExternalOracleDriverId::new(driver).unwrap(),
+            image_id: "sha256:external-test".to_string(),
+            network: NetworkGrant::Deny,
+            auth: None,
+        }),
+        request: BTreeMap::from([
+            ("suite".to_string(), "cargo-test".to_string()),
+            ("artifact".to_string(), "workspace".to_string()),
+        ]),
+        timeout_secs: 120,
+        poll_secs: 5,
+    })
+}
+
+fn unresolved_external_spec(driver: &str) -> OracleSpec {
+    OracleSpec::External(ExternalOracle {
+        driver: ExternalOracleDriverId::new(driver).unwrap(),
+        driver_identity: None,
         request: BTreeMap::from([
             ("suite".to_string(), "cargo-test".to_string()),
             ("artifact".to_string(), "workspace".to_string()),
@@ -36,9 +55,56 @@ fn external_proposal(driver: &str) -> MissionProposal {
     let mut proposal = proposal(0, simple_plan());
     proposal.oracles = Some(BTreeMap::from([(
         OracleName::new("cargo-test").unwrap(),
-        external_spec(driver),
+        unresolved_external_spec(driver),
     )]));
     proposal
+}
+
+fn external_driver_identity(
+    driver: &str,
+    network: NetworkGrant,
+) -> (ExternalOracleDriverId, ExternalOracleDriverIdentity) {
+    let id = ExternalOracleDriverId::new(driver).unwrap();
+    (
+        id.clone(),
+        ExternalOracleDriverIdentity {
+            driver: id,
+            image_id: "localhost/lionclaw-runtime-dev:v1".to_string(),
+            network,
+            auth: None,
+        },
+    )
+}
+
+async fn harness_with_external_driver(
+    workspace: &std::path::Path,
+    identity: ExternalOracleDriverIdentity,
+    oracle_runner: MockOracleRunner,
+) -> common::TestHarness {
+    let driver_id = identity.driver.clone();
+    let mut runtime_identities = common::default_runtime_identities();
+    runtime_identities
+        .get_mut("codex")
+        .unwrap()
+        .external_oracle_drivers
+        .insert(driver_id.clone(), identity.clone());
+    let role_runner = Arc::new(MockRoleRunner::happy(HEAD_SHA));
+    let oracle_runner = Arc::new(oracle_runner);
+    common::initialize_repository(workspace);
+    let engine = common::engine_with_runtime_and_external_driver_identities(
+        workspace,
+        common::test_mission_type(),
+        role_runner.clone(),
+        oracle_runner.clone(),
+        runtime_identities,
+        BTreeMap::from([(driver_id, identity)]),
+    )
+    .await;
+    common::TestHarness {
+        engine,
+        role_runner,
+        oracle_runner,
+    }
 }
 
 fn passing_outcome() -> OracleOutcome {
@@ -71,7 +137,8 @@ async fn pending_external_oracle_stays_in_resolve_effect_until_polled_complete()
             }
         }
     }));
-    let h = common::harness(dir.path(), MockRoleRunner::happy(HEAD_SHA), oracle).await;
+    let (_driver_id, identity) = external_driver_identity("local-ci", NetworkGrant::Deny);
+    let h = harness_with_external_driver(dir.path(), identity, oracle).await;
     let mission_id = h
         .engine
         .create_mission(dir.path().to_str().unwrap(), "external proof", BASE_SHA)
@@ -109,6 +176,69 @@ async fn pending_external_oracle_stays_in_resolve_effect_until_polled_complete()
         ready.state.terminal.is_none(),
         "external pass never auto-finishes"
     );
+}
+
+#[tokio::test]
+async fn plan_admission_resolves_external_driver_identity_before_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_driver_id, identity) = external_driver_identity("local-ci", NetworkGrant::Deny);
+    let h =
+        harness_with_external_driver(dir.path(), identity.clone(), MockOracleRunner::exiting(0))
+            .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "external oracle identity",
+            BASE_SHA,
+        )
+        .await
+        .unwrap();
+
+    h.engine
+        .propose_plan(&mission_id, external_proposal("local-ci"))
+        .await
+        .unwrap();
+    let state = h.engine.store().require_state(&mission_id).await.unwrap();
+    let recorded = state
+        .proposal
+        .as_ref()
+        .and_then(|proposal| proposal.oracles.as_ref())
+        .and_then(|oracles| oracles.get(&OracleName::new("cargo-test").unwrap()))
+        .expect("recorded oracle");
+    let OracleSpec::External(external) = recorded else {
+        panic!("expected external oracle");
+    };
+
+    assert_eq!(external.driver_identity.as_ref(), Some(&identity));
+}
+
+#[tokio::test]
+async fn plan_admission_rejects_external_driver_network_above_mission_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_driver_id, identity) = external_driver_identity(
+        "local-ci",
+        NetworkGrant::allow_single("ci.example.com", 443).unwrap(),
+    );
+    let h = harness_with_external_driver(dir.path(), identity, MockOracleRunner::exiting(0)).await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "external oracle ceiling",
+            BASE_SHA,
+        )
+        .await
+        .unwrap();
+
+    let error = h
+        .engine
+        .propose_plan(&mission_id, external_proposal("local-ci"))
+        .await
+        .expect_err("driver network above mission ceiling must be rejected");
+    assert!(error
+        .to_string()
+        .contains("oracle authority exceeds mission ceilings"));
 }
 
 #[derive(Default)]

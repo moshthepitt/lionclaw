@@ -9,10 +9,10 @@ use lionclaw::engine::{Engine, EngineServices, MissionView};
 use lionclaw::mission_type::{MissionType, MissionTypeDefinition};
 use lionclaw::model::{
     Assertion, AssertionId, AuthorityCeilings, AuthorityGrants, Choice, CommandOracle,
-    ConfinementResources, FinishClass, MissionId, MissionProposal, OracleName, OracleSpec,
-    OutputSemantics, Plan, PlanProposal, Requirement, RequirementDisposition, RequirementId,
-    RequirementKind, RoleInstance, RoleInstanceId, RuntimeInstrumentIdentity, StopBar, Task,
-    TeamRevision, WorkspaceRelativeDir,
+    ConfinementResources, ExternalOracleDriverId, ExternalOracleDriverIdentity, FinishClass,
+    MissionId, MissionProposal, OracleName, OracleSpec, OutputSemantics, Plan, PlanProposal,
+    Requirement, RequirementDisposition, RequirementId, RequirementKind, RoleInstance,
+    RoleInstanceId, RuntimeInstrumentIdentity, StopBar, Task, TeamRevision, WorkspaceRelativeDir,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
@@ -520,6 +520,7 @@ pub fn default_runtime_identities() -> BTreeMap<String, RuntimeInstrumentIdentit
                 model: None,
                 mode: None,
                 model_network: lionclaw::model::NetworkGrant::Deny,
+                external_oracle_drivers: BTreeMap::new(),
             },
         ),
         (
@@ -529,6 +530,7 @@ pub fn default_runtime_identities() -> BTreeMap<String, RuntimeInstrumentIdentit
                 model: None,
                 mode: None,
                 model_network: lionclaw::model::NetworkGrant::Deny,
+                external_oracle_drivers: BTreeMap::new(),
             },
         ),
     ])
@@ -566,6 +568,28 @@ pub async fn engine_with_runtime_identities(
     oracle_runner: Arc<MockOracleRunner>,
     runtime_identities: BTreeMap<String, RuntimeInstrumentIdentity>,
 ) -> Engine {
+    engine_with_runtime_and_external_driver_identities(
+        workspace,
+        mission_type,
+        role_runner,
+        oracle_runner,
+        runtime_identities,
+        BTreeMap::new(),
+    )
+    .await
+}
+
+pub async fn engine_with_runtime_and_external_driver_identities(
+    workspace: &Path,
+    mission_type: MissionType,
+    role_runner: Arc<MockRoleRunner>,
+    oracle_runner: Arc<MockOracleRunner>,
+    runtime_identities: BTreeMap<String, RuntimeInstrumentIdentity>,
+    external_oracle_driver_identities: BTreeMap<
+        ExternalOracleDriverId,
+        ExternalOracleDriverIdentity,
+    >,
+) -> Engine {
     let store = MissionStore::open(workspace).await.expect("open store");
     Engine::new(
         store,
@@ -577,7 +601,8 @@ pub async fn engine_with_runtime_identities(
             Arc::new(NoopEffectCleaner),
             Arc::new(MockClock::default()),
         )
-        .with_runtime_identities(runtime_identities),
+        .with_runtime_identities(runtime_identities)
+        .with_external_oracle_driver_identities(external_oracle_driver_identities),
     )
 }
 

@@ -13,7 +13,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::mission_type::Home;
-use crate::model::{ExternalOracleDriverId, NetworkGrant};
+use crate::model::{
+    ExternalOracleDriverAuthIdentity, ExternalOracleDriverId, ExternalOracleDriverIdentity,
+    NetworkGrant,
+};
 
 const DEFAULT_RUNTIMES_TOML: &str = r#"
 [runtimes.codex]
@@ -90,6 +93,18 @@ pub struct MissionRuntimeProfile {
 pub struct ExternalOracleDriverProfile {
     pub id: ExternalOracleDriverId,
     pub network: NetworkGrant,
+    pub auth: Option<RuntimeAuthConfig>,
+}
+
+impl ExternalOracleDriverProfile {
+    pub(crate) fn identity(&self, image_id: &str) -> ExternalOracleDriverIdentity {
+        ExternalOracleDriverIdentity {
+            driver: self.id.clone(),
+            image_id: image_id.to_string(),
+            network: self.network.clone(),
+            auth: self.auth.as_ref().map(external_driver_auth_identity),
+        }
+    }
 }
 
 impl MissionRuntimeProfile {
@@ -212,6 +227,36 @@ fn digest_network(digest: &mut Sha256, label: &[u8], network: &NetworkGrant) {
     }
 }
 
+fn external_driver_auth_identity(auth: &RuntimeAuthConfig) -> ExternalOracleDriverAuthIdentity {
+    ExternalOracleDriverAuthIdentity {
+        kind: auth.kind().to_string(),
+        config_digest: external_driver_auth_config_digest(auth),
+    }
+}
+
+fn external_driver_auth_config_digest(auth: &RuntimeAuthConfig) -> String {
+    let mut digest = Sha256::new();
+    digest_field(
+        &mut digest,
+        b"domain",
+        b"lionclaw.external-oracle-driver-auth-config.v1",
+    );
+    match auth {
+        RuntimeAuthConfig::Provider(kind) => {
+            digest_field(&mut digest, b"kind", b"provider");
+            digest_field(&mut digest, b"provider", kind.as_bytes());
+        }
+        RuntimeAuthConfig::NativeHome(config) => {
+            digest_field(&mut digest, b"kind", b"native-home");
+            digest_field(&mut digest, b"source", config.source.as_os_str().as_bytes());
+            digest_field(&mut digest, b"target", config.target.as_os_str().as_bytes());
+            digest_paths(&mut digest, b"required", &config.required_files);
+            digest_paths(&mut digest, b"optional", &config.optional_files);
+        }
+    }
+    format!("sha256:{}", hex::encode(digest.finalize()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAuthConfig {
     Provider(String),
@@ -319,10 +364,16 @@ impl RuntimeProfiles {
 
     pub(crate) fn instrument_identities(
         &self,
+        image_id: &str,
     ) -> BTreeMap<String, crate::model::RuntimeInstrumentIdentity> {
         self.profiles
             .iter()
             .map(|(name, profile)| {
+                let external_oracle_drivers = profile
+                    .external_oracle_drivers
+                    .iter()
+                    .map(|(id, driver)| (id.clone(), driver.identity(image_id)))
+                    .collect();
                 (
                     name.clone(),
                     crate::model::RuntimeInstrumentIdentity {
@@ -330,6 +381,7 @@ impl RuntimeProfiles {
                         model: profile.model.clone(),
                         mode: profile.mode.clone(),
                         model_network: profile.model_network.clone(),
+                        external_oracle_drivers,
                     },
                 )
             })
@@ -377,6 +429,8 @@ struct RuntimeProfileFile {
 struct ExternalOracleDriverFile {
     #[serde(default)]
     network: NetworkGrant,
+    #[serde(default)]
+    auth: Option<RuntimeAuthConfigFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,13 +503,20 @@ impl RuntimeProfileFile {
                 .external_oracle_drivers
                 .into_iter()
                 .map(|(id, config)| {
+                    let auth = config.auth.map(|auth| auth.apply(user_home)).transpose()?;
+                    if matches!(auth, Some(RuntimeAuthConfig::Provider(_))) {
+                        return Err(anyhow!(
+                            "external oracle driver '{id}' auth must use native-home"
+                        ));
+                    }
                     let profile = ExternalOracleDriverProfile {
                         id: id.clone(),
                         network: config.network,
+                        auth,
                     };
-                    (id, profile)
+                    Ok((id, profile))
                 })
-                .collect(),
+                .collect::<Result<BTreeMap<_, _>>>()?,
             native_resume: self.native_resume,
             confinement: self.confinement,
         })
@@ -719,7 +780,9 @@ mod tests {
         .expect("profile");
 
         let identity = profiles
-            .instrument_identities()
+            .instrument_identities(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .remove("codex")
             .expect("runtime identity");
         let identity = serde_json::to_value(identity).expect("identity JSON");
@@ -754,6 +817,52 @@ mod tests {
             .get(&crate::model::ExternalOracleDriverId::new("local-ci").unwrap())
             .expect("installed driver");
         assert!(driver.network.allows("ci.example.com", 443));
+
+        let identity = profiles
+            .instrument_identities(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .remove("codex")
+            .expect("runtime identity");
+        let driver_identity = identity
+            .external_oracle_drivers
+            .get(&crate::model::ExternalOracleDriverId::new("local-ci").unwrap())
+            .expect("driver identity");
+        assert!(driver_identity.network.allows("ci.example.com", 443));
+        assert_eq!(
+            driver_identity.image_id,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn external_oracle_driver_auth_is_profile_data() {
+        let profiles = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.codex]
+            driver = "codex"
+            command = "codex"
+
+            [runtimes.codex.external-oracle-drivers.hosted-lab]
+            auth = { kind = "native-home", source = "~/.hosted-lab", target = ".hosted-lab", required-files = ["token.json"] }
+            "#,
+            Path::new("/home/alice"),
+        )
+        .expect("profile");
+
+        let profile = profiles.get("codex").expect("runtime");
+        let driver = profile
+            .external_oracle_drivers
+            .get(&crate::model::ExternalOracleDriverId::new("hosted-lab").unwrap())
+            .expect("installed driver");
+        let RuntimeAuthConfig::NativeHome(auth) = driver.auth.clone().expect("driver auth") else {
+            panic!("expected native-home external driver auth");
+        };
+
+        assert_eq!(auth.source, PathBuf::from("/home/alice/.hosted-lab"));
+        assert_eq!(auth.target, PathBuf::from(".hosted-lab"));
+        assert_eq!(auth.required_files, [PathBuf::from("token.json")]);
+        assert!(auth.optional_files.is_empty());
     }
 
     #[test]
