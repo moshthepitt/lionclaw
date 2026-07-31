@@ -478,8 +478,7 @@ fn prepare_oci_network(
     validate_oci_resource_name(&internal_network_name)?;
     validate_oci_resource_name(&egress_network_name)?;
     validate_oci_resource_name(&proxy_name)?;
-    let proxy_binary =
-        std::env::current_exe().context("resolving LionClaw network proxy binary")?;
+    let proxy_binary = resolve_network_proxy_binary()?;
     Ok(PreparedOciNetwork::Proxy {
         destinations: destinations.clone(),
         internal_network_name,
@@ -487,6 +486,38 @@ fn prepare_oci_network(
         proxy_name,
         proxy_binary,
     })
+}
+
+fn resolve_network_proxy_binary() -> Result<PathBuf> {
+    let current = std::env::current_exe()
+        .context("resolving current LionClaw executable for network proxy")?;
+    Ok(network_proxy_binary_for_current(&current))
+}
+
+fn network_proxy_binary_for_current(current: &Path) -> PathBuf {
+    if !looks_like_cargo_lionclaw_test_harness(current) {
+        return current.to_path_buf();
+    }
+    let Some(target_dir) = current.parent().and_then(Path::parent) else {
+        return current.to_path_buf();
+    };
+    let candidate = target_dir.join(format!("lionclaw{}", std::env::consts::EXE_SUFFIX));
+    if candidate.is_file() {
+        return candidate;
+    }
+    current.to_path_buf()
+}
+
+fn looks_like_cargo_lionclaw_test_harness(current: &Path) -> bool {
+    current
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("deps")
+        && current
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("lionclaw-"))
 }
 
 fn append_bind_mount_identity_args(args: &mut Vec<String>, root_in_userns: bool) {
@@ -820,6 +851,7 @@ impl OciNetworkSession {
         )
         .await?;
         if output.success() {
+            self.ensure_proxy_running().await?;
             return Ok(());
         }
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -827,6 +859,27 @@ impl OciNetworkSession {
             "failed to start OCI network proxy '{}' ({}): {stderr}",
             self.proxy_name,
             output.status_description()
+        )
+    }
+
+    async fn ensure_proxy_running(&self) -> Result<()> {
+        let output = run_oci_preflight_command(
+            &build_container_running_inspect_invocation(&self.engine, &self.proxy_name),
+            &format!("inspect OCI network proxy '{}'", self.proxy_name),
+            OCI_PREFLIGHT_TIMEOUT,
+        )
+        .await?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if output.success() && stdout == "true" {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "OCI network proxy '{}' exited before readiness (inspect {}): stdout='{}' stderr='{}'",
+            self.proxy_name,
+            output.status_description(),
+            stdout,
+            stderr
         )
     }
 
@@ -1139,6 +1192,24 @@ fn build_network_proxy_invocation(
         environment: Vec::new(),
         input: String::new(),
     })
+}
+
+fn build_container_running_inspect_invocation(
+    engine: &str,
+    container_name: &str,
+) -> ProcessInvocation {
+    ProcessInvocation {
+        executable: engine.to_string(),
+        args: vec![
+            "inspect".to_string(),
+            "--format".to_string(),
+            "{{.State.Running}}".to_string(),
+            container_name.to_string(),
+        ],
+        working_dir: None,
+        environment: Vec::new(),
+        input: String::new(),
+    }
 }
 
 /// Remove a named OCI container. Absence is success, making this suitable for
@@ -2019,6 +2090,43 @@ mod tests {
         assert!(err
             .to_string()
             .contains("destination-scoped OCI network requires an effect resource name"));
+    }
+
+    #[test]
+    fn network_proxy_binary_prefers_cargo_built_cli_over_libtest_harness() {
+        let temp = tempdir().unwrap();
+        let debug = temp.path().join("target/debug");
+        let deps = debug.join("deps");
+        fs::create_dir_all(&deps).unwrap();
+        let harness = deps.join("lionclaw-abc123");
+        fs::File::create(&harness).unwrap();
+        let binary = debug.join(format!("lionclaw{}", std::env::consts::EXE_SUFFIX));
+        fs::File::create(&binary).unwrap();
+
+        assert_eq!(super::network_proxy_binary_for_current(&harness), binary);
+    }
+
+    #[test]
+    fn network_proxy_binary_keeps_non_harness_current_exe() {
+        let current = Path::new("/opt/lionclaw/bin/lionclaw");
+
+        assert_eq!(super::network_proxy_binary_for_current(current), current);
+    }
+
+    #[test]
+    fn proxy_readiness_inspects_container_running_state() {
+        let inspect = super::build_container_running_inspect_invocation("podman", "effect-proxy");
+
+        assert_eq!(inspect.executable, "podman");
+        assert_eq!(
+            inspect.args,
+            [
+                "inspect".to_string(),
+                "--format".to_string(),
+                "{{.State.Running}}".to_string(),
+                "effect-proxy".to_string(),
+            ]
+        );
     }
 
     #[test]
