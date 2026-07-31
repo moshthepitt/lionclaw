@@ -139,6 +139,40 @@ The exact base commit has a valid signature from
 `Kelvin Jayanoris <kelvin@jayanoris.com>`, and the chunk branch was confirmed to
 start at that exact commit before its first signed commit.
 
+The implementation is signed commit
+`899a11aa8d8e648bce325d0f7d8f58783b3481e8`, a direct descendant of the
+accepted base.
+
+The three authenticated native-session continuity tests passed from that clean
+signed source against `localhost/lionclaw-runtime:v1`, resolved before launch
+to immutable image identity
+`e1541b6609e7209de4087aac38b08151ad5feb9dd901cf464e088b41b32ba05d`:
+
+- Codex: `1 passed; 0 failed`, 31.23 seconds. Preserved root:
+  `/tmp/lionclaw-chunk7-live-codex-20260731-170311`. Receipt SHA-256:
+  `021b003c3efa8a1805728934efaa30b1d28cca2c7749adf42a300c1c35e70cce`.
+- OpenCode: `1 passed; 0 failed`, 21.79 seconds. Preserved root:
+  `/tmp/lionclaw-chunk7-live-opencode-20260731-170311`. Receipt SHA-256:
+  `d392ee65bb79651a038941e6a69e2daaec89132afabf3366ae925617c4ed4a2d`.
+- Hermes: `1 passed; 0 failed`, 38.21 seconds. Preserved root:
+  `/tmp/lionclaw-chunk7-live-hermes-20260731-170311`. Receipt SHA-256:
+  `a5bfe909566804efdd451d5a45fb5cfc1b830692db197df213eeec5706de86d0`.
+
+Each `lionclaw.runtime-continuity-proof.v2` receipt records the signed source
+head, immutable image identity, first observation `Reconstructed`, second
+observation `Resumed`, distinct effect ids, exact effect cleanup, retained
+native home and runtime state, removed credential projection, and a second
+response digest equal to the hidden token digest.
+
+An earlier Codex launch failure is preserved at
+`/tmp/lionclaw-chunk7-live-codex-20260731-170034`. The explicitly named
+untagged image `9ed8b30de84295193f92baf66e88e6f28bd4f0f4aa77d1448e7f22220bb3a126`
+contained all three agent CLIs but lacked the required
+`/usr/local/bin/lionclaw` network-proxy binary, so the proxy exited before
+readiness with Podman inspect code 125. The correct runtime image passed all
+three tests without a source change. The failed root contains no passing
+receipt and is retained as infrastructure RED evidence.
+
 ## Residual Coverage
 
 Four tests are ignored by the default Cargo gate:
@@ -148,9 +182,9 @@ Four tests are ignored by the default Cargo gate:
 - authenticated Hermes native-session continuity;
 - production external-oracle OCI execution.
 
-The three native-session tests require committed clean source and are run only
-from the signed implementation commit; their fresh roots, image identity,
-timings, and receipt digests are appended in the signed evidence follow-up.
+The three native-session tests require committed clean source, real auth,
+network, and the OCI runtime image. All three were explicitly run and passed as
+recorded above; none remains blocked.
 
 The external-oracle OCI test remains blocked on this host because delegated
 CPU/memory cgroup controllers are unavailable. `scripts/ci.sh` reported this
