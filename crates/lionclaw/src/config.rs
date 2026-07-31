@@ -24,7 +24,8 @@ auth = "codex"
 skills-dir = ".agents/skills"
 model-network = { mode = "allow", destinations = [
   { host = "api.openai.com", ports = [443] },
-  { host = "auth.openai.com", ports = [443] }
+  { host = "auth.openai.com", ports = [443] },
+  { host = "chatgpt.com", ports = [443] }
 ] }
 confinement = { backend = "podman", image = "localhost/lionclaw-runtime-dev:v1", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 
@@ -794,7 +795,11 @@ mod tests {
             profiles.names().collect::<Vec<_>>(),
             ["codex", "hermes", "opencode"]
         );
-        assert_eq!(profiles.get("codex").unwrap().driver, "codex");
+        let codex = profiles.get("codex").unwrap();
+        assert_eq!(codex.driver, "codex");
+        assert!(codex.model_network.allows("api.openai.com", 443));
+        assert!(codex.model_network.allows("auth.openai.com", 443));
+        assert!(codex.model_network.allows("chatgpt.com", 443));
         let hermes = profiles.get("hermes").unwrap();
         assert_eq!(hermes.driver, "acp");
         assert_eq!(hermes.mode.as_deref(), Some("dont_ask"));
