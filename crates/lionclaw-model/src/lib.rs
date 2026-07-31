@@ -39,9 +39,10 @@ pub mod verdict;
 pub mod workflow;
 
 pub use child::{
-    ChildMissionAssignment, ChildMissionOutput, ChildMissionReceipt, ChildMissionRequest,
-    ChildProofSummary, MissionLineage, MAX_CHILD_MISSION_DEPTH, MAX_CHILD_MISSION_DESCENDANTS,
-    MAX_CHILD_MISSION_OBJECTIVE_BYTES, MAX_CHILD_MISSION_REQUEST_BYTES,
+    child_failure_digest, ChildMissionAssignment, ChildMissionDependencyRef, ChildMissionOutput,
+    ChildMissionReceipt, ChildMissionRequest, ChildProofSummary, MissionLineage,
+    MAX_CHILD_MISSION_DEPTH, MAX_CHILD_MISSION_DESCENDANTS, MAX_CHILD_MISSION_OBJECTIVE_BYTES,
+    MAX_CHILD_MISSION_REQUEST_BYTES,
 };
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
@@ -49,12 +50,12 @@ pub use event::{
     role_success_contract_error, ArtifactOutcome, BlobRef, ContinueMode, ControlAction,
     DecisionAction, EffectEventClass, EffectResource, EnvironmentAssignment, EnvironmentPreflight,
     EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff, MessageReference, MissionConfig,
-    MissionEvent, MissionProposal, MissionSkill, MissionTypeRef, OracleRunSuccess, PayloadRef,
-    PreparedInputRef, RecoveryConfig, ReportEvidenceRef, RoleInstrumentIdentity,
-    RolePromptTemplate, RoleProofFreshness, RoleTurnSuccess, RuntimeConfigurationEvidence,
-    RuntimeInstrumentIdentity, SkillInstrumentIdentity, StopBar, TaskCandidateRef,
-    UnavailableReferenceCause, ValidationItem, VersionStamps, WorkspacePreparation,
-    MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES,
+    MissionDependencyInput, MissionEvent, MissionProposal, MissionSkill, MissionTypeRef,
+    OracleRunSuccess, PayloadRef, PreparedInputRef, RecoveryConfig, ReportEvidenceRef,
+    RoleInstrumentIdentity, RolePromptTemplate, RoleProofFreshness, RoleTurnSuccess,
+    RuntimeConfigurationEvidence, RuntimeInstrumentIdentity, SkillInstrumentIdentity, StopBar,
+    TaskCandidateRef, UnavailableReferenceCause, ValidationItem, VersionStamps,
+    WorkspacePreparation, MAX_EXECUTION_DURATION_SECS, MAX_FINAL_RESPONSE_BYTES, MAX_MESSAGE_BYTES,
     MAX_MESSAGE_RECIPIENTS, MAX_MESSAGE_REFERENCES, MAX_QUEUED_MESSAGES_PER_CONVERSATION,
     MAX_ROLE_REPORT_BYTES, SCHEMA_VERSION,
 };

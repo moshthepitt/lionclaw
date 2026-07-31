@@ -24,9 +24,8 @@ use crate::{
     NetworkGrant, RuntimeUsage, TypedFailure, TypedFailureEvidence,
 };
 
-/// Version 41 records kernel-owned mission lineage and typed child mission
-/// request, binding, receipt, and cleanup facts.
-pub const SCHEMA_VERSION: u32 = 41;
+/// Version 42 records immutable task inputs inherited by a child mission.
+pub const SCHEMA_VERSION: u32 = 42;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -537,6 +536,43 @@ pub struct TaskCandidateRef {
     pub sha: String,
 }
 
+/// Immutable ordinary-task input attached to a mission at creation. The
+/// content-bound child request carries only digests; the kernel resolves these
+/// payloads from folded parent receipts before recording this generic input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissionDependencyInput {
+    pub task_id: TaskId,
+    pub effect_id: super::EffectId,
+    pub candidate_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<PayloadRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TypedFailure>,
+}
+
+impl MissionDependencyInput {
+    pub fn candidate_ref(&self) -> TaskCandidateRef {
+        TaskCandidateRef {
+            task_id: self.task_id.clone(),
+            sha: self.candidate_sha.clone(),
+        }
+    }
+
+    pub fn child_ref(&self) -> Option<super::ChildMissionDependencyRef> {
+        Some(super::ChildMissionDependencyRef {
+            task_id: self.task_id.clone(),
+            effect_id: self.effect_id.clone(),
+            candidate_sha: self.candidate_sha.clone(),
+            report_sha256: self.report.as_ref().and_then(PayloadRef::content_sha256),
+            failure_sha256: match &self.failure {
+                Some(failure) => Some(super::child_failure_digest(failure)?),
+                None => None,
+            },
+        })
+    }
+}
+
 /// Exact report deliverable identity presented to a judgment role. Report
 /// bytes remain in their producer receipt; the request binds their digest and
 /// producer effect so replay and proof freshness cannot substitute content.
@@ -684,6 +720,9 @@ pub enum MissionEvent {
         /// through the child assignment contract.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lineage: Option<super::MissionLineage>,
+    },
+    MissionInputRecorded {
+        dependencies: Vec<MissionDependencyInput>,
     },
     ProposalRecorded {
         proposal: Box<MissionProposal>,
@@ -938,6 +977,7 @@ impl MissionEvent {
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::MissionCreated { .. } => "mission_created",
+            Self::MissionInputRecorded { .. } => "mission_input_recorded",
             Self::ProposalRecorded { .. } => "proposal_recorded",
             Self::TeamConfigured { .. } => "team_configured",
             Self::SkillAdded { .. } => "skill_added",
@@ -980,6 +1020,7 @@ impl MissionEvent {
             // Facts are not members of the request/outcome pair, even when
             // they identify the effect they describe. Exhaustive on purpose.
             Self::MissionCreated { .. }
+            | Self::MissionInputRecorded { .. }
             | Self::ProposalRecorded { .. }
             | Self::TeamConfigured { .. }
             | Self::SkillAdded { .. }

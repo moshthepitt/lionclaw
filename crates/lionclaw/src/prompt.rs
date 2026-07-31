@@ -170,6 +170,8 @@ pub struct PlanningPromptContext<'a> {
     pub task_body: &'a str,
     /// Reports supplied to this planning turn by the lead.
     pub upstream_reports: &'a [String],
+    /// Exact upstream artifact identities inherited by this mission or task.
+    pub upstream_refs: &'a [TaskCandidateRef],
     /// Accepted team guidance.
     pub guidance: &'a str,
     /// Rework for this planning role's current attempt, separate from the
@@ -270,6 +272,12 @@ fn render_planning(role: &RoleInstance, ctx: &PlanningPromptContext<'_>) -> Stri
         prompt.push_str("\n\n## Upstream planning reports\n\n");
         for report in ctx.upstream_reports {
             prompt.push_str(&format!("- {report}\n"));
+        }
+    }
+    if !ctx.upstream_refs.is_empty() {
+        prompt.push_str("\n\n## Upstream task candidate refs\n\n");
+        for candidate in ctx.upstream_refs {
+            prompt.push_str(&format!("- {}: {}\n", candidate.task_id, candidate.sha));
         }
     }
     if !ctx.guidance.is_empty() {
@@ -697,6 +705,7 @@ mod team_prompt_tests {
                 max_oracle_timeout_secs: 3600,
                 task_body: "plan it",
                 upstream_reports: &[],
+                upstream_refs: &[],
                 guidance,
                 task_feedback: &[],
             },

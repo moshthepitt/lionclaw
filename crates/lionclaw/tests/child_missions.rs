@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -122,40 +122,153 @@ fn parent_proposal_with_assignment(assignment: ChildMissionAssignment) -> Missio
     }
 }
 
+fn report_dependency_plan() -> lionclaw::model::Plan {
+    use lionclaw::model::{Assertion, Requirement, RequirementDisposition, RequirementKind, Task};
+
+    let delegated_assertion = lionclaw::model::AssertionId::new("DELEGATED-REPORT").unwrap();
+    let consumed_assertion = lionclaw::model::AssertionId::new("REPORT-CONSUMED").unwrap();
+    let delegated_task = TaskId::new("delegated").unwrap();
+    let consumed_task = TaskId::new("consume").unwrap();
+    lionclaw::model::Plan {
+        requirements: vec![
+            Requirement {
+                id: lionclaw::model::RequirementId::new("DELEGATE-WORK").unwrap(),
+                kind: RequirementKind::Capability,
+                prose: "delegate report production".into(),
+                disposition: RequirementDisposition::ConfinedProvable {
+                    assertion_ids: vec![delegated_assertion.clone()],
+                },
+            },
+            Requirement {
+                id: lionclaw::model::RequirementId::new("CONSUME-REPORT").unwrap(),
+                kind: RequirementKind::Capability,
+                prose: "consume the delegated report".into(),
+                disposition: RequirementDisposition::ConfinedProvable {
+                    assertion_ids: vec![consumed_assertion.clone()],
+                },
+            },
+        ],
+        assertions: vec![
+            Assertion {
+                id: delegated_assertion.clone(),
+                prose: "the child produces its report".into(),
+                oracle: Some(lionclaw::model::OracleName::new("child-report").unwrap()),
+            },
+            Assertion {
+                id: consumed_assertion.clone(),
+                prose: "the downstream role consumes the child report".into(),
+                oracle: Some(lionclaw::model::OracleName::new("report-consumer").unwrap()),
+            },
+        ],
+        tasks: vec![
+            Task {
+                id: delegated_task.clone(),
+                body: "Produce the delegated report.".into(),
+                targets: vec![delegated_assertion],
+                depends_on: Vec::new(),
+            },
+            Task {
+                id: consumed_task.clone(),
+                body: "Consume delegated report.".into(),
+                targets: vec![consumed_assertion],
+                depends_on: vec![delegated_task.clone()],
+            },
+        ],
+    }
+}
+
+fn parent_report_dependency_proposal() -> MissionProposal {
+    let plan = report_dependency_plan();
+    let delegated_task = TaskId::new("delegated").unwrap();
+    let mut parent_team = team(1, Some(&plan), false);
+    let implementer = parent_team
+        .roles
+        .get_mut(&RoleInstanceId::new("implementer").unwrap())
+        .unwrap();
+    implementer.output = OutputSemantics::ProducesReport;
+    implementer.grants.writes = false;
+    parent_team.task_assignments.insert(
+        delegated_task,
+        TaskAssignment::ChildMission {
+            mission: Box::new(child_assignment(OutputSemantics::ProducesReport)),
+        },
+    );
+    MissionProposal {
+        plan: Some(PlanProposal {
+            base_revision: 0,
+            requirement_changes: Vec::new(),
+            assertion_supersessions: Vec::new(),
+            plan: plan.clone(),
+        }),
+        team: Some(parent_team),
+        oracles: Some(common::oracle_specs(&plan)),
+    }
+}
+
+fn child_with_report_dependency_proposal() -> MissionProposal {
+    let plan = report_dependency_plan();
+    let consumed_task = TaskId::new("consume").unwrap();
+    let mut parent_team = team(1, Some(&plan), false);
+    let implementer = parent_team
+        .roles
+        .get_mut(&RoleInstanceId::new("implementer").unwrap())
+        .unwrap();
+    implementer.output = OutputSemantics::ProducesReport;
+    implementer.grants.writes = false;
+    parent_team.task_assignments.insert(
+        consumed_task,
+        TaskAssignment::ChildMission {
+            mission: Box::new(child_assignment(OutputSemantics::ProducesReport)),
+        },
+    );
+    MissionProposal {
+        plan: Some(PlanProposal {
+            base_revision: 0,
+            requirement_changes: Vec::new(),
+            assertion_supersessions: Vec::new(),
+            plan: plan.clone(),
+        }),
+        team: Some(parent_team),
+        oracles: Some(common::oracle_specs(&plan)),
+    }
+}
+
+fn successful_outcome(request: &RoleTurnRequest) -> Result<RoleTurnOutcome, TypedFailure> {
+    let handoff = match request.role.output {
+        OutputSemantics::EmitsVerdict => Handoff::Validate {
+            done: true,
+            report: PayloadRef::inline("independent judgment passed"),
+            items: request
+                .assertion_ids
+                .iter()
+                .cloned()
+                .map(|item_id| lionclaw::model::ValidationItem {
+                    item_id,
+                    passed: true,
+                })
+                .collect(),
+            passed: true,
+            request_attention: false,
+        },
+        OutputSemantics::ProducesReport | OutputSemantics::ProducesArtifact => Handoff::Work {
+            done: true,
+            report: PayloadRef::inline("delegated task output"),
+            request_attention: false,
+        },
+        other => panic!("unexpected child runtime output {other:?}"),
+    };
+    Ok(RoleTurnOutcome {
+        handoff: Some(handoff),
+        artifact: None,
+        prepared_inputs: Vec::new(),
+        runtime_configuration: Default::default(),
+        runtime_usage: Default::default(),
+        final_response: "completed".into(),
+    })
+}
+
 fn successful_runner() -> MockRoleRunner {
-    MockRoleRunner::new(Box::new(|request| {
-        let handoff = match request.role.output {
-            OutputSemantics::EmitsVerdict => Handoff::Validate {
-                done: true,
-                report: PayloadRef::inline("independent judgment passed"),
-                items: request
-                    .assertion_ids
-                    .iter()
-                    .cloned()
-                    .map(|item_id| lionclaw::model::ValidationItem {
-                        item_id,
-                        passed: true,
-                    })
-                    .collect(),
-                passed: true,
-                request_attention: false,
-            },
-            OutputSemantics::ProducesReport | OutputSemantics::ProducesArtifact => Handoff::Work {
-                done: true,
-                report: PayloadRef::inline("delegated task output"),
-                request_attention: false,
-            },
-            other => panic!("unexpected child runtime output {other:?}"),
-        };
-        Ok(RoleTurnOutcome {
-            handoff: Some(handoff),
-            artifact: None,
-            prepared_inputs: Vec::new(),
-            runtime_configuration: Default::default(),
-            runtime_usage: Default::default(),
-            final_response: "completed".into(),
-        })
-    }))
+    MockRoleRunner::new(Box::new(successful_outcome))
 }
 
 struct BlockingChildRunner {
@@ -483,6 +596,42 @@ async fn setup_with_proposal(
     let directory = tempfile::tempdir().unwrap();
     initialize_repository(directory.path());
     let harness = common::harness(directory.path(), runner, MockOracleRunner::exiting(0)).await;
+    let mission = harness
+        .engine
+        .create_mission(
+            directory.path().to_str().unwrap(),
+            "delegate through the same machine",
+            BASE_SHA,
+        )
+        .await
+        .unwrap();
+    harness
+        .engine
+        .propose_plan(&mission, proposal)
+        .await
+        .unwrap();
+    approve_plan(&harness.engine, &mission).await;
+    (directory, harness, mission)
+}
+
+async fn setup_with_parent_recovery(
+    runner: MockRoleRunner,
+    proposal: MissionProposal,
+    max_attempts: u32,
+) -> (tempfile::TempDir, common::TestHarness, MissionId) {
+    let directory = tempfile::tempdir().unwrap();
+    initialize_repository(directory.path());
+    let mut mission_type = test_mission_type();
+    mission_type.edit_for_testing(|definition| {
+        definition.recovery.max_attempts = max_attempts;
+    });
+    let harness = common::harness_with_type(
+        directory.path(),
+        mission_type,
+        runner,
+        MockOracleRunner::exiting(0),
+    )
+    .await;
     let mission = harness
         .engine
         .create_mission(
@@ -845,6 +994,17 @@ async fn nested_children_execute_with_deterministic_kernel_lineage() {
     .await;
 
     advance_until_finish(&harness.engine, &parent_id).await;
+    let parent = harness.engine.load_state(&parent_id).await.unwrap();
+    assert_eq!(parent.descendant_count(), 2);
+    assert_eq!(
+        parent
+            .child_mission_receipts
+            .values()
+            .next()
+            .unwrap()
+            .descendant_count,
+        1
+    );
     let store = MissionStore::open(directory.path()).await.unwrap();
     let mission_ids = store.list_missions().await.unwrap();
     assert_eq!(mission_ids.len(), 3);
@@ -858,6 +1018,182 @@ async fn nested_children_execute_with_deterministic_kernel_lineage() {
     }
     depths.sort();
     assert_eq!(depths, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn report_child_handoff_reaches_an_ordinary_downstream_role() {
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let observed = prompts.clone();
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        observed.lock().unwrap().push(request.prompt.clone());
+        successful_outcome(request)
+    }));
+    let (_directory, harness, parent_id) = setup_with_proposal(
+        OutputSemantics::ProducesReport,
+        runner,
+        parent_report_dependency_proposal(),
+    )
+    .await;
+
+    for _ in 0..20 {
+        harness.engine.advance(&parent_id).await.unwrap();
+        if prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|prompt| prompt.contains("Consume delegated report."))
+        {
+            break;
+        }
+    }
+
+    let downstream = prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|prompt| prompt.contains("Consume delegated report."))
+        .cloned()
+        .expect("ordinary downstream role was dispatched");
+    assert!(downstream.contains("delegated task output"));
+}
+
+#[tokio::test]
+async fn report_child_handoff_reaches_the_parent_independent_judge() {
+    let directory = tempfile::tempdir().unwrap();
+    initialize_repository(directory.path());
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let observed = prompts.clone();
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        observed.lock().unwrap().push(request.prompt.clone());
+        successful_outcome(request)
+    }));
+    let mut mission_type = test_mission_type();
+    mission_type
+        .edit_for_testing(|definition| definition.stop = lionclaw::model::StopBar::Attested);
+    let harness = common::harness_with_type(
+        directory.path(),
+        mission_type,
+        runner,
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let parent_id = harness
+        .engine
+        .create_mission(
+            directory.path().to_str().unwrap(),
+            "judge a delegated report independently",
+            BASE_SHA,
+        )
+        .await
+        .unwrap();
+    let plan = common::advisory_plan();
+    let mut parent_team = team(1, Some(&plan), false);
+    parent_team.task_assignments.insert(
+        TaskId::new("write").unwrap(),
+        TaskAssignment::ChildMission {
+            mission: Box::new(child_assignment(OutputSemantics::ProducesReport)),
+        },
+    );
+    harness
+        .engine
+        .propose_plan(
+            &parent_id,
+            MissionProposal {
+                plan: Some(PlanProposal {
+                    base_revision: 0,
+                    requirement_changes: Vec::new(),
+                    assertion_supersessions: Vec::new(),
+                    plan,
+                }),
+                team: Some(parent_team),
+                oracles: Some(BTreeMap::new()),
+            },
+        )
+        .await
+        .unwrap();
+    approve_plan(&harness.engine, &parent_id).await;
+
+    for _ in 0..20 {
+        harness.engine.advance(&parent_id).await.unwrap();
+        if prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|prompt| prompt.contains("## Untrusted report deliverables"))
+        {
+            break;
+        }
+    }
+
+    let judgment = prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|prompt| prompt.contains("## Untrusted report deliverables"))
+        .cloned()
+        .expect("parent judgment role was dispatched");
+    assert!(judgment.contains("delegated task output"));
+}
+
+#[tokio::test]
+async fn report_dependency_reaches_child_through_ordinary_mission_input() {
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let observed = prompts.clone();
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        observed.lock().unwrap().push(request.prompt.clone());
+        successful_outcome(request)
+    }));
+    let (_directory, harness, parent_id) = setup_with_proposal(
+        OutputSemantics::ProducesReport,
+        runner,
+        child_with_report_dependency_proposal(),
+    )
+    .await;
+
+    for _ in 0..20 {
+        harness.engine.advance(&parent_id).await.unwrap();
+        if prompts.lock().unwrap().iter().any(|prompt| {
+            prompt.contains("run the delegated proof-bearing task")
+                && prompt.contains("Make the failing test pass.")
+        }) {
+            break;
+        }
+    }
+
+    let child_prompt = prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|prompt| {
+            prompt.contains("run the delegated proof-bearing task")
+                && prompt.contains("Make the failing test pass.")
+        })
+        .cloned()
+        .expect("child worker was dispatched");
+    assert!(child_prompt.contains("delegated task output"));
+
+    let mut replayed = harness.engine.load_state(&parent_id).await.unwrap();
+    let dependency = TaskId::new("delegated").unwrap();
+    let child_task = TaskId::new("consume").unwrap();
+    let effect_id = replayed.tasks[&dependency]
+        .cleared_outcome()
+        .unwrap()
+        .effect_id()
+        .clone();
+    let lionclaw::model::RoleEffectSource::Turn { request, .. } =
+        &replayed.role_attempt_receipts[&effect_id].source;
+    replayed
+        .team_history
+        .get_mut(&request.team_revision)
+        .unwrap()
+        .roles
+        .get_mut(&request.role_instance)
+        .unwrap()
+        .grants
+        .secrets = true;
+    assert!(replayed
+        .child_mission_dependency_refs(&child_task)
+        .is_none());
 }
 
 #[tokio::test]
@@ -892,7 +1228,9 @@ async fn failed_child_parks_on_existing_retry_decision_and_new_attempt_gets_new_
             final_response: "judged".into(),
         })
     }));
-    let (directory, harness, parent_id) = setup(OutputSemantics::ProducesReport, runner).await;
+    let (directory, harness, parent_id) =
+        setup_with_parent_recovery(runner, parent_proposal(OutputSemantics::ProducesReport), 2)
+            .await;
     let first = projected_child_request(&harness.engine.load_state(&parent_id).await.unwrap());
     for _ in 0..12 {
         let state = harness.engine.advance(&parent_id).await.unwrap().state;
@@ -939,9 +1277,11 @@ async fn failed_child_parks_on_existing_retry_decision_and_new_attempt_gets_new_
 
     for _ in 0..12 {
         let state = harness.engine.advance(&parent_id).await.unwrap().state;
-        if state
-            .child_mission_receipts
-            .contains_key(&second.parent_effect_id)
+        if state.tasks[&second.task_id].status == TaskStatus::Failed
+            && state
+                .child_mission_receipts
+                .contains_key(&second.parent_effect_id)
+            && next(&state).effects.is_empty()
         {
             break;
         }
@@ -959,5 +1299,17 @@ async fn failed_child_parks_on_existing_retry_decision_and_new_attempt_gets_new_
             .unwrap()
             .len(),
         3
+    );
+    let projected = next(&retried);
+    assert!(
+        !projected.choices.iter().any(|choice| matches!(
+            choice,
+            Choice::Decide {
+                id,
+                action: DecisionAction::Retry,
+            } if id == &format!("node_failed:{}", second.task_id)
+        )),
+        "a child task must not advertise an attempt beyond its reserved retry budget: {:?}",
+        projected.choices
     );
 }

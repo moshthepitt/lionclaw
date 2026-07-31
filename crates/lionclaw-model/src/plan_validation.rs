@@ -43,6 +43,16 @@ pub fn validate_plan(
     oracles: &BTreeMap<OracleName, OracleSpec>,
     config: &MissionConfig,
 ) -> Vec<PlanValidationError> {
+    validate_plan_with_descendant_usage(plan, team, oracles, config, 0)
+}
+
+pub(crate) fn validate_plan_with_descendant_usage(
+    plan: &Plan,
+    team: &TeamRevision,
+    oracles: &BTreeMap<OracleName, OracleSpec>,
+    config: &MissionConfig,
+    descendant_usage: u64,
+) -> Vec<PlanValidationError> {
     // Group 0: emptiness (zenith empty_contract / empty_task_list).
     if plan.assertions.is_empty() {
         return vec![err(
@@ -72,7 +82,7 @@ pub fn validate_plan(
         return errors;
     }
     // Group 3: work shape plus team/oracle resolution.
-    let errors = check_shape(plan, team, oracles, config);
+    let errors = check_shape(plan, team, oracles, config, descendant_usage);
     if !errors.is_empty() {
         return errors;
     }
@@ -269,7 +279,13 @@ pub fn validate_plan_proposal(
             "mission has no accepted team revision",
         )]));
     };
-    let errors = validate_plan(&proposal.plan, team, &state.oracles, &state.config);
+    let errors = validate_plan_with_descendant_usage(
+        &proposal.plan,
+        team,
+        &state.oracles,
+        &state.config,
+        state.descendant_count(),
+    );
     if errors.is_empty() {
         Ok(())
     } else {
@@ -317,6 +333,25 @@ pub fn validate_mission_proposal(
                 format!("proposed team must be complete revision {expected} within ceilings"),
             )]));
         }
+        if (state.lineage.is_some() || team_has_child_mission(team)) && team_has_secret_grants(team)
+        {
+            return Err(ProposalError::Invalid(vec![err(
+                "child_secret_grant_forbidden",
+                "missions that author or execute child work must use secret-free role grants",
+            )]));
+        }
+        if team_has_child_mission(team)
+            && state
+                .team
+                .as_ref()
+                .and_then(|current| current.role(&current.planning_assignment))
+                .is_some_and(|planner| planner.grants.secrets)
+        {
+            return Err(ProposalError::Invalid(vec![err(
+                "child_author_secret_grant_forbidden",
+                "a secret-bearing planning role cannot author child mission assignments",
+            )]));
+        }
     }
     if let Some(plan) = &proposal.plan {
         validate_plan_transition(state, plan, oracle_change)?;
@@ -358,7 +393,13 @@ pub fn validate_mission_proposal(
         .map(|candidate| &candidate.plan)
         .or(state.plan.as_ref());
     if let Some(plan) = plan {
-        let errors = validate_plan(plan, team, oracles, &state.config);
+        let errors = validate_plan_with_descendant_usage(
+            plan,
+            team,
+            oracles,
+            &state.config,
+            state.descendant_count(),
+        );
         if !errors.is_empty() {
             return Err(ProposalError::Invalid(errors));
         }
@@ -705,11 +746,18 @@ fn check_shape(
     team: &TeamRevision,
     oracles: &BTreeMap<OracleName, OracleSpec>,
     config: &MissionConfig,
+    descendant_usage: u64,
 ) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
     if let Err(detail) = team.validate_shape() {
         errors.push(err("invalid_team", detail));
         return errors;
+    }
+    if team_has_child_mission(team) && team_has_secret_grants(team) {
+        errors.push(err(
+            "child_secret_grant_forbidden",
+            "missions that author child work must use secret-free role grants",
+        ));
     }
     for (id, role) in &team.roles {
         if !config.runtime_ceilings.is_empty() && !config.runtime_ceilings.contains(&role.runtime) {
@@ -861,6 +909,7 @@ fn check_shape(
             ));
         }
     }
+    let legal_attempts = config.recovery.max_attempts.max(1);
     let descendant_reservation = team
         .task_assignments
         .values()
@@ -868,15 +917,16 @@ fn check_shape(
         .map(|mission| {
             u64::from(mission.config.execution.max_descendants)
                 .saturating_add(1)
-                .saturating_mul(u64::from(config.recovery.max_attempts))
+                .saturating_mul(u64::from(legal_attempts))
         })
         .sum::<u64>();
-    if descendant_reservation > u64::from(config.execution.max_descendants) {
+    let required_descendants = descendant_usage.saturating_add(descendant_reservation);
+    if required_descendants > u64::from(config.execution.max_descendants) {
         errors.push(err(
             "descendant_limit_exceeded",
             format!(
-                "plan reserves {descendant_reservation} descendants across {} legal task attempts above mission limit {}",
-                config.recovery.max_attempts, config.execution.max_descendants
+                "mission has {descendant_usage} descendants and the plan reserves {descendant_reservation} more across {legal_attempts} legal task attempts above mission limit {}",
+                config.execution.max_descendants
             ),
         ));
     }
@@ -975,6 +1025,9 @@ fn validate_child_assignment(
             format!("task '{task_id}' child mission: {}", details.join("; ")),
         )];
     };
+    if team_has_secret_grants(team) {
+        details.push("child team role grants must be secret-free".to_string());
+    }
     if plan.base_revision != 0
         || !plan.requirement_changes.is_empty()
         || !plan.assertion_supersessions.is_empty()
@@ -1025,6 +1078,16 @@ fn validate_child_assignment(
             format!("task '{task_id}' child mission: {}", details.join("; ")),
         )]
     }
+}
+
+fn team_has_child_mission(team: &TeamRevision) -> bool {
+    team.task_assignments
+        .values()
+        .any(|assignment| matches!(assignment, TaskAssignment::ChildMission { .. }))
+}
+
+fn team_has_secret_grants(team: &TeamRevision) -> bool {
+    team.roles.values().any(|role| role.grants.secrets)
 }
 
 fn check_deps_resolve(plan: &Plan) -> Vec<PlanValidationError> {
@@ -1289,7 +1352,7 @@ mod topology_tests {
         team.roles.insert(reporter.id.clone(), reporter);
 
         assert!(
-            !check_shape(&plan, &team, &BTreeMap::new(), &MissionConfig::default())
+            !check_shape(&plan, &team, &BTreeMap::new(), &MissionConfig::default(), 0,)
                 .iter()
                 .any(|error| error.code == "task_output_mismatch")
         );
@@ -1317,7 +1380,7 @@ mod topology_tests {
         team.roles.insert(reporter.id.clone(), reporter);
 
         assert!(
-            !check_shape(&plan, &team, &BTreeMap::new(), &MissionConfig::default())
+            !check_shape(&plan, &team, &BTreeMap::new(), &MissionConfig::default(), 0,)
                 .iter()
                 .any(|error| error.code == "read_only_task_fan_in")
         );

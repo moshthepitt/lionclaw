@@ -1397,16 +1397,22 @@ impl Engine {
         let runtime_identities = self.resolve_team_runtime_identities(team)?;
         let proposal_json = serde_json::to_vec(&request.assignment.proposal)?;
         let proposal_hash = hex::encode(Sha256::digest(&proposal_json));
-        let events = [
-            NewEvent::new(MissionEvent::MissionCreated {
-                objective: request.assignment.objective.clone(),
-                mission_type: parent.mission_type.clone(),
-                image_id: parent.image_id.clone(),
-                workspace_dir: parent.workspace_dir.clone(),
-                base_sha: request.input_artifact.clone(),
-                config: request.assignment.config.clone(),
-                lineage: Some(lineage),
-            }),
+        let mission_inputs = self.resolve_child_mission_inputs(parent, request)?;
+        let mut events = vec![NewEvent::new(MissionEvent::MissionCreated {
+            objective: request.assignment.objective.clone(),
+            mission_type: parent.mission_type.clone(),
+            image_id: parent.image_id.clone(),
+            workspace_dir: parent.workspace_dir.clone(),
+            base_sha: request.input_artifact.clone(),
+            config: request.assignment.config.clone(),
+            lineage: Some(lineage),
+        })];
+        if !mission_inputs.is_empty() {
+            events.push(NewEvent::new(MissionEvent::MissionInputRecorded {
+                dependencies: mission_inputs,
+            }));
+        }
+        events.extend([
             NewEvent::new(MissionEvent::ProposalRecorded {
                 proposal: request.assignment.proposal.clone(),
                 proposal_hash,
@@ -1418,7 +1424,7 @@ impl Engine {
                 requirement_changes: Vec::new(),
                 proposal_runtime_identities: runtime_identities,
             }),
-        ];
+        ]);
         match self
             .store
             .create_mission_with_events(
@@ -1508,6 +1514,50 @@ impl Engine {
         Ok(())
     }
 
+    fn resolve_child_mission_inputs(
+        &self,
+        parent: &MissionState,
+        request: &ChildMissionRequest,
+    ) -> Result<Vec<crate::model::MissionDependencyInput>> {
+        let expected = parent
+            .child_mission_dependency_refs(&request.task_id)
+            .context("child request task dependencies are not cleared")?;
+        ensure!(
+            expected == request.dependencies,
+            "child request dependency inputs drifted from folded parent truth"
+        );
+        request
+            .dependencies
+            .iter()
+            .map(|reference| {
+                let report = parent
+                    .accepted_task_report(&reference.effect_id)
+                    .cloned()
+                    .map(|payload| self.store.blobs().externalize(payload))
+                    .transpose()?;
+                ensure!(
+                    report.as_ref().and_then(PayloadRef::content_sha256) == reference.report_sha256,
+                    "child request report input digest drifted"
+                );
+                let failure = parent.task_attempt_failure(&reference.effect_id).cloned();
+                ensure!(
+                    failure
+                        .as_ref()
+                        .and_then(crate::model::child_failure_digest)
+                        == reference.failure_sha256,
+                    "child request failure input digest drifted"
+                );
+                Ok(crate::model::MissionDependencyInput {
+                    task_id: reference.task_id.clone(),
+                    effect_id: reference.effect_id.clone(),
+                    candidate_sha: reference.candidate_sha.clone(),
+                    report,
+                    failure,
+                })
+            })
+            .collect()
+    }
+
     fn ensure_child_matches_request(
         &self,
         parent: &MissionState,
@@ -1557,6 +1607,16 @@ impl Engine {
         ensure!(
             child.lineage.as_ref() == Some(&expected_lineage),
             "child lineage drift"
+        );
+        let child_inputs = child
+            .mission_inputs
+            .iter()
+            .map(crate::model::MissionDependencyInput::child_ref)
+            .collect::<Option<Vec<_>>>()
+            .context("child mission input is not content-addressable")?;
+        ensure!(
+            child_inputs == request.dependencies,
+            "child mission input drift"
         );
         ensure!(
             child.plan
@@ -1727,6 +1787,8 @@ impl Engine {
             request_digest: request.request_digest.clone(),
             input_artifact: request.input_artifact.clone(),
             terminal,
+            descendant_count: u32::try_from(child.descendant_count())
+                .context("child descendant count exceeds its bounded model")?,
             output,
             proof: ChildProofSummary {
                 finish: child.finish(),
@@ -2624,52 +2686,97 @@ impl Engine {
             else {
                 continue;
             };
-            let receipt = state
-                .role_attempt_receipts
-                .get(outcome.effect_id())
-                .context("cleared dependency points to a missing role-attempt receipt")?;
-            let (prefix, report) = match outcome {
-                crate::model::TaskAttemptOutcome::Accepted { .. } => (
-                    String::new(),
-                    Some(receipt.accepted_report().context(
-                        "accepted dependency outcome does not contain an accepted handoff",
-                    )?),
-                ),
+            ensure!(
+                state
+                    .role_attempt_receipts
+                    .contains_key(outcome.effect_id())
+                    || state
+                        .child_mission_receipts
+                        .contains_key(outcome.effect_id()),
+                "cleared dependency points to a missing task receipt"
+            );
+            let (failure, report) = match outcome {
+                crate::model::TaskAttemptOutcome::Accepted { .. } => {
+                    let report = state.accepted_task_report(outcome.effect_id());
+                    if state.team.as_ref().and_then(|team| team.task_output(dep))
+                        == Some(OutputSemantics::ProducesReport)
+                    {
+                        report.context(
+                            "accepted report dependency outcome does not contain an accepted handoff",
+                        )?;
+                    }
+                    (None, report)
+                }
                 crate::model::TaskAttemptOutcome::Failed { .. } => {
-                    let failure = receipt
-                        .failure()
+                    let failure = state
+                        .task_attempt_failure(outcome.effect_id())
                         .context("failed dependency receipt has no failure")?;
                     (
-                        format!(
-                            "Lead accepted failed dependency '{dep}' ({}): {}",
-                            failure.category(),
-                            failure.detail()
-                        ),
-                        receipt.accepted_report(),
+                        Some(failure),
+                        state.accepted_task_report(outcome.effect_id()),
                     )
                 }
             };
-            if prefix.len() > remaining {
-                bail!("accepted upstream outcomes exceeded their aggregate prompt budget");
-            }
-            remaining -= prefix.len();
-            let Some(report) = report else {
-                reports.push(prefix);
-                continue;
-            };
-            let resolved = self
-                .store
-                .blobs()
-                .resolve_bounded(report, remaining)
-                .context("accepted upstream reports exceeded their aggregate prompt budget")?;
-            remaining -= resolved.len();
-            reports.push(if prefix.is_empty() {
-                resolved
-            } else {
-                format!("{prefix}\nRetained handoff report:\n{resolved}")
-            });
+            self.push_resolved_task_input(&mut reports, &mut remaining, dep, failure, report)?;
         }
         Ok(reports)
+    }
+
+    fn resolve_mission_input_reports(&self, state: &MissionState) -> Result<Vec<String>> {
+        const MAX_MISSION_INPUT_BYTES: usize =
+            crate::model::MAX_TASK_DEPENDENCIES * MAX_ROLE_REPORT_BYTES;
+        let mut reports = Vec::with_capacity(state.mission_inputs.len());
+        let mut remaining = MAX_MISSION_INPUT_BYTES;
+        for input in &state.mission_inputs {
+            self.push_resolved_task_input(
+                &mut reports,
+                &mut remaining,
+                &input.task_id,
+                input.failure.as_ref(),
+                input.report.as_ref(),
+            )?;
+        }
+        Ok(reports)
+    }
+
+    fn push_resolved_task_input(
+        &self,
+        reports: &mut Vec<String>,
+        remaining: &mut usize,
+        task_id: &TaskId,
+        failure: Option<&TypedFailure>,
+        report: Option<&PayloadRef>,
+    ) -> Result<()> {
+        let prefix = failure.map_or_else(String::new, |failure| {
+            format!(
+                "Lead accepted failed dependency '{task_id}' ({}): {}",
+                failure.category(),
+                failure.detail()
+            )
+        });
+        ensure!(
+            prefix.len() <= *remaining,
+            "accepted upstream outcomes exceeded their aggregate prompt budget"
+        );
+        *remaining -= prefix.len();
+        let Some(report) = report else {
+            if !prefix.is_empty() {
+                reports.push(prefix);
+            }
+            return Ok(());
+        };
+        let resolved = self
+            .store
+            .blobs()
+            .resolve_bounded(report, *remaining)
+            .context("accepted upstream reports exceeded their aggregate prompt budget")?;
+        *remaining -= resolved.len();
+        reports.push(if prefix.is_empty() {
+            resolved
+        } else {
+            format!("{prefix}\nRetained handoff report:\n{resolved}")
+        });
+        Ok(())
     }
 
     fn resolve_task_feedback(&self, state: &MissionState, task_id: &TaskId) -> Result<Vec<String>> {
@@ -2703,18 +2810,14 @@ impl Engine {
         let mut remaining = MAX_JUDGMENT_REPORT_BYTES;
         let mut reports = Vec::with_capacity(report_refs.len());
         for reference in report_refs {
-            let receipt = state
-                .role_attempt_receipts
-                .get(&reference.effect_id)
+            let report = state
+                .accepted_task_report(&reference.effect_id)
                 .with_context(|| {
                     format!(
                         "judgment report task '{}' points to a missing producer receipt",
                         reference.task_id
                     )
                 })?;
-            let report = receipt
-                .accepted_report()
-                .context("judgment report producer has no accepted report")?;
             ensure!(
                 report.content_sha256().as_deref() == Some(&reference.report_sha256),
                 "judgment report digest differs from its durable request identity"
@@ -2752,7 +2855,10 @@ impl Engine {
             .iter()
             .find(|task| Some(&task.id) == intent.task_id.as_ref())
             .context("dispatched task not in plan")?;
-        let upstream_reports = self.resolve_upstream_reports(state, &task.depends_on)?;
+        let mut upstream_reports = self.resolve_mission_input_reports(state)?;
+        upstream_reports.extend(self.resolve_upstream_reports(state, &task.depends_on)?);
+        let mut upstream_refs = state.mission_input_dependency_refs();
+        upstream_refs.extend(intent.dependency_refs.iter().cloned());
         let mut feedback = state
             .tasks
             .contains_key(&task.id)
@@ -2767,7 +2873,7 @@ impl Engine {
                 task_body: &intent.body,
                 targets: &targets,
                 upstream_reports: &upstream_reports,
-                upstream_refs: &intent.dependency_refs,
+                upstream_refs: &upstream_refs,
                 guidance: state
                     .team
                     .as_ref()
@@ -2788,7 +2894,7 @@ impl Engine {
         intent: &RoleDispatchIntent,
         dialogue: &[String],
     ) -> Result<String> {
-        let (upstream_reports, mut task_feedback) =
+        let (task_reports, mut task_feedback) =
             if let (Some(plan), Some(task_id)) = (&state.plan, &intent.task_id) {
                 let task = plan
                     .tasks
@@ -2802,6 +2908,10 @@ impl Engine {
             } else {
                 (Vec::new(), Vec::new())
             };
+        let mut upstream_reports = self.resolve_mission_input_reports(state)?;
+        upstream_reports.extend(task_reports);
+        let mut upstream_refs = state.mission_input_dependency_refs();
+        upstream_refs.extend(intent.dependency_refs.iter().cloned());
         task_feedback.extend_from_slice(dialogue);
         let planning_input = self.resolve_planning_prompt_input(state)?;
         let prompt = render(TurnContext::Planning(
@@ -2823,6 +2933,7 @@ impl Engine {
                 max_oracle_timeout_secs: state.config.execution.max_task_time_secs,
                 task_body: &intent.body,
                 upstream_reports: &upstream_reports,
+                upstream_refs: &upstream_refs,
                 guidance: state
                     .team
                     .as_ref()
@@ -2972,6 +3083,8 @@ impl Engine {
                 request.parent_mission_id == state.mission_id,
                 "child request belongs to another parent mission"
             );
+            self.validate_child_lineage_admission(state, &request)
+                .await?;
             let initial_secs = state
                 .config
                 .execution

@@ -3,12 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use lionclaw_model::{
     apply, fold, next, resolve_execution_deadline_ms, ArtifactOutcome, Assertion, AssertionId,
     AuthorityCeilings, AuthorityGrants, ChildMissionAssignment, ChildMissionOutput,
-    ChildMissionReceipt, ChildProofSummary, ControlAction, DecisionAction, EffectIntent,
+    ChildMissionReceipt, ChildProofSummary, ControlAction, DecisionAction, EffectId, EffectIntent,
     EventEnvelope, ExecutionPolicy, FinishClass, MissionConfig, MissionEvent, MissionId,
     MissionProposal, MissionState, MissionTypeRef, NetworkGrant, OutputSemantics, PayloadRef, Plan,
     PlanProposal, RecoveryConfig, Requirement, RequirementDisposition, RequirementId,
     RequirementKind, RoleInstance, RoleInstanceId, RuntimeInstrumentIdentity, StopBar, Task,
-    TaskAssignment, TaskId, TaskStatus, TeamRevision, TerminalState, VersionStamps, SCHEMA_VERSION,
+    TaskAssignment, TaskId, TaskStatus, TeamRevision, TerminalState, TypedFailure, VersionStamps,
+    SCHEMA_VERSION,
 };
 
 fn id(raw: &str) -> RoleInstanceId {
@@ -433,7 +434,7 @@ fn child_subtree_reservation_prevents_parent_local_capacity_multiplication() {
 }
 
 #[test]
-fn child_request_has_kernel_lineage_and_secret_values_outside_its_schema() {
+fn child_request_schema_carries_secret_authority_without_secret_material_fields() {
     let mut events = parent_events(OutputSemantics::ProducesReport);
     if let MissionEvent::MissionCreated { config, .. } = &mut events[0].event {
         config.ceilings.secrets = true;
@@ -454,13 +455,86 @@ fn child_request_has_kernel_lineage_and_secret_values_outside_its_schema() {
     mission.config.ceilings.secrets = true;
     let request = projected_request(&fold(events).unwrap());
     let serialized = serde_json::to_string(&request).unwrap();
-    let operator_secret = "operator-only-secret-sentinel";
 
     assert!(serialized.contains("\"secrets\":true"));
-    assert!(!serialized.contains(operator_secret));
     assert!(!serialized.contains("secret_values"));
     assert!(!serialized.contains("lineage"));
     assert!(!serialized.contains("ancestry"));
+}
+
+#[test]
+fn child_authoring_and_execution_roles_must_be_secret_free() {
+    let mut state = fold(
+        parent_events(OutputSemantics::ProducesReport)[..2]
+            .iter()
+            .cloned(),
+    )
+    .unwrap();
+    state.config.ceilings.secrets = true;
+    let mut candidate = match &parent_events(OutputSemantics::ProducesReport)[2].event {
+        MissionEvent::ProposalRecorded { proposal, .. } => (**proposal).clone(),
+        _ => unreachable!(),
+    };
+    {
+        let TaskAssignment::ChildMission { mission } = candidate
+            .team
+            .as_mut()
+            .unwrap()
+            .task_assignments
+            .get_mut(&TaskId::new("parent-work").unwrap())
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        mission.config.ceilings.secrets = true;
+        mission
+            .proposal
+            .team
+            .as_mut()
+            .unwrap()
+            .roles
+            .get_mut(&id("child-worker"))
+            .unwrap()
+            .grants
+            .secrets = true;
+    }
+
+    let error = lionclaw_model::validate_mission_proposal(&state, &candidate).unwrap_err();
+    assert!(error.to_string().contains("secret-free"));
+
+    let TaskAssignment::ChildMission { mission } = candidate
+        .team
+        .as_mut()
+        .unwrap()
+        .task_assignments
+        .get_mut(&TaskId::new("parent-work").unwrap())
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    mission
+        .proposal
+        .team
+        .as_mut()
+        .unwrap()
+        .roles
+        .get_mut(&id("child-worker"))
+        .unwrap()
+        .grants
+        .secrets = false;
+    state
+        .team
+        .as_mut()
+        .unwrap()
+        .roles
+        .get_mut(&id("planner"))
+        .unwrap()
+        .grants
+        .secrets = true;
+    let error = lionclaw_model::validate_mission_proposal(&state, &candidate).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("secret-bearing planning role cannot author"));
 }
 
 #[test]
@@ -496,6 +570,7 @@ fn request_bind_receipt_and_cleanup_replay_without_promoting_child_proof() {
         terminal: TerminalState::Done {
             finish: FinishClass::Attested,
         },
+        descendant_count: 0,
         output: Some(ChildMissionOutput::Report {
             report,
             report_sha256,
@@ -597,6 +672,7 @@ fn durable_parent_stop_dominates_a_later_successful_child_receipt() {
                     terminal: TerminalState::Done {
                         finish: FinishClass::Attested,
                     },
+                    descendant_count: 0,
                     output: Some(ChildMissionOutput::Report {
                         report,
                         report_sha256,
@@ -656,11 +732,39 @@ fn descendant_admission_reserves_every_legal_child_attempt() {
     let mut limit_two = state.clone();
     limit_two.config.execution.max_descendants = 2;
     let error = lionclaw_model::validate_mission_proposal(&limit_two, &candidate).unwrap_err();
-    assert!(error.to_string().contains("reserves 3 descendants"));
+    assert!(error.to_string().contains("reserves 3 more"));
 
     let mut limit_three = state;
     limit_three.config.execution.max_descendants = 3;
     lionclaw_model::validate_mission_proposal(&limit_three, &candidate).unwrap();
+
+    let historical_effect = EffectId::for_parts(&["historical-child"]);
+    limit_three.child_mission_receipts.insert(
+        historical_effect.clone(),
+        ChildMissionReceipt {
+            parent_mission_id: limit_three.mission_id.clone(),
+            parent_effect_id: historical_effect,
+            child_mission_id: MissionId::parse("m111111111111").unwrap(),
+            request_digest: "historical-request".into(),
+            input_artifact: "parent-base".into(),
+            terminal: TerminalState::Aborted {
+                reason: "historical child failed".into(),
+            },
+            descendant_count: 0,
+            output: None,
+            proof: ChildProofSummary {
+                finish: None,
+                authoritative_receipt_digests: Vec::new(),
+                advisory_receipt_digests: Vec::new(),
+            },
+            failure: Some(TypedFailure::permanent(
+                "test.historical_child",
+                "historical child failed",
+            )),
+        },
+    );
+    let error = lionclaw_model::validate_mission_proposal(&limit_three, &candidate).unwrap_err();
+    assert!(error.to_string().contains("has 1 descendants"));
 }
 
 #[test]
@@ -699,6 +803,7 @@ fn artifact_child_settles_through_the_normal_task_candidate() {
                     terminal: TerminalState::Done {
                         finish: FinishClass::Attested,
                     },
+                    descendant_count: 0,
                     output: Some(ChildMissionOutput::Artifact {
                         artifact: ArtifactOutcome {
                             base_sha: request.input_artifact.clone(),

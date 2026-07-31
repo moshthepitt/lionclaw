@@ -16,8 +16,8 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 78 makes durable parent cancellation dominate child settlement.
-pub const REDUCER_VERSION: u32 = 78;
+/// Reducer 79 folds immutable mission inputs resolved from parent task truth.
+pub const REDUCER_VERSION: u32 = 79;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -53,6 +53,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         base_sha: base_sha.clone(),
         config: config.clone(),
         lineage: lineage.clone(),
+        mission_inputs: Vec::new(),
         team: None,
         team_history: BTreeMap::new(),
         runtime_identity_history: BTreeMap::new(),
@@ -98,6 +99,16 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     let seq = envelope.sequence_no;
     match &envelope.event {
         MissionEvent::MissionCreated { .. } => {}
+        MissionEvent::MissionInputRecorded { dependencies } => {
+            if state.lineage.is_some()
+                && !dependencies.is_empty()
+                && state.mission_inputs.is_empty()
+                && state.revision == 0
+                && state.inflight.is_empty()
+            {
+                state.mission_inputs = dependencies.clone();
+            }
+        }
         MissionEvent::TeamConfigured {
             team,
             runtime_identities,
@@ -563,7 +574,14 @@ fn apply_team(
         })
         || !runtime_identities_match_team(team, runtime_identities)
         || plan.is_some_and(|plan| {
-            !super::validate_plan(plan, team, &state.oracles, &state.config).is_empty()
+            !super::plan_validation::validate_plan_with_descendant_usage(
+                plan,
+                team,
+                &state.oracles,
+                &state.config,
+                state.descendant_count(),
+            )
+            .is_empty()
         })
     {
         return;

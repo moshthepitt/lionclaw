@@ -444,6 +444,20 @@ fn task_accept_is_legal(state: &MissionState, task_id: &TaskId) -> bool {
             .is_some_and(|dependencies| dependencies.len() <= 1)
 }
 
+fn task_retry_is_legal(state: &MissionState, task_id: &TaskId) -> bool {
+    let Some(super::TaskAssignment::ChildMission { .. }) = state
+        .team
+        .as_ref()
+        .and_then(|team| team.task_assignments.get(task_id))
+    else {
+        return true;
+    };
+    state
+        .tasks
+        .get(task_id)
+        .is_some_and(|task| task.attempts < state.config.recovery.max_attempts.max(1))
+}
+
 fn failure_choices(state: &MissionState) -> Vec<Choice> {
     let mut choices = Vec::new();
     if proposal_awaits_decision(state) {
@@ -451,7 +465,10 @@ fn failure_choices(state: &MissionState) -> Vec<Choice> {
     }
     for (task_id, task) in &state.tasks {
         if task.status == TaskStatus::Failed && !state.task_automatic_retry_remaining(task_id) {
-            let mut actions = vec![super::DecisionAction::Retry, super::DecisionAction::Revise];
+            let mut actions = vec![super::DecisionAction::Revise];
+            if task_retry_is_legal(state, task_id) {
+                actions.insert(0, super::DecisionAction::Retry);
+            }
             if task_accept_is_legal(state, task_id) {
                 actions.push(super::DecisionAction::Accept);
             }
@@ -694,6 +711,12 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
                 }
             }
             super::TaskAssignment::ChildMission { mission } => {
+                if !task_retry_is_legal(state, &task.id) {
+                    continue;
+                }
+                let Some(dependencies) = state.child_mission_dependency_refs(&task.id) else {
+                    continue;
+                };
                 let reservation = mission.config.execution.effect_capacity;
                 if reservation > remaining_capacity.saturating_sub(reserved_by_intents) {
                     continue;
@@ -702,7 +725,7 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
                     state,
                     task.id.clone(),
                     base_sha,
-                    dependency_refs,
+                    dependencies,
                     mission.as_ref().clone(),
                 ) {
                     reserved_tasks.insert(task.id.clone());
@@ -830,7 +853,7 @@ fn child_mission_intent(
     state: &MissionState,
     task_id: TaskId,
     input_artifact: String,
-    dependency_refs: Vec<super::TaskCandidateRef>,
+    dependencies: Vec<super::ChildMissionDependencyRef>,
     assignment: super::ChildMissionAssignment,
 ) -> Option<super::ChildMissionRequest> {
     let attempt_no = state
@@ -842,7 +865,7 @@ fn child_mission_intent(
         task_id,
         attempt_no,
         input_artifact,
-        dependency_refs,
+        dependencies,
         assignment,
     )
 }

@@ -994,6 +994,7 @@ impl InflightEffect {
             // Exhaustive on purpose: every new `…Requested` event must build
             // its inflight entry here.
             MissionEvent::MissionCreated { .. }
+            | MissionEvent::MissionInputRecorded { .. }
             | MissionEvent::ProposalRecorded { .. }
             | MissionEvent::TeamConfigured { .. }
             | MissionEvent::SkillAdded { .. }
@@ -1031,6 +1032,8 @@ pub struct MissionState {
     pub config: MissionConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<super::MissionLineage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mission_inputs: Vec<super::MissionDependencyInput>,
     pub team: Option<super::TeamRevision>,
     pub team_history: BTreeMap<u32, super::TeamRevision>,
     pub runtime_identity_history:
@@ -1797,6 +1800,72 @@ impl MissionState {
                     })
             })
             .collect()
+    }
+
+    pub fn child_mission_dependency_refs(
+        &self,
+        task_id: &TaskId,
+    ) -> Option<Vec<super::ChildMissionDependencyRef>> {
+        let task = self
+            .plan
+            .as_ref()?
+            .tasks
+            .iter()
+            .find(|task| &task.id == task_id)?;
+        let team = self.team.as_ref()?;
+        task.depends_on
+            .iter()
+            .map(|dependency| {
+                let outcome = self.tasks.get(dependency)?.cleared_outcome()?;
+                if !self.task_effect_is_secret_free(outcome.effect_id()) {
+                    return None;
+                }
+                let candidate_sha = self.tasks.get(dependency)?.candidate_sha.as_ref()?.clone();
+                let report = self.accepted_task_report(outcome.effect_id());
+                if team.task_output(dependency) == Some(OutputSemantics::ProducesReport)
+                    && report.is_none()
+                {
+                    return None;
+                }
+                let failure_sha256 = match self.task_attempt_failure(outcome.effect_id()) {
+                    Some(failure) => Some(super::child_failure_digest(failure)?),
+                    None => None,
+                };
+                Some(super::ChildMissionDependencyRef {
+                    task_id: dependency.clone(),
+                    effect_id: outcome.effect_id().clone(),
+                    candidate_sha,
+                    report_sha256: report.and_then(PayloadRef::content_sha256),
+                    failure_sha256,
+                })
+            })
+            .collect()
+    }
+
+    fn task_effect_is_secret_free(&self, effect_id: &super::EffectId) -> bool {
+        if let Some(receipt) = self.role_attempt_receipts.get(effect_id) {
+            let RoleEffectSource::Turn { request, .. } = &receipt.source;
+            return self
+                .team_history
+                .get(&request.team_revision)
+                .and_then(|team| team.role(&request.role_instance))
+                .is_some_and(|role| !role.grants.secrets);
+        }
+        self.child_mission_receipts.contains_key(effect_id)
+    }
+
+    pub fn mission_input_dependency_refs(&self) -> Vec<TaskCandidateRef> {
+        self.mission_inputs
+            .iter()
+            .map(super::MissionDependencyInput::candidate_ref)
+            .collect()
+    }
+
+    pub fn descendant_count(&self) -> u64 {
+        self.child_mission_receipts
+            .values()
+            .map(|receipt| u64::from(receipt.descendant_count).saturating_add(1))
+            .sum()
     }
 
     /// Current report deliverables relevant to one judgment assignment, in

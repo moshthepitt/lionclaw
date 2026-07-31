@@ -14,6 +14,36 @@ pub const MAX_CHILD_MISSION_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_CHILD_MISSION_DEPTH: u32 = 16;
 pub const MAX_CHILD_MISSION_DESCENDANTS: u32 = 1024;
 
+/// Content-bound identity of one cleared parent dependency supplied to a child.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildMissionDependencyRef {
+    pub task_id: TaskId,
+    pub effect_id: EffectId,
+    pub candidate_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_sha256: Option<String>,
+}
+
+impl ChildMissionDependencyRef {
+    pub fn candidate_ref(&self) -> TaskCandidateRef {
+        TaskCandidateRef {
+            task_id: self.task_id.clone(),
+            sha: self.candidate_sha.clone(),
+        }
+    }
+}
+
+pub fn child_failure_digest(failure: &TypedFailure) -> Option<String> {
+    canonical_serialize_digest(
+        "lionclaw.child-mission-failure.v1",
+        failure,
+        MAX_CHILD_MISSION_REQUEST_BYTES,
+    )
+}
+
 /// A complete child mission authored as one task assignment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,7 +82,7 @@ pub struct ChildMissionRequest {
     pub request_digest: String,
     pub input_artifact: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dependency_refs: Vec<TaskCandidateRef>,
+    pub dependencies: Vec<ChildMissionDependencyRef>,
     pub assignment: Box<ChildMissionAssignment>,
 }
 
@@ -62,20 +92,36 @@ impl ChildMissionRequest {
         task_id: TaskId,
         attempt_no: u32,
         input_artifact: String,
-        dependency_refs: Vec<TaskCandidateRef>,
+        dependencies: Vec<ChildMissionDependencyRef>,
         assignment: ChildMissionAssignment,
     ) -> Option<Self> {
         let assignment_digest = assignment.digest()?;
-        let mut digest = CanonicalDigest::new("lionclaw.child-mission-request.v1");
+        let mut digest = CanonicalDigest::new("lionclaw.child-mission-request.v2");
         digest.str("assignment_digest", &assignment_digest);
         digest.str("input_artifact", &input_artifact);
-        digest.u64("dependency_count", dependency_refs.len() as u64);
-        for (index, dependency) in dependency_refs.iter().enumerate() {
+        digest.u64("dependency_count", dependencies.len() as u64);
+        for (index, dependency) in dependencies.iter().enumerate() {
             digest.str(
                 &format!("dependency.{index}.task_id"),
                 dependency.task_id.as_str(),
             );
-            digest.str(&format!("dependency.{index}.sha"), &dependency.sha);
+            digest.str(
+                &format!("dependency.{index}.effect_id"),
+                dependency.effect_id.as_str(),
+            );
+            digest.str(
+                &format!("dependency.{index}.sha"),
+                &dependency.candidate_sha,
+            );
+            if let Some(report_sha256) = &dependency.report_sha256 {
+                digest.str(&format!("dependency.{index}.report_sha256"), report_sha256);
+            }
+            if let Some(failure_sha256) = &dependency.failure_sha256 {
+                digest.str(
+                    &format!("dependency.{index}.failure_sha256"),
+                    failure_sha256,
+                );
+            }
         }
         let request_digest = digest.finish();
         let parent_effect_id =
@@ -94,9 +140,16 @@ impl ChildMissionRequest {
             attempt_no,
             request_digest,
             input_artifact,
-            dependency_refs,
+            dependencies,
             assignment: Box::new(assignment),
         })
+    }
+
+    pub fn dependency_refs(&self) -> Vec<TaskCandidateRef> {
+        self.dependencies
+            .iter()
+            .map(ChildMissionDependencyRef::candidate_ref)
+            .collect()
     }
 }
 
@@ -159,6 +212,10 @@ pub struct ChildMissionReceipt {
     pub request_digest: String,
     pub input_artifact: String,
     pub terminal: TerminalState,
+    /// Folded number of descendants below this child. Its parent adds one for
+    /// the child itself when accounting the total descendant budget.
+    #[serde(default)]
+    pub descendant_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<ChildMissionOutput>,
     pub proof: ChildProofSummary,
