@@ -7,17 +7,20 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lionclaw::config::RuntimeProfiles;
+use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::model::{
-    Choice, EffectId, ExternalOracle, ExternalOracleDriverId, ExternalOracleDriverIdentity,
-    MissionId, MissionProposal, NetworkGrant, OracleName, OracleSpec,
+    Choice, EffectId, EventEnvelope, ExternalOracle, ExternalOracleDriverId,
+    ExternalOracleDriverIdentity, MissionEvent, MissionId, MissionProposal, NetworkGrant,
+    OracleName, OracleSpec,
 };
 use lionclaw::oracle::OciOracleRunner;
 use lionclaw::ports::{
-    ExternalOracleDriver, ExternalOracleDriverContext, ExternalOracleDriverRegistry,
+    EventSink, ExternalOracleDriver, ExternalOracleDriverContext, ExternalOracleDriverRegistry,
     ExternalOraclePoll, ExternalOraclePollRequest, ExternalOracleProof, ExternalOracleSubmission,
     ExternalOracleSubmitRequest, OracleOutcome, OracleRunRequest, OracleRunStatus, OracleRunner,
 };
-use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
+use lionclaw::store::MissionStore;
+use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 use lionclaw_runtime_api::TypedFailure;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -85,6 +88,16 @@ async fn harness_with_external_driver(
     identity: ExternalOracleDriverIdentity,
     oracle_runner: MockOracleRunner,
 ) -> common::TestHarness {
+    common::initialize_repository(workspace);
+    let store = MissionStore::open(workspace).await.unwrap();
+    harness_with_external_driver_store(identity, oracle_runner, store).await
+}
+
+async fn harness_with_external_driver_store(
+    identity: ExternalOracleDriverIdentity,
+    oracle_runner: MockOracleRunner,
+    store: MissionStore,
+) -> common::TestHarness {
     let driver_id = identity.driver.clone();
     let mut runtime_identities = common::default_runtime_identities();
     runtime_identities
@@ -94,16 +107,19 @@ async fn harness_with_external_driver(
         .insert(driver_id.clone(), identity.clone());
     let role_runner = Arc::new(MockRoleRunner::happy(HEAD_SHA));
     let oracle_runner = Arc::new(oracle_runner);
-    common::initialize_repository(workspace);
-    let engine = common::engine_with_runtime_and_external_driver_identities(
-        workspace,
+    let engine = Engine::new(
+        store,
         common::test_mission_type(),
-        role_runner.clone(),
-        oracle_runner.clone(),
-        runtime_identities,
-        BTreeMap::from([(driver_id, identity)]),
-    )
-    .await;
+        "localhost/lionclaw-runtime-dev:v1".to_string(),
+        EngineServices::new(
+            role_runner.clone(),
+            oracle_runner.clone(),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        )
+        .with_runtime_identities(runtime_identities)
+        .with_external_oracle_driver_identities(BTreeMap::from([(driver_id, identity)])),
+    );
     common::TestHarness {
         engine,
         role_runner,
@@ -119,6 +135,16 @@ fn passing_outcome() -> OracleOutcome {
         stderr: Vec::new(),
         prepared_inputs: Vec::new(),
         duration_ms: 10,
+    }
+}
+
+struct CrashAfterExternalOutcome;
+
+impl EventSink for CrashAfterExternalOutcome {
+    fn emit(&self, event: &EventEnvelope) {
+        if matches!(event.event, MissionEvent::OracleRunCompleted { .. }) {
+            panic!("injected crash after durable external oracle outcome");
+        }
     }
 }
 
@@ -199,6 +225,79 @@ async fn pending_external_oracle_stays_in_resolve_effect_until_polled_complete()
         !authority_dir.exists(),
         "durable request authority must retire after outcome append"
     );
+}
+
+#[tokio::test]
+async fn post_outcome_crash_retires_request_budget_without_replaying_oracle() {
+    let dir = tempfile::tempdir().unwrap();
+    common::initialize_repository(dir.path());
+    let calls = Arc::new(Mutex::new(0usize));
+    let oracle = MockOracleRunner::new_status(Box::new({
+        let calls = calls.clone();
+        move |request| {
+            let mut calls = calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                Ok(OracleRunStatus::Pending {
+                    next_poll_after_ms: request.now_ms + 5_000,
+                })
+            } else {
+                Ok(OracleRunStatus::Complete(passing_outcome()))
+            }
+        }
+    }));
+    let (_driver_id, identity) = external_driver_identity("local-ci", NetworkGrant::Deny);
+    let store = MissionStore::open(dir.path())
+        .await
+        .unwrap()
+        .with_sink(Arc::new(CrashAfterExternalOutcome));
+    let engine = Arc::new(
+        harness_with_external_driver_store(identity, oracle, store.clone())
+            .await
+            .engine,
+    );
+    let mission_id = engine
+        .create_mission(dir.path().to_str().unwrap(), "external proof", BASE_SHA)
+        .await
+        .unwrap();
+    engine
+        .propose_plan(&mission_id, external_proposal("local-ci"))
+        .await
+        .unwrap();
+    approve_plan(&engine, &mission_id).await;
+
+    let pending = engine.advance(&mission_id).await.unwrap();
+    let effect_id = pending.state.inflight.keys().next().unwrap().clone();
+    let authority_dir = dir
+        .path()
+        .join(".lionclaw/missions")
+        .join(mission_id.as_str())
+        .join("external-oracle-request-budgets")
+        .join(effect_id.as_str());
+    std::fs::create_dir_all(&authority_dir).unwrap();
+    std::fs::write(authority_dir.join("sentinel"), "durable authority").unwrap();
+
+    let crashed = tokio::spawn({
+        let engine = engine.clone();
+        let mission_id = mission_id.clone();
+        async move { engine.advance(&mission_id).await }
+    })
+    .await
+    .expect_err("driver must crash after the outcome commit");
+    assert!(crashed.is_panic());
+    assert!(store
+        .require_state(&mission_id)
+        .await
+        .unwrap()
+        .inflight
+        .is_empty());
+    assert!(authority_dir.exists());
+    assert_eq!(*calls.lock().unwrap(), 2);
+
+    let recovered = engine.advance(&mission_id).await.unwrap();
+    assert!(recovered.state.inflight.is_empty());
+    assert!(!authority_dir.exists());
+    assert_eq!(*calls.lock().unwrap(), 2, "settled oracle must not replay");
 }
 
 #[tokio::test]

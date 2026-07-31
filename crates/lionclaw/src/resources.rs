@@ -5,6 +5,7 @@
 //! settlement. Callers derive paths here and perform only the preparation their
 //! ownership boundary requires.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
@@ -135,11 +136,13 @@ impl MissionDirs {
         &self,
         effect_id: &EffectId,
     ) -> ExternalOracleRequestBudgetDirs {
-        ExternalOracleRequestBudgetDirs::new(
+        self.external_oracle_request_budgets().effect(effect_id)
+    }
+
+    pub(crate) fn external_oracle_request_budgets(&self) -> ExternalOracleRequestBudgets {
+        ExternalOracleRequestBudgets::new(
             self.state_dir.clone(),
-            self.root
-                .join("external-oracle-request-budgets")
-                .join(effect_id.as_str()),
+            self.root.join("external-oracle-request-budgets"),
         )
     }
 }
@@ -485,8 +488,41 @@ impl RuntimeProfileDirs {
     }
 }
 
-/// Durable network-authority accounting for one external oracle effect.
-/// This survives disposable effect cleanup until the outcome is recorded.
+/// Mission-owned namespace for durable external-oracle request authority.
+/// Entries survive disposable effect cleanup until their outcome is recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalOracleRequestBudgets {
+    state_dir: PathBuf,
+    root: PathBuf,
+}
+
+impl ExternalOracleRequestBudgets {
+    fn new(state_dir: PathBuf, root: PathBuf) -> Self {
+        Self { state_dir, root }
+    }
+
+    pub(crate) fn effect(&self, effect_id: &EffectId) -> ExternalOracleRequestBudgetDirs {
+        ExternalOracleRequestBudgetDirs::new(
+            self.state_dir.clone(),
+            self.root.join(effect_id.as_str()),
+        )
+    }
+
+    pub(crate) fn effect_ids(&self, max_effects: usize) -> anyhow::Result<BTreeSet<EffectId>> {
+        RootedDirectory::new(self.state_dir.clone(), self.root.clone())?
+            .immediate_directory_names(max_effects, "external oracle request budgets")?
+            .into_iter()
+            .map(|name| {
+                let name = name.into_string().map_err(|_| {
+                    anyhow::anyhow!("external oracle request budget name is not UTF-8")
+                })?;
+                EffectId::parse(name).map_err(anyhow::Error::from)
+            })
+            .collect()
+    }
+}
+
+/// One effect's durable external-oracle request authority accounting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternalOracleRequestBudgetDirs {
     state_dir: PathBuf,

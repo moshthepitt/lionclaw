@@ -107,4 +107,5 @@ Each submit or poll invocation accepts at most 16 authenticated requests across
 all of its connections. The effect-lifetime ceiling is derived from that cap
 and the admitted submit/poll lifecycle. LionClaw durably reserves each request
 before forwarding it; reservations survive disposable-resource cleanup and
-crash recovery, then retire only after the effect outcome is recorded.
+crash recovery, then retire only after the effect outcome is recorded. A later
+advance reconciles any budget left by a crash immediately after that commit.

@@ -890,6 +890,9 @@ impl Engine {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
+        let state = self.load_state(mission_id).await?;
+        self.reconcile_external_oracle_request_budgets(&state)
+            .await?;
         crate::activity::clear_driver_run_evidence(&self.store.mission_dirs(mission_id))?;
         if let Some(path) = handshake {
             let temporary = path.with_extension("tmp");
@@ -1402,6 +1405,24 @@ impl Engine {
             .with_context(|| {
                 format!("retiring external oracle request budget for effect '{effect_id}'")
             })
+    }
+
+    async fn reconcile_external_oracle_request_budgets(&self, state: &MissionState) -> Result<()> {
+        let budgets = self
+            .store
+            .mission_dirs(&state.mission_id)
+            .external_oracle_request_budgets();
+        let max_budgets = usize::try_from(state.config.execution.effect_capacity)
+            .context("effect capacity does not fit this host")?;
+        for effect_id in budgets.effect_ids(max_budgets)? {
+            if state.inflight.contains_key(&effect_id) {
+                continue;
+            }
+            budgets.effect(&effect_id).remove().await.with_context(|| {
+                format!("retiring stale external oracle request budget for effect '{effect_id}'")
+            })?;
+        }
+        Ok(())
     }
 
     async fn record_cleanup_failure(
