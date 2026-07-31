@@ -572,6 +572,10 @@ impl OracleEffectDirs {
         &self.root
     }
 
+    pub(crate) fn files(&self) -> anyhow::Result<RootedDirectory> {
+        RootedDirectory::new(self.state_dir.clone(), self.root.clone())
+    }
+
     pub(crate) fn scratch(&self) -> &Path {
         &self.scratch
     }

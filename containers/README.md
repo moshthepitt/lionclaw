@@ -103,5 +103,6 @@ disables redirects, and injects the configured credential header. `header`
 defaults to `authorization` and `prefix` defaults to `Bearer `; both can be
 set explicitly for services using another header scheme. Credentialed HTTP is
 accepted only for `localhost`; all other broker destinations require HTTPS.
-Each effect-scoped broker accepts at most 16 requests across all connections.
-The existing bounded polling lifecycle limits broker recreation.
+Each effect accepts at most 16 authenticated requests across all connections,
+submit/poll invocations, process restarts, and crash recovery. LionClaw
+durably reserves each request before forwarding it.

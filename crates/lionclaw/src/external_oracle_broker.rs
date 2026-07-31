@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use lionclaw_durable_fs::RootedDirectory;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Url};
+use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -15,7 +17,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::ExternalOracleDriverAuthConfig;
 use crate::credential_file::read_absolute_regular_file_bounded;
-use crate::model::{EffectId, NetworkGrant};
+use crate::model::{EffectId, ExternalOracleDriverIdentity, MissionId, NetworkGrant};
 
 pub(crate) const EXTERNAL_ORACLE_BROKER_MOUNT_TARGET: &str =
     "/run/lionclaw/external-oracle-broker.sock";
@@ -23,7 +25,10 @@ pub(crate) const EXTERNAL_ORACLE_BROKER_ENV: &str = "LIONCLAW_EXTERNAL_ORACLE_BR
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_REQUESTS_PER_BROKER: usize = 16;
+const MAX_REQUESTS_PER_EFFECT: usize = 16;
+const REQUEST_BUDGET_FILE: &str = "external-oracle-request-budget.json";
+const REQUEST_BUDGET_LOCK_FILE: &str = "external-oracle-request-budget.lock";
+const MAX_REQUEST_BUDGET_BYTES: usize = 256 * 1024;
 const MAX_HEADERS: usize = 64;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
@@ -56,6 +61,116 @@ pub(crate) enum ExternalOracleBrokerResponse {
     Rejected { code: String, detail: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalOracleRequestBudgetIdentity {
+    mission_id: MissionId,
+    effect_id: EffectId,
+    driver_identity: ExternalOracleDriverIdentity,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalOracleRequestBudgetState {
+    identity: ExternalOracleRequestBudgetIdentity,
+    remaining_requests: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalOracleRequestBudget {
+    files: RootedDirectory,
+    identity: ExternalOracleRequestBudgetIdentity,
+}
+
+impl ExternalOracleRequestBudget {
+    pub(crate) fn new(
+        files: RootedDirectory,
+        mission_id: MissionId,
+        effect_id: EffectId,
+        driver_identity: ExternalOracleDriverIdentity,
+        idempotency_key: String,
+    ) -> Self {
+        Self {
+            files,
+            identity: ExternalOracleRequestBudgetIdentity {
+                mission_id,
+                effect_id,
+                driver_identity,
+                idempotency_key,
+            },
+        }
+    }
+
+    fn network(&self) -> &NetworkGrant {
+        &self.identity.driver_identity.network
+    }
+
+    async fn prepare(&self) -> Result<()> {
+        let budget = self.clone();
+        tokio::task::spawn_blocking(move || budget.transact(|_| ()))
+            .await
+            .context("external oracle request budget task failed")?
+    }
+
+    async fn reserve(&self) -> Result<bool> {
+        let budget = self.clone();
+        tokio::task::spawn_blocking(move || {
+            budget.transact(|state| {
+                let Some(remaining) = state.remaining_requests.checked_sub(1) else {
+                    return false;
+                };
+                state.remaining_requests = remaining;
+                true
+            })
+        })
+        .await
+        .context("external oracle request budget task failed")?
+    }
+
+    fn transact<T>(
+        &self,
+        update: impl FnOnce(&mut ExternalOracleRequestBudgetState) -> T,
+    ) -> Result<T> {
+        let lock = self.files.open_private_lock_file(
+            OsStr::new(REQUEST_BUDGET_LOCK_FILE),
+            "external oracle request budget lock",
+        )?;
+        flock(&lock, FlockOperation::LockExclusive)
+            .context("locking external oracle request budget")?;
+
+        let mut state = match self.files.read_private_bounded_with_metadata(
+            OsStr::new(REQUEST_BUDGET_FILE),
+            MAX_REQUEST_BUDGET_BYTES,
+            "external oracle request budget",
+        )? {
+            Some((bytes, _)) => serde_json::from_slice(&bytes)
+                .context("external oracle request budget is malformed")?,
+            None => ExternalOracleRequestBudgetState {
+                identity: self.identity.clone(),
+                remaining_requests: MAX_REQUESTS_PER_EFFECT,
+            },
+        };
+        if state.identity != self.identity {
+            bail!("external oracle request budget identity does not match the active effect");
+        }
+        if state.remaining_requests > MAX_REQUESTS_PER_EFFECT {
+            bail!("external oracle request budget exceeds its fixed limit");
+        }
+
+        let result = update(&mut state);
+        let bytes =
+            serde_json::to_vec(&state).context("encoding external oracle request budget")?;
+        self.files.write_private_atomic(
+            OsStr::new(REQUEST_BUDGET_FILE),
+            &bytes,
+            MAX_REQUEST_BUDGET_BYTES,
+            "external oracle request budget",
+        )?;
+        Ok(result)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ExternalOracleBroker {
     socket_path: PathBuf,
@@ -65,9 +180,10 @@ pub(crate) struct ExternalOracleBroker {
 impl ExternalOracleBroker {
     pub(crate) async fn start(
         config: &ExternalOracleDriverAuthConfig,
-        network: NetworkGrant,
         socket_path: PathBuf,
+        request_budget: ExternalOracleRequestBudget,
     ) -> Result<Self> {
+        request_budget.prepare().await?;
         let credential = read_credential(&config.source).await?;
         let auth_name = HeaderName::from_bytes(config.header.as_bytes())
             .context("external oracle auth header is invalid")?;
@@ -98,12 +214,12 @@ impl ExternalOracleBroker {
             })?;
 
         let state = Arc::new(BrokerState {
-            network,
+            network: request_budget.network().clone(),
             auth_name,
             auth_value,
             credential,
             client,
-            remaining_requests: AtomicUsize::new(MAX_REQUESTS_PER_BROKER),
+            request_budget,
         });
         let task = tokio::spawn(serve(listener, state));
         Ok(Self { socket_path, task })
@@ -123,7 +239,7 @@ struct BrokerState {
     auth_value: HeaderValue,
     credential: String,
     client: reqwest::Client,
-    remaining_requests: AtomicUsize,
+    request_budget: ExternalOracleRequestBudget,
 }
 
 async fn serve(listener: UnixListener, state: Arc<BrokerState>) {
@@ -145,18 +261,7 @@ async fn serve_connection(stream: UnixStream, state: &BrokerState) -> Result<()>
         if read == 0 {
             return Ok(());
         }
-        let response = if state
-            .remaining_requests
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_err()
-        {
-            rejected(
-                "request_limit",
-                "credential broker request limit is exhausted",
-            )
-        } else if line.len() > MAX_REQUEST_BYTES {
+        let response = if line.len() > MAX_REQUEST_BYTES {
             let response = rejected("request_too_large", "broker request exceeds its size limit");
             write_response(&mut writer, &response).await?;
             return Ok(());
@@ -201,6 +306,12 @@ async fn execute_request(
     let method = parse_method(&request.method)?;
     let mut headers = parse_headers(request.headers, &state.auth_name)?;
     headers.insert(state.auth_name.clone(), state.auth_value.clone());
+    if !state.request_budget.reserve().await? {
+        return Ok(rejected(
+            "request_limit",
+            "credential broker request limit is exhausted",
+        ));
+    }
 
     let mut response = state
         .client
@@ -364,8 +475,75 @@ fn rejected(code: &str, detail: &str) -> ExternalOracleBrokerResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lionclaw_durable_fs::RootedDirectory;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
+
+    fn auth_config(source: PathBuf) -> ExternalOracleDriverAuthConfig {
+        ExternalOracleDriverAuthConfig {
+            source,
+            header: "authorization".to_string(),
+            prefix: "Bearer ".to_string(),
+        }
+    }
+
+    fn request_budget(root: &Path, network: NetworkGrant) -> ExternalOracleRequestBudget {
+        let driver = crate::model::ExternalOracleDriverId::new("test-driver").unwrap();
+        ExternalOracleRequestBudget::new(
+            RootedDirectory::new(root, root).unwrap(),
+            crate::model::MissionId::parse("m123456789abc").unwrap(),
+            EffectId::for_parts(&["external-oracle-broker-test"]),
+            crate::model::ExternalOracleDriverIdentity {
+                driver,
+                image_id: "sha256:test-driver".to_string(),
+                network,
+                auth: Some(crate::model::ExternalOracleDriverAuthIdentity {
+                    kind: "header-file".to_string(),
+                    config_digest: "sha256:test-auth-config".to_string(),
+                }),
+            },
+            "test-idempotency-key".to_string(),
+        )
+    }
+
+    async fn local_service(expected_requests: usize) -> (u16, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = tokio::spawn(async move {
+            let mut targets = Vec::with_capacity(expected_requests);
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut byte = [0u8; 1];
+                    if stream.read(&mut byte).await.unwrap() == 0 {
+                        break;
+                    }
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                targets.push(
+                    request
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .to_string(),
+                );
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+            }
+            targets
+        });
+        (port, service)
+    }
 
     async fn broker_call(
         socket: &Path,
@@ -414,14 +592,11 @@ mod tests {
                 .unwrap();
         });
         let socket = temp.path().join("broker.sock");
+        let network = NetworkGrant::allow_single("localhost", port).unwrap();
         let _broker = ExternalOracleBroker::start(
-            &ExternalOracleDriverAuthConfig {
-                source: credential,
-                header: "authorization".to_string(),
-                prefix: "Bearer ".to_string(),
-            },
-            NetworkGrant::allow_single("localhost", port).unwrap(),
+            &auth_config(credential),
             socket.clone(),
+            request_budget(temp.path(), network),
         )
         .await
         .unwrap();
@@ -485,14 +660,11 @@ mod tests {
             }
         });
         let socket = temp.path().join("broker.sock");
+        let network = NetworkGrant::allow_single("localhost", port).unwrap();
         let _broker = ExternalOracleBroker::start(
-            &ExternalOracleDriverAuthConfig {
-                source: credential,
-                header: "authorization".to_string(),
-                prefix: "Bearer ".to_string(),
-            },
-            NetworkGrant::allow_single("localhost", port).unwrap(),
+            &auth_config(credential),
             socket.clone(),
+            request_budget(temp.path(), network),
         )
         .await
         .unwrap();
@@ -525,13 +697,9 @@ mod tests {
         std::os::unix::fs::symlink(&credential, &alias).unwrap();
 
         let error = ExternalOracleBroker::start(
-            &ExternalOracleDriverAuthConfig {
-                source: alias,
-                header: "authorization".to_string(),
-                prefix: "Bearer ".to_string(),
-            },
-            NetworkGrant::Deny,
+            &auth_config(alias),
             temp.path().join("broker.sock"),
+            request_budget(temp.path(), NetworkGrant::Deny),
         )
         .await
         .expect_err("symlink credential must be rejected");
@@ -543,25 +711,23 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let credential = temp.path().join("credential");
         std::fs::write(&credential, "secret").unwrap();
+        let (port, service) = local_service(MAX_REQUESTS_PER_EFFECT).await;
+        let network = NetworkGrant::allow_single("localhost", port).unwrap();
         let socket = temp.path().join("broker.sock");
         let _broker = ExternalOracleBroker::start(
-            &ExternalOracleDriverAuthConfig {
-                source: credential,
-                header: "authorization".to_string(),
-                prefix: "Bearer ".to_string(),
-            },
-            NetworkGrant::Deny,
+            &auth_config(credential),
             socket.clone(),
+            request_budget(temp.path(), network),
         )
         .await
         .unwrap();
 
-        for index in 0..=MAX_REQUESTS_PER_BROKER {
+        for index in 0..=MAX_REQUESTS_PER_EFFECT {
             let (response, _) = broker_call(
                 &socket,
                 ExternalOracleBrokerRequest {
                     method: "POST".to_string(),
-                    url: "http://localhost:1/submit".to_string(),
+                    url: format!("http://localhost:{port}/submit"),
                     headers: BTreeMap::new(),
                     body: "{}".to_string(),
                 },
@@ -569,18 +735,128 @@ mod tests {
             .await;
             match response {
                 ExternalOracleBrokerResponse::Rejected { code, .. }
-                    if index == MAX_REQUESTS_PER_BROKER =>
+                    if index == MAX_REQUESTS_PER_EFFECT =>
                 {
                     assert_eq!(code, "request_limit");
                 }
-                ExternalOracleBrokerResponse::Rejected { code, .. } => {
-                    assert_eq!(code, "request_rejected");
+                ExternalOracleBrokerResponse::Complete { http_status, .. } => {
+                    assert_eq!(http_status, 200);
                 }
-                ExternalOracleBrokerResponse::Complete { .. } => {
-                    panic!("denied broker request unexpectedly completed");
-                }
+                response => panic!("unexpected broker response: {response:?}"),
             }
         }
+        assert_eq!(service.await.unwrap().len(), MAX_REQUESTS_PER_EFFECT);
+    }
+
+    #[tokio::test]
+    async fn request_budget_survives_submit_and_poll_crash_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let credential = temp.path().join("credential");
+        std::fs::write(&credential, "secret").unwrap();
+        let (port, service) = local_service(MAX_REQUESTS_PER_EFFECT).await;
+        let network = NetworkGrant::allow_single("localhost", port).unwrap();
+        let socket = temp.path().join("broker.sock");
+
+        for (operation, requests) in [
+            ("submit", 1),
+            ("poll", 1),
+            ("poll", MAX_REQUESTS_PER_EFFECT - 2),
+        ] {
+            let broker = ExternalOracleBroker::start(
+                &auth_config(credential.clone()),
+                socket.clone(),
+                request_budget(temp.path(), network.clone()),
+            )
+            .await
+            .unwrap();
+            for _ in 0..requests {
+                let (response, _) = broker_call(
+                    &socket,
+                    ExternalOracleBrokerRequest {
+                        method: "POST".to_string(),
+                        url: format!("http://localhost:{port}/{operation}"),
+                        headers: BTreeMap::new(),
+                        body: "{}".to_string(),
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    response,
+                    ExternalOracleBrokerResponse::Complete {
+                        http_status: 200,
+                        ..
+                    }
+                ));
+            }
+            drop(broker);
+        }
+
+        let _broker = ExternalOracleBroker::start(
+            &auth_config(credential),
+            socket.clone(),
+            request_budget(temp.path(), network),
+        )
+        .await
+        .unwrap();
+        let (response, _) = broker_call(
+            &socket,
+            ExternalOracleBrokerRequest {
+                method: "POST".to_string(),
+                url: format!("http://localhost:{port}/poll"),
+                headers: BTreeMap::new(),
+                body: "{}".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            response,
+            ExternalOracleBrokerResponse::Rejected { code, .. } if code == "request_limit"
+        ));
+
+        let targets = service.await.unwrap();
+        assert_eq!(targets.len(), MAX_REQUESTS_PER_EFFECT);
+        assert_eq!(targets[0], "/submit");
+        assert!(targets[1..].iter().all(|target| target == "/poll"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn request_budget_reservations_are_atomic_across_brokers() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = request_budget(temp.path(), NetworkGrant::Deny);
+        budget.prepare().await.unwrap();
+
+        let reservations = (0..MAX_REQUESTS_PER_EFFECT * 2)
+            .map(|_| {
+                let budget = budget.clone();
+                tokio::spawn(async move { budget.reserve().await.unwrap() })
+            })
+            .collect::<Vec<_>>();
+        let mut granted = 0;
+        for reservation in reservations {
+            granted += usize::from(reservation.await.unwrap());
+        }
+
+        assert_eq!(granted, MAX_REQUESTS_PER_EFFECT);
+        assert!(!budget.reserve().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn request_budget_rejects_identity_drift_on_recreation() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = request_budget(temp.path(), NetworkGrant::Deny);
+        budget.prepare().await.unwrap();
+
+        let mut changed = budget.clone();
+        changed.identity.idempotency_key = "different-request".to_string();
+        let error = changed
+            .prepare()
+            .await
+            .expect_err("request identity drift must be rejected");
+
+        assert!(
+            error.to_string().contains("identity does not match"),
+            "got {error:#}"
+        );
     }
 
     #[tokio::test]
@@ -593,13 +869,9 @@ mod tests {
         std::os::unix::fs::symlink(&real_parent, &alias_parent).unwrap();
 
         let error = ExternalOracleBroker::start(
-            &ExternalOracleDriverAuthConfig {
-                source: alias_parent.join("credential"),
-                header: "authorization".to_string(),
-                prefix: "Bearer ".to_string(),
-            },
-            NetworkGrant::Deny,
+            &auth_config(alias_parent.join("credential")),
             temp.path().join("broker.sock"),
+            request_budget(temp.path(), NetworkGrant::Deny),
         )
         .await
         .expect_err("symlinked credential ancestor must be rejected");

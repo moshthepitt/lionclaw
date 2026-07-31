@@ -26,7 +26,7 @@ use crate::authority::{
 use crate::config::MissionRuntimeProfile;
 use crate::external_oracle_broker::{
     socket_path as external_oracle_broker_socket_path, ExternalOracleBroker,
-    EXTERNAL_ORACLE_BROKER_ENV, EXTERNAL_ORACLE_BROKER_MOUNT_TARGET,
+    ExternalOracleRequestBudget, EXTERNAL_ORACLE_BROKER_ENV, EXTERNAL_ORACLE_BROKER_MOUNT_TARGET,
 };
 use crate::ports::{
     ExecutionControl, ExternalOracleDriver, ExternalOracleDriverContext,
@@ -200,19 +200,28 @@ impl ProfileExternalOracleDriver {
         }
         let broker_socket = external_oracle_broker_socket_path(&effect_id);
         let broker = match &self.driver.auth {
-            Some(auth) => Some(
-                ExternalOracleBroker::start(
-                    auth,
-                    driver_identity.network.clone(),
-                    broker_socket.clone(),
+            Some(auth) => {
+                let request_budget = ExternalOracleRequestBudget::new(
+                    dirs.files().map_err(|error| {
+                        fail(format!(
+                            "failed to open external oracle effect state: {error:#}"
+                        ))
+                    })?,
+                    mission_id,
+                    effect_id.clone(),
+                    driver_identity.clone(),
+                    request.idempotency_key().to_string(),
+                );
+                Some(
+                    ExternalOracleBroker::start(auth, broker_socket.clone(), request_budget)
+                        .await
+                        .map_err(|error| {
+                            fail(format!(
+                                "external oracle credential broker refused to start: {error:#}"
+                            ))
+                        })?,
                 )
-                .await
-                .map_err(|error| {
-                    fail(format!(
-                        "external oracle credential broker refused to start: {error:#}"
-                    ))
-                })?,
-            ),
+            }
             None => None,
         };
         let compiled = compile_external_driver_plan(
@@ -328,6 +337,7 @@ trait DriverRequestIdentity {
     fn mission_id(&self) -> &crate::model::MissionId;
     fn effect_id(&self) -> &crate::model::EffectId;
     fn driver_identity(&self) -> &crate::model::ExternalOracleDriverIdentity;
+    fn idempotency_key(&self) -> &str;
 }
 
 impl DriverRequestIdentity for ExternalOracleSubmitRequest {
@@ -342,6 +352,10 @@ impl DriverRequestIdentity for ExternalOracleSubmitRequest {
     fn driver_identity(&self) -> &crate::model::ExternalOracleDriverIdentity {
         &self.driver_identity
     }
+
+    fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
 }
 
 impl DriverRequestIdentity for ExternalOraclePollRequest {
@@ -355,6 +369,10 @@ impl DriverRequestIdentity for ExternalOraclePollRequest {
 
     fn driver_identity(&self) -> &crate::model::ExternalOracleDriverIdentity {
         &self.driver_identity
+    }
+
+    fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
     }
 }
 
