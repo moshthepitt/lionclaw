@@ -3,12 +3,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use lionclaw_model::{
     apply, fold, next, resolve_execution_deadline_ms, ArtifactOutcome, Assertion, AssertionId,
     AuthorityCeilings, AuthorityGrants, ChildMissionAssignment, ChildMissionOutput,
-    ChildMissionReceipt, ChildProofSummary, DecisionAction, EffectIntent, EventEnvelope,
-    ExecutionPolicy, FinishClass, MissionConfig, MissionEvent, MissionId, MissionProposal,
-    MissionState, MissionTypeRef, NetworkGrant, OutputSemantics, PayloadRef, Plan, PlanProposal,
-    RecoveryConfig, Requirement, RequirementDisposition, RequirementId, RequirementKind,
-    RoleInstance, RoleInstanceId, RuntimeInstrumentIdentity, StopBar, Task, TaskAssignment, TaskId,
-    TaskStatus, TeamRevision, TerminalState, VersionStamps, SCHEMA_VERSION,
+    ChildMissionReceipt, ChildProofSummary, ControlAction, DecisionAction, EffectIntent,
+    EventEnvelope, ExecutionPolicy, FinishClass, MissionConfig, MissionEvent, MissionId,
+    MissionProposal, MissionState, MissionTypeRef, NetworkGrant, OutputSemantics, PayloadRef, Plan,
+    PlanProposal, RecoveryConfig, Requirement, RequirementDisposition, RequirementId,
+    RequirementKind, RoleInstance, RoleInstanceId, RuntimeInstrumentIdentity, StopBar, Task,
+    TaskAssignment, TaskId, TaskStatus, TeamRevision, TerminalState, VersionStamps, SCHEMA_VERSION,
 };
 
 fn id(raw: &str) -> RoleInstanceId {
@@ -550,6 +550,117 @@ fn request_bind_receipt_and_cleanup_replay_without_promoting_child_proof() {
         effect,
         EffectIntent::DispatchRole(turn) if turn.output == OutputSemantics::EmitsVerdict
     )));
+}
+
+#[test]
+fn durable_parent_stop_dominates_a_later_successful_child_receipt() {
+    let mut events = parent_events(OutputSemantics::ProducesReport);
+    let request = projected_request(&fold(events.clone()).unwrap());
+    let requested_at_ms = 1_000;
+    let report = PayloadRef::inline("child report");
+    let report_sha256 = report.content_sha256().unwrap();
+    events.extend([
+        event(
+            5,
+            MissionEvent::ChildMissionRequested {
+                request: Box::new(request.clone()),
+                requested_at_ms,
+                deadline_ms: resolve_execution_deadline_ms(requested_at_ms, 120).unwrap(),
+                budget_deadline_ms: resolve_execution_deadline_ms(requested_at_ms, 120).unwrap(),
+            },
+        ),
+        event(
+            6,
+            MissionEvent::ChildMissionBound {
+                effect_id: request.parent_effect_id.clone(),
+                child_mission_id: request.child_mission_id.clone(),
+            },
+        ),
+        event(
+            7,
+            MissionEvent::ControlRequested {
+                effect_id: request.parent_effect_id.clone(),
+                action: ControlAction::Stop,
+                reason: "operator stopped delegated work".into(),
+            },
+        ),
+        event(
+            8,
+            MissionEvent::ChildMissionCompleted {
+                effect_id: request.parent_effect_id.clone(),
+                receipt: Box::new(ChildMissionReceipt {
+                    parent_mission_id: request.parent_mission_id.clone(),
+                    parent_effect_id: request.parent_effect_id.clone(),
+                    child_mission_id: request.child_mission_id.clone(),
+                    request_digest: request.request_digest.clone(),
+                    input_artifact: request.input_artifact.clone(),
+                    terminal: TerminalState::Done {
+                        finish: FinishClass::Attested,
+                    },
+                    output: Some(ChildMissionOutput::Report {
+                        report,
+                        report_sha256,
+                    }),
+                    proof: ChildProofSummary {
+                        finish: Some(FinishClass::Verified),
+                        authoritative_receipt_digests: Vec::new(),
+                        advisory_receipt_digests: Vec::new(),
+                    },
+                    failure: None,
+                }),
+            },
+        ),
+    ]);
+
+    let settled = fold(events).unwrap();
+    assert_eq!(settled.tasks[&request.task_id].status, TaskStatus::Failed);
+    assert_eq!(
+        settled
+            .task_last_failure(&request.task_id)
+            .unwrap()
+            .evidence()
+            .code
+            .as_deref(),
+        Some("control.stopped_before_settlement")
+    );
+}
+
+#[test]
+fn descendant_admission_reserves_every_legal_child_attempt() {
+    let state = fold(
+        parent_events(OutputSemantics::ProducesReport)[..2]
+            .iter()
+            .cloned(),
+    )
+    .unwrap();
+    let mut candidate = match &parent_events(OutputSemantics::ProducesReport)[2].event {
+        MissionEvent::ProposalRecorded { proposal, .. } => (**proposal).clone(),
+        _ => unreachable!(),
+    };
+    let TaskAssignment::ChildMission { mission } = candidate
+        .team
+        .as_mut()
+        .unwrap()
+        .task_assignments
+        .get_mut(&TaskId::new("parent-work").unwrap())
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    mission.config.execution.max_descendants = 0;
+    mission.config.execution.max_child_depth = 0;
+    mission.config.recovery.max_attempts = 3;
+    candidate.plan.as_mut().unwrap().plan.tasks[0].body =
+        "complete parent work with bounded retries".into();
+
+    let mut limit_two = state.clone();
+    limit_two.config.execution.max_descendants = 2;
+    let error = lionclaw_model::validate_mission_proposal(&limit_two, &candidate).unwrap_err();
+    assert!(error.to_string().contains("reserves 3 descendants"));
+
+    let mut limit_three = state;
+    limit_three.config.execution.max_descendants = 3;
+    lionclaw_model::validate_mission_proposal(&limit_three, &candidate).unwrap();
 }
 
 #[test]

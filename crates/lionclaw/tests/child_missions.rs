@@ -1,22 +1,36 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
+use clap::Parser;
 use common::{
     approve_plan, default_runtime_identities, engine_with_runtime_identities, fault_append_events,
     initialize_repository, simple_plan, team, test_mission_type, BASE_SHA,
 };
-use lionclaw::engine::record_control;
+use lionclaw::authority::AuthorityCeiling;
+use lionclaw::cli;
+use lionclaw::config::RuntimeProfiles;
+use lionclaw::engine::{record_control, Engine, EngineServices};
+use lionclaw::mission_type::load_mission_type;
 use lionclaw::model::{
     next, resolve_execution_deadline_ms, AuthorityCeilings, ChildMissionAssignment,
     ChildMissionOutput, Choice, ControlAction, DecisionAction, EffectIntent, ExecutionPolicy,
     Handoff, MissionConfig, MissionEvent, MissionId, MissionProposal, OutputSemantics, PayloadRef,
     PlanProposal, RecoveryConfig, RoleInstanceId, TaskAssignment, TaskId, TaskStatus, TeamRevision,
 };
-use lionclaw::ports::RoleTurnOutcome;
+use lionclaw::ports::{ExecutionControl, RoleRunner, RoleTurnOutcome, RoleTurnRequest};
 use lionclaw::store::{MissionStore, NewEvent};
-use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
-use lionclaw_runtime_api::TypedFailure;
+use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
+use lionclaw_runtime_api::{
+    RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverProvider, RuntimeDriverRegistry,
+};
+use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
+use lionclaw_runtime_codex::{CodexRuntimeAuthProvider, CodexRuntimeDriver};
+use tokio::sync::Notify;
 
 fn child_team(output: OutputSemantics, plan: &lionclaw::model::Plan) -> TeamRevision {
     let planner = common::role("child-planner", OutputSemantics::ProposesPlan);
@@ -142,6 +156,316 @@ fn successful_runner() -> MockRoleRunner {
             final_response: "completed".into(),
         })
     }))
+}
+
+struct BlockingChildRunner {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl RoleRunner for BlockingChildRunner {
+    async fn run(&self, request: RoleTurnRequest) -> Result<RoleTurnOutcome, TypedFailure> {
+        if request.role.output != OutputSemantics::ProducesReport {
+            return successful_runner().run(request).await;
+        }
+
+        self.started.notify_one();
+        let mut control = request.control;
+        loop {
+            let observed = control.borrow().clone();
+            let failure = match observed {
+                ExecutionControl::RunUntil(_) => None,
+                ExecutionControl::DeadlineExhausted => Some(TypedFailure::DeadlineExhausted {
+                    evidence: Box::new(TypedFailureEvidence::new(
+                        Some("test.child_deadline".into()),
+                        "child observed deadline cancellation",
+                    )),
+                }),
+                ExecutionControl::Stop(reason) => {
+                    let mut evidence = TypedFailureEvidence::new(
+                        Some("test.child_stop".into()),
+                        "child observed stop cancellation",
+                    );
+                    evidence.stop_reason = Some(reason);
+                    Some(TypedFailure::OperatorStopped {
+                        evidence: Box::new(evidence),
+                    })
+                }
+                ExecutionControl::Abort(reason) => {
+                    let mut evidence = TypedFailureEvidence::new(
+                        Some("test.child_abort".into()),
+                        "child observed abort cancellation",
+                    );
+                    evidence.stop_reason = Some(reason);
+                    Some(TypedFailure::OperatorAborted {
+                        evidence: Box::new(evidence),
+                    })
+                }
+            };
+            if let Some(failure) = failure {
+                return Err(failure);
+            }
+            control.changed().await.unwrap();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LiveParentCancellation {
+    Stop,
+    Deadline,
+    Abort,
+}
+
+async fn assert_live_parent_cancellation(cancellation: LiveParentCancellation) {
+    let directory = tempfile::tempdir().unwrap();
+    initialize_repository(directory.path());
+    let started = Arc::new(Notify::new());
+    let store = MissionStore::open(directory.path()).await.unwrap();
+    let engine = Engine::new(
+        store,
+        test_mission_type(),
+        "localhost/lionclaw-runtime-dev:v1".into(),
+        EngineServices::new(
+            Arc::new(BlockingChildRunner {
+                started: started.clone(),
+            }),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        )
+        .with_runtime_identities(default_runtime_identities()),
+    );
+    let parent_id = engine
+        .create_mission(
+            directory.path().to_str().unwrap(),
+            "cancel live delegated work",
+            BASE_SHA,
+        )
+        .await
+        .unwrap();
+    let mut proposal = parent_proposal(OutputSemantics::ProducesReport);
+    for role in proposal.team.as_mut().unwrap().roles.values_mut() {
+        role.runtime = "codex".into();
+    }
+    engine.propose_plan(&parent_id, proposal).await.unwrap();
+    approve_plan(&engine, &parent_id).await;
+    let request = projected_child_request(&engine.load_state(&parent_id).await.unwrap());
+    engine.advance(&parent_id).await.unwrap();
+    engine.advance(&parent_id).await.unwrap();
+
+    let advance_engine = engine.clone();
+    let advance_parent = parent_id.clone();
+    let mut advance = tokio::spawn(async move { advance_engine.advance(&advance_parent).await });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("child role did not start");
+    match cancellation {
+        LiveParentCancellation::Stop => record_control(
+            engine.store(),
+            1,
+            &parent_id,
+            &request.parent_effect_id,
+            ControlAction::Stop,
+            "operator stopped live delegated work",
+        )
+        .await
+        .unwrap(),
+        LiveParentCancellation::Deadline => {
+            let parent = engine.load_state(&parent_id).await.unwrap();
+            let deadline_ms = parent.inflight[&request.parent_effect_id].deadline_ms();
+            fault_append_events(
+                directory.path(),
+                &parent_id,
+                parent.head,
+                &[NewEvent::new(MissionEvent::ControlRequested {
+                    effect_id: request.parent_effect_id.clone(),
+                    action: ControlAction::DeadlineReached { deadline_ms },
+                    reason: "engine observed live delegated deadline".into(),
+                })],
+                deadline_ms,
+            )
+            .await;
+        }
+        LiveParentCancellation::Abort => engine
+            .abort(&parent_id, "operator aborted live delegated work")
+            .await
+            .unwrap(),
+    }
+
+    let completed = tokio::time::timeout(Duration::from_secs(2), &mut advance).await;
+    if completed.is_err() {
+        engine
+            .abort(
+                &request.child_mission_id,
+                "test cleanup after parent cancellation was not propagated",
+            )
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut advance).await;
+        panic!("{cancellation:?} did not interrupt the active child driver");
+    }
+    completed.unwrap().unwrap().unwrap();
+
+    let parent = engine.load_state(&parent_id).await.unwrap();
+    let child = engine.load_state(&request.child_mission_id).await.unwrap();
+    let receipt = &parent.child_mission_receipts[&request.parent_effect_id];
+    let expected_category = match cancellation {
+        LiveParentCancellation::Stop => "operator_stopped",
+        LiveParentCancellation::Deadline => "deadline_exhausted",
+        LiveParentCancellation::Abort => "operator_aborted",
+    };
+    assert_eq!(
+        receipt.failure.as_ref().unwrap().category(),
+        expected_category
+    );
+    assert!(child.terminal.is_some());
+    assert!(child.inflight.is_empty());
+}
+
+fn write_cli_mission_type(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("roles")).unwrap();
+    std::fs::write(
+        root.join("playbook.md"),
+        "Delegate work through the same machine.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("mission.toml"),
+        r#"[mission-type]
+name = "child-reopen"
+stop = "verified"
+image = "child-reopen-image"
+
+[team]
+planning-assignment = "strategist"
+
+[ceilings]
+writes = true
+
+[recovery]
+max-attempts = 3
+
+[execution]
+default-timeout-secs = 60
+max-task-time-secs = 120
+extension-step-secs = 30
+effect-capacity = 4
+auto-continue-candidate = false
+auto-continue-proof = false
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("roles/strategist.md"),
+        "---\noutput: proposes-plan\nruntime: codex\n---\nPlan delegated work.\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_cli_reopens_a_child_from_the_kernel_owned_root_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = directory.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    initialize_repository(&repo);
+    let mission_type_root = directory.path().join("mission-type");
+    write_cli_mission_type(&mission_type_root);
+    let fake_oci = directory.path().join("fake-oci");
+    std::fs::write(
+        &fake_oci,
+        "#!/bin/sh\nif [ \"$1 $2\" = \"image inspect\" ]; then echo child-reopen-image-id; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_oci, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profiles = RuntimeProfiles::from_toml(
+        &format!(
+            r#"[runtimes.codex]
+driver = "codex"
+command = "external-codex"
+auth = "codex"
+confinement = {{ backend = "podman", engine = "{}", read-only-rootfs = true }}
+"#,
+            fake_oci.display()
+        ),
+        directory.path(),
+    )
+    .unwrap();
+    let role_runner = Arc::new(successful_runner());
+    let oracle_runner = Arc::new(MockOracleRunner::exiting(0));
+    let transports = cli::MissionTransports::external(
+        profiles,
+        RuntimeDriverRegistry::new(
+            [Arc::new(CodexRuntimeDriver) as Arc<dyn RuntimeDriverProvider>],
+        ),
+        RuntimeAuthRegistry::new([
+            Arc::new(CodexRuntimeAuthProvider) as Arc<dyn RuntimeAuthProvider>
+        ]),
+        oracle_runner.clone(),
+    )
+    .with_role_transport(role_runner.clone(), Arc::new(NoopEffectCleaner));
+    let start = cli::Cli::try_parse_from([
+        "lionclaw",
+        "mission",
+        "start",
+        "--type",
+        mission_type_root.to_str().unwrap(),
+        "--repo",
+        repo.to_str().unwrap(),
+        "--objective",
+        "prove ordinary child reopening",
+        "--runtime",
+        "codex",
+    ])
+    .unwrap();
+    cli::run_with_transports(start, transports.clone())
+        .await
+        .unwrap();
+
+    let store = MissionStore::open(&repo).await.unwrap();
+    let missions = store.list_missions().await.unwrap();
+    let [parent_id] = missions.as_slice() else {
+        panic!("mission start did not create exactly one parent")
+    };
+    let parent_id = parent_id.clone();
+    let mission_type = load_mission_type(&mission_type_root, &AuthorityCeiling::default()).unwrap();
+    let parent = store.require_state(&parent_id).await.unwrap();
+    let engine = Engine::new(
+        store,
+        mission_type,
+        parent.image_id,
+        EngineServices::new(
+            role_runner,
+            oracle_runner,
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        )
+        .with_runtime_identities(default_runtime_identities()),
+    );
+    let mut proposal = parent_proposal(OutputSemantics::ProducesReport);
+    for role in proposal.team.as_mut().unwrap().roles.values_mut() {
+        role.runtime = "codex".into();
+    }
+    engine.propose_plan(&parent_id, proposal).await.unwrap();
+    approve_plan(&engine, &parent_id).await;
+    let request = projected_child_request(&engine.load_state(&parent_id).await.unwrap());
+    engine.advance(&parent_id).await.unwrap();
+    engine.advance(&parent_id).await.unwrap();
+
+    let advance_child = cli::Cli::try_parse_from([
+        "lionclaw",
+        "mission",
+        "advance",
+        request.child_mission_id.as_str(),
+        "--repo",
+        repo.to_str().unwrap(),
+        "--json",
+    ])
+    .unwrap();
+    let code = cli::run_with_transports(advance_child, transports)
+        .await
+        .unwrap();
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
 }
 
 async fn setup(
@@ -306,6 +630,66 @@ async fn crash_boundaries_reconnect_exact_child_without_duplicate() {
 }
 
 #[tokio::test]
+async fn cancellation_before_child_creation_never_leaves_an_active_child() {
+    let (directory, harness, parent_id) =
+        setup(OutputSemantics::ProducesReport, successful_runner()).await;
+    let parent = harness.engine.load_state(&parent_id).await.unwrap();
+    let request = projected_child_request(&parent);
+    let requested_at_ms = 1_000_000;
+    fault_append_events(
+        directory.path(),
+        &parent_id,
+        parent.head,
+        &[NewEvent::new(MissionEvent::ChildMissionRequested {
+            request: Box::new(request.clone()),
+            requested_at_ms,
+            deadline_ms: resolve_execution_deadline_ms(requested_at_ms, 120).unwrap(),
+            budget_deadline_ms: resolve_execution_deadline_ms(requested_at_ms, 120).unwrap(),
+        })],
+        requested_at_ms,
+    )
+    .await;
+    record_control(
+        harness.engine.store(),
+        requested_at_ms + 1,
+        &parent_id,
+        &request.parent_effect_id,
+        ControlAction::Stop,
+        "operator stopped before child creation",
+    )
+    .await
+    .unwrap();
+
+    harness.engine.advance(&parent_id).await.unwrap();
+    let child = harness
+        .engine
+        .load_state(&request.child_mission_id)
+        .await
+        .unwrap();
+    assert!(child.terminal.is_some());
+    assert!(child.inflight.is_empty());
+
+    for _ in 0..8 {
+        let parent = harness.engine.advance(&parent_id).await.unwrap().state;
+        if parent
+            .child_mission_receipts
+            .contains_key(&request.parent_effect_id)
+        {
+            break;
+        }
+    }
+    let parent = harness.engine.load_state(&parent_id).await.unwrap();
+    assert_eq!(
+        parent.child_mission_receipts[&request.parent_effect_id]
+            .failure
+            .as_ref()
+            .unwrap()
+            .category(),
+        "operator_stopped"
+    );
+}
+
+#[tokio::test]
 async fn artifact_child_and_parent_abort_use_the_same_normal_task_flow() {
     let (directory, harness, parent_id) =
         setup(OutputSemantics::ProducesArtifact, successful_runner()).await;
@@ -422,11 +806,22 @@ async fn stopping_parent_effect_aborts_and_quiesces_bound_child() {
 }
 
 #[tokio::test]
+async fn live_parent_stop_deadline_and_abort_interrupt_the_active_child() {
+    for cancellation in [
+        LiveParentCancellation::Stop,
+        LiveParentCancellation::Deadline,
+        LiveParentCancellation::Abort,
+    ] {
+        assert_live_parent_cancellation(cancellation).await;
+    }
+}
+
+#[tokio::test]
 async fn nested_children_execute_with_deterministic_kernel_lineage() {
     let mut leaf = child_assignment(OutputSemantics::ProducesReport);
     leaf.objective = "leaf delegated mission".into();
     leaf.config.execution.max_child_depth = 2;
-    leaf.config.execution.max_descendants = 4;
+    leaf.config.execution.max_descendants = 0;
     let mut middle = child_assignment(OutputSemantics::ProducesReport);
     middle.objective = "middle delegated mission".into();
     middle
@@ -469,10 +864,10 @@ async fn nested_children_execute_with_deterministic_kernel_lineage() {
 async fn failed_child_parks_on_existing_retry_decision_and_new_attempt_gets_new_id() {
     let runner = MockRoleRunner::new(Box::new(|request| {
         if request.role.output == OutputSemantics::ProducesReport {
-            return Err(TypedFailure::permanent(
-                "test.child_failure",
-                "unchanged delegated failure",
-            ));
+            let mut failure =
+                TypedFailure::permanent("test.child_failure", "unchanged delegated failure");
+            failure.evidence_mut().final_response = "bounded child failure response".into();
+            return Err(failure);
         }
         Ok(RoleTurnOutcome {
             handoff: Some(Handoff::Validate {
@@ -497,7 +892,7 @@ async fn failed_child_parks_on_existing_retry_decision_and_new_attempt_gets_new_
             final_response: "judged".into(),
         })
     }));
-    let (_directory, harness, parent_id) = setup(OutputSemantics::ProducesReport, runner).await;
+    let (directory, harness, parent_id) = setup(OutputSemantics::ProducesReport, runner).await;
     let first = projected_child_request(&harness.engine.load_state(&parent_id).await.unwrap());
     for _ in 0..12 {
         let state = harness.engine.advance(&parent_id).await.unwrap().state;
@@ -509,6 +904,16 @@ async fn failed_child_parks_on_existing_retry_decision_and_new_attempt_gets_new_
     }
     let failed = harness.engine.load_state(&parent_id).await.unwrap();
     assert_eq!(failed.tasks[&first.task_id].status, TaskStatus::Failed);
+    let first_failure = failed.task_last_failure(&first.task_id).unwrap();
+    assert_eq!(
+        first_failure.evidence().code.as_deref(),
+        Some("test.child_failure")
+    );
+    assert_eq!(first_failure.detail(), "unchanged delegated failure");
+    assert_eq!(
+        first_failure.evidence().final_response,
+        "bounded child failure response"
+    );
     assert!(next(&failed).effects.is_empty());
     assert!(next(&failed).choices.iter().any(|choice| matches!(
         choice,
@@ -531,4 +936,28 @@ async fn failed_child_parks_on_existing_retry_decision_and_new_attempt_gets_new_
     assert_eq!(second.attempt_no, 2);
     assert_ne!(second.child_mission_id, first.child_mission_id);
     assert_eq!(second.request_digest, first.request_digest);
+
+    for _ in 0..12 {
+        let state = harness.engine.advance(&parent_id).await.unwrap().state;
+        if state
+            .child_mission_receipts
+            .contains_key(&second.parent_effect_id)
+        {
+            break;
+        }
+    }
+    let retried = harness.engine.load_state(&parent_id).await.unwrap();
+    assert!(retried
+        .child_mission_receipts
+        .contains_key(&second.parent_effect_id));
+    assert_eq!(
+        MissionStore::open(directory.path())
+            .await
+            .unwrap()
+            .list_missions()
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
 }

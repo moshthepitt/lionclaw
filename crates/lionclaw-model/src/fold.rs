@@ -16,9 +16,8 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 77 folds child requests, bindings, terminal receipts, and cleanup
-/// while keeping child proof separate from parent authority.
-pub const REDUCER_VERSION: u32 = 77;
+/// Reducer 78 makes durable parent cancellation dominate child settlement.
+pub const REDUCER_VERSION: u32 = 78;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -415,8 +414,18 @@ fn apply_child_outcome(
         return;
     }
     let request = (**request).clone();
-    let success_candidate = if receipt.succeeded() {
-        match receipt.output.as_ref() {
+    let mut settled_receipt = receipt.clone();
+    if let Some(cancellation) = state.durable_cancellation(effect_id) {
+        let evidence = settled_receipt
+            .failure
+            .as_ref()
+            .map(|failure| failure.evidence().clone())
+            .unwrap_or_default();
+        settled_receipt.failure = Some(cancellation.into_failure(evidence));
+        settled_receipt.output = None;
+    }
+    let success_candidate = if settled_receipt.succeeded() {
+        match settled_receipt.output.as_ref() {
             Some(super::ChildMissionOutput::Artifact { artifact })
                 if artifact.base_sha == request.input_artifact =>
             {
@@ -436,7 +445,7 @@ fn apply_child_outcome(
     state.inflight.remove(effect_id);
     state
         .child_mission_receipts
-        .insert(effect_id.clone(), receipt.clone());
+        .insert(effect_id.clone(), settled_receipt);
     if let Some(candidate) = success_candidate {
         clear_task_with_candidate(state, &request.task_id, effect_id, candidate);
     } else if let Some(task) = state.tasks.get_mut(&request.task_id) {

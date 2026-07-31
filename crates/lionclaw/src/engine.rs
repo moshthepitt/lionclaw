@@ -22,12 +22,12 @@ use crate::driver_lock::DriverGuard;
 use crate::mission_type::MissionType;
 use crate::model::{
     next, validate_mission_proposal, ArtifactOutcome, ChildMissionOutput, ChildMissionReceipt,
-    ChildMissionRequest, ChildProofSummary, Choice, EffectEventClass, EffectId, EffectIntent,
-    ExternalOracleDriverId, ExternalOracleDriverIdentity, Handoff, InflightEffect, MissionEvent,
-    MissionId, MissionLineage, MissionProposal, MissionState, Next, OracleDispatchIntent,
-    OracleRunSuccess, OutputSemantics, PayloadRef, PlanValidationError, ProposalError,
-    RoleDispatchIntent, RoleInstance, RoleInstanceId, RoleTurnSuccess, RuntimeInstrumentIdentity,
-    TaskAssignment, TaskId, TerminalState, MAX_ROLE_REPORT_BYTES,
+    ChildMissionRequest, ChildProofSummary, Choice, DurableCancellation, EffectEventClass,
+    EffectId, EffectIntent, ExternalOracleDriverId, ExternalOracleDriverIdentity, Handoff,
+    InflightEffect, MissionEvent, MissionId, MissionLineage, MissionProposal, MissionState, Next,
+    OracleDispatchIntent, OracleRunSuccess, OutputSemantics, PayloadRef, PlanValidationError,
+    ProposalError, RoleDispatchIntent, RoleInstance, RoleInstanceId, RoleTurnSuccess,
+    RuntimeInstrumentIdentity, TaskAssignment, TaskId, TerminalState, MAX_ROLE_REPORT_BYTES,
 };
 use crate::ports::{
     ArtifactCapture, Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl,
@@ -1168,77 +1168,32 @@ impl Engine {
         effect_id: &EffectId,
     ) -> Result<bool> {
         let parent = self.load_state(parent_mission_id).await?;
-        let Some(InflightEffect::ChildMission {
-            request,
-            bound,
-            deadline_ms,
-            budget_deadline_ms,
-            ..
-        }) = parent.inflight.get(effect_id)
+        let Some(InflightEffect::ChildMission { request, bound, .. }) =
+            parent.inflight.get(effect_id)
         else {
             return Ok(true);
         };
         let request = (**request).clone();
-        if parent.terminal.is_none()
-            && !parent.stop_requests.contains_key(effect_id)
-            && !parent.reached_deadlines.contains_key(effect_id)
-        {
-            let now_ms = self.clock.now_ms();
-            if now_ms >= *deadline_ms {
-                self.append_fact(
-                    parent_mission_id,
-                    parent.head,
-                    NewEvent::new(MissionEvent::ControlRequested {
-                        effect_id: effect_id.clone(),
-                        action: crate::model::ControlAction::DeadlineReached {
-                            deadline_ms: *deadline_ms,
-                        },
-                        reason: "child mission reached its parent-owned deadline".into(),
-                    }),
-                )
-                .await?;
-                return Ok(true);
-            }
-            let extension_ms = i64::try_from(
-                parent
-                    .config
-                    .execution
-                    .extension_step_secs
-                    .saturating_mul(1_000),
-            )
-            .unwrap_or(i64::MAX);
-            if deadline_ms < budget_deadline_ms
-                && now_ms.saturating_add(extension_ms) >= *deadline_ms
-            {
-                let new_deadline_ms = deadline_ms
-                    .saturating_add(extension_ms)
-                    .min(*budget_deadline_ms);
-                self.append_fact(
-                    parent_mission_id,
-                    parent.head,
-                    NewEvent::new(MissionEvent::ControlRequested {
-                        effect_id: effect_id.clone(),
-                        action: crate::model::ControlAction::ExtendDeadline {
-                            old_deadline_ms: *deadline_ms,
-                            new_deadline_ms,
-                            automatic: true,
-                        },
-                        reason: "parent execution policy extended child mission deadline".into(),
-                    }),
-                )
-                .await?;
-                return Ok(true);
-            }
-        }
+        let control = self
+            .refresh_execution_control(parent_mission_id, effect_id)
+            .await?;
         if !*bound {
             if !self.child_mission_exists(&request.child_mission_id).await? {
                 self.create_child_mission(&parent, &request).await?;
+                if let Some(reason) = child_abort_reason(&control) {
+                    self.abort(&request.child_mission_id, &reason).await?;
+                }
                 // Creation is durable before binding, giving recovery a
                 // separately observable reconnect boundary.
                 return Ok(false);
             }
             let child = self.load_state(&request.child_mission_id).await?;
             self.ensure_child_matches_request(&parent, &request, &child)?;
+            if child.terminal.is_none() {
+                if let Some(reason) = child_abort_reason(&control) {
+                    self.abort(&request.child_mission_id, &reason).await?;
+                }
+            }
             self.append_fact(
                 parent_mission_id,
                 parent.head,
@@ -1252,25 +1207,12 @@ impl Engine {
         }
 
         let mut child = self.load_state(&request.child_mission_id).await?;
-        self.ensure_child_matches_request(&parent, &request, &child)?;
-        let cancellation = if let Some(TerminalState::Aborted { reason }) = &parent.terminal {
-            Some(format!("parent mission aborted: {reason}"))
-        } else if let Some(reason) = parent.stop_requests.get(effect_id) {
-            Some(format!("parent stopped child effect: {reason}"))
-        } else if parent.reached_deadlines.contains_key(effect_id) {
-            Some("parent child-mission deadline exhausted".to_string())
-        } else {
-            None
-        };
-        if let Some(reason) = cancellation {
-            if child.terminal.is_none() {
-                self.abort(&child.mission_id, &reason).await?;
-            }
-            // Reuse the ordinary driver so active role/oracle work observes
-            // the child's durable abort and performs its normal cleanup.
-            child = self.advance_child_once(&child.mission_id).await?;
-        } else if child.terminal.is_none() {
-            child = self.advance_child_once(&child.mission_id).await?;
+        let current_parent = self.load_state(parent_mission_id).await?;
+        self.ensure_child_matches_request(&current_parent, &request, &child)?;
+        if child.terminal.is_none() {
+            child = self
+                .advance_child_under_parent_control(parent_mission_id, effect_id, &child.mission_id)
+                .await?;
         }
 
         if child.terminal.is_none() && child.inflight.is_empty() {
@@ -1300,18 +1242,8 @@ impl Engine {
         if child.terminal.is_none() || !child.inflight.is_empty() {
             return Ok(true);
         }
-        let receipt = self
-            .derive_child_mission_receipt(&parent, &request, &child)
+        self.append_child_mission_receipt(parent_mission_id, effect_id, &request, &child)
             .await?;
-        self.append_fact(
-            parent_mission_id,
-            parent.head,
-            NewEvent::new(MissionEvent::ChildMissionCompleted {
-                effect_id: effect_id.clone(),
-                receipt: Box::new(receipt),
-            }),
-        )
-        .await?;
         // Receipt durability is a checkpoint before projected cleanup.
         Ok(false)
     }
@@ -1323,13 +1255,103 @@ impl Engine {
         Box::pin(self.advance(mission_id))
     }
 
-    async fn advance_child_once(&self, child_mission_id: &MissionId) -> Result<MissionState> {
+    async fn advance_child_under_parent_control(
+        &self,
+        parent_mission_id: &MissionId,
+        effect_id: &EffectId,
+        child_mission_id: &MissionId,
+    ) -> Result<MissionState> {
         let engine = self.clone();
-        let child_mission_id = child_mission_id.clone();
-        tokio::spawn(async move { engine.advance_boxed(&child_mission_id).await })
-            .await
-            .context("joining ordinary child mission driver")?
-            .map(|view| view.state)
+        let driven_child_id = child_mission_id.clone();
+        let mut advance = tokio::spawn(async move { engine.advance_boxed(&driven_child_id).await });
+        loop {
+            tokio::select! {
+                result = &mut advance => {
+                    return result
+                        .context("joining ordinary child mission driver")?
+                        .map(|view| view.state);
+                }
+                () = tokio::time::sleep(Duration::from_millis(100)) => {
+                    let control = self
+                        .refresh_execution_control(parent_mission_id, effect_id)
+                        .await?;
+                    let Some(reason) = child_abort_reason(&control) else {
+                        continue;
+                    };
+                    let child = self.load_state(child_mission_id).await?;
+                    if child.terminal.is_none() {
+                        self.abort(child_mission_id, &reason).await?;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn refresh_execution_control(
+        &self,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+    ) -> Result<ExecutionControl> {
+        let current = self.load_state(mission_id).await?;
+        let active = current.inflight.get(effect_id).with_context(|| {
+            format!("active effect '{effect_id}' disappeared without an outcome")
+        })?;
+        if let Some(cancellation) = current.durable_cancellation(effect_id) {
+            return Ok(execution_control_from_cancellation(cancellation));
+        }
+
+        let mut deadline_ms = active.deadline_ms();
+        let now_ms = self.clock.now_ms();
+        let extension_step_ms = i64::try_from(
+            current
+                .config
+                .execution
+                .extension_step_secs
+                .saturating_mul(1_000),
+        )
+        .unwrap_or(i64::MAX);
+        if now_ms.saturating_add(extension_step_ms) >= deadline_ms {
+            if let Some(budget_deadline_ms) = active.budget_deadline_ms() {
+                if deadline_ms < budget_deadline_ms {
+                    let new_deadline_ms = deadline_ms
+                        .saturating_add(extension_step_ms)
+                        .min(budget_deadline_ms);
+                    self.append_fact(
+                        mission_id,
+                        current.head,
+                        NewEvent::new(MissionEvent::ControlRequested {
+                            effect_id: effect_id.clone(),
+                            action: crate::model::ControlAction::ExtendDeadline {
+                                old_deadline_ms: deadline_ms,
+                                new_deadline_ms,
+                                automatic: true,
+                            },
+                            reason: "mission execution policy time budget".into(),
+                        }),
+                    )
+                    .await?;
+                    deadline_ms = new_deadline_ms;
+                }
+            }
+        }
+        if now_ms >= deadline_ms {
+            self.append_fact(
+                mission_id,
+                self.load_state(mission_id).await?.head,
+                NewEvent::new(MissionEvent::ControlRequested {
+                    effect_id: effect_id.clone(),
+                    action: crate::model::ControlAction::DeadlineReached { deadline_ms },
+                    reason: "effect reached its configured deadline".into(),
+                }),
+            )
+            .await?;
+            let latest = self.load_state(mission_id).await?;
+            let cancellation = latest
+                .durable_cancellation(effect_id)
+                .context("deadline observation was not accepted for the active effect")?;
+            return Ok(execution_control_from_cancellation(cancellation));
+        }
+        Ok(ExecutionControl::RunUntil(deadline_ms))
     }
 
     async fn child_mission_exists(&self, mission_id: &MissionId) -> Result<bool> {
@@ -1574,6 +1596,50 @@ impl Engine {
         Ok(())
     }
 
+    async fn append_child_mission_receipt(
+        &self,
+        parent_mission_id: &MissionId,
+        effect_id: &EffectId,
+        request: &ChildMissionRequest,
+        child: &MissionState,
+    ) -> Result<()> {
+        for _ in 0..MAX_LOOP_ITERATIONS {
+            let parent = self.load_state(parent_mission_id).await?;
+            if parent.child_mission_receipts.contains_key(effect_id) {
+                return Ok(());
+            }
+            ensure!(
+                matches!(
+                    parent.inflight.get(effect_id),
+                    Some(InflightEffect::ChildMission { .. })
+                ),
+                "child effect '{effect_id}' disappeared before terminal settlement"
+            );
+            let receipt = self
+                .derive_child_mission_receipt(&parent, request, child)
+                .await?;
+            let event = NewEvent::new(MissionEvent::ChildMissionCompleted {
+                effect_id: effect_id.clone(),
+                receipt: Box::new(receipt),
+            });
+            match self
+                .store
+                .append(
+                    parent_mission_id,
+                    parent.head,
+                    &[event],
+                    self.clock.now_ms(),
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(AppendError::Conflict { .. } | AppendError::Duplicate { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("child receipt append kept conflicting after {MAX_LOOP_ITERATIONS} retries")
+    }
+
     async fn derive_child_mission_receipt(
         &self,
         parent: &MissionState,
@@ -1584,8 +1650,23 @@ impl Engine {
             .terminal
             .clone()
             .context("cannot settle a nonterminal child mission")?;
-        let output = match (&terminal, request.assignment.output) {
-            (TerminalState::Done { .. }, OutputSemantics::ProducesArtifact) => {
+        let child_failure = folded_child_failure(child);
+        let settlement_evidence = child_failure
+            .as_ref()
+            .map(|failure| failure.evidence().clone())
+            .unwrap_or_default();
+        let failure =
+            durable_settlement_failure(parent, &request.parent_effect_id, settlement_evidence)
+                .or_else(|| match &terminal {
+                    TerminalState::Done { .. } => None,
+                    TerminalState::Aborted { reason } => Some(child_failure.unwrap_or_else(|| {
+                        TypedFailure::permanent("child_mission.failed", reason.clone())
+                    })),
+                })
+                .map(TypedFailure::projected);
+        let output = match (&terminal, request.assignment.output, failure.is_none()) {
+            (_, _, false) => None,
+            (TerminalState::Done { .. }, OutputSemantics::ProducesArtifact, true) => {
                 Some(ChildMissionOutput::Artifact {
                     artifact: ArtifactOutcome {
                         base_sha: request.input_artifact.clone(),
@@ -1593,7 +1674,7 @@ impl Engine {
                     },
                 })
             }
-            (TerminalState::Done { .. }, OutputSemantics::ProducesReport) => {
+            (TerminalState::Done { .. }, OutputSemantics::ProducesReport, true) => {
                 let plan = child.plan.as_ref().context("child has no accepted plan")?;
                 let depended_on: BTreeSet<_> = plan
                     .tasks
@@ -1623,10 +1704,10 @@ impl Engine {
                     report_sha256,
                 })
             }
-            (TerminalState::Done { .. }, _) => {
+            (TerminalState::Done { .. }, _, true) => {
                 bail!("child task output contract is not a producer")
             }
-            (TerminalState::Aborted { .. }, _) => None,
+            (TerminalState::Aborted { .. }, _, true) => None,
         };
         if let Some(ChildMissionOutput::Artifact { artifact }) = &output {
             ensure!(
@@ -1639,43 +1720,6 @@ impl Engine {
                 "child artifact is outside the requested input lineage"
             );
         }
-        let failure = match &terminal {
-            TerminalState::Done { .. } => None,
-            TerminalState::Aborted { reason } => {
-                let failure = if let Some(stop_reason) =
-                    parent.stop_requests.get(&request.parent_effect_id)
-                {
-                    let mut evidence = crate::model::TypedFailureEvidence::new(
-                        Some("child_mission.operator_stopped".into()),
-                        "operator stopped the parent child-mission effect",
-                    );
-                    evidence.stop_reason = Some(stop_reason.clone());
-                    TypedFailure::OperatorStopped {
-                        evidence: Box::new(evidence),
-                    }
-                } else if parent
-                    .reached_deadlines
-                    .contains_key(&request.parent_effect_id)
-                {
-                    TypedFailure::DeadlineExhausted {
-                        evidence: Box::new(crate::model::TypedFailureEvidence::new(
-                            Some("child_mission.deadline_exhausted".into()),
-                            "parent child-mission deadline exhausted",
-                        )),
-                    }
-                } else if matches!(parent.terminal, Some(TerminalState::Aborted { .. })) {
-                    TypedFailure::OperatorAborted {
-                        evidence: Box::new(crate::model::TypedFailureEvidence::new(
-                            Some("child_mission.parent_aborted".into()),
-                            reason.clone(),
-                        )),
-                    }
-                } else {
-                    TypedFailure::permanent("child_mission.failed", reason.clone())
-                };
-                Some(failure.projected())
-            }
-        };
         Ok(ChildMissionReceipt {
             parent_mission_id: parent.mission_id.clone(),
             parent_effect_id: request.parent_effect_id.clone(),
@@ -1883,71 +1927,10 @@ impl Engine {
             tokio::select! {
                 outcome = &mut execution => break outcome?,
                 () = tokio::time::sleep(Duration::from_millis(100)) => {
-                    let current = self.load_state(&state.mission_id).await?;
-                    let Some(active) = current.inflight.get(&effect_id) else {
-                        bail!("active effect '{effect_id}' disappeared without an outcome");
-                    };
-                    if let Some(TerminalState::Aborted { reason }) = &current.terminal {
-                        control_tx.send_replace(ExecutionControl::Abort(reason.clone()));
-                        continue;
-                    }
-                    if current.reached_deadlines.contains_key(&effect_id) {
-                        control_tx.send_replace(ExecutionControl::DeadlineExhausted);
-                        continue;
-                    }
-                    if let Some(reason) = current.stop_requests.get(&effect_id) {
-                        control_tx.send_replace(ExecutionControl::Stop(reason.clone()));
-                        continue;
-                    }
-                    let mut deadline_ms = active.deadline_ms();
-                    let now_ms = self.clock.now_ms();
-                    let extension_step_ms = i64::try_from(
-                        current.config.execution.extension_step_secs.saturating_mul(1_000),
-                    )
-                    .unwrap_or(i64::MAX);
-                    if now_ms.saturating_add(extension_step_ms) >= deadline_ms {
-                        if let Some(budget_deadline_ms) = active.budget_deadline_ms() {
-                            if deadline_ms < budget_deadline_ms {
-                                let new_deadline_ms = deadline_ms
-                                    .saturating_add(extension_step_ms)
-                                    .min(budget_deadline_ms);
-                                self.append_fact(
-                                    &current.mission_id,
-                                    current.head,
-                                    NewEvent::new(MissionEvent::ControlRequested {
-                                        effect_id: effect_id.clone(),
-                                        action: crate::model::ControlAction::ExtendDeadline {
-                                            old_deadline_ms: deadline_ms,
-                                            new_deadline_ms,
-                                            automatic: true,
-                                        },
-                                        reason: "mission execution policy time budget".into(),
-                                    }),
-                                ).await?;
-                                deadline_ms = new_deadline_ms;
-                            }
-                        }
-                    }
-                    if now_ms >= deadline_ms {
-                        self.append_fact(
-                            &current.mission_id,
-                            current.head,
-                            NewEvent::new(MissionEvent::ControlRequested {
-                                effect_id: effect_id.clone(),
-                                action: crate::model::ControlAction::DeadlineReached {
-                                    deadline_ms,
-                                },
-                                reason: "effect reached its configured deadline".into(),
-                            }),
-                        )
+                    let control = self
+                        .refresh_execution_control(&state.mission_id, &effect_id)
                         .await?;
-                        let latest = self.load_state(&current.mission_id).await?;
-                        if latest.reached_deadlines.get(&effect_id) == Some(&deadline_ms) {
-                            control_tx.send_replace(ExecutionControl::DeadlineExhausted);
-                        }
-                    } else {
-                        control_tx.send_replace(ExecutionControl::RunUntil(deadline_ms));
-                    }
+                    control_tx.send_replace(control);
                 }
             }
         };
@@ -3543,13 +3526,57 @@ fn settlement_failure(
     effect_id: &EffectId,
     outcome: &NewEvent,
 ) -> Option<TypedFailure> {
-    let cancellation = state.durable_cancellation(effect_id)?;
     let evidence = outcome
         .settlement_evidence
         .clone()
         .or_else(|| outcome.event.outcome_failure_evidence())
         .unwrap_or_default();
-    Some(cancellation.into_failure(evidence))
+    durable_settlement_failure(state, effect_id, evidence)
+}
+
+fn durable_settlement_failure(
+    state: &MissionState,
+    effect_id: &EffectId,
+    evidence: lionclaw_runtime_api::TypedFailureEvidence,
+) -> Option<TypedFailure> {
+    Some(
+        state
+            .durable_cancellation(effect_id)?
+            .into_failure(evidence),
+    )
+}
+
+fn execution_control_from_cancellation(cancellation: DurableCancellation) -> ExecutionControl {
+    match cancellation {
+        DurableCancellation::Aborted { reason } => ExecutionControl::Abort(reason),
+        DurableCancellation::Stopped { reason } => ExecutionControl::Stop(reason),
+        DurableCancellation::DeadlineReached { .. } => ExecutionControl::DeadlineExhausted,
+    }
+}
+
+fn child_abort_reason(control: &ExecutionControl) -> Option<String> {
+    match control {
+        ExecutionControl::RunUntil(_) => None,
+        ExecutionControl::DeadlineExhausted => {
+            Some("parent child-mission deadline exhausted".into())
+        }
+        ExecutionControl::Stop(reason) => Some(format!("parent stopped child effect: {reason}")),
+        ExecutionControl::Abort(reason) => Some(format!("parent mission aborted: {reason}")),
+    }
+}
+
+fn folded_child_failure(child: &MissionState) -> Option<TypedFailure> {
+    child
+        .plan
+        .as_ref()
+        .and_then(|plan| {
+            plan.tasks
+                .iter()
+                .find_map(|task| child.task_last_failure(&task.id))
+        })
+        .or_else(|| child.oracle_failures.values().next())
+        .cloned()
+        .map(TypedFailure::projected)
 }
 
 fn decision_requirement_changes(

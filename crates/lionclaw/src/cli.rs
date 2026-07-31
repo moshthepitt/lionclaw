@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand};
 
 use crate::authority::AuthorityCeiling;
@@ -24,9 +24,9 @@ use crate::mission_type::{
 };
 use crate::model::{
     fold, short_hex, AuthorityGrants, Choice, ControlAction, DecisionAction, Destination, EffectId,
-    EnvironmentPreflight, FinishClass, InputName, MissionGuidance, MissionId, MissionSkill,
-    NetworkGrant, OutputSemantics, RequirementDisposition, RoleInstance, RoleInstanceId, TaskId,
-    TerminalState,
+    EnvironmentPreflight, FinishClass, InflightEffect, InputName, MissionGuidance, MissionId,
+    MissionSkill, NetworkGrant, OutputSemantics, RequirementDisposition, RoleInstance,
+    RoleInstanceId, TaskId, TerminalState,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, EffectCleaner, OracleRunner, RoleRunner, SystemClock};
@@ -1126,7 +1126,8 @@ async fn build_engine_for_mission(
 ) -> Result<Engine> {
     let state = store.require_state(mission_id).await?;
     let ceiling = AuthorityCeiling::default();
-    let mission_type = load_mission_type_snapshot(&store, mission_id, &ceiling)?;
+    let snapshot_owner = mission_type_snapshot_owner(&store, &state).await?;
+    let mission_type = load_mission_type_snapshot(&store, &snapshot_owner, &ceiling)?;
     let profiles = transports.profiles()?;
     let runtime = state
         .team
@@ -1150,6 +1151,63 @@ async fn build_engine_for_mission(
     // Verify the pinned mission-type digest before anything runs.
     engine.load_state(mission_id).await?;
     Ok(engine)
+}
+
+async fn mission_type_snapshot_owner(
+    store: &MissionStore,
+    state: &crate::model::MissionState,
+) -> Result<MissionId> {
+    let Some(lineage) = &state.lineage else {
+        return Ok(state.mission_id.clone());
+    };
+    let root_id = lineage.root_mission_id.clone();
+    let mut current = state.clone();
+    let mut seen = BTreeSet::new();
+    loop {
+        ensure!(
+            seen.insert(current.mission_id.clone()),
+            "kernel-owned mission lineage contains a cycle"
+        );
+        let Some(lineage) = current.lineage.clone() else {
+            ensure!(
+                current.mission_id == root_id,
+                "kernel-owned child lineage disagrees about its snapshot root"
+            );
+            return Ok(root_id);
+        };
+        ensure!(
+            lineage.root_mission_id == root_id && lineage.depth > 0,
+            "kernel-owned child lineage has an invalid root or depth"
+        );
+        let parent = store.require_state(&lineage.parent_mission_id).await?;
+        let parent_depth = parent.lineage.as_ref().map_or(0, |parent| parent.depth);
+        ensure!(
+            parent_depth.saturating_add(1) == lineage.depth,
+            "kernel-owned child lineage depth is discontinuous"
+        );
+        ensure!(
+            parent.mission_type == current.mission_type,
+            "child mission type differs from its kernel-owned parent"
+        );
+        ensure!(
+            parent.workspace_dir == current.workspace_dir,
+            "child workspace differs from its kernel-owned parent"
+        );
+        let linked_inflight = matches!(
+            parent.inflight.get(&lineage.parent_effect_id),
+            Some(InflightEffect::ChildMission { request, .. })
+                if request.child_mission_id == current.mission_id
+        );
+        let linked_receipt = parent
+            .child_mission_receipts
+            .get(&lineage.parent_effect_id)
+            .is_some_and(|receipt| receipt.child_mission_id == current.mission_id);
+        ensure!(
+            linked_inflight || linked_receipt,
+            "child is not bound by its kernel-owned parent effect"
+        );
+        current = parent;
+    }
 }
 
 /// Resolve `--repo` (an explicit path is canonicalized; omitted ⇒ the enclosing

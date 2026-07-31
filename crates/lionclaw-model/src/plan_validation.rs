@@ -865,14 +865,18 @@ fn check_shape(
         .task_assignments
         .values()
         .filter_map(TaskAssignment::child_mission)
-        .map(|mission| mission.config.execution.max_descendants.saturating_add(1))
-        .sum::<u32>();
-    if descendant_reservation > config.execution.max_descendants {
+        .map(|mission| {
+            u64::from(mission.config.execution.max_descendants)
+                .saturating_add(1)
+                .saturating_mul(u64::from(config.recovery.max_attempts))
+        })
+        .sum::<u64>();
+    if descendant_reservation > u64::from(config.execution.max_descendants) {
         errors.push(err(
             "descendant_limit_exceeded",
             format!(
-                "plan reserves {descendant_reservation} descendants above mission limit {}",
-                config.execution.max_descendants
+                "plan reserves {descendant_reservation} descendants across {} legal task attempts above mission limit {}",
+                config.recovery.max_attempts, config.execution.max_descendants
             ),
         ));
     }
