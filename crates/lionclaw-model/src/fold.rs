@@ -16,9 +16,9 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 76 keeps external oracle deadline identity immutable and requires
-/// resolved driver authority in durable oracle specs.
-pub const REDUCER_VERSION: u32 = 76;
+/// Reducer 77 folds child requests, bindings, terminal receipts, and cleanup
+/// while keeping child proof separate from parent authority.
+pub const REDUCER_VERSION: u32 = 77;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
@@ -39,6 +39,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         workspace_dir,
         base_sha,
         config,
+        lineage,
     } = &envelope.event
     else {
         return None;
@@ -52,6 +53,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         workspace_dir: workspace_dir.clone(),
         base_sha: base_sha.clone(),
         config: config.clone(),
+        lineage: lineage.clone(),
         team: None,
         team_history: BTreeMap::new(),
         runtime_identity_history: BTreeMap::new(),
@@ -75,6 +77,8 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         conversations: BTreeMap::new(),
         retained_workspace_archives: BTreeMap::new(),
         authoritative_receipts: BTreeMap::new(),
+        child_mission_receipts: BTreeMap::new(),
+        cleaned_child_missions: BTreeSet::new(),
         reachable_commits: BTreeSet::from([base_sha.clone()]),
         stop_requests: BTreeMap::new(),
         reached_deadlines: BTreeMap::new(),
@@ -206,6 +210,38 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }
         }
         event @ MissionEvent::OracleRunCompleted { .. } => apply_oracle_outcome(state, event),
+        MissionEvent::ChildMissionRequested { .. } => apply_child_request(state, envelope),
+        MissionEvent::ChildMissionBound {
+            effect_id,
+            child_mission_id,
+        } => {
+            if let Some(InflightEffect::ChildMission { request, bound, .. }) =
+                state.inflight.get_mut(effect_id)
+            {
+                if request.child_mission_id == *child_mission_id {
+                    *bound = true;
+                }
+            }
+        }
+        MissionEvent::ChildMissionCompleted { effect_id, receipt } => {
+            apply_child_outcome(state, effect_id, receipt)
+        }
+        MissionEvent::ChildMissionCleaned {
+            effect_id,
+            child_mission_id,
+        } => {
+            if super::next(state).effects.iter().any(|intent| {
+                matches!(
+                    intent,
+                    super::EffectIntent::CleanupChildMission {
+                        effect_id: legal_effect,
+                        child_mission_id: legal_child,
+                    } if legal_effect == effect_id && legal_child == child_mission_id
+                )
+            }) {
+                state.cleaned_child_missions.insert(effect_id.clone());
+            }
+        }
         MissionEvent::ControlRequested {
             effect_id,
             action,
@@ -312,6 +348,104 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     }
     state.head = seq;
     recompute_current_sha(state);
+}
+
+fn apply_child_request(state: &mut MissionState, envelope: &EventEnvelope) {
+    let MissionEvent::ChildMissionRequested {
+        request,
+        requested_at_ms,
+        deadline_ms,
+        budget_deadline_ms,
+    } = &envelope.event
+    else {
+        return;
+    };
+    if request.parent_mission_id != state.mission_id
+        || !super::next(state)
+            .effects
+            .contains(&super::EffectIntent::ChildMission((**request).clone()))
+        || state.inflight.contains_key(&request.parent_effect_id)
+        || state
+            .child_mission_receipts
+            .contains_key(&request.parent_effect_id)
+    {
+        return;
+    }
+    let initial_secs = state
+        .config
+        .execution
+        .default_timeout_secs
+        .min(request.assignment.deadline_secs);
+    if super::resolve_execution_deadline_ms(*requested_at_ms, initial_secs) != Ok(*deadline_ms)
+        || super::resolve_execution_deadline_ms(*requested_at_ms, request.assignment.deadline_secs)
+            != Ok(*budget_deadline_ms)
+    {
+        return;
+    }
+    let Some((effect_id, inflight)) = InflightEffect::from_request(
+        &envelope.event,
+        envelope.sequence_no,
+        &state.team_history,
+        *requested_at_ms,
+    ) else {
+        return;
+    };
+    let task = state
+        .tasks
+        .entry(request.task_id.clone())
+        .or_insert_with(pending_task);
+    task.status = TaskStatus::Running;
+    task.attempts = request.attempt_no;
+    state.inflight.insert(effect_id, inflight);
+}
+
+fn apply_child_outcome(
+    state: &mut MissionState,
+    effect_id: &super::EffectId,
+    receipt: &super::ChildMissionReceipt,
+) {
+    let Some(InflightEffect::ChildMission { request, bound, .. }) = state.inflight.get(effect_id)
+    else {
+        return;
+    };
+    if !*bound
+        || !receipt.matches_request(request)
+        || state.child_mission_receipts.contains_key(effect_id)
+    {
+        return;
+    }
+    let request = (**request).clone();
+    let success_candidate = if receipt.succeeded() {
+        match receipt.output.as_ref() {
+            Some(super::ChildMissionOutput::Artifact { artifact })
+                if artifact.base_sha == request.input_artifact =>
+            {
+                Some(artifact.head_sha.clone())
+            }
+            Some(super::ChildMissionOutput::Report {
+                report,
+                report_sha256,
+            }) if report.content_sha256().as_deref() == Some(report_sha256) => {
+                Some(request.input_artifact.clone())
+            }
+            Some(_) | None => None,
+        }
+    } else {
+        None
+    };
+    state.inflight.remove(effect_id);
+    state
+        .child_mission_receipts
+        .insert(effect_id.clone(), receipt.clone());
+    if let Some(candidate) = success_candidate {
+        clear_task_with_candidate(state, &request.task_id, effect_id, candidate);
+    } else if let Some(task) = state.tasks.get_mut(&request.task_id) {
+        task.status = TaskStatus::Failed;
+        task.consecutive_failures = task.consecutive_failures.saturating_add(1);
+        task.last_outcome = Some(TaskAttemptOutcome::Failed {
+            effect_id: effect_id.clone(),
+        });
+    }
 }
 
 fn valid_skill(skill: &super::MissionSkill) -> bool {

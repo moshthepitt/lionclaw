@@ -39,7 +39,7 @@ async fn assigned_report_task_clears_without_write_or_artifact_authority() {
     team.revision = 1;
     team.task_assignments = BTreeMap::from([(
         plan.tasks[0].id.clone(),
-        RoleInstanceId::new("investigator").unwrap(),
+        RoleInstanceId::new("investigator").unwrap().into(),
     )]);
     team.judgment_assignments = BTreeMap::from([(
         plan.assertions[0].id.clone(),
@@ -217,7 +217,7 @@ async fn bad_report_is_presented_to_the_judge_and_cannot_finish() {
     team.revision = 1;
     team.task_assignments = BTreeMap::from([(
         plan.tasks[0].id.clone(),
-        RoleInstanceId::new("investigator").unwrap(),
+        RoleInstanceId::new("investigator").unwrap().into(),
     )]);
     team.judgment_assignments = BTreeMap::from([(
         plan.assertions[0].id.clone(),
@@ -359,9 +359,9 @@ async fn report_synthesis_accepts_multiple_compatible_read_only_dependencies() {
         team.roles.insert(role_id.clone(), role);
     }
     team.task_assignments = BTreeMap::from([
-        (left.clone(), left_role),
-        (right.clone(), right_role),
-        (synthesis.clone(), synthesis_role),
+        (left.clone(), left_role.into()),
+        (right.clone(), right_role.into()),
+        (synthesis.clone(), synthesis_role.into()),
     ]);
     team.judgment_assignments =
         BTreeMap::from([(target, vec![RoleInstanceId::new("reviewer").unwrap()])]);

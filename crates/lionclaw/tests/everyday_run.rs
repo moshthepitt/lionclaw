@@ -397,7 +397,7 @@ impl AttachedRuntimeExecutor for BridgeAttached {
                     ],
                     "",
                 )?;
-                for _ in 0..5 {
+                for _ in 0..20 {
                     if lionclaw::model::next(&store.require_state(&mission_id).await?)
                         .choices
                         .iter()
@@ -486,7 +486,9 @@ fn software_dev_proposal_json() -> String {
     team.revision = 1;
     team.task_assignments = std::collections::BTreeMap::from([(
         plan.tasks[0].id.clone(),
-        lionclaw::model::RoleInstanceId::new("implementer").unwrap(),
+        lionclaw::model::RoleInstanceId::new("implementer")
+            .unwrap()
+            .into(),
     )]);
     team.judgment_assignments = std::collections::BTreeMap::from([(
         plan.assertions[0].id.clone(),
@@ -501,6 +503,110 @@ fn software_dev_proposal_json() -> String {
             plan,
         }),
         oracles: Some(common::oracle_specs(&common::simple_plan())),
+    })
+    .unwrap()
+}
+
+fn software_dev_child_proposal_json() -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap();
+    let mission_type = lionclaw::mission_type::load_mission_type(
+        &root.join("mission-types/software-dev"),
+        &lionclaw::authority::AuthorityCeiling::default(),
+    )
+    .unwrap();
+    let plan = common::simple_plan();
+    let child_planner = common::role(
+        "child-planner",
+        lionclaw::model::OutputSemantics::ProposesPlan,
+    );
+    let child_worker = common::role(
+        "child-worker",
+        lionclaw::model::OutputSemantics::ProducesArtifact,
+    );
+    let child_reviewer = common::role(
+        "child-reviewer",
+        lionclaw::model::OutputSemantics::EmitsVerdict,
+    );
+    let child_team = lionclaw::model::TeamRevision {
+        revision: 0,
+        roles: std::collections::BTreeMap::from([
+            (child_planner.id.clone(), child_planner),
+            (child_worker.id.clone(), child_worker),
+            (child_reviewer.id.clone(), child_reviewer),
+        ]),
+        planning_assignment: lionclaw::model::RoleInstanceId::new("child-planner").unwrap(),
+        task_assignments: std::collections::BTreeMap::from([(
+            plan.tasks[0].id.clone(),
+            lionclaw::model::RoleInstanceId::new("child-worker")
+                .unwrap()
+                .into(),
+        )]),
+        judgment_assignments: std::collections::BTreeMap::from([(
+            plan.assertions[0].id.clone(),
+            vec![lionclaw::model::RoleInstanceId::new("child-reviewer").unwrap()],
+        )]),
+        gap_review_assignment: None,
+        guidance: None,
+    };
+    let child = lionclaw::model::ChildMissionAssignment {
+        objective: "produce the delegated report through an ordinary child mission".into(),
+        output: lionclaw::model::OutputSemantics::ProducesArtifact,
+        config: lionclaw::model::MissionConfig {
+            stop: lionclaw::model::StopBar::Verified,
+            ceilings: lionclaw::model::AuthorityCeilings {
+                writes: true,
+                ..Default::default()
+            },
+            runtime_ceilings: std::collections::BTreeSet::from(["codex".into()]),
+            recovery: lionclaw::model::RecoveryConfig { max_attempts: 2 },
+            execution: lionclaw::model::ExecutionPolicy {
+                default_timeout_secs: 60,
+                max_task_time_secs: 120,
+                extension_step_secs: 30,
+                effect_capacity: 1,
+                max_child_depth: 3,
+                max_descendants: 8,
+                auto_continue_candidate: false,
+                auto_continue_proof: false,
+            },
+            ..Default::default()
+        },
+        proposal: Box::new(lionclaw::model::MissionProposal {
+            team: Some(child_team),
+            plan: Some(lionclaw::model::PlanProposal {
+                base_revision: 0,
+                requirement_changes: Vec::new(),
+                assertion_supersessions: Vec::new(),
+                plan: plan.clone(),
+            }),
+            oracles: Some(common::oracle_specs(&plan)),
+        }),
+        deadline_secs: 120,
+    };
+    let mut parent_team = mission_type.default_team.clone();
+    parent_team.revision = 1;
+    parent_team.task_assignments = std::collections::BTreeMap::from([(
+        plan.tasks[0].id.clone(),
+        lionclaw::model::TaskAssignment::ChildMission {
+            mission: Box::new(child),
+        },
+    )]);
+    parent_team.judgment_assignments = std::collections::BTreeMap::from([(
+        plan.assertions[0].id.clone(),
+        vec![lionclaw::model::RoleInstanceId::new("reviewer").unwrap()],
+    )]);
+    serde_json::to_string(&lionclaw::model::MissionProposal {
+        team: Some(parent_team),
+        plan: Some(lionclaw::model::PlanProposal {
+            base_revision: 0,
+            requirement_changes: Vec::new(),
+            assertion_supersessions: Vec::new(),
+            plan: plan.clone(),
+        }),
+        oracles: Some(common::oracle_specs(&plan)),
     })
     .unwrap()
 }
@@ -634,6 +740,66 @@ fn apply_cli(repo: &Path) -> Cli {
     .expect("lionclaw mission apply parses")
 }
 
+fn bridge_role_runner() -> Arc<MockRoleRunner> {
+    Arc::new(MockRoleRunner::new(Box::new(|request| {
+        use lionclaw::model::OutputSemantics;
+
+        if request.role.output == OutputSemantics::EmitsGapVerdict {
+            return Ok(lionclaw::testing::review_verdict(request, true, Vec::new()));
+        }
+        let (handoff, artifact) = match request.role.output {
+            OutputSemantics::EmitsVerdict => (
+                lionclaw::model::Handoff::Validate {
+                    done: true,
+                    report: lionclaw::model::PayloadRef::inline("bridge judgment"),
+                    items: request
+                        .assertion_ids
+                        .iter()
+                        .cloned()
+                        .map(|item_id| lionclaw::model::ValidationItem {
+                            item_id,
+                            passed: true,
+                        })
+                        .collect(),
+                    passed: true,
+                    request_attention: false,
+                },
+                None,
+            ),
+            OutputSemantics::ProducesReport => (
+                lionclaw::model::Handoff::Work {
+                    done: true,
+                    report: lionclaw::model::PayloadRef::inline("bridge-created report"),
+                    request_attention: false,
+                },
+                None,
+            ),
+            OutputSemantics::ProducesArtifact => (
+                lionclaw::model::Handoff::Work {
+                    done: true,
+                    report: lionclaw::model::PayloadRef::inline("bridge-created artifact"),
+                    request_attention: false,
+                },
+                Some(lionclaw::ports::CapturedArtifact::for_testing(
+                    request.base_sha.clone(),
+                    common::HEAD_SHA,
+                )),
+            ),
+            OutputSemantics::ProposesPlan | OutputSemantics::EmitsGapVerdict => {
+                unreachable!("attached acceptance does not dispatch planning")
+            }
+        };
+        Ok(lionclaw::ports::RoleTurnOutcome {
+            handoff: Some(handoff),
+            artifact,
+            prepared_inputs: Vec::new(),
+            runtime_configuration: Default::default(),
+            runtime_usage: Default::default(),
+            final_response: "bridge role completed".to_string(),
+        })
+    })))
+}
+
 #[tokio::test]
 async fn everyday_run_reaches_validated_profile_auth_and_confinement() {
     let temp = tempfile::tempdir().unwrap();
@@ -710,26 +876,7 @@ async fn attached_runtime_drives_full_mission_lifecycle_through_the_projected_br
         Arc::clone(&commands),
         Arc::clone(&mission_id),
     ));
-    let role_runner = Arc::new(MockRoleRunner::new(Box::new(|request| {
-        if request.role.output == lionclaw::model::OutputSemantics::EmitsGapVerdict {
-            return Ok(lionclaw::testing::review_verdict(request, true, Vec::new()));
-        }
-        Ok(lionclaw::ports::RoleTurnOutcome {
-            handoff: Some(lionclaw::model::Handoff::Work {
-                done: true,
-                report: lionclaw::model::PayloadRef::inline("bridge-created artifact"),
-                request_attention: false,
-            }),
-            artifact: Some(lionclaw::ports::CapturedArtifact::for_testing(
-                request.base_sha.clone(),
-                common::HEAD_SHA,
-            )),
-            prepared_inputs: Vec::new(),
-            runtime_configuration: Default::default(),
-            runtime_usage: Default::default(),
-            final_response: "bridge-created artifact".to_string(),
-        })
-    })));
+    let role_runner = bridge_role_runner();
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -781,6 +928,72 @@ async fn attached_runtime_drives_full_mission_lifecycle_through_the_projected_br
             "missing bridge command {command}: {commands:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn attached_runtime_authors_and_executes_child_mission_through_everyday_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    common::initialize_repository(temp.path());
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let mission_id = Arc::new(Mutex::new(None));
+    let attached = Arc::new(BridgeAttached::new(
+        Arc::clone(&observations),
+        software_dev_child_proposal_json(),
+        Arc::clone(&commands),
+        Arc::clone(&mission_id),
+    ));
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("mission-types");
+    let transports = MissionTransports::external(
+        profiles(temp.path()),
+        RuntimeDriverRegistry::new([Arc::new(FakeDriver {
+            observations: Arc::clone(&observations),
+        }) as Arc<dyn RuntimeDriverProvider>]),
+        RuntimeAuthRegistry::new([Arc::new(FakeAuth {
+            observations: Arc::clone(&observations),
+        }) as Arc<dyn RuntimeAuthProvider>]),
+        Arc::new(MockOracleRunner::exiting(0)),
+    )
+    .with_attached_runtime(attached)
+    .with_everyday_runtime_root(runtime.path().to_path_buf())
+    .with_role_transport(bridge_role_runner(), Arc::new(NoopEffectCleaner))
+    .with_mission_types_root(source_root)
+    .with_in_process_operator_bridge();
+
+    let code = cli::run_with_transports(run_cli(temp.path()), transports)
+        .await
+        .expect("everyday child mission lifecycle succeeds");
+
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
+    let parent_id = mission_id.lock().unwrap().clone().unwrap();
+    let store = MissionStore::open(temp.path()).await.unwrap();
+    let parent = store.require_state(&parent_id).await.unwrap();
+    assert!(parent.is_terminal());
+    assert_eq!(parent.child_mission_receipts.len(), 1);
+    assert_eq!(parent.cleaned_child_missions.len(), 1);
+    let child_id = parent
+        .child_mission_receipts
+        .values()
+        .next()
+        .unwrap()
+        .child_mission_id
+        .clone();
+    let child = store.require_state(&child_id).await.unwrap();
+    assert!(child.is_terminal());
+    assert_eq!(child.lineage.as_ref().unwrap().parent_mission_id, parent_id);
+    assert_eq!(store.list_missions().await.unwrap().len(), 2);
+    let commands = commands.lock().unwrap();
+    assert!(commands
+        .iter()
+        .any(|args| args.iter().any(|argument| argument == "propose")));
+    assert!(commands
+        .iter()
+        .any(|args| args.iter().any(|argument| argument == "advance")));
 }
 
 #[tokio::test]

@@ -1573,8 +1573,19 @@ async fn cmd_team(command: TeamCommand, transports: &MissionTransports) -> Resul
                     );
                 }
                 println!("  planner: {}", team.planning_assignment);
-                for (task, role) in &team.task_assignments {
-                    println!("  task {task}: {role}");
+                for (task, assignment) in &team.task_assignments {
+                    match assignment {
+                        crate::model::TaskAssignment::Role { role_instance } => {
+                            println!("  task {task}: role {role_instance}");
+                        }
+                        crate::model::TaskAssignment::ChildMission { mission } => {
+                            println!(
+                                "  task {task}: child mission output={} objective={}",
+                                output_name(mission.output),
+                                mission.objective
+                            );
+                        }
+                    }
                 }
                 for (assertion, panel) in &team.judgment_assignments {
                     println!(
@@ -1649,7 +1660,7 @@ async fn cmd_team(command: TeamCommand, transports: &MissionTransports) -> Resul
             }
             let role = RoleInstanceId::new(args.role_instance)?;
             let mut team = next_team(&state)?;
-            team.task_assignments.insert(task, role);
+            team.task_assignments.insert(task, role.into());
             engine.configure_team(&mission_id, team).await?;
             println!("reassigned task in mission {mission_id}");
         }
@@ -1663,7 +1674,7 @@ async fn cmd_team(command: TeamCommand, transports: &MissionTransports) -> Resul
                 || team
                     .task_assignments
                     .values()
-                    .any(|assigned| assigned == &role)
+                    .any(|assigned| assigned.role_instance() == Some(&role))
                 || team
                     .judgment_assignments
                     .values()
@@ -2058,6 +2069,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "parked_effects": parked_effect_views(state),
                 "conversations": conversation_views(state, &store)?,
                 "role_attempt_receipts": role_attempt_receipts_json(state, store.blobs()),
+                "child_mission_receipts": child_mission_receipts_json(state, store.blobs()),
                 "assertions": rows.iter().map(|row| serde_json::json!({
                     "id": row.id,
                     "oracle": row.oracle,
@@ -2126,6 +2138,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     print_conversations(state, &store, "  ")?;
     print_non_task_failures(store.blobs(), state);
     print_role_attempt_receipts(store.blobs(), state, "  ");
+    print_child_mission_receipts(store.blobs(), state, "  ");
     if let Some(failure) = &state.cleanup_failure {
         println!(
             "  cleanup: blocked for effect {} ({:?}): {}",
@@ -3094,6 +3107,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
         }
         print_non_task_failures(store.blobs(), state);
         print_role_attempt_receipts(store.blobs(), state, "  ");
+        print_child_mission_receipts(store.blobs(), state, "  ");
         print_superseded_assertions(state, store.blobs(), "  ");
         print_task_workspace_observations(state, "  ", &workspace_observations);
         print_workspace_control_state(state, "  ");
@@ -3630,6 +3644,7 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
         }
         print_non_task_failures(blobs, state);
         print_role_attempt_receipts(blobs, state, "  ");
+        print_child_mission_receipts(blobs, state, "  ");
         if state.is_terminal() {
             print_gap_review_receipt(blobs, state, "  ");
         }
@@ -3808,6 +3823,20 @@ fn active_effects_json(state: &crate::model::MissionState) -> Vec<serde_json::Va
                 "assertion_ids": assertion_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
                 "deadline_ms": deadline_ms,
             }),
+            crate::model::InflightEffect::ChildMission {
+                request,
+                bound,
+                deadline_ms,
+                ..
+            } => serde_json::json!({
+                "effect_id": effect_id.as_str(),
+                "kind": "child_mission",
+                "task_id": request.task_id.as_str(),
+                "child_mission_id": request.child_mission_id.as_str(),
+                "request_digest": request.request_digest,
+                "bound": bound,
+                "deadline_ms": deadline_ms,
+            }),
         })
         .collect()
 }
@@ -3832,6 +3861,7 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
         "objective": state.objective,
         "conversations": conversation_views(state, store)?,
         "role_attempt_receipts": role_attempt_receipts_json(state, blobs),
+        "child_mission_receipts": child_mission_receipts_json(state, blobs),
         "tasks": state.tasks.iter().map(|(id, task)| {
             task_runtime_json(
                 state,
@@ -4035,15 +4065,15 @@ fn task_outcome_json(
     let receipt = state
         .task_last_role_attempt(task_id)
         .filter(|receipt| &receipt.effect_id == effect_id);
+    let child_receipt = state.child_mission_receipts.get(effect_id);
+    let receipt = child_receipt.map_or_else(
+        || crate::evidence::resolved_role_attempt_reference_json(blobs, state, effect_id, receipt),
+        |receipt| crate::evidence::child_mission_receipt_json(blobs, state, effect_id, receipt),
+    );
     serde_json::json!({
         "kind": kind,
         "effect_id": effect_id.as_str(),
-        "receipt": crate::evidence::resolved_role_attempt_reference_json(
-            blobs,
-            state,
-            effect_id,
-            receipt,
-        ),
+        "receipt": receipt,
     })
 }
 
@@ -4061,7 +4091,20 @@ fn print_task_outcome(
         crate::model::TaskAttemptOutcome::Accepted { .. } => "accepted",
         crate::model::TaskAttemptOutcome::Failed { .. } => "failed",
     };
-    println!("{label} {kind} role attempt {}:", outcome.effect_id());
+    println!("{label} {kind} attempt {}:", outcome.effect_id());
+    if let Some(receipt) = state.child_mission_receipts.get(outcome.effect_id()) {
+        for line in crate::evidence::render_child_mission_receipt(
+            blobs,
+            state,
+            outcome.effect_id(),
+            receipt,
+        )
+        .lines()
+        {
+            println!("    {line}");
+        }
+        return;
+    }
     let receipt = state
         .task_last_role_attempt(task_id)
         .filter(|receipt| receipt.effect_id == *outcome.effect_id());
@@ -4202,7 +4245,8 @@ fn conversation_views(
                 "retained_workspace_archives": state.retained_workspace_archives
                     .iter()
                     .filter(|(task_id, _)| state.team.as_ref()
-                        .and_then(|team| team.task_assignments.get(*task_id)) == Some(id))
+                        .and_then(|team| team.task_assignments.get(*task_id))
+                        .and_then(crate::model::TaskAssignment::role_instance) == Some(id))
                     .flat_map(|(_, archives)| archives)
                     .map(|effect_id| effect_id.as_str())
                     .collect::<Vec<_>>(),
@@ -4264,6 +4308,19 @@ fn role_attempt_receipts_json(
         .collect()
 }
 
+fn child_mission_receipts_json(
+    state: &crate::model::MissionState,
+    blobs: &BlobStore,
+) -> Vec<serde_json::Value> {
+    state
+        .child_mission_receipts
+        .iter()
+        .map(|(effect_id, receipt)| {
+            crate::evidence::child_mission_receipt_json(blobs, state, effect_id, receipt)
+        })
+        .collect()
+}
+
 fn print_role_attempt_receipts(
     blobs: &BlobStore,
     state: &crate::model::MissionState,
@@ -4272,6 +4329,21 @@ fn print_role_attempt_receipts(
     for receipt in state.role_attempt_receipts.values() {
         println!("{indent}role attempt receipt:");
         for line in crate::evidence::render_role_attempt_receipt(blobs, state, receipt).lines() {
+            println!("{indent}  {line}");
+        }
+    }
+}
+
+fn print_child_mission_receipts(
+    blobs: &BlobStore,
+    state: &crate::model::MissionState,
+    indent: &str,
+) {
+    for (effect_id, receipt) in &state.child_mission_receipts {
+        println!("{indent}child mission receipt:");
+        for line in
+            crate::evidence::render_child_mission_receipt(blobs, state, effect_id, receipt).lines()
+        {
             println!("{indent}  {line}");
         }
     }

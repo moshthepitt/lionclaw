@@ -759,6 +759,16 @@ pub enum InflightEffect {
         deadline_ms: i64,
         requested_seq: u64,
     },
+    ChildMission {
+        request: Box<super::ChildMissionRequest>,
+        #[serde(default)]
+        bound: bool,
+        requested_at_ms: i64,
+        not_before_ms: i64,
+        deadline_ms: i64,
+        budget_deadline_ms: i64,
+        requested_seq: u64,
+    },
 }
 
 impl InflightEffect {
@@ -775,7 +785,7 @@ impl InflightEffect {
                 request: Box::new(self.role_turn_provenance()?),
                 plan_revision,
             },
-            Self::OracleRun { .. } => return None,
+            Self::OracleRun { .. } | Self::ChildMission { .. } => return None,
         };
         Some(RoleAttemptReceipt {
             effect_id: effect_id.clone(),
@@ -834,25 +844,25 @@ impl InflightEffect {
 
     pub fn set_deadline_ms(&mut self, new_deadline_ms: i64) {
         match self {
-            Self::RoleTurn { deadline_ms, .. } | Self::OracleRun { deadline_ms, .. } => {
-                *deadline_ms = new_deadline_ms
-            }
+            Self::RoleTurn { deadline_ms, .. }
+            | Self::OracleRun { deadline_ms, .. }
+            | Self::ChildMission { deadline_ms, .. } => *deadline_ms = new_deadline_ms,
         }
     }
 
     pub fn deadline_ms(&self) -> i64 {
         match self {
-            Self::RoleTurn { deadline_ms, .. } | Self::OracleRun { deadline_ms, .. } => {
-                *deadline_ms
-            }
+            Self::RoleTurn { deadline_ms, .. }
+            | Self::OracleRun { deadline_ms, .. }
+            | Self::ChildMission { deadline_ms, .. } => *deadline_ms,
         }
     }
 
     pub fn not_before_ms(&self) -> i64 {
         match self {
-            Self::RoleTurn { not_before_ms, .. } | Self::OracleRun { not_before_ms, .. } => {
-                *not_before_ms
-            }
+            Self::RoleTurn { not_before_ms, .. }
+            | Self::OracleRun { not_before_ms, .. }
+            | Self::ChildMission { not_before_ms, .. } => *not_before_ms,
         }
     }
 
@@ -860,8 +870,21 @@ impl InflightEffect {
         match self {
             Self::RoleTurn {
                 budget_deadline_ms, ..
+            }
+            | Self::ChildMission {
+                budget_deadline_ms, ..
             } => Some(*budget_deadline_ms),
             Self::OracleRun { .. } => None,
+        }
+    }
+
+    /// Capacity reserved at every ancestor while this effect is active.
+    pub fn capacity_reservation(&self) -> u32 {
+        match self {
+            Self::RoleTurn { .. } | Self::OracleRun { .. } => 1,
+            Self::ChildMission { request, .. } => {
+                request.assignment.config.execution.effect_capacity
+            }
         }
     }
 
@@ -951,6 +974,23 @@ impl InflightEffect {
                     requested_seq,
                 },
             )),
+            MissionEvent::ChildMissionRequested {
+                request,
+                requested_at_ms,
+                deadline_ms,
+                budget_deadline_ms,
+            } => Some((
+                request.parent_effect_id.clone(),
+                Self::ChildMission {
+                    request: request.clone(),
+                    bound: false,
+                    requested_at_ms: *requested_at_ms,
+                    not_before_ms,
+                    deadline_ms: *deadline_ms,
+                    budget_deadline_ms: *budget_deadline_ms,
+                    requested_seq,
+                },
+            )),
             // Exhaustive on purpose: every new `…Requested` event must build
             // its inflight entry here.
             MissionEvent::MissionCreated { .. }
@@ -962,6 +1002,9 @@ impl InflightEffect {
             | MissionEvent::MessageSent { .. }
             | MissionEvent::RoleTurnCompleted { .. }
             | MissionEvent::OracleRunCompleted { .. }
+            | MissionEvent::ChildMissionBound { .. }
+            | MissionEvent::ChildMissionCompleted { .. }
+            | MissionEvent::ChildMissionCleaned { .. }
             | MissionEvent::MissionAborted { .. }
             | MissionEvent::MissionFinished { .. }
             | MissionEvent::ResultApplied { .. }
@@ -986,6 +1029,8 @@ pub struct MissionState {
     /// Target repo HEAD at mission creation.
     pub base_sha: String,
     pub config: MissionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<super::MissionLineage>,
     pub team: Option<super::TeamRevision>,
     pub team_history: BTreeMap<u32, super::TeamRevision>,
     pub runtime_identity_history:
@@ -1030,6 +1075,12 @@ pub struct MissionState {
     /// receipt IDs and resolve verdicts through this map.
     #[serde(default)]
     pub authoritative_receipts: BTreeMap<super::EffectId, AuthoritativeVerdict>,
+    /// Child receipts remain audit/task evidence and never enter the
+    /// authoritative parent-proof map above.
+    #[serde(default)]
+    pub child_mission_receipts: BTreeMap<super::EffectId, super::ChildMissionReceipt>,
+    #[serde(default)]
+    pub cleaned_child_missions: BTreeSet<super::EffectId>,
     /// Commits established by mission creation or accepted artifact outcomes.
     #[serde(default)]
     pub reachable_commits: BTreeSet<String>,
@@ -1223,7 +1274,8 @@ impl MissionState {
     }
 
     pub fn task_last_failure(&self, task_id: &TaskId) -> Option<&TypedFailure> {
-        self.task_last_role_attempt(task_id)?.failure()
+        let effect_id = self.tasks.get(task_id)?.last_outcome.as_ref()?.effect_id();
+        self.task_attempt_failure(effect_id)
     }
 
     pub fn task_automatic_retry_remaining(&self, task_id: &TaskId) -> bool {
@@ -1405,7 +1457,10 @@ impl MissionState {
         };
         match (role.output, task_id) {
             (output, Some(task_id)) if output.produces_task_output() => {
-                team.task_assignments.get(task_id) == Some(role_instance)
+                team.task_assignments
+                    .get(task_id)
+                    .and_then(super::TaskAssignment::role_instance)
+                    == Some(role_instance)
                     && self
                         .plan
                         .as_ref()
@@ -1761,15 +1816,11 @@ impl MissionState {
                     .any(|target| assertion_ids.contains(target))
             })
             .filter(|task| {
-                team.task_assignments
-                    .get(&task.id)
-                    .and_then(|role_id| team.role(role_id))
-                    .is_some_and(|role| role.output == super::OutputSemantics::ProducesReport)
+                team.task_output(&task.id) == Some(super::OutputSemantics::ProducesReport)
             })
             .map(|task| {
                 let outcome = self.tasks.get(&task.id)?.cleared_outcome()?;
-                let receipt = self.role_attempt_receipts.get(outcome.effect_id())?;
-                let report = receipt.accepted_report()?;
+                let report = self.accepted_task_report(outcome.effect_id())?;
                 Some(ReportEvidenceRef {
                     task_id: task.id.clone(),
                     effect_id: outcome.effect_id().clone(),
@@ -1777,6 +1828,30 @@ impl MissionState {
                 })
             })
             .collect()
+    }
+
+    pub fn accepted_task_report(&self, effect_id: &super::EffectId) -> Option<&PayloadRef> {
+        self.role_attempt_receipts
+            .get(effect_id)
+            .and_then(RoleAttemptReceipt::accepted_report)
+            .or_else(|| {
+                self.child_mission_receipts
+                    .get(effect_id)?
+                    .output
+                    .as_ref()?
+                    .report()
+            })
+    }
+
+    pub fn task_attempt_failure(&self, effect_id: &super::EffectId) -> Option<&TypedFailure> {
+        self.role_attempt_receipts
+            .get(effect_id)
+            .and_then(RoleAttemptReceipt::failure)
+            .or_else(|| {
+                self.child_mission_receipts
+                    .get(effect_id)
+                    .and_then(|receipt| receipt.failure.as_ref())
+            })
     }
 
     pub(crate) fn role_report_refs_match(
@@ -1913,7 +1988,10 @@ impl MissionState {
             } => match task_id {
                 Some(task_id) => {
                     self.team.as_ref().is_some_and(|team| {
-                        team.task_assignments.get(task_id) == Some(role_instance)
+                        team.task_assignments
+                            .get(task_id)
+                            .and_then(super::TaskAssignment::role_instance)
+                            == Some(role_instance)
                     }) && self
                         .tasks
                         .get(task_id)

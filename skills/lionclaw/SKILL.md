@@ -95,6 +95,30 @@ if the current choice permits it:
 lionclaw mission plan propose --file - < /scratch/proposal.json
 ```
 
+### Delegate a task to a child mission
+
+A task assignment may be either a tagged `role` assignment or a tagged
+`child_mission` assignment. Use a child mission only when the task benefits
+from its own complete mission contract and proof loop on this same machine.
+The assignment contains the child objective, report-or-artifact output
+semantics, complete narrower `MissionConfig`, complete revision-zero
+plan/team/oracle proposal, and a bounded deadline. It never contains lineage,
+ancestry, credentials, tokens, passwords, API keys, or other secret values.
+
+The child is an ordinary LionClaw mission. Do not invent a child command loop
+or start it separately. Once the parent proposal is approved,
+`mission guide --json` visibly projects the child request in `next.effects`;
+drive it with the same `lionclaw mission advance --wait` command used for role
+and oracle effects. The kernel durably records the parent request before it
+creates and binds the deterministic child mission, reconnects that same child
+after recovery, and exposes the folded result in `child_mission_receipts`.
+
+Child success supplies only the assigned task output. Its proof summary is
+audit evidence, not authoritative parent proof; the parent still runs every
+required oracle and independent review. A pending child blocks finish. Child
+failure enters the existing task failure choices, and parent stop or abort
+propagates to the child before the parent effect is cleaned.
+
 ## Ratify and drive
 
 When a plan proposal parks, inspect it with `lionclaw mission plan show

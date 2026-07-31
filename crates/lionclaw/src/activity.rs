@@ -235,7 +235,7 @@ pub async fn publish_observed(
                     }
                 }
             }
-            InflightEffect::OracleRun { .. } => {}
+            InflightEffect::OracleRun { .. } | InflightEffect::ChildMission { .. } => {}
         }
     }
     workspace_observations.extend(observe_workspaces(workspace_requests).await);
@@ -249,6 +249,9 @@ pub async fn publish_observed(
                     requested_at_ms, ..
                 } => *requested_at_ms,
                 InflightEffect::OracleRun {
+                    requested_at_ms, ..
+                } => *requested_at_ms,
+                InflightEffect::ChildMission {
                     requested_at_ms, ..
                 } => *requested_at_ms,
             };

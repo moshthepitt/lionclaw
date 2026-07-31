@@ -488,7 +488,7 @@ impl EverydayMissionSelector {
         let all = load_mission_states(store).await?;
         let ignored_settled = all
             .iter()
-            .filter(|(_, state)| state.is_terminal())
+            .filter(|(_, state)| state.lineage.is_none() && state.is_terminal())
             .map(|(id, _)| id.clone())
             .collect::<BTreeSet<_>>();
         if let Some(bound) = read_current_mission(&files)? {
@@ -517,7 +517,12 @@ impl EverydayMissionSelector {
 
     async fn load_facts(&mut self, store: &MissionStore, runtime: &str) -> Result<EverydayFacts> {
         let all = load_mission_states(store).await?;
-        let live = all
+        let roots = all
+            .iter()
+            .filter(|(_, state)| state.lineage.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let live = roots
             .iter()
             .filter(|(_, state)| !state.is_terminal())
             .cloned()
@@ -536,7 +541,7 @@ impl EverydayMissionSelector {
                 1,
             )
         } else {
-            let candidates = all
+            let candidates = roots
                 .iter()
                 .filter(|(id, state)| !state.is_terminal() || !self.ignored_settled.contains(id))
                 .cloned()
@@ -572,7 +577,7 @@ impl EverydayMissionSelector {
             None => (
                 MissionSelection::Ambiguous {
                     live: live.len(),
-                    total: all.len(),
+                    total: roots.len(),
                 },
                 None,
             ),

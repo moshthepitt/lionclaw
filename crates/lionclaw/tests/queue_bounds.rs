@@ -334,8 +334,10 @@ async fn production_broadcast_is_atomic_when_one_live_conversation_is_full() {
         reporter_id.clone(),
         common::role("second-implementer", OutputSemantics::ProducesArtifact),
     );
-    team.task_assignments
-        .insert(TaskId::new("validator").unwrap(), reporter_id.clone());
+    team.task_assignments.insert(
+        TaskId::new("validator").unwrap(),
+        reporter_id.clone().into(),
+    );
     engine
         .propose_plan(&mission, mission_proposal)
         .await

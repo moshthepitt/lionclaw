@@ -145,6 +145,7 @@ fn role_instrument_for_revision(
                     },
                     ..Default::default()
                 },
+                lineage: None,
             },
         ),
         event(2, team_event(team(0, false))),
@@ -171,7 +172,7 @@ fn role_instance_identity_survives_assignment_and_team_revisions() {
             (engineer.clone(), original),
         ]),
         planning_assignment: planner.id.clone(),
-        task_assignments: BTreeMap::from([(task.clone(), engineer.clone())]),
+        task_assignments: BTreeMap::from([(task.clone(), engineer.clone().into())]),
         judgment_assignments: BTreeMap::new(),
         gap_review_assignment: None,
         guidance: None,
@@ -181,7 +182,10 @@ fn role_instance_identity_survives_assignment_and_team_revisions() {
         roles: BTreeMap::from([(planner.id.clone(), planner), (engineer.clone(), revised)]),
         ..revision_zero.clone()
     };
-    assert_eq!(revision_one.task_assignments[&task], engineer);
+    assert_eq!(
+        revision_one.task_assignments[&task],
+        engineer.clone().into()
+    );
     assert_eq!(revision_one.roles[&engineer].runtime, "hermes");
 }
 
@@ -203,7 +207,7 @@ fn team_owns_contracts_assignments_and_guidance() {
             (gap.id.clone(), gap),
         ]),
         planning_assignment: instance("planner"),
-        task_assignments: BTreeMap::from([(task, instance("engineer"))]),
+        task_assignments: BTreeMap::from([(task, instance("engineer").into())]),
         judgment_assignments: BTreeMap::from([(assertion, vec![instance("reviewer")])]),
         gap_review_assignment: Some(instance("gap-reviewer")),
         guidance: Some(MissionGuidance::new("Prefer the smallest correct change.")),
@@ -264,6 +268,7 @@ fn role_resource_overrides_are_bounded_by_mission_resource_ceilings() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
+                lineage: None,
             },
         ),
         event(2, team_event(team(0, true))),
@@ -313,6 +318,7 @@ fn over_ceiling_team_configured_event_is_ignored_during_replay() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
+                lineage: None,
             },
         ),
         event(2, team_event(team(0, true))),
@@ -331,6 +337,7 @@ fn sunset_wire_shapes_have_no_planning_or_role_bridges() {
         skills: BTreeMap::new(),
         ceilings: AuthorityCeilings::default(),
         resource_ceilings: Default::default(),
+        runtime_ceilings: Default::default(),
         requires_gap_review: true,
         recovery: RecoveryConfig::default(),
         execution: ExecutionPolicy::default(),
@@ -466,7 +473,11 @@ fn team(revision: u32, assigned: bool) -> TeamRevision {
         ]),
         planning_assignment: instance("planner"),
         task_assignments: if assigned {
-            [(TaskId::new("implement").unwrap(), instance("engineer"))].into()
+            [(
+                TaskId::new("implement").unwrap(),
+                instance("engineer").into(),
+            )]
+            .into()
         } else {
             BTreeMap::new()
         },
@@ -505,6 +516,7 @@ fn oracle_dispatch_is_bounded_by_remaining_effect_capacity() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
+                lineage: None,
             },
         ),
         event(2, team_event(team(0, false))),
@@ -645,6 +657,7 @@ fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
             ..Default::default()
         },
         resource_ceilings: Default::default(),
+        runtime_ceilings: Default::default(),
         requires_gap_review: false,
         recovery: RecoveryConfig::default(),
         execution: ExecutionPolicy::default(),
@@ -672,6 +685,7 @@ fn accepted_joint_proposal_promotes_the_plan_and_exact_team_revision() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
+                lineage: None,
             },
         ),
         event(2, team_event(team(0, false))),
@@ -722,6 +736,7 @@ fn a_skipped_team_revision_is_ignored_during_replay() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
+                lineage: None,
             },
         ),
         event(2, team_event(team(0, false))),
@@ -764,6 +779,7 @@ fn role_completion_cannot_override_the_team_owned_output_contract() {
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
                 config,
+                lineage: None,
             },
         ),
         event(2, team_event(team(0, false))),
@@ -879,6 +895,7 @@ fn accepted_advisory_state() -> MissionState {
                     },
                     ..Default::default()
                 },
+                lineage: None,
             },
         ),
         event(2, team_event(team(0, false))),
@@ -1654,7 +1671,7 @@ fn queued_continuation_uses_the_roles_running_serial_task() {
         .as_mut()
         .unwrap()
         .task_assignments
-        .insert(active.clone(), instance("engineer"));
+        .insert(active.clone(), instance("engineer").into());
     state.tasks.insert(
         active.clone(),
         TaskRuntimeState {

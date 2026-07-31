@@ -249,7 +249,7 @@ async fn accepted_commit_object_fault_settles_once_and_does_not_block_later_mess
 }
 
 async fn prove_commit_object_fault_settles_once(fault: CommitObjectFault) {
-    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (40, 76));
+    assert_eq!((SCHEMA_VERSION, REDUCER_VERSION), (41, 77));
     let dir = tempfile::tempdir().unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let h = checkpoint_harness(dir.path(), prompts.clone()).await;
@@ -889,7 +889,7 @@ async fn accepted_park_reference_survives_legal_clear_from_durable_history() {
         ),
     );
     team.task_assignments
-        .insert(TaskId::new("park-source").unwrap(), source_role);
+        .insert(TaskId::new("park-source").unwrap(), source_role.into());
     h.engine
         .propose_plan(&mission, mission_proposal)
         .await

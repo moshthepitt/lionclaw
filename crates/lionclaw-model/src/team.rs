@@ -87,6 +87,18 @@ impl AuthorityGrants {
     }
 }
 
+impl AuthorityCeilings {
+    /// Whether every child ceiling is no broader than this parent ceiling.
+    pub fn contains(&self, child: &Self) -> bool {
+        (!child.secrets || self.secrets)
+            && child.network.within(&self.network)
+            && (!child.install || self.install)
+            && (!child.writes || self.writes)
+            && child.devices.is_subset(&self.devices)
+            && child.inputs.is_subset(&self.inputs)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ConfinementResources {
@@ -334,6 +346,40 @@ pub struct RoleInstance {
     pub deadline_secs: Option<u64>,
 }
 
+/// The one closed execution assignment for a generic plan task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TaskAssignment {
+    Role {
+        role_instance: RoleInstanceId,
+    },
+    ChildMission {
+        mission: Box<super::ChildMissionAssignment>,
+    },
+}
+
+impl TaskAssignment {
+    pub const fn role_instance(&self) -> Option<&RoleInstanceId> {
+        match self {
+            Self::Role { role_instance } => Some(role_instance),
+            Self::ChildMission { .. } => None,
+        }
+    }
+
+    pub const fn child_mission(&self) -> Option<&super::ChildMissionAssignment> {
+        match self {
+            Self::ChildMission { mission } => Some(mission),
+            Self::Role { .. } => None,
+        }
+    }
+}
+
+impl From<RoleInstanceId> for TaskAssignment {
+    fn from(role_instance: RoleInstanceId) -> Self {
+        Self::Role { role_instance }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TeamRevision {
@@ -341,7 +387,7 @@ pub struct TeamRevision {
     pub roles: BTreeMap<RoleInstanceId, RoleInstance>,
     pub planning_assignment: RoleInstanceId,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub task_assignments: BTreeMap<TaskId, RoleInstanceId>,
+    pub task_assignments: BTreeMap<TaskId, TaskAssignment>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub judgment_assignments: BTreeMap<AssertionId, Vec<RoleInstanceId>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -353,6 +399,22 @@ pub struct TeamRevision {
 impl TeamRevision {
     pub fn role(&self, id: &RoleInstanceId) -> Option<&RoleInstance> {
         self.roles.get(id)
+    }
+
+    pub fn task_role(&self, task_id: &TaskId) -> Option<&RoleInstance> {
+        self.task_assignments
+            .get(task_id)?
+            .role_instance()
+            .and_then(|role| self.role(role))
+    }
+
+    pub fn task_output(&self, task_id: &TaskId) -> Option<OutputSemantics> {
+        match self.task_assignments.get(task_id)? {
+            TaskAssignment::Role { role_instance } => {
+                self.role(role_instance).map(|role| role.output)
+            }
+            TaskAssignment::ChildMission { mission } => Some(mission.output),
+        }
     }
 
     pub fn validate_shape(&self) -> Result<(), String> {

@@ -4,8 +4,9 @@
 use anyhow::Result;
 
 use crate::model::{
-    AuthoritativeVerdict, DecisionEvidence, EffectId, FailureFeedback, MissionState, PayloadRef,
-    RoleAttemptDisposition, RoleAttemptReceipt, RoleEffectSource, RuntimeUsage,
+    AuthoritativeVerdict, ChildMissionOutput, ChildMissionReceipt, DecisionEvidence, EffectId,
+    FailureFeedback, MissionState, PayloadRef, RoleAttemptDisposition, RoleAttemptReceipt,
+    RoleEffectSource, RuntimeUsage,
 };
 use crate::store::BlobStore;
 
@@ -281,6 +282,74 @@ pub fn role_attempt_receipt_json(
         "handoff": handoff,
         "disposition": disposition,
     })
+}
+
+pub fn child_mission_receipt_json(
+    blobs: &BlobStore,
+    state: &MissionState,
+    effect_id: &EffectId,
+    receipt: &ChildMissionReceipt,
+) -> serde_json::Value {
+    let report_content = match &receipt.output {
+        Some(ChildMissionOutput::Report { report, .. }) => {
+            serde_json::Value::String(render_payload(blobs, report))
+        }
+        Some(ChildMissionOutput::Artifact { .. }) | None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "effect_id": effect_id.as_str(),
+        "authority": "kernel_folded_child_truth",
+        "generation": "child_mission",
+        "parent_mission_id": receipt.parent_mission_id.as_str(),
+        "parent_effect_id": receipt.parent_effect_id.as_str(),
+        "child_mission_id": receipt.child_mission_id.as_str(),
+        "request_digest": receipt.request_digest,
+        "input_artifact": receipt.input_artifact,
+        "terminal": receipt.terminal,
+        "output": receipt.output,
+        "report_content": report_content,
+        "proof_summary": receipt.proof,
+        "failure": receipt.failure,
+        "cleaned": state.cleaned_child_missions.contains(effect_id),
+    })
+}
+
+pub fn render_child_mission_receipt(
+    blobs: &BlobStore,
+    state: &MissionState,
+    effect_id: &EffectId,
+    receipt: &ChildMissionReceipt,
+) -> String {
+    let output = match &receipt.output {
+        Some(ChildMissionOutput::Artifact { artifact }) => {
+            format!("artifact {} -> {}", artifact.base_sha, artifact.head_sha)
+        }
+        Some(ChildMissionOutput::Report {
+            report,
+            report_sha256,
+        }) => format!(
+            "report sha256={}\nreport:\n{}",
+            report_sha256,
+            render_payload(blobs, report)
+        ),
+        None => "none".to_string(),
+    };
+    let failure = receipt
+        .failure
+        .as_ref()
+        .map_or_else(|| "none".to_string(), render_typed_failure);
+    format!(
+        "effect: {effect_id}\nsource: child mission {}\nauthority: kernel-folded child truth\nrequest: {}\ninput artifact: {}\nterminal: {}\noutput: {}\nchild proof summary: authoritative={} advisory={}\nfailure: {}\ncleaned: {}",
+        receipt.child_mission_id,
+        receipt.request_digest,
+        receipt.input_artifact,
+        receipt.terminal.slug(),
+        output,
+        receipt.proof.authoritative_receipt_digests.len(),
+        receipt.proof.advisory_receipt_digests.len(),
+        failure,
+        state.cleaned_child_missions.contains(effect_id),
+    )
 }
 
 pub fn role_attempt_reference_json(

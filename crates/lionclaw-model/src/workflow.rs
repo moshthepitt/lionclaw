@@ -32,6 +32,11 @@ pub enum EffectIntent {
         role_instance: RoleInstanceId,
         effect_id: EffectId,
     },
+    CleanupChildMission {
+        effect_id: EffectId,
+        child_mission_id: super::MissionId,
+    },
+    ChildMission(super::ChildMissionRequest),
     DispatchRole(RoleDispatchIntent),
     DispatchOracle(OracleDispatchIntent),
 }
@@ -134,6 +139,17 @@ impl Choice {
 }
 
 pub fn next(state: &MissionState) -> Next {
+    let child_cleanup = child_cleanup_intents(state);
+    if !child_cleanup.is_empty() {
+        return Next {
+            effects: child_cleanup,
+            choices: if state.terminal.is_none() {
+                vec![Choice::Abort]
+            } else {
+                Vec::new()
+            },
+        };
+    }
     let cleanup = conversation_cleanup_intents(state);
     if !cleanup.is_empty() {
         let mut choices = active_control_choices(state);
@@ -214,6 +230,18 @@ fn active_effects(state: &MissionState) -> Vec<EffectIntent> {
         .keys()
         .cloned()
         .map(|effect_id| EffectIntent::ResolveEffect { effect_id })
+        .collect()
+}
+
+fn child_cleanup_intents(state: &MissionState) -> Vec<EffectIntent> {
+    state
+        .child_mission_receipts
+        .iter()
+        .filter(|(effect_id, _)| !state.cleaned_child_missions.contains(*effect_id))
+        .map(|(effect_id, receipt)| EffectIntent::CleanupChildMission {
+            effect_id: effect_id.clone(),
+            child_mission_id: receipt.child_mission_id.clone(),
+        })
         .collect()
 }
 
@@ -516,8 +544,14 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
     let Some(plan) = &state.plan else {
         return intents;
     };
-    let capacity = state.config.execution.effect_capacity as usize;
-    let remaining_capacity = capacity.saturating_sub(state.inflight.len());
+    let capacity = state.config.execution.effect_capacity;
+    let remaining_capacity = capacity.saturating_sub(
+        state
+            .inflight
+            .values()
+            .map(InflightEffect::capacity_reservation)
+            .sum(),
+    );
     if remaining_capacity == 0 {
         return intents;
     }
@@ -592,7 +626,7 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
         .values()
         .filter_map(|effect| match effect {
             InflightEffect::RoleTurn { role_instance, .. } => Some(role_instance.clone()),
-            InflightEffect::OracleRun { .. } => None,
+            InflightEffect::OracleRun { .. } | InflightEffect::ChildMission { .. } => None,
         })
         .collect();
     let active_tasks: BTreeSet<_> = state
@@ -603,6 +637,7 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
                 task_id: Some(task_id),
                 ..
             } => Some(task_id.clone()),
+            InflightEffect::ChildMission { request, .. } => Some(request.task_id.clone()),
             InflightEffect::RoleTurn { task_id: None, .. } | InflightEffect::OracleRun { .. } => {
                 None
             }
@@ -624,10 +659,10 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
         let Some(team) = state.team.as_ref() else {
             return Vec::new();
         };
-        let Some(role_id) = team.task_assignments.get(&task.id) else {
+        let Some(assignment) = team.task_assignments.get(&task.id) else {
             return Vec::new();
         };
-        if reserved_tasks.contains(&task.id) || reserved_roles.contains(role_id) {
+        if reserved_tasks.contains(&task.id) {
             continue;
         }
         let Some(base_sha) = state.task_required_base(&task.id) else {
@@ -636,20 +671,43 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
         let Some(dependency_refs) = state.task_dependency_refs(&task.id) else {
             continue;
         };
-        if let Some(intent) = role_intent(
-            state,
-            role_id,
-            Some(task.id.clone()),
-            task.body.clone(),
-            task.targets.clone(),
-            base_sha,
-            dependency_refs,
-        ) {
-            reserved_tasks.insert(task.id.clone());
-            reserved_roles.insert(role_id.clone());
-            intents.push(EffectIntent::DispatchRole(intent));
-            if intents.len() == remaining_capacity {
-                break;
+        let reserved_by_intents = projected_capacity(&intents);
+        match assignment {
+            super::TaskAssignment::Role { role_instance } => {
+                if remaining_capacity.saturating_sub(reserved_by_intents) < 1
+                    || reserved_roles.contains(role_instance)
+                {
+                    continue;
+                }
+                if let Some(intent) = role_intent(
+                    state,
+                    role_instance,
+                    Some(task.id.clone()),
+                    task.body.clone(),
+                    task.targets.clone(),
+                    base_sha,
+                    dependency_refs,
+                ) {
+                    reserved_tasks.insert(task.id.clone());
+                    reserved_roles.insert(role_instance.clone());
+                    intents.push(EffectIntent::DispatchRole(intent));
+                }
+            }
+            super::TaskAssignment::ChildMission { mission } => {
+                let reservation = mission.config.execution.effect_capacity;
+                if reservation > remaining_capacity.saturating_sub(reserved_by_intents) {
+                    continue;
+                }
+                if let Some(request) = child_mission_intent(
+                    state,
+                    task.id.clone(),
+                    base_sha,
+                    dependency_refs,
+                    mission.as_ref().clone(),
+                ) {
+                    reserved_tasks.insert(task.id.clone());
+                    intents.push(EffectIntent::ChildMission(request));
+                }
             }
         }
     }
@@ -708,7 +766,7 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
         ) {
             reserved_judges.insert(role_instance.clone());
             intents.push(EffectIntent::DispatchRole(intent));
-            if intents.len() == remaining_capacity {
+            if projected_capacity(&intents) >= remaining_capacity {
                 break;
             }
         }
@@ -728,7 +786,9 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
         };
         if state.oracle_dispatchable(&oracle) {
             by_oracle.insert(oracle, assertion_ids);
-            if by_oracle.len() == remaining_capacity {
+            if projected_capacity(&intents).saturating_add(by_oracle.len() as u32)
+                >= remaining_capacity
+            {
                 break;
             }
         }
@@ -749,6 +809,42 @@ fn dispatch_intents(state: &MissionState) -> Vec<EffectIntent> {
     }
 
     intents
+}
+
+fn projected_capacity(intents: &[EffectIntent]) -> u32 {
+    intents
+        .iter()
+        .map(|intent| match intent {
+            EffectIntent::ChildMission(request) => {
+                request.assignment.config.execution.effect_capacity
+            }
+            EffectIntent::DispatchRole(_) | EffectIntent::DispatchOracle(_) => 1,
+            EffectIntent::ResolveEffect { .. }
+            | EffectIntent::CleanupConversation { .. }
+            | EffectIntent::CleanupChildMission { .. } => 0,
+        })
+        .sum()
+}
+
+fn child_mission_intent(
+    state: &MissionState,
+    task_id: TaskId,
+    input_artifact: String,
+    dependency_refs: Vec<super::TaskCandidateRef>,
+    assignment: super::ChildMissionAssignment,
+) -> Option<super::ChildMissionRequest> {
+    let attempt_no = state
+        .tasks
+        .get(&task_id)
+        .map_or(1, |task| task.attempts.saturating_add(1));
+    super::ChildMissionRequest::derive(
+        &state.mission_id,
+        task_id,
+        attempt_no,
+        input_artifact,
+        dependency_refs,
+        assignment,
+    )
 }
 
 fn planning_intent(state: &MissionState) -> Option<RoleDispatchIntent> {

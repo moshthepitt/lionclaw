@@ -22,6 +22,7 @@ mod prelude {
     };
 }
 
+pub mod child;
 pub mod decision;
 mod digest;
 pub mod event;
@@ -37,6 +38,11 @@ pub mod team;
 pub mod verdict;
 pub mod workflow;
 
+pub use child::{
+    ChildMissionAssignment, ChildMissionOutput, ChildMissionReceipt, ChildMissionRequest,
+    ChildProofSummary, MissionLineage, MAX_CHILD_MISSION_DEPTH, MAX_CHILD_MISSION_DESCENDANTS,
+    MAX_CHILD_MISSION_OBJECTIVE_BYTES, MAX_CHILD_MISSION_REQUEST_BYTES,
+};
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
     resolve_execution_deadline_ms, role_assignment_prompt_template, role_prompt_template,
@@ -95,8 +101,8 @@ pub use state::{
 };
 pub use team::{
     parse_confinement_size_bytes, validate_environment_entry, AuthorityCeilings, AuthorityGrants,
-    ConfinementResources, ConfinementTmpfsResource, MissionGuidance, RoleInstance, TeamRevision,
-    KERNEL_ENVIRONMENT_KEYS, MAX_GUIDANCE_BYTES, MAX_TMPFS_RESOURCE_OVERRIDES,
+    ConfinementResources, ConfinementTmpfsResource, MissionGuidance, RoleInstance, TaskAssignment,
+    TeamRevision, KERNEL_ENVIRONMENT_KEYS, MAX_GUIDANCE_BYTES, MAX_TMPFS_RESOURCE_OVERRIDES,
 };
 pub use verdict::{AuthoritativeVerdict, FinishClass};
 pub use workflow::{next, Choice, EffectIntent, Next, OracleDispatchIntent, RoleDispatchIntent};

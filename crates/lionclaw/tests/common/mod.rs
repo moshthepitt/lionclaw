@@ -246,7 +246,12 @@ pub fn team(revision: u32, plan: Option<&Plan>, gap_review: bool) -> TeamRevisio
         task_assignments: plan
             .into_iter()
             .flat_map(|plan| &plan.tasks)
-            .map(|task| (task.id.clone(), RoleInstanceId::new("implementer").unwrap()))
+            .map(|task| {
+                (
+                    task.id.clone(),
+                    RoleInstanceId::new("implementer").unwrap().into(),
+                )
+            })
             .collect(),
         judgment_assignments: plan
             .into_iter()
@@ -432,7 +437,12 @@ pub fn proposal_with_team(
     next_team.task_assignments = plan
         .tasks
         .iter()
-        .map(|task| (task.id.clone(), RoleInstanceId::new("implementer").unwrap()))
+        .map(|task| {
+            (
+                task.id.clone(),
+                RoleInstanceId::new("implementer").unwrap().into(),
+            )
+        })
         .collect();
     next_team.judgment_assignments = plan
         .assertions

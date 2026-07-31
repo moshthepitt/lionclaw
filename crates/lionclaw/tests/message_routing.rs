@@ -295,7 +295,7 @@ async fn production_cli_routes_atomically_only_to_explicit_live_conversations() 
     );
     replacement_team
         .task_assignments
-        .insert(replacement.clone(), replacement_role.clone());
+        .insert(replacement.clone(), replacement_role.clone().into());
     h.engine
         .propose_plan(
             &mission,

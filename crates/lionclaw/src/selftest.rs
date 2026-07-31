@@ -556,7 +556,7 @@ async fn proposal(
     team.task_assignments = plan
         .tasks
         .iter()
-        .map(|task| (task.id.clone(), implementer.clone()))
+        .map(|task| (task.id.clone(), implementer.clone().into()))
         .collect();
     team.judgment_assignments = plan
         .assertions

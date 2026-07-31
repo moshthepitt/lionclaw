@@ -74,7 +74,22 @@ fn assert_advertised_actions_are_legal(view: &MissionView) {
                     )
                 }));
             }
-            EffectIntent::DispatchRole(_) | EffectIntent::DispatchOracle(_) => {
+            EffectIntent::CleanupChildMission {
+                effect_id,
+                child_mission_id,
+            } => {
+                assert_eq!(
+                    view.state
+                        .child_mission_receipts
+                        .get(effect_id)
+                        .map(|receipt| &receipt.child_mission_id),
+                    Some(child_mission_id)
+                );
+                assert!(!view.state.cleaned_child_missions.contains(effect_id));
+            }
+            EffectIntent::ChildMission(_)
+            | EffectIntent::DispatchRole(_)
+            | EffectIntent::DispatchOracle(_) => {
                 assert!(!view.state.is_terminal());
                 assert!(view.state.inflight.is_empty());
             }

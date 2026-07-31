@@ -255,6 +255,7 @@ impl MissionType {
                 .collect(),
             ceilings: self.ceilings.clone(),
             resource_ceilings: self.resource_ceilings.clone(),
+            runtime_ceilings: Default::default(),
             requires_gap_review: self.requires_gap_review,
             recovery: self.recovery.clone(),
             execution: self.execution.clone(),

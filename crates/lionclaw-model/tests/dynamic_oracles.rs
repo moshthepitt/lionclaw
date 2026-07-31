@@ -43,7 +43,7 @@ fn team() -> TeamRevision {
             (reviewer.id.clone(), reviewer.clone()),
         ]),
         planning_assignment: planner.id,
-        task_assignments: BTreeMap::from([(task, worker.id)]),
+        task_assignments: BTreeMap::from([(task, worker.id.into())]),
         judgment_assignments: BTreeMap::from([(assertion, vec![reviewer.id])]),
         gap_review_assignment: None,
         guidance: None,
@@ -106,6 +106,7 @@ fn bootstrap_events() -> Vec<EventEnvelope> {
                     },
                     ..Default::default()
                 },
+                lineage: None,
             },
         ),
         event(

@@ -161,6 +161,8 @@ pub struct PlanningPromptContext<'a> {
     pub resource_ceilings: &'a ConfinementResources,
     /// Authority ceilings shared by proposed roles and command oracles.
     pub authority_ceilings: &'a AuthorityCeilings,
+    /// Complete folded parent limits used to validate child mission requests.
+    pub mission_config: &'a crate::model::MissionConfig,
     /// The accepted oracle set. A proposal may retain it or replace it
     /// completely alongside a plan revision.
     pub current_oracles: &'a std::collections::BTreeMap<OracleName, OracleSpec>,
@@ -252,6 +254,13 @@ fn render_planning(role: &RoleInstance, ctx: &PlanningPromptContext<'_>) -> Stri
         "\n```\n\nMaximum oracle timeout: {} seconds.\n",
         ctx.max_oracle_timeout_secs
     ));
+    prompt.push_str("\n\n## Parent mission limits for child missions\n\n");
+    prompt.push_str("A child mission is an ordinary LionClaw mission executed as a typed task assignment on this same machine. Its complete config and revision-zero proposal must be equal to or narrower than the folded parent limits below. Keep the child `skills` map empty in this planning surface; native skill packages and their control text are deliberately not copied into prompts. Child output can satisfy only its assigned task; child proof is audit evidence and never satisfies parent assertions. Never place credentials, secret values, tokens, passwords, or API keys in a child objective, config, proposal, role environment, oracle request, or instructions.\n\n```json\n");
+    prompt.push_str(
+        &serde_json::to_string_pretty(&child_mission_parent_limits(ctx.mission_config))
+            .expect("child mission parent limits serialize"),
+    );
+    prompt.push_str("\n```\n");
     if !ctx.task_body.is_empty() {
         prompt.push_str("\n\n## Task\n\n");
         prompt.push_str(ctx.task_body);
@@ -268,6 +277,18 @@ fn render_planning(role: &RoleInstance, ctx: &PlanningPromptContext<'_>) -> Stri
         prompt.push_str(ctx.guidance);
     }
     prompt
+}
+
+fn child_mission_parent_limits(config: &crate::model::MissionConfig) -> serde_json::Value {
+    serde_json::json!({
+        "stop": config.stop,
+        "ceilings": config.ceilings,
+        "resource_ceilings": config.resource_ceilings,
+        "runtime_ceilings": config.runtime_ceilings,
+        "requires_gap_review": config.requires_gap_review,
+        "recovery": config.recovery,
+        "execution": config.execution,
+    })
 }
 
 /// Context for the gap reviewer. A **separate** assembler with no fields
@@ -492,8 +513,12 @@ A proposal separates outcomes from proof:
 - each assertion has exactly one active task owner; dependencies express
   contribution and real ordering between tasks
 - the complete team revision owns role contracts, task assignments, independent
-  judgment panels, and the optional gap-review assignment; a task may use a
-  read-only `produces-report` role or a writable `produces-artifact` role
+  judgment panels, and the optional gap-review assignment; a task assignment
+  is either a tagged `role` or a tagged `child_mission`
+- a child mission is an ordinary mission on the same machine, with a complete
+  revision-zero plan/team/oracle proposal and a config equal to or narrower
+  than the parent mission limits; it supplies only the task output, while the
+  parent still runs its own required oracles and independent review
 - the complete oracle map owns every command or external proof driver used as proof
 
 Rules the engine enforces (an invalid proposal is rejected):
@@ -514,6 +539,9 @@ Rules the engine enforces (an invalid proposal is rejected):
   change the product tree
 - role instances carry their complete output semantics, runtime, instructions,
   skills, environment, authority grants, and optional deadline
+- child configs may only narrow parent ceilings, skills, resources, runtimes,
+  deadlines, recovery, depth, descendant count, and effect capacity; never put
+  secret values or credentials anywhere in a child mission assignment
 - command oracles use structured argv with a non-shell executable and clean
   workspace-relative cwd, stay read-only and secret-free, and remain within the displayed timeout,
   authority, input, device, and resource ceilings
@@ -549,7 +577,33 @@ When you are finished you MUST write /mission/handoff/handoff.json exactly like:
                   \"runtime\": \"<runtime>\", \"instructions\": \"...\",
                   \"grants\": {\"writes\": <true-only-for-produces-artifact>}}},
                 \"planning_assignment\": \"<planning-role-id>\",
-                \"task_assignments\": {\"change\": \"<task-producer-role-id>\"},
+                \"task_assignments\": {
+                  \"change\": {\"type\": \"role\",
+                    \"role_instance\": \"<task-producer-role-id>\"},
+                  \"delegated\": {\"type\": \"child_mission\", \"mission\": {
+                    \"objective\": \"<bounded child mission objective>\",
+                    \"output\": \"produces-report\",
+                    \"config\": {\"stop\": \"attested\", \"skills\": {},
+                      \"ceilings\": {}, \"resource_ceilings\": {},
+                      \"runtime_ceilings\": [\"<parent-runtime>\"],
+                      \"requires_gap_review\": false,
+                      \"recovery\": {\"max_attempts\": 1},
+                      \"execution\": {\"default_timeout_secs\": 300,
+                        \"max_task_time_secs\": 600, \"extension_step_secs\": 60,
+                        \"effect_capacity\": 1, \"max_child_depth\": 0,
+                        \"max_descendants\": 0,
+                        \"auto_continue_candidate\": false,
+                        \"auto_continue_proof\": false}},
+                    \"proposal\": {\"plan\": {\"base_revision\": 0,
+                      \"requirement_changes\": [], \"assertion_supersessions\": [],
+                      \"plan\": {\"requirements\": [\"<complete child requirements>\"],
+                        \"assertions\": [\"<complete child assertions>\"],
+                        \"tasks\": [\"<complete child tasks>\"]}},
+                      \"team\": {\"revision\": 0, \"roles\": {},
+                        \"planning_assignment\": \"<child-planner-role-id>\",
+                        \"task_assignments\": {}, \"judgment_assignments\": {}},
+                      \"oracles\": {}},
+                    \"deadline_secs\": 600}}},
                 \"judgment_assignments\": {\"OUTCOME-HOLDS\": [\"<judge-role-id>\"]},
                 \"gap_review_assignment\": \"<gap-review-role-id>\"},
       \"oracles\": {\"outcome-check\": {\"type\": \"command\",
@@ -597,7 +651,10 @@ mod team_prompt_tests {
                 (gap.id.clone(), gap.clone()),
             ]),
             planning_assignment: planner.id.clone(),
-            task_assignments: BTreeMap::from([(TaskId::new("change").unwrap(), worker.id.clone())]),
+            task_assignments: BTreeMap::from([(
+                TaskId::new("change").unwrap(),
+                worker.id.clone().into(),
+            )]),
             judgment_assignments: BTreeMap::new(),
             gap_review_assignment: Some(gap.id.clone()),
             guidance: None,
@@ -606,6 +663,7 @@ mod team_prompt_tests {
         let resource_ceilings = ConfinementResources {
             tmpfs: vec!["/tmp:rw,size=2g".to_string()],
         };
+        let mission_config = crate::model::MissionConfig::default();
 
         let execution = render(TurnContext::Execution(
             &worker,
@@ -634,6 +692,7 @@ mod team_prompt_tests {
                 team: &team,
                 resource_ceilings: &resource_ceilings,
                 authority_ceilings: &AuthorityCeilings::default(),
+                mission_config: &mission_config,
                 current_oracles: &BTreeMap::new(),
                 max_oracle_timeout_secs: 3600,
                 task_body: "plan it",
@@ -674,5 +733,12 @@ mod team_prompt_tests {
         assert!(!planning.contains("\"kind\": \"work\""));
         assert!(!judgment.contains(guidance));
         assert!(!gap_review.contains(guidance));
+    }
+
+    #[test]
+    fn planning_prompt_exposes_typed_child_mission_assignments() {
+        assert!(PROPOSES_PLAN_SKELETON.contains("\"type\": \"child_mission\""));
+        assert!(PROPOSES_PLAN_SKELETON.contains("child mission"));
+        assert!(PROPOSES_PLAN_SKELETON.contains("parent mission"));
     }
 }

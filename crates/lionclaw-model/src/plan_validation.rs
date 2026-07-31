@@ -12,7 +12,10 @@
 use super::ids::TaskId;
 use super::plan::{OutputSemantics, Plan, PlanProposal, RequirementDisposition};
 use super::state::MissionState;
-use super::{MissionConfig, MissionProposal, OracleName, OracleSpec, StopBar, TeamRevision};
+use super::{
+    ChildMissionAssignment, MissionConfig, MissionProposal, OracleName, OracleSpec, StopBar,
+    TaskAssignment, TeamRevision,
+};
 use crate::prelude::*;
 
 /// Maximum direct fan-in for one task. Role reports are independently bounded
@@ -123,7 +126,10 @@ fn check_dispatch_topology(plan: &Plan, team: &TeamRevision) -> Vec<PlanValidati
 
     let mut by_role: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for task in &plan.tasks {
-        if let Some(role) = team.task_assignments.get(&task.id) {
+        if let Some(TaskAssignment::Role {
+            role_instance: role,
+        }) = team.task_assignments.get(&task.id)
+        {
             by_role.entry(role).or_default().push(&task.id);
         }
     }
@@ -706,6 +712,12 @@ fn check_shape(
         return errors;
     }
     for (id, role) in &team.roles {
+        if !config.runtime_ceilings.is_empty() && !config.runtime_ceilings.contains(&role.runtime) {
+            errors.push(err(
+                "runtime_exceeds_ceiling",
+                format!("role instance '{id}' requests runtime outside mission ceilings"),
+            ));
+        }
         if !role.grants.within(&config.ceilings) {
             errors.push(err(
                 "authority_exceeds_ceiling",
@@ -803,29 +815,34 @@ fn check_shape(
                 format!("task '{}' has no body", task.id),
             ));
         }
-        let Some(role_id) = team.task_assignments.get(&task.id) else {
+        let Some(assignment) = team.task_assignments.get(&task.id) else {
             errors.push(err(
                 "missing_task_assignment",
                 format!("task '{}' has no producer assignment", task.id),
             ));
             continue;
         };
-        match team.roles.get(role_id) {
-            Some(role) if role.output.produces_task_output() => {}
-            Some(_) => errors.push(err(
-                "task_output_mismatch",
-                format!(
-                    "task '{}' assigns role instance '{role_id}' whose output cannot satisfy a task",
-                    task.id
-                ),
-            )),
-            None => errors.push(err(
-                "unknown_task_role",
-                format!(
-                    "task '{}' assigns unknown role instance '{role_id}'",
-                    task.id
-                ),
-            )),
+        match assignment {
+            TaskAssignment::Role { role_instance } => match team.roles.get(role_instance) {
+                Some(role) if role.output.produces_task_output() => {}
+                Some(_) => errors.push(err(
+                    "task_output_mismatch",
+                    format!(
+                        "task '{}' assigns role instance '{role_instance}' whose output cannot satisfy a task",
+                        task.id
+                    ),
+                )),
+                None => errors.push(err(
+                    "unknown_task_role",
+                    format!(
+                        "task '{}' assigns unknown role instance '{role_instance}'",
+                        task.id
+                    ),
+                )),
+            },
+            TaskAssignment::ChildMission { mission } => {
+                errors.extend(validate_child_assignment(&task.id, mission, config));
+            }
         }
         for target in &task.targets {
             if !known.contains(target) {
@@ -844,6 +861,21 @@ fn check_shape(
             ));
         }
     }
+    let descendant_reservation = team
+        .task_assignments
+        .values()
+        .filter_map(TaskAssignment::child_mission)
+        .map(|mission| mission.config.execution.max_descendants.saturating_add(1))
+        .sum::<u32>();
+    if descendant_reservation > config.execution.max_descendants {
+        errors.push(err(
+            "descendant_limit_exceeded",
+            format!(
+                "plan reserves {descendant_reservation} descendants above mission limit {}",
+                config.execution.max_descendants
+            ),
+        ));
+    }
     for assertion_id in team.judgment_assignments.keys() {
         if !plan
             .assertions
@@ -857,6 +889,138 @@ fn check_shape(
         }
     }
     errors
+}
+
+fn validate_child_assignment(
+    task_id: &TaskId,
+    child: &ChildMissionAssignment,
+    parent: &MissionConfig,
+) -> Vec<PlanValidationError> {
+    let mut details = Vec::new();
+    if child.objective.trim().is_empty()
+        || child.objective.len() > super::MAX_CHILD_MISSION_OBJECTIVE_BYTES
+    {
+        details.push("objective is empty or exceeds its byte limit".to_string());
+    }
+    if !child.output.produces_task_output() {
+        details.push("output must be produces_report or produces_artifact".to_string());
+    }
+    if child.deadline_secs == 0 || child.deadline_secs > parent.execution.max_task_time_secs {
+        details.push("deadline exceeds the parent task-time ceiling".to_string());
+    }
+    if let Err(detail) = child.config.execution.validate() {
+        details.push(format!("execution policy is invalid: {detail}"));
+    }
+    if child.config.recovery.max_attempts == 0
+        || child.config.recovery.max_attempts > parent.recovery.max_attempts
+    {
+        details.push("recovery attempts exceed the parent ceiling".to_string());
+    }
+    if !parent.ceilings.contains(&child.config.ceilings) {
+        details.push("authority ceilings exceed the parent".to_string());
+    }
+    if let Err(detail) = child
+        .config
+        .resource_ceilings
+        .within(&parent.resource_ceilings)
+    {
+        details.push(format!("resource ceilings exceed the parent: {detail}"));
+    }
+    if child.config.runtime_ceilings.is_empty()
+        || !child
+            .config
+            .runtime_ceilings
+            .is_subset(&parent.runtime_ceilings)
+    {
+        details.push("runtime ceilings are empty or exceed the parent".to_string());
+    }
+    if child
+        .config
+        .skills
+        .iter()
+        .any(|(name, skill)| parent.skills.get(name) != Some(skill))
+    {
+        details.push("skill authority exceeds or differs from the parent".to_string());
+    }
+    let child_execution = &child.config.execution;
+    let parent_execution = &parent.execution;
+    if child_execution.default_timeout_secs > parent_execution.default_timeout_secs
+        || child_execution.max_task_time_secs > parent_execution.max_task_time_secs
+        || child_execution.max_task_time_secs > child.deadline_secs
+        || child_execution.extension_step_secs > parent_execution.extension_step_secs
+        || child_execution.effect_capacity > parent_execution.effect_capacity
+        || child_execution.max_child_depth.saturating_add(1) > parent_execution.max_child_depth
+        || child_execution.max_descendants.saturating_add(1) > parent_execution.max_descendants
+        || (child_execution.auto_continue_candidate && !parent_execution.auto_continue_candidate)
+        || (child_execution.auto_continue_proof && !parent_execution.auto_continue_proof)
+    {
+        details.push("execution authority is not equal to or narrower than the parent".to_string());
+    }
+    if child.digest().is_none() {
+        details.push("canonical request exceeds its serialized byte limit".to_string());
+    }
+
+    let (Some(plan), Some(team), Some(oracles)) = (
+        child.proposal.plan.as_ref(),
+        child.proposal.team.as_ref(),
+        child.proposal.oracles.as_ref(),
+    ) else {
+        details.push("initial proposal must contain a complete plan, team, and oracle map".into());
+        return vec![err(
+            "invalid_child_mission",
+            format!("task '{task_id}' child mission: {}", details.join("; ")),
+        )];
+    };
+    if plan.base_revision != 0
+        || !plan.requirement_changes.is_empty()
+        || !plan.assertion_supersessions.is_empty()
+        || team.revision != 0
+    {
+        details.push("initial child plan and team must start at revision zero".to_string());
+    }
+    for (name, oracle) in oracles {
+        if let Err(detail) = oracle.validate(
+            &child.config.ceilings,
+            &child.config.resource_ceilings,
+            &child.config.execution,
+        ) {
+            details.push(format!("oracle '{name}' is invalid: {detail}"));
+        }
+    }
+    if details.is_empty() {
+        let child_plan_errors = validate_plan(&plan.plan, team, oracles, &child.config);
+        details.extend(child_plan_errors.into_iter().map(|error| error.to_string()));
+        let depended_on: BTreeSet<_> = plan
+            .plan
+            .tasks
+            .iter()
+            .flat_map(|task| task.depends_on.iter())
+            .collect();
+        let sink = plan
+            .plan
+            .tasks
+            .iter()
+            .find(|task| !depended_on.contains(&task.id));
+        let sink_output = sink
+            .and_then(|task| team.task_assignments.get(&task.id))
+            .and_then(|assignment| match assignment {
+                TaskAssignment::Role { role_instance } => {
+                    team.roles.get(role_instance).map(|role| role.output)
+                }
+                TaskAssignment::ChildMission { mission } => Some(mission.output),
+            });
+        if sink_output != Some(child.output) {
+            details.push("deliverable sink does not match the declared child output".to_string());
+        }
+    }
+    if details.is_empty() {
+        Vec::new()
+    } else {
+        vec![err(
+            "invalid_child_mission",
+            format!("task '{task_id}' child mission: {}", details.join("; ")),
+        )]
+    }
 }
 
 fn check_deps_resolve(plan: &Plan) -> Vec<PlanValidationError> {
@@ -1038,7 +1202,10 @@ mod topology_tests {
                 .map(|role| (role.id.clone(), role))
                 .collect(),
             planning_assignment: planner.id,
-            task_assignments: assignments,
+            task_assignments: assignments
+                .into_iter()
+                .map(|(task, role)| (task, role.into()))
+                .collect(),
             judgment_assignments: BTreeMap::from([(
                 AssertionId::new("A-1").unwrap(),
                 vec![judge.id],

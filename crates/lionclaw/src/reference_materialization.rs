@@ -467,6 +467,7 @@ mod tests {
                     workspace_dir: "/workspace".into(),
                     base_sha: "base".into(),
                     config: crate::model::MissionConfig::default(),
+                    lineage: None,
                 },
             ),
             envelope(

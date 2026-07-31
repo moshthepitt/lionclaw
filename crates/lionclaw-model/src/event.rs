@@ -24,9 +24,9 @@ use crate::{
     NetworkGrant, RuntimeUsage, TypedFailure, TypedFailureEvidence,
 };
 
-/// Version 40 records runtime-profile external oracle driver authority in
-/// durable proof identity so changed driver grants invalidate old proof.
-pub const SCHEMA_VERSION: u32 = 40;
+/// Version 41 records kernel-owned mission lineage and typed child mission
+/// request, binding, receipt, and cleanup facts.
+pub const SCHEMA_VERSION: u32 = 41;
 
 /// Maximum durable message body. Reference expansion is deliberately not
 /// represented here: the shell resolves it transiently for a turn.
@@ -258,6 +258,8 @@ pub struct MissionConfig {
     pub ceilings: super::AuthorityCeilings,
     #[serde(default, skip_serializing_if = "super::ConfinementResources::is_empty")]
     pub resource_ceilings: super::ConfinementResources,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub runtime_ceilings: BTreeSet<String>,
     #[serde(default)]
     pub requires_gap_review: bool,
     #[serde(default)]
@@ -273,6 +275,7 @@ impl Default for MissionConfig {
             skills: BTreeMap::new(),
             ceilings: super::AuthorityCeilings::default(),
             resource_ceilings: super::ConfinementResources::default(),
+            runtime_ceilings: BTreeSet::new(),
             requires_gap_review: false,
             recovery: RecoveryConfig::default(),
             execution: ExecutionPolicy::default(),
@@ -288,6 +291,10 @@ pub struct ExecutionPolicy {
     pub extension_step_secs: u64,
     #[serde(default = "default_effect_capacity")]
     pub effect_capacity: u32,
+    #[serde(default = "default_max_child_depth")]
+    pub max_child_depth: u32,
+    #[serde(default = "default_max_descendants")]
+    pub max_descendants: u32,
     #[serde(default)]
     pub auto_continue_candidate: bool,
     #[serde(default)]
@@ -301,6 +308,8 @@ impl Default for ExecutionPolicy {
             max_task_time_secs: 30 * 60,
             extension_step_secs: 5 * 60,
             effect_capacity: default_effect_capacity(),
+            max_child_depth: default_max_child_depth(),
+            max_descendants: default_max_descendants(),
             auto_continue_candidate: false,
             auto_continue_proof: false,
         }
@@ -311,6 +320,14 @@ const fn default_effect_capacity() -> u32 {
     4
 }
 
+const fn default_max_child_depth() -> u32 {
+    4
+}
+
+const fn default_max_descendants() -> u32 {
+    32
+}
+
 impl ExecutionPolicy {
     pub fn validate(&self) -> Result<(), String> {
         if self.default_timeout_secs == 0 || self.extension_step_secs == 0 {
@@ -318,6 +335,18 @@ impl ExecutionPolicy {
         }
         if self.effect_capacity == 0 || self.effect_capacity > 64 {
             return Err("effect-capacity must be between 1 and 64".into());
+        }
+        if self.max_child_depth > super::MAX_CHILD_MISSION_DEPTH {
+            return Err(format!(
+                "max-child-depth must not exceed {}",
+                super::MAX_CHILD_MISSION_DEPTH
+            ));
+        }
+        if self.max_descendants > super::MAX_CHILD_MISSION_DESCENDANTS {
+            return Err(format!(
+                "max-descendants must not exceed {}",
+                super::MAX_CHILD_MISSION_DESCENDANTS
+            ));
         }
         if self.max_task_time_secs < self.default_timeout_secs {
             return Err("max-task-time-secs must be at least default-timeout-secs".into());
@@ -651,6 +680,10 @@ pub enum MissionEvent {
         /// HEAD of the target repo when the mission was created.
         base_sha: String,
         config: MissionConfig,
+        /// Present only for a kernel-created child. Callers cannot supply it
+        /// through the child assignment contract.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lineage: Option<super::MissionLineage>,
     },
     ProposalRecorded {
         proposal: Box<MissionProposal>,
@@ -745,6 +778,26 @@ pub enum MissionEvent {
         attempt_no: u32,
         effect_id: super::EffectId,
         outcome: Result<OracleRunSuccess, TypedFailure>,
+    },
+    ChildMissionRequested {
+        request: Box<super::ChildMissionRequest>,
+        requested_at_ms: i64,
+        deadline_ms: i64,
+        budget_deadline_ms: i64,
+    },
+    /// Confirms that the deterministic child stream exists with the exact
+    /// kernel-owned lineage. It carries no new scheduling authority.
+    ChildMissionBound {
+        effect_id: super::EffectId,
+        child_mission_id: MissionId,
+    },
+    ChildMissionCompleted {
+        effect_id: super::EffectId,
+        receipt: Box<super::ChildMissionReceipt>,
+    },
+    ChildMissionCleaned {
+        effect_id: super::EffectId,
+        child_mission_id: MissionId,
     },
     /// A durable control for one exact effect generation.
     ControlRequested {
@@ -894,6 +947,10 @@ impl MissionEvent {
             Self::RoleTurnCompleted { .. } => "role_turn_completed",
             Self::OracleRunRequested { .. } => "oracle_run_requested",
             Self::OracleRunCompleted { .. } => "oracle_run_completed",
+            Self::ChildMissionRequested { .. } => "child_mission_requested",
+            Self::ChildMissionBound { .. } => "child_mission_bound",
+            Self::ChildMissionCompleted { .. } => "child_mission_completed",
+            Self::ChildMissionCleaned { .. } => "child_mission_cleaned",
             Self::ControlRequested { .. } => "control_requested",
             Self::EffectCleanupFailed { .. } => "effect_cleanup_failed",
             Self::ConversationResourcesCleaned { .. } => "conversation_resources_cleaned",
@@ -912,8 +969,12 @@ impl MissionEvent {
             | Self::OracleRunRequested { effect_id, .. } => {
                 Some((EffectEventClass::Request, effect_id.as_str()))
             }
+            Self::ChildMissionRequested { request, .. } => {
+                Some((EffectEventClass::Request, request.parent_effect_id.as_str()))
+            }
             Self::RoleTurnCompleted { effect_id, .. }
-            | Self::OracleRunCompleted { effect_id, .. } => {
+            | Self::OracleRunCompleted { effect_id, .. }
+            | Self::ChildMissionCompleted { effect_id, .. } => {
                 Some((EffectEventClass::Outcome, effect_id.as_str()))
             }
             // Facts are not members of the request/outcome pair, even when
@@ -924,6 +985,8 @@ impl MissionEvent {
             | Self::SkillAdded { .. }
             | Self::EnvironmentAssigned { .. }
             | Self::MessageSent { .. }
+            | Self::ChildMissionBound { .. }
+            | Self::ChildMissionCleaned { .. }
             | Self::ControlRequested { .. }
             | Self::ConversationResourcesCleaned { .. }
             | Self::MissionAborted { .. }
@@ -945,6 +1008,7 @@ impl MissionEvent {
                 outcome: Err(failure),
                 ..
             } => Some(failure),
+            Self::ChildMissionCompleted { receipt, .. } => receipt.failure.as_ref(),
             _ => None,
         }
     }
@@ -971,6 +1035,10 @@ impl MissionEvent {
                 },
                 Err(failure) => failure.evidence().clone(),
             }),
+            Self::ChildMissionCompleted { receipt, .. } => receipt
+                .failure
+                .as_ref()
+                .map(|failure| failure.evidence().clone()),
             _ => None,
         }
     }

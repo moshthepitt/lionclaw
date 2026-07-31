@@ -874,6 +874,7 @@ fn parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_re
                 },
                 ..Default::default()
             },
+            lineage: None,
         },
     }];
     prefix.push(envelope(
@@ -1132,7 +1133,7 @@ fn judged_team(revision: u32, plan: &Plan) -> TeamRevision {
         planning_assignment: RoleInstanceId::new("strategist").unwrap(),
         task_assignments: BTreeMap::from([(
             "build".parse_task(),
-            RoleInstanceId::new("implementer").unwrap(),
+            RoleInstanceId::new("implementer").unwrap().into(),
         )]),
         judgment_assignments: BTreeMap::from([
             (
@@ -1157,15 +1158,15 @@ fn assigned_team(revision: u32, plan: &Plan) -> TeamRevision {
         task_assignments: BTreeMap::from([
             (
                 LEFT.parse_task(),
-                RoleInstanceId::new("left-writer").unwrap(),
+                RoleInstanceId::new("left-writer").unwrap().into(),
             ),
             (
                 RIGHT.parse_task(),
-                RoleInstanceId::new("right-writer").unwrap(),
+                RoleInstanceId::new("right-writer").unwrap().into(),
             ),
             (
                 MERGE.parse_task(),
-                RoleInstanceId::new("integrator").unwrap(),
+                RoleInstanceId::new("integrator").unwrap().into(),
             ),
         ]),
         judgment_assignments: plan
@@ -1189,7 +1190,7 @@ fn report_synthesis_team(revision: u32, plan: &Plan) -> TeamRevision {
     team.roles.insert(reporter.id.clone(), reporter);
     team.task_assignments.insert(
         MERGE.parse_task(),
-        RoleInstanceId::new("report-synthesizer").unwrap(),
+        RoleInstanceId::new("report-synthesizer").unwrap().into(),
     );
     team
 }

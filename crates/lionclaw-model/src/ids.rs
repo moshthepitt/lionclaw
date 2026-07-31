@@ -198,6 +198,21 @@ impl EffectId {
         ])
     }
 
+    pub fn for_child_mission(
+        parent_mission_id: &MissionId,
+        task_id: &TaskId,
+        attempt_no: u32,
+        request_digest: &str,
+    ) -> Self {
+        Self::for_parts(&[
+            "child-mission",
+            parent_mission_id.as_str(),
+            task_id.as_str(),
+            &attempt_no.to_string(),
+            request_digest,
+        ])
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -268,6 +283,27 @@ impl MissionId {
 
         Self::from_digest_prefix(&lowercase_hex(&Sha256::digest(
             format!("{workspace}\u{1f}{objective}\u{1f}{now_ms}").as_bytes(),
+        )))
+    }
+
+    pub fn for_child_mission(
+        parent_mission_id: &MissionId,
+        parent_effect_id: &EffectId,
+        attempt_no: u32,
+        request_digest: &str,
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+
+        Self::from_digest_prefix(&lowercase_hex(&Sha256::digest(
+            [
+                "child-mission",
+                parent_mission_id.as_str(),
+                parent_effect_id.as_str(),
+                &attempt_no.to_string(),
+                request_digest,
+            ]
+            .join("\u{1f}")
+            .as_bytes(),
         )))
     }
 

@@ -9,6 +9,8 @@
 //! whether an external turn completed and never silently replays one.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,12 +21,13 @@ use sha2::{Digest, Sha256};
 use crate::driver_lock::DriverGuard;
 use crate::mission_type::MissionType;
 use crate::model::{
-    next, validate_mission_proposal, Choice, EffectEventClass, EffectId, EffectIntent,
+    next, validate_mission_proposal, ArtifactOutcome, ChildMissionOutput, ChildMissionReceipt,
+    ChildMissionRequest, ChildProofSummary, Choice, EffectEventClass, EffectId, EffectIntent,
     ExternalOracleDriverId, ExternalOracleDriverIdentity, Handoff, InflightEffect, MissionEvent,
-    MissionId, MissionProposal, MissionState, Next, OracleDispatchIntent, OracleRunSuccess,
-    PayloadRef, PlanValidationError, ProposalError, RoleDispatchIntent, RoleInstance,
-    RoleInstanceId, RoleTurnSuccess, RuntimeInstrumentIdentity, TaskId, TerminalState,
-    MAX_ROLE_REPORT_BYTES,
+    MissionId, MissionLineage, MissionProposal, MissionState, Next, OracleDispatchIntent,
+    OracleRunSuccess, OutputSemantics, PayloadRef, PlanValidationError, ProposalError,
+    RoleDispatchIntent, RoleInstance, RoleInstanceId, RoleTurnSuccess, RuntimeInstrumentIdentity,
+    TaskAssignment, TaskId, TerminalState, MAX_ROLE_REPORT_BYTES,
 };
 use crate::ports::{
     ArtifactCapture, Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl,
@@ -279,6 +282,8 @@ async fn execute_projected_conversation_cleanup(
                         effect_id,
                     } => Some((role_instance, effect_id)),
                     EffectIntent::ResolveEffect { .. }
+                    | EffectIntent::CleanupChildMission { .. }
+                    | EffectIntent::ChildMission(_)
                     | EffectIntent::DispatchRole(_)
                     | EffectIntent::DispatchOracle(_) => None,
                 })
@@ -573,44 +578,65 @@ impl Engine {
         _state: &MissionState,
         mut proposal: MissionProposal,
     ) -> Result<MissionProposal, ProposalError> {
-        let Some(oracles) = proposal.oracles.as_mut() else {
-            return Ok(proposal);
-        };
         let mut errors = Vec::new();
-        for (name, spec) in oracles {
-            let crate::model::OracleSpec::External(external) = spec else {
-                continue;
-            };
-            let Some(identity) = self
-                .external_oracle_driver_identities
-                .get(&external.driver)
-                .cloned()
-            else {
-                errors.push(plan_error(
-                    "invalid_oracle",
-                    format!(
-                        "oracle '{name}' names external driver '{}' that is not installed in the selected runtime profile",
-                        external.driver
-                    ),
-                ));
-                continue;
-            };
-            match &external.driver_identity {
-                Some(existing) if existing != &identity => errors.push(plan_error(
-                    "invalid_oracle",
-                    format!(
-                        "oracle '{name}' carries stale external driver authority for '{}'",
-                        external.driver
-                    ),
-                )),
-                Some(_) => {}
-                None => external.driver_identity = Some(identity),
-            }
-        }
+        self.resolve_external_oracles_in_proposal(&mut proposal, "mission", &mut errors);
         if errors.is_empty() {
             Ok(proposal)
         } else {
             Err(ProposalError::Invalid(errors))
+        }
+    }
+
+    fn resolve_external_oracles_in_proposal(
+        &self,
+        proposal: &mut MissionProposal,
+        scope: &str,
+        errors: &mut Vec<PlanValidationError>,
+    ) {
+        if let Some(oracles) = proposal.oracles.as_mut() {
+            for (name, spec) in oracles {
+                let crate::model::OracleSpec::External(external) = spec else {
+                    continue;
+                };
+                let Some(identity) = self
+                    .external_oracle_driver_identities
+                    .get(&external.driver)
+                    .cloned()
+                else {
+                    errors.push(plan_error(
+                        "invalid_oracle",
+                        format!(
+                            "{scope} oracle '{name}' names external driver '{}' that is not installed in the selected runtime profile",
+                            external.driver
+                        ),
+                    ));
+                    continue;
+                };
+                match &external.driver_identity {
+                    Some(existing) if existing != &identity => errors.push(plan_error(
+                        "invalid_oracle",
+                        format!(
+                            "{scope} oracle '{name}' carries stale external driver authority for '{}'",
+                            external.driver
+                        ),
+                    )),
+                    Some(_) => {}
+                    None => external.driver_identity = Some(identity),
+                }
+            }
+        }
+        let Some(team) = proposal.team.as_mut() else {
+            return;
+        };
+        for (task_id, assignment) in &mut team.task_assignments {
+            let TaskAssignment::ChildMission { mission } = assignment else {
+                continue;
+            };
+            self.resolve_external_oracles_in_proposal(
+                &mut mission.proposal,
+                &format!("{scope} child task '{task_id}'"),
+                errors,
+            );
         }
     }
 
@@ -638,7 +664,8 @@ impl Engine {
         base_sha: &str,
     ) -> Result<MissionId> {
         self.mission_type.validate_at(now_ms)?;
-        let config = self.mission_type.mission_config();
+        let mut config = self.mission_type.mission_config();
+        config.runtime_ceilings = self.runtime_identities.keys().cloned().collect();
         let runtime_identities =
             self.resolve_team_runtime_identities(&self.mission_type.default_team)?;
         let created = NewEvent::new(MissionEvent::MissionCreated {
@@ -648,6 +675,7 @@ impl Engine {
             workspace_dir: workspace_dir.to_string(),
             base_sha: base_sha.to_string(),
             config,
+            lineage: None,
         });
         self.store
             .create_mission_with_events(
@@ -937,18 +965,28 @@ impl Engine {
                 return Ok(());
             }
             let mut resolve_effects = Vec::new();
+            let mut has_child_cleanup = false;
             let mut has_conversation_cleanup = false;
+            let mut child_intents = Vec::new();
             let mut role_intents = Vec::new();
             let mut oracle_intents = Vec::new();
             for effect in projection.effects {
                 match effect {
                     EffectIntent::ResolveEffect { effect_id } => resolve_effects.push(effect_id),
+                    EffectIntent::CleanupChildMission { .. } => {
+                        has_child_cleanup = true;
+                    }
                     EffectIntent::CleanupConversation { .. } => {
                         has_conversation_cleanup = true;
                     }
+                    EffectIntent::ChildMission(request) => child_intents.push(request),
                     EffectIntent::DispatchRole(intent) => role_intents.push(intent),
                     EffectIntent::DispatchOracle(intent) => oracle_intents.push(intent),
                 }
+            }
+            if has_child_cleanup {
+                self.execute_projected_child_cleanup(mission_id).await?;
+                continue;
             }
             if has_conversation_cleanup {
                 execute_projected_conversation_cleanup(
@@ -967,13 +1005,21 @@ impl Engine {
                 // protocol is idempotent and the submission handle is durable.
                 let current = self.load_state(mission_id).await?;
                 let mut resumable_external = Vec::new();
+                let mut resumable_children = Vec::new();
                 for effect_id in resolve_effects {
-                    if self.effect_is_resumable_external_oracle(&current, &effect_id) {
+                    if self.effect_is_resumable_child_mission(&current, &effect_id) {
+                        resumable_children.push(effect_id);
+                    } else if self.effect_is_resumable_external_oracle(&current, &effect_id) {
                         resumable_external.push(effect_id);
                     } else if !self
                         .recover_interrupted_effect(mission_id, &effect_id)
                         .await?
                     {
+                        return Ok(());
+                    }
+                }
+                for effect_id in resumable_children {
+                    if !Box::pin(self.drive_child_mission_effect(mission_id, &effect_id)).await? {
                         return Ok(());
                     }
                 }
@@ -985,6 +1031,17 @@ impl Engine {
                         continue;
                     }
                     return Ok(());
+                }
+                continue;
+            }
+            if !child_intents.is_empty() {
+                let effect_ids = self
+                    .materialize_child_mission_requests(&state, child_intents)
+                    .await?;
+                for effect_id in effect_ids {
+                    if !Box::pin(self.drive_child_mission_effect(mission_id, &effect_id)).await? {
+                        return Ok(());
+                    }
                 }
                 continue;
             }
@@ -1092,6 +1149,593 @@ impl Engine {
                 .filter(|spec| spec.digest() == *spec_digest),
             Some(crate::model::OracleSpec::External(_))
         )
+    }
+
+    fn effect_is_resumable_child_mission(
+        &self,
+        state: &MissionState,
+        effect_id: &EffectId,
+    ) -> bool {
+        matches!(
+            state.inflight.get(effect_id),
+            Some(InflightEffect::ChildMission { .. })
+        )
+    }
+
+    async fn drive_child_mission_effect(
+        &self,
+        parent_mission_id: &MissionId,
+        effect_id: &EffectId,
+    ) -> Result<bool> {
+        let parent = self.load_state(parent_mission_id).await?;
+        let Some(InflightEffect::ChildMission {
+            request,
+            bound,
+            deadline_ms,
+            budget_deadline_ms,
+            ..
+        }) = parent.inflight.get(effect_id)
+        else {
+            return Ok(true);
+        };
+        let request = (**request).clone();
+        if parent.terminal.is_none()
+            && !parent.stop_requests.contains_key(effect_id)
+            && !parent.reached_deadlines.contains_key(effect_id)
+        {
+            let now_ms = self.clock.now_ms();
+            if now_ms >= *deadline_ms {
+                self.append_fact(
+                    parent_mission_id,
+                    parent.head,
+                    NewEvent::new(MissionEvent::ControlRequested {
+                        effect_id: effect_id.clone(),
+                        action: crate::model::ControlAction::DeadlineReached {
+                            deadline_ms: *deadline_ms,
+                        },
+                        reason: "child mission reached its parent-owned deadline".into(),
+                    }),
+                )
+                .await?;
+                return Ok(true);
+            }
+            let extension_ms = i64::try_from(
+                parent
+                    .config
+                    .execution
+                    .extension_step_secs
+                    .saturating_mul(1_000),
+            )
+            .unwrap_or(i64::MAX);
+            if deadline_ms < budget_deadline_ms
+                && now_ms.saturating_add(extension_ms) >= *deadline_ms
+            {
+                let new_deadline_ms = deadline_ms
+                    .saturating_add(extension_ms)
+                    .min(*budget_deadline_ms);
+                self.append_fact(
+                    parent_mission_id,
+                    parent.head,
+                    NewEvent::new(MissionEvent::ControlRequested {
+                        effect_id: effect_id.clone(),
+                        action: crate::model::ControlAction::ExtendDeadline {
+                            old_deadline_ms: *deadline_ms,
+                            new_deadline_ms,
+                            automatic: true,
+                        },
+                        reason: "parent execution policy extended child mission deadline".into(),
+                    }),
+                )
+                .await?;
+                return Ok(true);
+            }
+        }
+        if !*bound {
+            if !self.child_mission_exists(&request.child_mission_id).await? {
+                self.create_child_mission(&parent, &request).await?;
+                // Creation is durable before binding, giving recovery a
+                // separately observable reconnect boundary.
+                return Ok(false);
+            }
+            let child = self.load_state(&request.child_mission_id).await?;
+            self.ensure_child_matches_request(&parent, &request, &child)?;
+            self.append_fact(
+                parent_mission_id,
+                parent.head,
+                NewEvent::new(MissionEvent::ChildMissionBound {
+                    effect_id: effect_id.clone(),
+                    child_mission_id: request.child_mission_id.clone(),
+                }),
+            )
+            .await?;
+            return Ok(false);
+        }
+
+        let mut child = self.load_state(&request.child_mission_id).await?;
+        self.ensure_child_matches_request(&parent, &request, &child)?;
+        let cancellation = if let Some(TerminalState::Aborted { reason }) = &parent.terminal {
+            Some(format!("parent mission aborted: {reason}"))
+        } else if let Some(reason) = parent.stop_requests.get(effect_id) {
+            Some(format!("parent stopped child effect: {reason}"))
+        } else if parent.reached_deadlines.contains_key(effect_id) {
+            Some("parent child-mission deadline exhausted".to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = cancellation {
+            if child.terminal.is_none() {
+                self.abort(&child.mission_id, &reason).await?;
+            }
+            // Reuse the ordinary driver so active role/oracle work observes
+            // the child's durable abort and performs its normal cleanup.
+            child = self.advance_child_once(&child.mission_id).await?;
+        } else if child.terminal.is_none() {
+            child = self.advance_child_once(&child.mission_id).await?;
+        }
+
+        if child.terminal.is_none() && child.inflight.is_empty() {
+            let child_next = next(&child);
+            if child_next
+                .choices
+                .iter()
+                .any(|choice| matches!(choice, Choice::Finish { .. }))
+            {
+                self.finish(
+                    &child.mission_id,
+                    "parent effect accepted the child's folded proof result",
+                )
+                .await?;
+                return Ok(true);
+            }
+            if child_next.effects.is_empty() {
+                self.abort(
+                    &child.mission_id,
+                    "child mission parked on failure or replanning instead of producing its task output",
+                )
+                .await?;
+                return Ok(true);
+            }
+        }
+
+        if child.terminal.is_none() || !child.inflight.is_empty() {
+            return Ok(true);
+        }
+        let receipt = self
+            .derive_child_mission_receipt(&parent, &request, &child)
+            .await?;
+        self.append_fact(
+            parent_mission_id,
+            parent.head,
+            NewEvent::new(MissionEvent::ChildMissionCompleted {
+                effect_id: effect_id.clone(),
+                receipt: Box::new(receipt),
+            }),
+        )
+        .await?;
+        // Receipt durability is a checkpoint before projected cleanup.
+        Ok(false)
+    }
+
+    fn advance_boxed<'a>(
+        &'a self,
+        mission_id: &'a MissionId,
+    ) -> Pin<Box<dyn Future<Output = Result<MissionView>> + Send + 'a>> {
+        Box::pin(self.advance(mission_id))
+    }
+
+    async fn advance_child_once(&self, child_mission_id: &MissionId) -> Result<MissionState> {
+        let engine = self.clone();
+        let child_mission_id = child_mission_id.clone();
+        tokio::spawn(async move { engine.advance_boxed(&child_mission_id).await })
+            .await
+            .context("joining ordinary child mission driver")?
+            .map(|view| view.state)
+    }
+
+    async fn child_mission_exists(&self, mission_id: &MissionId) -> Result<bool> {
+        Ok(self.store.list_missions().await?.contains(mission_id))
+    }
+
+    async fn create_child_mission(
+        &self,
+        parent: &MissionState,
+        request: &ChildMissionRequest,
+    ) -> Result<()> {
+        ensure!(
+            request.parent_mission_id == parent.mission_id,
+            "child request parent does not match folded state"
+        );
+        let projected = next(parent);
+        ensure!(
+            projected.effects.contains(&EffectIntent::ResolveEffect {
+                effect_id: request.parent_effect_id.clone(),
+            }),
+            "child creation is not a projected active parent effect"
+        );
+        self.validate_child_lineage_admission(parent, request)
+            .await?;
+        let lineage = MissionLineage {
+            parent_mission_id: parent.mission_id.clone(),
+            parent_effect_id: request.parent_effect_id.clone(),
+            root_mission_id: parent.lineage.as_ref().map_or_else(
+                || parent.mission_id.clone(),
+                |lineage| lineage.root_mission_id.clone(),
+            ),
+            depth: parent
+                .lineage
+                .as_ref()
+                .map_or(1, |lineage| lineage.depth.saturating_add(1)),
+        };
+        let team = request
+            .assignment
+            .proposal
+            .team
+            .as_ref()
+            .context("validated child proposal lost its complete team")?;
+        let runtime_identities = self.resolve_team_runtime_identities(team)?;
+        let proposal_json = serde_json::to_vec(&request.assignment.proposal)?;
+        let proposal_hash = hex::encode(Sha256::digest(&proposal_json));
+        let events = [
+            NewEvent::new(MissionEvent::MissionCreated {
+                objective: request.assignment.objective.clone(),
+                mission_type: parent.mission_type.clone(),
+                image_id: parent.image_id.clone(),
+                workspace_dir: parent.workspace_dir.clone(),
+                base_sha: request.input_artifact.clone(),
+                config: request.assignment.config.clone(),
+                lineage: Some(lineage),
+            }),
+            NewEvent::new(MissionEvent::ProposalRecorded {
+                proposal: request.assignment.proposal.clone(),
+                proposal_hash,
+            }),
+            NewEvent::new(MissionEvent::DecisionRecorded {
+                attention_id: "plan_proposal:mission".into(),
+                action: crate::model::DecisionAction::Approve,
+                justification: "accepted typed child mission assignment".into(),
+                requirement_changes: Vec::new(),
+                proposal_runtime_identities: runtime_identities,
+            }),
+        ];
+        match self
+            .store
+            .create_mission_with_events(
+                &request.child_mission_id,
+                &parent.workspace_dir,
+                &request.assignment.objective,
+                &events,
+                self.clock.now_ms(),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(AppendError::AlreadyExists(_)) => {
+                let child = self.load_state(&request.child_mission_id).await?;
+                self.ensure_child_matches_request(parent, request, &child)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn validate_child_lineage_admission(
+        &self,
+        parent: &MissionState,
+        request: &ChildMissionRequest,
+    ) -> Result<()> {
+        let mut states = BTreeMap::new();
+        for mission_id in self.store.list_missions().await? {
+            states.insert(
+                mission_id.clone(),
+                self.store.require_state(&mission_id).await?,
+            );
+        }
+        let root_id = parent
+            .lineage
+            .as_ref()
+            .map_or(&parent.mission_id, |lineage| &lineage.root_mission_id);
+        let root = states
+            .get(root_id)
+            .context("child parent names a missing kernel-owned root mission")?;
+        let depth = parent
+            .lineage
+            .as_ref()
+            .map_or(1, |lineage| lineage.depth.saturating_add(1));
+        ensure!(
+            depth <= root.config.execution.max_child_depth,
+            "child mission depth {depth} exceeds root limit {}",
+            root.config.execution.max_child_depth
+        );
+
+        let mut ancestors = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut cursor = parent;
+        loop {
+            ensure!(
+                seen.insert(cursor.mission_id.clone()),
+                "kernel-owned mission lineage contains a cycle"
+            );
+            ensure!(
+                cursor.mission_id != request.child_mission_id,
+                "child mission id would create a lineage cycle"
+            );
+            ancestors.push(cursor.mission_id.clone());
+            let Some(lineage) = &cursor.lineage else {
+                break;
+            };
+            cursor = states
+                .get(&lineage.parent_mission_id)
+                .context("kernel-owned mission lineage names a missing parent")?;
+        }
+        ensure!(
+            cursor.mission_id == *root_id,
+            "kernel-owned child lineage disagrees about its root"
+        );
+        for ancestor_id in ancestors {
+            let ancestor = &states[&ancestor_id];
+            let descendants = states
+                .values()
+                .filter(|candidate| is_kernel_descendant(candidate, &ancestor_id, &states))
+                .count();
+            ensure!(
+                descendants.saturating_add(1) <= ancestor.config.execution.max_descendants as usize,
+                "child mission would exceed descendant limit {} for ancestor '{}'",
+                ancestor.config.execution.max_descendants,
+                ancestor_id
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_child_matches_request(
+        &self,
+        parent: &MissionState,
+        request: &ChildMissionRequest,
+        child: &MissionState,
+    ) -> Result<()> {
+        let expected_lineage = MissionLineage {
+            parent_mission_id: parent.mission_id.clone(),
+            parent_effect_id: request.parent_effect_id.clone(),
+            root_mission_id: parent.lineage.as_ref().map_or_else(
+                || parent.mission_id.clone(),
+                |lineage| lineage.root_mission_id.clone(),
+            ),
+            depth: parent
+                .lineage
+                .as_ref()
+                .map_or(1, |lineage| lineage.depth.saturating_add(1)),
+        };
+        ensure!(
+            child.mission_id == request.child_mission_id,
+            "child id drift"
+        );
+        ensure!(
+            child.objective == request.assignment.objective,
+            "child objective drift"
+        );
+        ensure!(
+            child.mission_type == parent.mission_type,
+            "child mission type drift"
+        );
+        ensure!(
+            child.image_id == parent.image_id,
+            "child confinement image drift"
+        );
+        ensure!(
+            child.workspace_dir == parent.workspace_dir,
+            "child workspace drift"
+        );
+        ensure!(
+            child.base_sha == request.input_artifact,
+            "child input artifact drift"
+        );
+        ensure!(
+            child.config == request.assignment.config,
+            "child authority drift"
+        );
+        ensure!(
+            child.lineage.as_ref() == Some(&expected_lineage),
+            "child lineage drift"
+        );
+        ensure!(
+            child.plan
+                == request
+                    .assignment
+                    .proposal
+                    .plan
+                    .as_ref()
+                    .map(|proposal| proposal.plan.clone()),
+            "child plan drift"
+        );
+        ensure!(
+            child.team == request.assignment.proposal.team,
+            "child team drift"
+        );
+        let expected_runtime_identities = request
+            .assignment
+            .proposal
+            .team
+            .as_ref()
+            .context("child request lost its complete team")
+            .and_then(|team| self.resolve_team_runtime_identities(team))?;
+        ensure!(
+            child.runtime_identity_history.get(&0) == Some(&expected_runtime_identities),
+            "child runtime identity drift"
+        );
+        ensure!(
+            child.oracles
+                == request
+                    .assignment
+                    .proposal
+                    .oracles
+                    .clone()
+                    .unwrap_or_default(),
+            "child oracle drift"
+        );
+        Ok(())
+    }
+
+    async fn derive_child_mission_receipt(
+        &self,
+        parent: &MissionState,
+        request: &ChildMissionRequest,
+        child: &MissionState,
+    ) -> Result<ChildMissionReceipt> {
+        let terminal = child
+            .terminal
+            .clone()
+            .context("cannot settle a nonterminal child mission")?;
+        let output = match (&terminal, request.assignment.output) {
+            (TerminalState::Done { .. }, OutputSemantics::ProducesArtifact) => {
+                Some(ChildMissionOutput::Artifact {
+                    artifact: ArtifactOutcome {
+                        base_sha: request.input_artifact.clone(),
+                        head_sha: child.deliverable_head().to_string(),
+                    },
+                })
+            }
+            (TerminalState::Done { .. }, OutputSemantics::ProducesReport) => {
+                let plan = child.plan.as_ref().context("child has no accepted plan")?;
+                let depended_on: BTreeSet<_> = plan
+                    .tasks
+                    .iter()
+                    .flat_map(|task| task.depends_on.iter())
+                    .collect();
+                let sink = plan
+                    .tasks
+                    .iter()
+                    .find(|task| !depended_on.contains(&task.id))
+                    .context("child plan has no deliverable sink")?;
+                let effect_id = child
+                    .tasks
+                    .get(&sink.id)
+                    .and_then(crate::model::TaskRuntimeState::cleared_outcome)
+                    .map(crate::model::TaskAttemptOutcome::effect_id)
+                    .context("child report sink has no accepted task outcome")?;
+                let report = child
+                    .accepted_task_report(effect_id)
+                    .cloned()
+                    .context("child report sink has no accepted report")?;
+                let report_sha256 = report
+                    .content_sha256()
+                    .context("child report reference has no valid digest")?;
+                Some(ChildMissionOutput::Report {
+                    report,
+                    report_sha256,
+                })
+            }
+            (TerminalState::Done { .. }, _) => {
+                bail!("child task output contract is not a producer")
+            }
+            (TerminalState::Aborted { .. }, _) => None,
+        };
+        if let Some(ChildMissionOutput::Artifact { artifact }) = &output {
+            ensure!(
+                crate::workspace::is_ancestor(
+                    std::path::Path::new(&parent.workspace_dir),
+                    &request.input_artifact,
+                    &artifact.head_sha,
+                )
+                .await?,
+                "child artifact is outside the requested input lineage"
+            );
+        }
+        let failure = match &terminal {
+            TerminalState::Done { .. } => None,
+            TerminalState::Aborted { reason } => {
+                let failure = if let Some(stop_reason) =
+                    parent.stop_requests.get(&request.parent_effect_id)
+                {
+                    let mut evidence = crate::model::TypedFailureEvidence::new(
+                        Some("child_mission.operator_stopped".into()),
+                        "operator stopped the parent child-mission effect",
+                    );
+                    evidence.stop_reason = Some(stop_reason.clone());
+                    TypedFailure::OperatorStopped {
+                        evidence: Box::new(evidence),
+                    }
+                } else if parent
+                    .reached_deadlines
+                    .contains_key(&request.parent_effect_id)
+                {
+                    TypedFailure::DeadlineExhausted {
+                        evidence: Box::new(crate::model::TypedFailureEvidence::new(
+                            Some("child_mission.deadline_exhausted".into()),
+                            "parent child-mission deadline exhausted",
+                        )),
+                    }
+                } else if matches!(parent.terminal, Some(TerminalState::Aborted { .. })) {
+                    TypedFailure::OperatorAborted {
+                        evidence: Box::new(crate::model::TypedFailureEvidence::new(
+                            Some("child_mission.parent_aborted".into()),
+                            reason.clone(),
+                        )),
+                    }
+                } else {
+                    TypedFailure::permanent("child_mission.failed", reason.clone())
+                };
+                Some(failure.projected())
+            }
+        };
+        Ok(ChildMissionReceipt {
+            parent_mission_id: parent.mission_id.clone(),
+            parent_effect_id: request.parent_effect_id.clone(),
+            child_mission_id: child.mission_id.clone(),
+            request_digest: request.request_digest.clone(),
+            input_artifact: request.input_artifact.clone(),
+            terminal,
+            output,
+            proof: ChildProofSummary {
+                finish: child.finish(),
+                authoritative_receipt_digests: digest_values(
+                    child.authoritative_receipts.values(),
+                )?,
+                advisory_receipt_digests: digest_values(child.role_attempt_receipts.values())?,
+            },
+            failure,
+        })
+    }
+
+    async fn execute_projected_child_cleanup(&self, parent_mission_id: &MissionId) -> Result<()> {
+        for _ in 0..MAX_LOOP_ITERATIONS {
+            let parent = self.load_state(parent_mission_id).await?;
+            let Some((effect_id, child_mission_id)) =
+                next(&parent)
+                    .effects
+                    .into_iter()
+                    .find_map(|intent| match intent {
+                        EffectIntent::CleanupChildMission {
+                            effect_id,
+                            child_mission_id,
+                        } => Some((effect_id, child_mission_id)),
+                        _ => None,
+                    })
+            else {
+                return Ok(());
+            };
+            let child = self.load_state(&child_mission_id).await?;
+            ensure!(
+                child.terminal.is_some() && child.inflight.is_empty(),
+                "child cleanup requires a quiescent terminal child"
+            );
+            let event = NewEvent::new(MissionEvent::ChildMissionCleaned {
+                effect_id,
+                child_mission_id,
+            });
+            match self
+                .store
+                .append(
+                    parent_mission_id,
+                    parent.head,
+                    &[event],
+                    self.clock.now_ms(),
+                )
+                .await
+            {
+                Ok(_) | Err(AppendError::Conflict { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("child cleanup kept conflicting after {MAX_LOOP_ITERATIONS} retries")
     }
 
     async fn drive_active(
@@ -1225,6 +1869,9 @@ impl Engine {
                 InflightEffect::OracleRun { .. } => {
                     self.execute_oracle_run(state, &effect_id, &effect, control_rx)
                         .await
+                }
+                InflightEffect::ChildMission { .. } => {
+                    unreachable!("child missions are driven through their ordinary mission loop")
                 }
             }
         };
@@ -2188,6 +2835,7 @@ impl Engine {
                     .context("planning dispatch without a team")?,
                 resource_ceilings: &state.config.resource_ceilings,
                 authority_ceilings: &state.config.ceilings,
+                mission_config: &state.config,
                 current_oracles: &state.oracles,
                 max_oracle_timeout_secs: state.config.execution.max_task_time_secs,
                 task_body: &intent.body,
@@ -2322,6 +2970,40 @@ impl Engine {
             let (effect_id, request_events) = self.build_role_turn_events(state, intent).await?;
             effect_ids.push(effect_id);
             events.extend(request_events);
+        }
+        self.append_idempotent(&state.mission_id, state.head, &events)
+            .await?;
+        Ok(effect_ids)
+    }
+
+    async fn materialize_child_mission_requests(
+        &self,
+        state: &MissionState,
+        requests: Vec<ChildMissionRequest>,
+    ) -> Result<Vec<EffectId>> {
+        let requested_at_ms = self.clock.now_ms();
+        let mut events = Vec::with_capacity(requests.len());
+        let mut effect_ids = Vec::with_capacity(requests.len());
+        for request in requests {
+            ensure!(
+                request.parent_mission_id == state.mission_id,
+                "child request belongs to another parent mission"
+            );
+            let initial_secs = state
+                .config
+                .execution
+                .default_timeout_secs
+                .min(request.assignment.deadline_secs);
+            effect_ids.push(request.parent_effect_id.clone());
+            events.push(NewEvent::new(MissionEvent::ChildMissionRequested {
+                deadline_ms: resolved_deadline(requested_at_ms, initial_secs)?,
+                budget_deadline_ms: resolved_deadline(
+                    requested_at_ms,
+                    request.assignment.deadline_secs,
+                )?,
+                requested_at_ms,
+                request: Box::new(request),
+            }));
         }
         self.append_idempotent(&state.mission_id, state.head, &events)
             .await?;
@@ -2645,6 +3327,37 @@ impl Engine {
     }
 }
 
+fn is_kernel_descendant(
+    candidate: &MissionState,
+    ancestor_id: &MissionId,
+    states: &BTreeMap<MissionId, MissionState>,
+) -> bool {
+    let mut lineage = candidate.lineage.as_ref();
+    let mut seen = BTreeSet::new();
+    while let Some(current) = lineage {
+        if &current.parent_mission_id == ancestor_id {
+            return true;
+        }
+        if !seen.insert(current.parent_mission_id.clone()) {
+            return false;
+        }
+        lineage = states
+            .get(&current.parent_mission_id)
+            .and_then(|state| state.lineage.as_ref());
+    }
+    false
+}
+
+fn digest_values<'a, T: serde::Serialize + 'a>(
+    values: impl Iterator<Item = &'a T>,
+) -> Result<Vec<String>> {
+    let mut digests = values
+        .map(|value| serde_json::to_vec(value).map(|bytes| hex::encode(Sha256::digest(bytes))))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    digests.sort();
+    Ok(digests)
+}
+
 fn granted_prepared_inputs(
     role: &RoleInstance,
     available: &std::collections::BTreeMap<
@@ -2784,6 +3497,9 @@ fn failed_outcome(
             effect_id: effect_id.clone(),
             outcome: Err(failure),
         },
+        InflightEffect::ChildMission { .. } => {
+            unreachable!("child mission failures settle from folded child truth")
+        }
     })
 }
 
@@ -3273,15 +3989,17 @@ fn resolve_message_recipients(
                 selected.push(exact.clone());
                 continue;
             }
-            let matches: Vec<_> =
-                current
-                    .iter()
-                    .filter(|recipient| {
-                        state.team.as_ref().and_then(|team| {
-                            team.task_assignments.get(&TaskId::new(selector).ok()?)
-                        }) == Some(*recipient)
-                    })
-                    .collect();
+            let matches: Vec<_> = current
+                .iter()
+                .filter(|recipient| {
+                    state
+                        .team
+                        .as_ref()
+                        .and_then(|team| team.task_assignments.get(&TaskId::new(selector).ok()?))
+                        .and_then(crate::model::TaskAssignment::role_instance)
+                        == Some(*recipient)
+                })
+                .collect();
             match matches.as_slice() {
                 [] => bail!("recipient '{selector}' is not a current role instance or task"),
                 [one] => selected.push((*one).clone()),
