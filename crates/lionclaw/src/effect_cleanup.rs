@@ -71,6 +71,9 @@ impl EffectCleaner for LocalEffectCleaner {
         {
             failures.push((EffectResource::Network, error.to_string()));
         }
+        if let Err(error) = crate::external_oracle_broker::remove_socket(&request.effect_id).await {
+            failures.push((EffectResource::EffectDirectory, error.to_string()));
+        }
         if let Err(error) = effect_dir.remove().await {
             failures.push((EffectResource::EffectDirectory, error.to_string()));
         }
@@ -126,6 +129,9 @@ mod tests {
             .oracle()
             .prepare()
             .unwrap();
+        let broker_socket = crate::external_oracle_broker::socket_path(&effect_id);
+        let broker_listener = std::os::unix::net::UnixListener::bind(&broker_socket).unwrap();
+        drop(broker_listener);
 
         LocalEffectCleaner::new(engine.to_string_lossy().into_owned())
             .cleanup(EffectCleanupRequest {
@@ -148,5 +154,6 @@ mod tests {
             log.contains(&format!("network rm --force {resource_name}-egress")),
             "missing egress network cleanup in {log}"
         );
+        assert!(!broker_socket.exists(), "credential broker socket leaked");
     }
 }

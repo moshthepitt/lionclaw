@@ -1159,6 +1159,7 @@ dependencies = [
  "lionclaw-runtime-api",
  "lionclaw-runtime-codex",
  "lionclaw-runtime-mock",
+ "reqwest",
  "rustix",
  "serde",
  "serde-saphyr",

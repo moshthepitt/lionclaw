@@ -1,6 +1,8 @@
 mod common;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::io::Read;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -17,6 +19,8 @@ use lionclaw::ports::{
 };
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 use lionclaw_runtime_api::TypedFailure;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use common::{approve_plan, proposal, simple_plan, BASE_SHA, HEAD_SHA};
 
@@ -345,6 +349,256 @@ fn runner(driver: Arc<LocalExternalDriver>) -> OciOracleRunner {
         ExternalOracleDriverRegistry::new()
             .with_driver(ExternalOracleDriverId::new("local-ci").unwrap(), driver),
     )
+}
+
+struct OwnedTestImage(String);
+
+impl Drop for OwnedTestImage {
+    fn drop(&mut self) {
+        let _ = Command::new("podman")
+            .args(["image", "rm", "--force", &self.0])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn build_authenticated_driver_image(temp: &tempfile::TempDir, port: u16) -> OwnedTestImage {
+    const BASE_IMAGE: &str = "localhost/lionclaw-runtime-dev:v1";
+    let suffix = temp
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap()
+        .trim_start_matches(".tmp");
+    let tag = format!("localhost/lionclaw-external-oracle-test:t{suffix}");
+    let driver = format!(
+        r#"#!/usr/bin/env python3
+import json
+import os
+import socket
+import sys
+
+request = json.load(sys.stdin)
+operation = sys.argv[2]
+if os.path.exists("/host-leak"):
+    raise RuntimeError("runtime profile mount leaked into external driver")
+try:
+    with open("/profile-rootfs-leak", "w", encoding="utf-8") as leaked:
+        leaked.write("mutable")
+except OSError:
+    pass
+else:
+    raise RuntimeError("runtime profile rootfs posture leaked into external driver")
+broker_request = {{
+    "method": "POST",
+    "url": "http://localhost:{port}/" + operation,
+    "headers": {{"content-type": "application/json"}},
+    "body": json.dumps(request, separators=(",", ":")),
+}}
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.connect(os.environ["LIONCLAW_EXTERNAL_ORACLE_BROKER"])
+client.sendall(json.dumps(broker_request, separators=(",", ":")).encode() + b"\n")
+response = b""
+while not response.endswith(b"\n"):
+    chunk = client.recv(65536)
+    if not chunk:
+        raise RuntimeError("credential broker closed without a response")
+    response += chunk
+broker = json.loads(response)
+if broker.get("status") != "complete" or broker.get("http_status") != 200:
+    raise RuntimeError("credential broker rejected authenticated request")
+
+if operation == "submit":
+    result = {{
+        "driver": request["driver"],
+        "idempotency_key": request["idempotency_key"],
+        "spec_digest": request["spec_digest"],
+        "request_digest": request["request_digest"],
+        "job_id": "job-" + request["idempotency_key"][:16],
+    }}
+else:
+    result = {{
+        "status": "passed",
+        "proof": {{
+            "driver": request["driver"],
+            "idempotency_key": request["idempotency_key"],
+            "spec_digest": request["spec_digest"],
+            "request_digest": request["request_digest"],
+            "job_id": request["job_id"],
+            "artifact_digest": request["artifact_digest"],
+            "summary": "authenticated local grader passed",
+        }},
+    }}
+json.dump(result, sys.stdout, separators=(",", ":"))
+"#
+    );
+    std::fs::write(temp.path().join("lionclaw-external-oracle-driver"), driver).unwrap();
+    std::fs::write(
+        temp.path().join("Containerfile"),
+        format!(
+            "FROM {BASE_IMAGE}\nUSER root\nCOPY lionclaw-external-oracle-driver /usr/local/bin/lionclaw-external-oracle-driver\nRUN chmod 0755 /usr/local/bin/lionclaw-external-oracle-driver\nUSER lionclaw\n"
+        ),
+    )
+    .unwrap();
+    let output = Command::new("podman")
+        .args(["build", "--quiet", "--tag", &tag])
+        .arg(temp.path())
+        .output()
+        .expect("launch podman build");
+    assert!(
+        output.status.success(),
+        "failed to build authenticated driver image: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    OwnedTestImage(tag)
+}
+
+async fn serve_authenticated_requests(
+    listener: TcpListener,
+    expected: usize,
+    secret: &'static str,
+) {
+    for _ in 0..expected {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "authenticated request ended before headers");
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let mut chunk = [0u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "authenticated request ended before its body");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains(&format!("authorization: bearer {secret}\r\n")));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    }
+}
+
+fn assert_secret_absent_from_tree(root: &std::path::Path, secret: &str) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        if metadata.is_dir() {
+            assert_secret_absent_from_tree(&path, secret);
+        } else if metadata.is_file() {
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .unwrap()
+                .take(4 * 1024 * 1024)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains(secret),
+                "credential leaked into {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn production_external_driver_uses_kernel_broker_without_container_credentials() {
+    const BASE_IMAGE: &str = "localhost/lionclaw-runtime-dev:v1";
+    const SECRET: &str = "effect-scoped-test-secret";
+    if !Command::new("podman")
+        .args(["image", "exists", BASE_IMAGE])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return;
+    }
+
+    let service = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = service.local_addr().unwrap().port();
+    let service_task = tokio::spawn(serve_authenticated_requests(service, 2, SECRET));
+    let temp = tempfile::tempdir().unwrap();
+    let image = build_authenticated_driver_image(&temp, port);
+    let image_id =
+        lionclaw_confinement::resolve_oci_image_compatibility_identity("podman", &image.0)
+            .await
+            .unwrap();
+    let credential = temp.path().join("credential");
+    std::fs::write(&credential, format!("{SECRET}\n")).unwrap();
+    let profile_mount = temp.path().join("profile-mount");
+    std::fs::create_dir(&profile_mount).unwrap();
+    let profiles = RuntimeProfiles::from_toml(
+        &format!(
+            r#"
+            [runtimes.test]
+            driver = "acp"
+            command = "unused-for-external"
+            confinement = {{ backend = "podman", image = "ignored", read-only-rootfs = false, tmpfs = ["/tmp:rw,size=512m"], additional-mounts = [
+              {{ source = "{}", target = "/host-leak", access = "read-write" }}
+            ] }}
+
+            [runtimes.test.external-oracle-drivers.hosted-lab]
+            network = {{ mode = "allow", destinations = [
+              {{ host = "localhost", ports = [{port}] }}
+            ] }}
+            auth = {{ kind = "header-file", source = "{}" }}
+            "#,
+            profile_mount.display(),
+            credential.display()
+        ),
+        temp.path(),
+    )
+    .unwrap();
+    let profile = profiles.get("test").unwrap();
+    let driver_id = ExternalOracleDriverId::new("hosted-lab").unwrap();
+    let identity = profile
+        .external_oracle_drivers
+        .get(&driver_id)
+        .unwrap()
+        .identity(&image_id);
+    let spec = OracleSpec::External(ExternalOracle {
+        driver: driver_id,
+        driver_identity: Some(identity),
+        request: BTreeMap::from([("suite".to_string(), "local-auth".to_string())]),
+        timeout_secs: 120,
+        poll_secs: 5,
+    });
+    let mut request = external_request(&temp, spec);
+    request.environment_digest = image_id;
+
+    let status = OciOracleRunner::new(profile).run(request).await.unwrap();
+
+    assert!(matches!(
+        status,
+        OracleRunStatus::Complete(outcome)
+            if outcome.exit_code == 0
+                && String::from_utf8_lossy(&outcome.stdout)
+                    .contains("authenticated local grader passed")
+    ));
+    service_task.await.unwrap();
+    assert_secret_absent_from_tree(&temp.path().join("state"), SECRET);
 }
 
 #[tokio::test]

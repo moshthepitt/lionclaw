@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
-use lionclaw_runtime_api::{
-    RuntimeAuthContext, RuntimeAuthKind, RuntimeAuthMaterialization, RuntimeAuthPreparation,
-    RuntimeAuthProvider, RuntimeProgramExecutor, TypedFailure, TypedFailureEvidence,
+use lionclaw_confinement::{
+    ConfinementConfig, ExecutionLimits, MountAccess, MountSpec, OciConfinementConfig,
+    RuntimeProgramSpec,
 };
+use lionclaw_runtime_api::{RuntimeProgramExecutor, TypedFailure, TypedFailureEvidence};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,7 +23,11 @@ use tokio::sync::Mutex;
 use crate::authority::{
     compile_role_plan, oracle_authority_with_network, MissionMounts, RolePlanRequest,
 };
-use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig};
+use crate::config::MissionRuntimeProfile;
+use crate::external_oracle_broker::{
+    socket_path as external_oracle_broker_socket_path, ExternalOracleBroker,
+    EXTERNAL_ORACLE_BROKER_ENV, EXTERNAL_ORACLE_BROKER_MOUNT_TARGET,
+};
 use crate::ports::{
     ExecutionControl, ExternalOracleDriver, ExternalOracleDriverContext,
     ExternalOracleDriverRegistry, ExternalOraclePoll, ExternalOraclePollRequest,
@@ -32,8 +36,7 @@ use crate::ports::{
 };
 use crate::resources::MissionDirs;
 use crate::runner::{
-    await_controlled, prepare_inputs, MissionProgramExecutor, NativeHomeAuthProvider,
-    PreparedInputs, NATIVE_HOME_AUTH_KIND, SCRATCH_MOUNT_TARGET,
+    await_controlled, prepare_inputs, MissionProgramExecutor, PreparedInputs, SCRATCH_MOUNT_TARGET,
 };
 use crate::workspace;
 
@@ -52,7 +55,6 @@ impl OciOracleRunner {
                 registry.with_driver(
                     id.clone(),
                     Arc::new(ProfileExternalOracleDriver {
-                        profile: profile.clone(),
                         driver: driver.clone(),
                     }),
                 )
@@ -82,7 +84,6 @@ const EXTERNAL_ORACLE_DRIVER_EXECUTABLE: &str = "lionclaw-external-oracle-driver
 
 #[derive(Clone)]
 struct ProfileExternalOracleDriver {
-    profile: MissionRuntimeProfile,
     driver: crate::config::ExternalOracleDriverProfile,
 }
 
@@ -180,16 +181,12 @@ impl ProfileExternalOracleDriver {
     {
         let mission_id = request.mission_id().clone();
         let effect_id = request.effect_id().clone();
-        let environment_digest = request.environment_digest().to_string();
         let dirs = MissionDirs::new(&context.state_dir, &mission_id)
             .effect(&effect_id)
             .oracle();
         dirs.prepare()
             .map_err(|error| fail(format!("failed to prepare external oracle dirs: {error}")))?;
 
-        let mut profile = self.profile.clone();
-        profile.confinement.oci_mut().image = Some(environment_digest);
-        profile.auth = self.driver.auth.clone();
         let driver_identity = request.driver_identity();
         if self.driver.id != driver_identity.driver {
             return Err(fail(
@@ -201,31 +198,29 @@ impl ProfileExternalOracleDriver {
                 "external oracle driver auth configuration changed after mission admission",
             ));
         }
-        let authority = oracle_authority_with_network(
-            &format!("external-driver:{}", self.driver.id),
-            BTreeSet::new(),
-            driver_identity.network.clone(),
-        );
-        let compiled = compile_role_plan(RolePlanRequest {
-            authority: &authority,
-            runtime_id: profile.name.clone(),
-            confinement: profile.confinement.clone(),
-            mounts: MissionMounts {
-                workspace: dirs.scratch().to_path_buf(),
-                extras: Vec::new(),
-            },
-            working_dir: dirs.scratch().to_path_buf(),
-            judged_roots: &[],
-            environment: external_driver_environment(),
-            resources: Default::default(),
-            resource_ceilings: &context.resource_ceilings,
-            runtime_network: crate::model::NetworkGrant::Deny,
-        })
-        .map_err(|error| {
-            fail(format!(
-                "external oracle driver plan refused to compile: {error}"
-            ))
-        })?;
+        let broker_socket = external_oracle_broker_socket_path(&effect_id);
+        let broker = match &self.driver.auth {
+            Some(auth) => Some(
+                ExternalOracleBroker::start(
+                    auth,
+                    driver_identity.network.clone(),
+                    broker_socket.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    fail(format!(
+                        "external oracle credential broker refused to start: {error:#}"
+                    ))
+                })?,
+            ),
+            None => None,
+        };
+        let compiled = compile_external_driver_plan(
+            driver_identity,
+            dirs.scratch(),
+            broker.as_ref().map(|_| broker_socket.as_path()),
+            &context.resource_ceilings,
+        )?;
 
         let stdin = serde_json::to_string(&request).map_err(|error| {
             TypedFailure::permanent(
@@ -233,34 +228,30 @@ impl ProfileExternalOracleDriver {
                 format!("failed to encode external oracle driver request: {error}"),
             )
         })?;
-        let (runtime_auth, program_auth, auth_staging_root) = materialize_external_driver_auth(
-            &profile,
-            &driver_identity.network,
-            dirs.auth_staging().to_path_buf(),
-        )
-        .await?;
         let program = RuntimeProgramSpec {
             executable: EXTERNAL_ORACLE_DRIVER_EXECUTABLE.to_string(),
             args: vec![self.driver.id.as_str().to_string(), operation.to_string()],
             environment: Vec::new(),
             stdin,
-            auth: program_auth,
+            auth: None,
         };
-        let mut executor = MissionProgramExecutor::new(
-            compiled.plan().clone(),
-            runtime_auth,
-            &effect_id,
-            auth_staging_root,
-        );
+        let mut executor =
+            MissionProgramExecutor::new(compiled.plan().clone(), None, &effect_id, None);
         let run = async move {
+            let _broker = broker;
             let output = executor
                 .execute_captured(program)
                 .await
                 .map_err(|error| fail(format!("external oracle driver failed to run: {error}")))?;
             if output.exit_code != Some(0) || output.exit_signal.is_some() {
+                let stderr =
+                    lionclaw_runtime_api::bounded_text(&String::from_utf8_lossy(&output.stderr));
                 return Err(TypedFailure::permanent(
                     "oracle.external_driver",
-                    "external oracle driver exited without a successful result",
+                    format!(
+                        "external oracle driver exited without a successful result (code {:?}, signal {:?}): {stderr}",
+                        output.exit_code, output.exit_signal
+                    ),
                 ));
             }
             serde_json::from_slice(&output.stdout).map_err(|error| {
@@ -274,10 +265,68 @@ impl ProfileExternalOracleDriver {
     }
 }
 
+fn compile_external_driver_plan(
+    identity: &crate::model::ExternalOracleDriverIdentity,
+    scratch: &Path,
+    broker_socket: Option<&Path>,
+    resource_ceilings: &crate::model::ConfinementResources,
+) -> Result<crate::authority::CompiledRolePlan, TypedFailure> {
+    let authority = oracle_authority_with_network(
+        &format!("external-driver:{}", identity.driver),
+        BTreeSet::new(),
+        identity.network.clone(),
+    );
+    let extras = broker_socket
+        .map(|source| MountSpec {
+            source: source.to_path_buf(),
+            target: EXTERNAL_ORACLE_BROKER_MOUNT_TARGET.to_string(),
+            access: MountAccess::ReadWrite,
+        })
+        .into_iter()
+        .collect();
+    let mut environment = external_driver_environment();
+    if broker_socket.is_some() {
+        environment.push((
+            EXTERNAL_ORACLE_BROKER_ENV.to_string(),
+            EXTERNAL_ORACLE_BROKER_MOUNT_TARGET.to_string(),
+        ));
+    }
+    compile_role_plan(RolePlanRequest {
+        authority: &authority,
+        runtime_id: format!("external-driver:{}", identity.driver),
+        confinement: ConfinementConfig::Oci(OciConfinementConfig {
+            engine: "podman".to_string(),
+            image: Some(identity.image_id.clone()),
+            read_only_rootfs: true,
+            tmpfs: vec!["/tmp:rw,size=64m".to_string()],
+            additional_mounts: Vec::new(),
+            limits: ExecutionLimits {
+                memory_limit: None,
+                cpu_limit: None,
+                pids_limit: Some(128),
+            },
+        }),
+        mounts: MissionMounts {
+            workspace: scratch.to_path_buf(),
+            extras,
+        },
+        working_dir: scratch.to_path_buf(),
+        judged_roots: &[],
+        environment,
+        resources: Default::default(),
+        resource_ceilings,
+        runtime_network: crate::model::NetworkGrant::Deny,
+    })
+    .map_err(|error| {
+        fail(format!(
+            "external oracle driver plan refused to compile: {error}"
+        ))
+    })
+}
+
 trait DriverRequestIdentity {
     fn mission_id(&self) -> &crate::model::MissionId;
     fn effect_id(&self) -> &crate::model::EffectId;
-    fn environment_digest(&self) -> &str;
     fn driver_identity(&self) -> &crate::model::ExternalOracleDriverIdentity;
 }
 
@@ -288,10 +337,6 @@ impl DriverRequestIdentity for ExternalOracleSubmitRequest {
 
     fn effect_id(&self) -> &crate::model::EffectId {
         &self.effect_id
-    }
-
-    fn environment_digest(&self) -> &str {
-        &self.environment_digest
     }
 
     fn driver_identity(&self) -> &crate::model::ExternalOracleDriverIdentity {
@@ -308,55 +353,9 @@ impl DriverRequestIdentity for ExternalOraclePollRequest {
         &self.effect_id
     }
 
-    fn environment_digest(&self) -> &str {
-        &self.environment_digest
-    }
-
     fn driver_identity(&self) -> &crate::model::ExternalOracleDriverIdentity {
         &self.driver_identity
     }
-}
-
-async fn materialize_external_driver_auth(
-    profile: &MissionRuntimeProfile,
-    network: &crate::model::NetworkGrant,
-    staging_root: std::path::PathBuf,
-) -> Result<
-    (
-        Option<RuntimeAuthMaterialization>,
-        Option<RuntimeAuthKind>,
-        Option<std::path::PathBuf>,
-    ),
-    TypedFailure,
-> {
-    let Some(auth) = &profile.auth else {
-        return Ok((None, None, None));
-    };
-    let RuntimeAuthConfig::NativeHome(config) = auth else {
-        return Err(fail(
-            "external oracle driver auth must use native-home credentials",
-        ));
-    };
-    let provider = NativeHomeAuthProvider::new(config.clone());
-    let context = RuntimeAuthContext::default();
-    let materialization = provider
-        .prepare(RuntimeAuthPreparation {
-            runtime_id: &profile.name,
-            network,
-            auth_staging_root: Some(&staging_root),
-            host_context: &context,
-        })
-        .await
-        .map_err(|error| {
-            fail(format!(
-                "external oracle driver auth materialization is invalid: {error:#}"
-            ))
-        })?;
-    Ok((
-        Some(materialization),
-        Some(RuntimeAuthKind::from_static(NATIVE_HOME_AUTH_KIND)),
-        Some(staging_root),
-    ))
 }
 
 #[async_trait]
@@ -1057,54 +1056,44 @@ mod tests {
         validate_external_proof(&proof, &state).expect("matching proof");
     }
 
-    #[tokio::test]
-    async fn external_driver_native_home_auth_materializes_effect_scoped_credentials() {
+    #[test]
+    fn external_driver_confinement_is_kernel_fixed_and_credential_free() {
         let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
-        let credential_dir = home.join(".hosted-lab");
-        std::fs::create_dir_all(&credential_dir).unwrap();
-        std::fs::write(credential_dir.join("token.json"), "super-secret-token").unwrap();
-        let profiles = RuntimeProfiles::from_toml(
-            r#"
-            [runtimes.test]
-            driver = "acp"
-            command = "unused-for-external"
+        let broker_socket = temp.path().join("broker.sock");
+        std::os::unix::net::UnixListener::bind(&broker_socket).unwrap();
+        let identity = crate::model::ExternalOracleDriverIdentity {
+            driver: crate::model::ExternalOracleDriverId::new("hosted-lab").unwrap(),
+            image_id: "sha256:driver-image".to_string(),
+            network: crate::model::NetworkGrant::allow_single("grader.example.com", 443).unwrap(),
+            auth: Some(crate::model::ExternalOracleDriverAuthIdentity {
+                kind: "header-file".to_string(),
+                config_digest: "sha256:auth-config".to_string(),
+            }),
+        };
 
-            [runtimes.test.external-oracle-drivers.hosted-lab]
-            auth = { kind = "native-home", source = "~/.hosted-lab", target = ".hosted-lab", required-files = ["token.json"] }
-            "#,
-            &home,
+        let compiled = compile_external_driver_plan(
+            &identity,
+            temp.path(),
+            Some(&broker_socket),
+            &Default::default(),
         )
         .unwrap();
-        let mut profile = profiles.get("test").unwrap();
-        let driver = profile
-            .external_oracle_drivers
-            .get(&crate::model::ExternalOracleDriverId::new("hosted-lab").unwrap())
-            .unwrap();
-        profile.auth = driver.auth.clone();
-        let staging = temp.path().join("effect-auth");
-        std::fs::create_dir_all(&staging).unwrap();
+        let confinement = compiled.plan().confinement.oci();
 
-        let (materialization, program_auth, auth_staging_root) = materialize_external_driver_auth(
-            &profile,
-            &crate::model::NetworkGrant::Deny,
-            staging.clone(),
-        )
-        .await
-        .unwrap();
-
-        let materialization = materialization.expect("materialized auth");
-        assert_eq!(
-            program_auth.as_ref().map(|auth| auth.as_str()),
-            Some(NATIVE_HOME_AUTH_KIND)
-        );
-        assert_eq!(auth_staging_root.as_deref(), Some(staging.as_path()));
-        assert_eq!(
-            std::fs::read_to_string(staging.join("native-home-credential-0000")).unwrap(),
-            "super-secret-token"
-        );
-        let debug = format!("{materialization:?}");
-        assert!(!debug.contains("super-secret-token"));
+        assert_eq!(confinement.engine, "podman");
+        assert_eq!(confinement.image.as_deref(), Some("sha256:driver-image"));
+        assert!(confinement.read_only_rootfs);
+        assert_eq!(confinement.tmpfs, ["/tmp:rw,size=64m"]);
+        assert!(confinement.additional_mounts.is_empty());
+        assert!(confinement.limits.memory_limit.is_none());
+        assert!(confinement.limits.cpu_limit.is_none());
+        assert_eq!(confinement.limits.pids_limit, Some(128));
+        assert!(compiled
+            .plan()
+            .mounts
+            .iter()
+            .any(|mount| mount.source == broker_socket));
+        assert!(!compiled.plan().mount_runtime_secrets);
     }
 
     #[tokio::test]

@@ -12,7 +12,6 @@ mod real_runtime_continuity_tests;
 
 pub use executor::MissionProgramExecutor;
 pub(crate) use handoff::validate_handoff;
-pub(crate) use native_home_auth::{NativeHomeAuthProvider, NATIVE_HOME_AUTH_KIND};
 pub(crate) use prepared_input::{prepare_inputs, PreparedInputs};
 pub use role_runner::OciRoleRunner;
 

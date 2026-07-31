@@ -550,7 +550,6 @@ impl RoleEffectDirs {
 pub(crate) struct OracleEffectDirs {
     state_dir: PathBuf,
     root: PathBuf,
-    auth_staging: PathBuf,
     scratch: PathBuf,
     work: PathBuf,
 }
@@ -558,7 +557,6 @@ pub(crate) struct OracleEffectDirs {
 impl OracleEffectDirs {
     fn new(state_dir: PathBuf, root: PathBuf) -> Self {
         Self {
-            auth_staging: root.join("auth-staging"),
             scratch: root.join("scratch"),
             work: root.join("work"),
             state_dir,
@@ -567,7 +565,7 @@ impl OracleEffectDirs {
     }
 
     pub(crate) fn prepare(&self) -> std::io::Result<()> {
-        ensure_dirs_beneath(&self.state_dir, [&self.auth_staging, &self.scratch])
+        ensure_dirs_beneath(&self.state_dir, [&self.scratch])
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -576,10 +574,6 @@ impl OracleEffectDirs {
 
     pub(crate) fn scratch(&self) -> &Path {
         &self.scratch
-    }
-
-    pub(crate) fn auth_staging(&self) -> &Path {
-        &self.auth_staging
     }
 
     pub(crate) fn work(&self) -> &Path {

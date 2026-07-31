@@ -68,18 +68,36 @@ Declare installed drivers in the runtime profile and scope their own network
 authority there. The selected runtime image digest, driver id, network grant,
 and non-secret auth configuration identity are resolved into mission state when
 the plan is admitted, so later runtime profile edits cannot silently change an
-inflight oracle's authority.
+inflight oracle's authority. External drivers always run under kernel-owned
+confinement: the pinned image, a read-only root, bounded `/tmp`, a process cap,
+no profile-supplied mounts, and the durable destination grant.
 
 ```toml
 [runtimes.codex.external-oracle-drivers.local-ci]
 network = { mode = "allow", destinations = [
   { host = "ci.example.com", ports = [443] }
 ] }
-auth = { kind = "native-home", source = "/home/operator/.ci-token" }
+auth = { kind = "header-file", source = "/home/operator/.ci-token" }
 ```
 
 LionClaw invokes the launcher with JSON submit/poll requests on stdin. Driver
-credentials stay in kernel-owned auth staging, scoped to the effect, and are
-never placed in mission requests, argv, environment variables, events, blobs,
-reports, or logs. External drivers currently accept `native-home` auth
-configuration only.
+credentials remain in the kernel process and are never mounted into the driver
+container or placed in mission requests, argv, environment variables, events,
+blobs, reports, or logs. For authenticated calls, LionClaw mounts only an
+effect-local Unix socket and sets `LIONCLAW_EXTERNAL_ORACLE_BROKER` to its
+container path.
+
+The broker accepts one bounded JSON request per line:
+
+```json
+{"method":"POST","url":"https://ci.example.com/jobs","headers":{"content-type":"application/json"},"body":"{}"}
+```
+
+It returns either
+`{"status":"complete","http_status":200,"body":"..."}` or a bounded
+`{"status":"rejected","code":"...","detail":"..."}` response. The kernel
+validates the URL against the driver's durable destination grant, owns DNS,
+disables redirects, and injects the configured credential header. `header`
+defaults to `authorization` and `prefix` defaults to `Bearer `; both can be
+set explicitly for services using another header scheme. Credentialed HTTP is
+accepted only for `localhost`; all other broker destinations require HTTPS.
