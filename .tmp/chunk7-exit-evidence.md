@@ -66,6 +66,21 @@ declared only after serialization and therefore could not prove non-leakage.
 The replacement tests exercise typed schema shape plus the kernel admission
 boundary for authoring, child execution, and historical dependency receipts.
 
+The second independent review produced three more focused RED cases before
+the final production changes:
+
+- `accepting_a_failed_child_supplies_the_downstream_fallback_candidate` left
+  the accepted child task candidate as `None` instead of the task's folded
+  base, so its ordinary downstream dependency never became runnable;
+- `descendant_replan_reserves_only_unspent_attempts_for_retained_tasks`
+  rejected a legal retained-task replan with `mission has 1 descendants and
+  the plan reserves 2 more ... above mission limit 2`, proving historical
+  attempts were reserved twice; and
+- `child_secret_authority_must_follow_the_typed_parent_subset` rejected a
+  secret-bearing child whose typed ceiling and role grants were within the
+  secret-bearing parent, returning `child_secret_grant_forbidden` instead of
+  using the existing subset predicates.
+
 ## Implementation
 
 - `TaskAssignment` is now a closed tagged enum with `role` and
@@ -97,9 +112,13 @@ boundary for authoring, child execution, and historical dependency receipts.
   Planning and execution receive that input through their existing prompt
   context rather than a child-only prompt path.
 - Descendant admission accounts folded historical descendants plus all legal
-  planned child attempts. Creation rechecks lineage capacity before appending
-  a request, and exhausted child retries are not projected, so admission
-  cannot create an inflight request that runtime must refuse.
+  unspent child attempts. Retained task attempts are subtracted once through
+  the same helper used by retry projection. Creation rechecks lineage capacity
+  before appending a request, so admission cannot create an inflight request
+  that runtime must refuse.
+- Failed-task acceptance projection and folding use one generic candidate
+  derivation. Existing output wins; otherwise only zero- or one-input lineage
+  supplies an unambiguous fallback, including child-assigned tasks.
 - Ordinary CLI opening walks and verifies the durable kernel-owned lineage,
   then reuses the immutable root mission-type snapshot. The loaded snapshot's
   digest is still checked against the child mission before execution.
@@ -126,13 +145,17 @@ boundary for authoring, child execution, and historical dependency receipts.
   drain a bound active child; cancellation before creation creates only the
   deterministic terminal child needed for receipt truth and never leaves an
   active orphan.
-- Secret capability remains a boolean authority, not serialized secret
-  material. Teams that author or execute child work must use secret-free role
-  grants, and dependency derivation rejects a historical role receipt produced
-  under secret authority. This keeps child objectives, dependency payloads,
-  prompts, reports, argv, environment, and receipts outside the runtime-secret
-  projection path. LionClaw does not claim arbitrary-text DLP; operator-supplied
-  text remains operator-owned input.
+- Secret capability remains typed boolean authority, not serialized secret
+  material. A child's secret ceiling must be within the parent ceiling through
+  `AuthorityCeilings::contains`, and every child role grant must be within that
+  child ceiling through `AuthorityGrants::within`. Proof roles remain
+  independently secret-free under the existing semantic moat.
+- Secret bytes remain kernel/operator-owned and enter execution only through
+  the existing compiled runtime-secret mount when both typed role authority and
+  the operator ceiling allow it. Child assignments, requests, lineage, events,
+  prompts, reports, argv, environment, and receipts add no field for secret
+  values. LionClaw does not claim arbitrary-text DLP for operator- or
+  agent-authored content.
 - The parent receipt is derived from folded child state and binds parent id,
   parent effect id, child id, request digest, input artifact, terminal state,
   output artifact/report digest, proof-summary digests, and typed failure.
@@ -165,13 +188,15 @@ This is an intentional typed wire-contract change:
 - No child-specific CLI mutation or SQL shape was added. The final correction
   intentionally changes the typed request, receipt, event, and folded-state
   contracts described above.
+- The second-review corrections add no event payload. They change proposal
+  admission, retry/accept projection, and fold semantics only.
 
 ## Schema And Reducer
 
 - Event schema: `42` (version `41` introduced child mission facts; `42` records
   immutable task inputs inherited by a child).
-- Reducer: `79` (version `78` made durable parent cancellation dominate child
-  settlement; `79` folds immutable mission inputs).
+- Reducer: `80` (version `79` folds immutable mission inputs; `80` derives an
+  accepted failed-task candidate from generic folded lineage).
 - SQL storage shape is unchanged because child state is represented by ordinary
   versioned event payloads in the existing event store. No SQL migration is
   required.
@@ -193,49 +218,53 @@ Passed after the final source change:
   - every runnable workspace test passed;
   - all nine named Podman mission self-tests passed.
 - `git diff --check`
-- model child suite: 10 passed;
-- engine child suite: 11 passed;
+- model child suite: 11 passed;
+- engine child suite: 12 passed;
 - everyday `lionclaw run` child acceptance passed as part of the 12-test suite;
 - runtime product-boundary tests: 2 passed.
 
-CodeIntel inspected the shared child dependency derivation before the final
-edit and diagnostics covered all 13 changed Rust files. It reported no errors:
-eight known macro-input `None` false-positive warnings and one inactive-`cfg`
-hint. Cargo and Clippy reported no warnings.
+CodeIntel inspected the shared acceptance and remaining-attempt helpers and
+confirmed exactly the projection/fold and admission/retry callers. Final
+diagnostics covered every file changed in this correction: no errors were
+reported; the wider reducer-stamp test check reported four pre-existing
+macro-input `None` false-positive warnings. Cargo and Clippy reported no
+warnings.
 
 The product-surface grep is restricted to implementation, bundled mission
 types, skills, scripts, containers, manifests, help, and CI; audit notes and
 tests are not product integration. It returned no prohibited product-name
-match. Leak checks found no typed child field for secret values and no secret
-grant path through child-author, child-execution, or inherited dependency
-admission. The removed sentinel test is not cited as evidence.
+match. Leak checks found no typed child field for secret values. Structured
+tests prove secret-bearing planner/worker grants survive `next` only when the
+child and parent typed ceilings allow them; proof roles remain secret-free.
+The removed sentinel test is not cited as evidence.
 
 The exact base commit has a valid signature from
 `Kelvin Jayanoris <kelvin@jayanoris.com>`, and the chunk branch was confirmed to
 start at that exact commit before its first signed commit.
 
-The initial implementation and first hardening commits remain signed and
-forward-only. The final task-flow, input, capacity, and secret-boundary fixes
-are signed commit `dbf61d62b8284f001735ca229eff8c3d04ee6cfd`, a direct descendant
-of the accepted base.
+The initial implementation and prior hardening commits remain signed and
+forward-only. The second-review invariant fixes are signed commit
+`5a60cd93bf65eb92a39d72810cb5dc5256f238fa`; snapshot invalidation for the fold
+change is signed commit `7a7f9113383bfc38832654391d9b7e9f6db0d884`. Both directly descend from the
+accepted base.
 
 The three authenticated native-session continuity tests passed from that clean
 signed source against `localhost/lionclaw-runtime:v1`, resolved before launch
 to immutable image identity
 `e1541b6609e7209de4087aac38b08151ad5feb9dd901cf464e088b41b32ba05d`:
 
-- Codex: `1 passed; 0 failed`, 31.63 seconds. Preserved root:
-  `/tmp/lionclaw-chunk7-final-codex-20260801-075035`. Receipt SHA-256:
-  `23436a9f198a3a6517d2d79d34b6cf3299f4116d76de12c481ac69b39adaad30`.
-- OpenCode: `1 passed; 0 failed`, 20.34 seconds. Preserved root:
-  `/tmp/lionclaw-chunk7-final-opencode-20260801-075035`. Receipt SHA-256:
-  `27fd9c94e3d16b206f5e73248cb01ad28e4f3f1a35ebdf0261858045c2c65bad`.
-- Hermes: `1 passed; 0 failed`, 37.45 seconds. Preserved root:
-  `/tmp/lionclaw-chunk7-final-hermes-20260801-075035`. Receipt SHA-256:
-  `733595bdbb502dc48a1a06604b376885cccf3dab93b38fe730286db8bf66495b`.
+- Codex: `1 passed; 0 failed`, 34.74 seconds. Preserved root:
+  `/tmp/lionclaw-chunk7-final2-codex-20260801-111452`. Receipt SHA-256:
+  `96f266c26fc5a73242cdfbdf97391f0751feb7a1cce89bc8537bd2ba8baeaacd`.
+- OpenCode: `1 passed; 0 failed`, 22.17 seconds. Preserved root:
+  `/tmp/lionclaw-chunk7-final2-opencode-20260801-111452`. Receipt SHA-256:
+  `22cd8890c888ec0adff45e7b46235c553b0cfa0f3d6f897118ea31e086186699`.
+- Hermes: `1 passed; 0 failed`, 43.93 seconds. Preserved root:
+  `/tmp/lionclaw-chunk7-final2-hermes-20260801-111452`. Receipt SHA-256:
+  `9ff6e4444e979b619e60206eec8fbb447a30a6900bc4faa839ae74182cee0bea`.
 
 Each `lionclaw.runtime-continuity-proof.v2` receipt records the signed source
-head `dbf61d62b8284f001735ca229eff8c3d04ee6cfd`, immutable image identity,
+head `7a7f9113383bfc38832654391d9b7e9f6db0d884`, immutable image identity,
 first observation `Reconstructed`, second
 observation `Resumed`, distinct effect ids, exact effect cleanup, retained
 native home and runtime state, removed credential projection, and a second
