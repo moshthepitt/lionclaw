@@ -16,8 +16,8 @@ use super::verdict::{
 use crate::prelude::*;
 use crate::{TypedFailure, TypedFailureEvidence};
 
-/// Reducer 79 folds immutable mission inputs resolved from parent task truth.
-pub const REDUCER_VERSION: u32 = 79;
+/// Reducer 80 derives accepted failed-task candidates from generic task lineage.
+pub const REDUCER_VERSION: u32 = 80;
 
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
     let mut state = None;
