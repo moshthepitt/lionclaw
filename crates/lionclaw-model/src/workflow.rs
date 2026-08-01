@@ -434,14 +434,7 @@ pub(crate) fn proof_failure_id(failure: &ProofFailure) -> String {
 }
 
 fn task_accept_is_legal(state: &MissionState, task_id: &TaskId) -> bool {
-    state
-        .tasks
-        .get(task_id)
-        .and_then(|task| task.candidate_sha.as_ref())
-        .is_some()
-        || state
-            .task_dependency_refs(task_id)
-            .is_some_and(|dependencies| dependencies.len() <= 1)
+    state.task_accept_candidate(task_id).is_some()
 }
 
 fn task_retry_is_legal(state: &MissionState, task_id: &TaskId) -> bool {
@@ -452,10 +445,9 @@ fn task_retry_is_legal(state: &MissionState, task_id: &TaskId) -> bool {
     else {
         return true;
     };
-    state
-        .tasks
-        .get(task_id)
-        .is_some_and(|task| task.attempts < state.config.recovery.max_attempts.max(1))
+    state.tasks.get(task_id).is_some_and(|task| {
+        super::plan_validation::remaining_task_attempts(&state.config, task.attempts) > 0
+    })
 }
 
 fn failure_choices(state: &MissionState) -> Vec<Choice> {

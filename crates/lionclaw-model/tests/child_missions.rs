@@ -453,9 +453,39 @@ fn child_request_schema_carries_secret_authority_without_secret_material_fields(
         unreachable!()
     };
     mission.config.ceilings.secrets = true;
+    let child_team = mission.proposal.team.as_mut().unwrap();
+    child_team
+        .roles
+        .get_mut(&id("child-planner"))
+        .unwrap()
+        .grants
+        .secrets = true;
+    child_team
+        .roles
+        .get_mut(&id("child-worker"))
+        .unwrap()
+        .grants
+        .secrets = true;
     let request = projected_request(&fold(events).unwrap());
+    let projected_team = request.assignment.proposal.team.as_ref().unwrap();
     let serialized = serde_json::to_string(&request).unwrap();
 
+    assert!(
+        projected_team
+            .roles
+            .get(&id("child-planner"))
+            .unwrap()
+            .grants
+            .secrets
+    );
+    assert!(
+        projected_team
+            .roles
+            .get(&id("child-worker"))
+            .unwrap()
+            .grants
+            .secrets
+    );
     assert!(serialized.contains("\"secrets\":true"));
     assert!(!serialized.contains("secret_values"));
     assert!(!serialized.contains("lineage"));
@@ -463,7 +493,7 @@ fn child_request_schema_carries_secret_authority_without_secret_material_fields(
 }
 
 #[test]
-fn child_authoring_and_execution_roles_must_be_secret_free() {
+fn child_secret_authority_must_follow_the_typed_parent_subset() {
     let mut state = fold(
         parent_events(OutputSemantics::ProducesReport)[..2]
             .iter()
@@ -487,11 +517,14 @@ fn child_authoring_and_execution_roles_must_be_secret_free() {
             unreachable!()
         };
         mission.config.ceilings.secrets = true;
-        mission
-            .proposal
-            .team
-            .as_mut()
+        let child_team = mission.proposal.team.as_mut().unwrap();
+        child_team
+            .roles
+            .get_mut(&id("child-planner"))
             .unwrap()
+            .grants
+            .secrets = true;
+        child_team
             .roles
             .get_mut(&id("child-worker"))
             .unwrap()
@@ -499,29 +532,6 @@ fn child_authoring_and_execution_roles_must_be_secret_free() {
             .secrets = true;
     }
 
-    let error = lionclaw_model::validate_mission_proposal(&state, &candidate).unwrap_err();
-    assert!(error.to_string().contains("secret-free"));
-
-    let TaskAssignment::ChildMission { mission } = candidate
-        .team
-        .as_mut()
-        .unwrap()
-        .task_assignments
-        .get_mut(&TaskId::new("parent-work").unwrap())
-        .unwrap()
-    else {
-        unreachable!()
-    };
-    mission
-        .proposal
-        .team
-        .as_mut()
-        .unwrap()
-        .roles
-        .get_mut(&id("child-worker"))
-        .unwrap()
-        .grants
-        .secrets = false;
     state
         .team
         .as_mut()
@@ -531,10 +541,21 @@ fn child_authoring_and_execution_roles_must_be_secret_free() {
         .unwrap()
         .grants
         .secrets = true;
+    candidate
+        .team
+        .as_mut()
+        .unwrap()
+        .roles
+        .get_mut(&id("planner"))
+        .unwrap()
+        .grants
+        .secrets = true;
+
+    lionclaw_model::validate_mission_proposal(&state, &candidate).unwrap();
+
+    state.config.ceilings.secrets = false;
     let error = lionclaw_model::validate_mission_proposal(&state, &candidate).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("secret-bearing planning role cannot author"));
+    assert!(error.to_string().contains("within ceilings"));
 }
 
 #[test]
@@ -765,6 +786,99 @@ fn descendant_admission_reserves_every_legal_child_attempt() {
     );
     let error = lionclaw_model::validate_mission_proposal(&limit_three, &candidate).unwrap_err();
     assert!(error.to_string().contains("has 1 descendants"));
+}
+
+#[test]
+fn descendant_replan_reserves_only_unspent_attempts_for_retained_tasks() {
+    let mut events = parent_events(OutputSemantics::ProducesReport);
+    if let MissionEvent::MissionCreated { config, .. } = &mut events[0].event {
+        config.recovery.max_attempts = 2;
+        config.execution.max_descendants = 2;
+    }
+    let MissionEvent::ProposalRecorded { proposal, .. } = &mut events[2].event else {
+        unreachable!()
+    };
+    let TaskAssignment::ChildMission { mission } = proposal
+        .team
+        .as_mut()
+        .unwrap()
+        .task_assignments
+        .get_mut(&TaskId::new("parent-work").unwrap())
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    mission.config.execution.max_descendants = 0;
+
+    let request = projected_request(&fold(events.clone()).unwrap());
+    let requested_at_ms = 1_000;
+    events.extend([
+        event(
+            5,
+            MissionEvent::ChildMissionRequested {
+                request: Box::new(request.clone()),
+                requested_at_ms,
+                deadline_ms: resolve_execution_deadline_ms(requested_at_ms, 120).unwrap(),
+                budget_deadline_ms: resolve_execution_deadline_ms(requested_at_ms, 120).unwrap(),
+            },
+        ),
+        event(
+            6,
+            MissionEvent::ChildMissionBound {
+                effect_id: request.parent_effect_id.clone(),
+                child_mission_id: request.child_mission_id.clone(),
+            },
+        ),
+        event(
+            7,
+            MissionEvent::ChildMissionCompleted {
+                effect_id: request.parent_effect_id.clone(),
+                receipt: Box::new(ChildMissionReceipt {
+                    parent_mission_id: request.parent_mission_id.clone(),
+                    parent_effect_id: request.parent_effect_id.clone(),
+                    child_mission_id: request.child_mission_id.clone(),
+                    request_digest: request.request_digest.clone(),
+                    input_artifact: request.input_artifact.clone(),
+                    terminal: TerminalState::Aborted {
+                        reason: "first child attempt failed".into(),
+                    },
+                    descendant_count: 0,
+                    output: None,
+                    proof: ChildProofSummary {
+                        finish: None,
+                        authoritative_receipt_digests: Vec::new(),
+                        advisory_receipt_digests: Vec::new(),
+                    },
+                    failure: Some(TypedFailure::permanent(
+                        "test.first_child_failed",
+                        "first child attempt failed",
+                    )),
+                }),
+            },
+        ),
+        event(
+            8,
+            MissionEvent::ChildMissionCleaned {
+                effect_id: request.parent_effect_id,
+                child_mission_id: request.child_mission_id,
+            },
+        ),
+    ]);
+    let state = fold(events).unwrap();
+    assert_eq!(state.descendant_count(), 1);
+    assert_eq!(state.tasks[&request.task_id].attempts, 1);
+
+    let mut next_team = state.team.clone().unwrap();
+    next_team.revision += 1;
+    lionclaw_model::validate_mission_proposal(
+        &state,
+        &MissionProposal {
+            plan: None,
+            team: Some(next_team),
+            oracles: None,
+        },
+    )
+    .unwrap();
 }
 
 #[test]

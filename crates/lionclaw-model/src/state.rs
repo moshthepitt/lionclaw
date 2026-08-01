@@ -1802,6 +1802,18 @@ impl MissionState {
             .collect()
     }
 
+    /// Candidate assigned when an operator accepts a failed task. Existing
+    /// output wins; otherwise only zero- or one-input lineage is unambiguous.
+    pub(crate) fn task_accept_candidate(&self, task_id: &TaskId) -> Option<String> {
+        let runtime = self.tasks.get(task_id)?;
+        if let Some(candidate) = &runtime.candidate_sha {
+            return Some(candidate.clone());
+        }
+        (self.task_dependency_refs(task_id)?.len() <= 1)
+            .then(|| self.task_required_base(task_id))
+            .flatten()
+    }
+
     pub fn child_mission_dependency_refs(
         &self,
         task_id: &TaskId,
@@ -1817,9 +1829,6 @@ impl MissionState {
             .iter()
             .map(|dependency| {
                 let outcome = self.tasks.get(dependency)?.cleared_outcome()?;
-                if !self.task_effect_is_secret_free(outcome.effect_id()) {
-                    return None;
-                }
                 let candidate_sha = self.tasks.get(dependency)?.candidate_sha.as_ref()?.clone();
                 let report = self.accepted_task_report(outcome.effect_id());
                 if team.task_output(dependency) == Some(OutputSemantics::ProducesReport)
@@ -1840,18 +1849,6 @@ impl MissionState {
                 })
             })
             .collect()
-    }
-
-    fn task_effect_is_secret_free(&self, effect_id: &super::EffectId) -> bool {
-        if let Some(receipt) = self.role_attempt_receipts.get(effect_id) {
-            let RoleEffectSource::Turn { request, .. } = &receipt.source;
-            return self
-                .team_history
-                .get(&request.team_revision)
-                .and_then(|team| team.role(&request.role_instance))
-                .is_some_and(|role| !role.grants.secrets);
-        }
-        self.child_mission_receipts.contains_key(effect_id)
     }
 
     pub fn mission_input_dependency_refs(&self) -> Vec<TaskCandidateRef> {

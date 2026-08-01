@@ -580,6 +580,7 @@ fn apply_team(
                 &state.oracles,
                 &state.config,
                 state.descendant_count(),
+                &state.tasks,
             )
             .is_empty()
         })
@@ -1467,15 +1468,14 @@ fn apply_decision(
             }
             super::DecisionAction::Accept => {
                 if let Some(task_id) = task_id {
-                    if let Some(task) = state.tasks.get_mut(&task_id) {
+                    if let Some(candidate) = state.task_accept_candidate(&task_id) {
+                        let Some(task) = state.tasks.get_mut(&task_id) else {
+                            return;
+                        };
                         task.status = TaskStatus::Cleared;
-                        if task.candidate_sha.is_none() {
-                            task.candidate_sha = task
-                                .role_assignment
-                                .as_ref()
-                                .map(|assignment| assignment.base_sha.clone());
-                        }
+                        task.candidate_sha = Some(candidate);
                         task.pending_base_sha = None;
+                        recompute_current_sha(state);
                     }
                 }
             }

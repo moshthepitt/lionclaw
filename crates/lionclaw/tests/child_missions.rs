@@ -1171,29 +1171,65 @@ async fn report_dependency_reaches_child_through_ordinary_mission_input() {
         .cloned()
         .expect("child worker was dispatched");
     assert!(child_prompt.contains("delegated task output"));
+}
 
-    let mut replayed = harness.engine.load_state(&parent_id).await.unwrap();
-    let dependency = TaskId::new("delegated").unwrap();
-    let child_task = TaskId::new("consume").unwrap();
-    let effect_id = replayed.tasks[&dependency]
-        .cleared_outcome()
-        .unwrap()
-        .effect_id()
-        .clone();
-    let lionclaw::model::RoleEffectSource::Turn { request, .. } =
-        &replayed.role_attempt_receipts[&effect_id].source;
-    replayed
-        .team_history
-        .get_mut(&request.team_revision)
-        .unwrap()
-        .roles
-        .get_mut(&request.role_instance)
-        .unwrap()
-        .grants
-        .secrets = true;
-    assert!(replayed
-        .child_mission_dependency_refs(&child_task)
-        .is_none());
+#[tokio::test]
+async fn accepting_a_failed_child_supplies_the_downstream_fallback_candidate() {
+    let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let observed = prompts.clone();
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        observed.lock().unwrap().push(request.prompt.clone());
+        if request.role.id == RoleInstanceId::new("child-worker").unwrap() {
+            return Err(TypedFailure::permanent(
+                "test.delegated_failure",
+                "operator accepted the bounded child failure",
+            ));
+        }
+        successful_outcome(request)
+    }));
+    let (_directory, harness, parent_id) = setup_with_proposal(
+        OutputSemantics::ProducesReport,
+        runner,
+        parent_report_dependency_proposal(),
+    )
+    .await;
+    let failed_task = TaskId::new("delegated").unwrap();
+
+    for _ in 0..20 {
+        let state = harness.engine.advance(&parent_id).await.unwrap().state;
+        if state.tasks[&failed_task].status == TaskStatus::Failed && next(&state).effects.is_empty()
+        {
+            break;
+        }
+    }
+    harness
+        .engine
+        .decide(
+            &parent_id,
+            "node_failed:delegated",
+            DecisionAction::Accept,
+            "accept the bounded child failure and continue",
+        )
+        .await
+        .unwrap();
+
+    let accepted = harness.engine.load_state(&parent_id).await.unwrap();
+    assert_eq!(
+        accepted.tasks[&failed_task].candidate_sha.as_deref(),
+        Some(BASE_SHA)
+    );
+    for _ in 0..8 {
+        harness.engine.advance(&parent_id).await.unwrap();
+        if prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|prompt| prompt.contains("Consume delegated report."))
+        {
+            return;
+        }
+    }
+    panic!("accepted child fallback never dispatched the downstream task");
 }
 
 #[tokio::test]
