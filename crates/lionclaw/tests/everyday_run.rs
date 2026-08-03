@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use clap::Parser;
 use lionclaw::cli::{self, Cli, MissionTransports};
 use lionclaw::config::RuntimeProfiles;
-use lionclaw::everyday::AttachedRuntimeExecutor;
+use lionclaw::everyday::{AttachedRuntimeExecutor, ProductionAttachedRuntimeExecutor};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 use lionclaw_confinement::{ExecutionRequest, MountAccess};
@@ -37,6 +37,7 @@ struct Observations {
     bridge_socket_mounts: usize,
     projected_clients: Vec<String>,
     image_resolutions: Vec<(String, String, String)>,
+    cleanup_requests: Vec<(String, String)>,
 }
 
 struct FakeDriver {
@@ -194,6 +195,14 @@ impl AttachedRuntimeExecutor for FakeAttached {
         ));
         Ok(identity)
     }
+    async fn cleanup_stale_resources(&self, engine: &str, resource_name: &str) -> Result<()> {
+        self.observations
+            .lock()
+            .unwrap()
+            .cleanup_requests
+            .push((engine.to_string(), resource_name.to_string()));
+        Ok(())
+    }
 
     async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
         let runtime_mount = request
@@ -309,6 +318,14 @@ impl AttachedRuntimeExecutor for BridgeAttached {
         _image: &str,
     ) -> Result<String> {
         Ok(IMAGE_A.to_string())
+    }
+    async fn cleanup_stale_resources(&self, engine: &str, resource_name: &str) -> Result<()> {
+        self.observations
+            .lock()
+            .unwrap()
+            .cleanup_requests
+            .push((engine.to_string(), resource_name.to_string()));
+        Ok(())
     }
 
     async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
@@ -841,6 +858,10 @@ async fn everyday_run_reaches_validated_profile_auth_and_confinement() {
         .expect("destination-scoped everyday network has an OCI resource owner");
     assert!(resource_name.starts_with("lionclaw-everyday-"));
     assert_eq!(resource_name.len(), "lionclaw-everyday-".len() + 32);
+    assert_eq!(
+        observations.cleanup_requests,
+        [("podman".to_string(), resource_name.to_string())]
+    );
     assert!(request
         .plan
         .environment
@@ -866,6 +887,42 @@ async fn everyday_run_reaches_validated_profile_auth_and_confinement() {
     assert!(observations.context[0].contains("\"repository\": \"/workspace\""));
     assert!(observations.context[0].contains("\"runtime\": \"fake\""));
     assert!(observations.context[0].contains("\"mission\": null"));
+}
+#[tokio::test]
+async fn production_everyday_cleanup_removes_only_its_exact_oci_resources() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = temp.path().join("calls");
+    let engine = temp.path().join("podman");
+    std::fs::write(
+        &engine,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    ProductionAttachedRuntimeExecutor
+        .cleanup_stale_resources(
+            engine.to_str().unwrap(),
+            "lionclaw-everyday-0123456789abcdef",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(calls)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "rm --force --ignore lionclaw-everyday-0123456789abcdef",
+            "rm --force --ignore lionclaw-everyday-0123456789abcdef-proxy",
+            "network rm --force lionclaw-everyday-0123456789abcdef-net",
+            "network rm --force lionclaw-everyday-0123456789abcdef-egress",
+        ]
+    );
 }
 
 #[tokio::test]

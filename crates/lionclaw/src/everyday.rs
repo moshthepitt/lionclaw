@@ -50,6 +50,8 @@ pub trait AttachedRuntimeExecutor: Send + Sync {
         image: &str,
     ) -> Result<String>;
 
+    async fn cleanup_stale_resources(&self, engine: &str, resource_name: &str) -> Result<()>;
+
     async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionOutput>;
 }
 
@@ -64,6 +66,15 @@ impl AttachedRuntimeExecutor for ProductionAttachedRuntimeExecutor {
         image: &str,
     ) -> Result<String> {
         lionclaw_confinement::resolve_oci_image_compatibility_identity(engine, image).await
+    }
+    async fn cleanup_stale_resources(&self, engine: &str, resource_name: &str) -> Result<()> {
+        let proxy_name = format!("{resource_name}-proxy");
+        let internal_network_name = format!("{resource_name}-net");
+        let egress_network_name = format!("{resource_name}-egress");
+        lionclaw_confinement::remove_oci_container(engine, resource_name).await?;
+        lionclaw_confinement::remove_oci_container(engine, &proxy_name).await?;
+        lionclaw_confinement::remove_oci_network(engine, &internal_network_name).await?;
+        lionclaw_confinement::remove_oci_network(engine, &egress_network_name).await
     }
 
     async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
@@ -215,6 +226,10 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
         .context("runtime auth materialization is invalid")?;
     let profile_key = profile.native_state_key(auth.identity());
     let resource_name = everyday_resource_name(dirs.role_state().runtime(), &profile_key);
+    executor
+        .cleanup_stale_resources(&profile.confinement.oci().engine, &resource_name)
+        .await
+        .context("cleaning stale everyday OCI resources")?;
     dirs.role_state()
         .admit_runtime_profile_async(profile_key.clone())
         .await
