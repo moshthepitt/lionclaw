@@ -245,12 +245,14 @@ Passed on final product HEAD `9d0e12c1a722249dc065f638987f91c9cc9644b2`:
 - Development image rebuild from the changed Containerfile passed and produced
   `localhost/lionclaw-runtime-dev:v1`.
 
-Final raw output is under `.tmp/chunk8-acceptance/logs/`, including
+Captured command output is under `.tmp/chunk8-acceptance/logs/`, including
 `final-cargo-fmt-check.raw.log`, `final-cargo-check.raw.log`,
 `final-cargo-test.raw.log`, `final-scripts-ci.raw.log`,
 `final-git-diff-check.raw.log`, `final-mission-eval-bash-n.raw.log`,
 `codeintel-diagnostics.raw.json`, `codeintel-crash-cleanup.raw.json`, and the
-three `stale-oci-*.raw.log` files.
+three `stale-oci-*.raw.log` files. Trailing blank lines were trimmed from
+affected `.raw.log` files solely for the whitespace gate; command content and
+status are unchanged.
 
 ## Ignored-Test Rationale
 
@@ -330,8 +332,9 @@ are unchanged.
 
 ## Repository Integrity
 
-Five signed product/evidence commits follow accepted base
-`a909832e01734af9eeee40ed4a1d04720fd2983e` directly and linearly:
+Six signed precursor product/evidence commits are inventoried below. The branch
+follows accepted base `a909832e01734af9eeee40ed4a1d04720fd2983e`
+directly and linearly:
 
 - `91978fd77af0ddc5d4718e4e8071a9296b6aff88` —
   `test(acceptance): harden mission matrix`
@@ -343,12 +346,14 @@ Five signed product/evidence commits follow accepted base
   `docs(acceptance): finalize Chunk 8 evidence`
 - `9d0e12c1a722249dc065f638987f91c9cc9644b2` —
   `fix(runtime): recover stale everyday resources`
+- `8fe200df7f7657d55919686f8ea813adb10321d1` —
+  `docs(acceptance): record review evidence`
 
-All five have good signatures from
+All six inventoried commits have good signatures from
 `Kelvin Jayanoris <kelvin@jayanoris.com>` using RSA key
-`11001593BC0EB11379D7725896EDA40C1DFDD88A`. The subsequent evidence-only
-correction is checked after creation because a commit cannot contain its own
-hash.
+`11001593BC0EB11379D7725896EDA40C1DFDD88A`. Later evidence-only commits
+containing revisions of this note are intentionally absent from the embedded
+inventory; their hashes and signatures are verified externally after creation.
 
 No work was pushed, merged, rebased, submitted for review, ported to `main`, or
 used to mutate `main`.
