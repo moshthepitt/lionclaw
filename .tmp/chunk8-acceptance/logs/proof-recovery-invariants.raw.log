@@ -1,0 +1,25 @@
+   Compiling lionclaw v0.8.0 (/home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-simple-chunk-8-acceptance/crates/lionclaw)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.53s
+     Running tests/happy_path.rs (target/debug/deps/happy_path-66d8e32dfdafc313)
+
+running 1 test
+test revising_one_of_multiple_proof_failures_replans_with_every_receipt ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.11s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running tests/happy_path.rs (target/debug/deps/happy_path-66d8e32dfdafc313)
+
+running 1 test
+test command_retry_is_reoffered_only_for_a_changed_outcome ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.13s
+
+   Compiling lionclaw v0.8.0 (/home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-simple-chunk-8-acceptance/crates/lionclaw)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.19s
+     Running tests/environment_assignment.rs (target/debug/deps/environment_assignment-20b3adbd5031d1e5)
+
+running 1 test
+test environment_digest_change_stales_authoritative_proof_and_reruns_oracle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.06s

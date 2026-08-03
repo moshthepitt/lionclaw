@@ -1,0 +1,21 @@
+   Compiling lionclaw v0.8.0 (/home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-simple-chunk-8-acceptance/crates/lionclaw)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.18s
+     Running tests/everyday_run.rs (target/debug/deps/everyday_run-922bffac8c2568ab)
+
+running 1 test
+runtime fake exited code 0
+mission state: no mission
+
+thread 'everyday_run_reaches_validated_profile_auth_and_confinement' (2583189) panicked at crates/lionclaw/tests/everyday_run.rs:841:10:
+destination-scoped everyday network has an OCI resource owner
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test everyday_run_reaches_validated_profile_auth_and_confinement ... FAILED
+
+failures:
+
+failures:
+    everyday_run_reaches_validated_profile_auth_and_confinement
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p lionclaw --test everyday_run`

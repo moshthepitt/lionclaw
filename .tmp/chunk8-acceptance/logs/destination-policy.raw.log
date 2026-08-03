@@ -1,0 +1,21 @@
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling thiserror v2.0.18
+   Compiling serde_json v1.0.150
+   Compiling memchr v2.8.0
+   Compiling syn v2.0.117
+   Compiling digest v0.11.3
+   Compiling sha2 v0.11.0
+   Compiling thiserror-impl v2.0.18
+   Compiling serde_derive v1.0.228
+   Compiling serde_spanned v1.1.1
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling toml v1.1.2+spec-1.1.0
+   Compiling lionclaw-model v0.8.0 (/home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-simple-chunk-8-acceptance/crates/lionclaw-model)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.03s
+     Running tests/dynamic_oracles.rs (target/debug/deps/dynamic_oracles-ec9fdc6f0923a257)
+
+running 1 test
+test command_oracles_may_request_only_destination_scoped_network ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s

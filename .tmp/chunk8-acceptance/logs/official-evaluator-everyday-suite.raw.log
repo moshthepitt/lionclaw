@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running tests/everyday_run.rs (target/debug/deps/everyday_run-922bffac8c2568ab)
+
+running 12 tests
+test runtime_state_inside_the_judged_repository_is_rejected ... ok
+test everyday_run_reaches_validated_profile_auth_and_confinement ... ok
+test runtime_signal_retries_are_bounded_and_cannot_append_a_decision ... ok
+test ordinary_runtime_failure_is_not_retried_or_allowed_to_append_a_decision ... ok
+test mutable_image_tag_is_resolved_before_native_resume_and_execution ... ok
+test corrupt_current_mission_binding_fails_before_runtime_execution ... ok
+test durable_binding_preserves_one_exact_live_mission ... ok
+test restart_resumes_native_conversation_and_releases_a_settled_mission ... ok
+test new_selection_releases_an_unapplied_result_without_destroying_it ... ok
+test completed_binding_is_preserved_through_apply_then_released ... ok
+test attached_runtime_drives_full_mission_lifecycle_through_the_projected_bridge ... ok
+test attached_runtime_authors_and_executes_child_mission_through_everyday_run ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s

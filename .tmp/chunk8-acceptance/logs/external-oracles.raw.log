@@ -1,0 +1,23 @@
+   Compiling lionclaw-runtime-mock v0.8.0 (/home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-simple-chunk-8-acceptance/crates/lionclaw-runtime-mock)
+   Compiling lionclaw v0.8.0 (/home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-simple-chunk-8-acceptance/crates/lionclaw)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.27s
+     Running tests/external_oracles.rs (target/debug/deps/external_oracles-c347f77fed96fefe)
+
+running 11 tests
+test production_external_driver_uses_kernel_broker_without_container_credentials ... ignored, requires Podman, the runtime image, and delegated CPU/memory cgroup controllers
+test external_driver_result_must_match_recorded_spec_digest ... ok
+test external_driver_result_must_carry_a_valid_artifact_digest ... ok
+test external_driver_result_must_match_submission_identity ... ok
+test external_submission_is_idempotent_across_crash_before_recording ... ok
+test external_submission_record_survives_crash_after_recording ... ok
+test admitted_polling_lifecycle_has_request_capacity_through_its_last_poll ... ok
+test plan_admission_rejects_external_driver_network_above_mission_ceiling ... ok
+test plan_admission_resolves_external_driver_identity_before_recording ... ok
+test pending_external_oracle_stays_in_resolve_effect_until_polled_complete ... ok
+
+thread 'post_outcome_crash_retires_request_budget_without_replaying_oracle' (2004321) panicked at crates/lionclaw/tests/external_oracles.rs:146:13:
+injected crash after durable external oracle outcome
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test post_outcome_crash_retires_request_budget_without_replaying_oracle ... ok
+
+test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.10s

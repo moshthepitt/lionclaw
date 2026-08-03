@@ -1,0 +1,14 @@
+   Compiling lionclaw v0.8.0 (/home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-simple-chunk-8-acceptance/crates/lionclaw)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.70s
+     Running tests/everyday_run.rs (target/debug/deps/everyday_run-922bffac8c2568ab)
+
+running 1 test
+runtime fake exited code 0
+mission m8250c1001b73: nonterminal
+runtime fake exited code 0
+mission state: no mission
+runtime fake exited code 0
+mission m150e5d8320b5: nonterminal
+test restart_resumes_native_conversation_and_releases_a_settled_mission ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.06s

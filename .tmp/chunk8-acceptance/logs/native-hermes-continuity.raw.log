@@ -1,0 +1,205 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/lionclaw-c02996a6903ad7da)
+
+running 1 test
+test runner::real_runtime_continuity_tests::real_hermes_runtime_resumes_across_exact_effect_cleanup ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 196 filtered out; finished in 41.26s
+
+     Running unittests src/main.rs (target/debug/deps/lionclaw-44824b70ddd10b5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/advisory_validator.rs (target/debug/deps/advisory_validator-ecd038f9c8523ff2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/approval.rs (target/debug/deps/approval-425eb7a4e6e48590)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/bundled_skills.rs (target/debug/deps/bundled_skills-cabf54b99db64cf9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/child_missions.rs (target/debug/deps/child_missions-f13a57461ca6ecac)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/controlled_effects.rs (target/debug/deps/controlled_effects-97ac7b455b44a0e2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+
+     Running tests/conversation_resource_lifecycle.rs (target/debug/deps/conversation_resource_lifecycle-5a71fde8bf538890)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/driver_recovery.rs (target/debug/deps/driver_recovery-7bc2d68955b71230)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+     Running tests/environment_assignment.rs (target/debug/deps/environment_assignment-20b3adbd5031d1e5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/eval_deterministic.rs (target/debug/deps/eval_deterministic-79207b059d07c2b8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/everyday_run.rs (target/debug/deps/everyday_run-922bffac8c2568ab)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/external_oracles.rs (target/debug/deps/external_oracles-c347f77fed96fefe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/fold_litmus.rs (target/debug/deps/fold_litmus-b289188ba02ba14b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/happy_path.rs (target/debug/deps/happy_path-66d8e32dfdafc313)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
+
+     Running tests/identity.rs (target/debug/deps/identity-9192e5fcf8717dd3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/message_routing.rs (target/debug/deps/message_routing-e1633b6c85b1d1ca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/mission_type_loading.rs (target/debug/deps/mission_type_loading-62e15a03451366bd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.00s
+
+     Running tests/operator_skill.rs (target/debug/deps/operator_skill-7bffa6167bc82f7b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/parallel_writers.rs (target/debug/deps/parallel_writers-989a3f0497d4f0e6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/phase0_liveness.rs (target/debug/deps/phase0_liveness-9e18a24d35e0a84f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/planning.rs (target/debug/deps/planning-3a78b6bf0def4adf)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/production_conversation_flow.rs (target/debug/deps/production_conversation_flow-6ce337631bf0a902)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/queue_bounds.rs (target/debug/deps/queue_bounds-f8e81a88462d53bb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/read_only_tasks.rs (target/debug/deps/read_only_tasks-39c6a5b99986463f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/recovery.rs (target/debug/deps/recovery-125fb8bad1800148)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/reference_expansion.rs (target/debug/deps/reference_expansion-a9dd3c2e42f3ae29)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/replanning.rs (target/debug/deps/replanning-066d8ee328364611)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/resume.rs (target/debug/deps/resume-89e92aaa7cc6ab31)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/runtime_boundary.rs (target/debug/deps/runtime_boundary-8d9f3bed4cb4c72b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/skill_dispatch.rs (target/debug/deps/skill_dispatch-10cff33d3dc720ca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/skill_prompts.rs (target/debug/deps/skill_prompts-1279a29c96d120eb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/store_hardening.rs (target/debug/deps/store_hardening-86032ab31349c2fd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/terminal_review.rs (target/debug/deps/terminal_review-14f6585b670a0a58)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.00s

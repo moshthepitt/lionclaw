@@ -1,0 +1,9 @@
+== Generic method acceptance ==
+  software-dev/python: PASS (verified, head changed)
+  software-dev/javascript: PASS (verified, head changed)
+eval stopped on operator-owned choices: {"mission_id": "m4b4532803042", "choices": [{"action": "retry", "id": "proof_failed:review:gap-reviewer", "kind": "decide"}, {"action": "repair", "id": "proof_failed:review:gap-reviewer", "kind": "decide"}, {"action": "revise", "id": "proof_failed:review:gap-reviewer", "kind": "decide"}, {"base_revision": 1, "kind": "propose_plan"}, {"kind": "configure_team", "revision": 2}, {"kind": "add_mission_skill"}, {"kind": "assign_environment", "team_revision": 1}, {"kind": "abort"}], "oracle_failures": {}, "failed_judgments": [], "gap_review": {"attempts": 1, "failure_receipt": null, "fresh": true, "gaps": {"blocking": 1, "major": 0, "minor": 0}, "judged_sha": "1f2650089feb0fd9147495309ec3f2c8a2cd569f", "role": "gap-reviewer", "verdict": "gaps"}}
+  optimization/optimization: FAIL (mission did not reach an advertised finish)
+  research/research: PASS (attested, head changed)
+  review/review: PASS (attested, head unchanged)
+  design/design: PASS (attested, head changed)
+preserved eval work: /tmp/tmp.hIVlYJVrf0

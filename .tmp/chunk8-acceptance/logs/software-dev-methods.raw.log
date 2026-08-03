@@ -1,0 +1,9 @@
+== Generic method acceptance ==
+Error: invalid JSON
+
+Caused by:
+    invalid type: string "implementer", expected internally tagged enum TaskAssignment at line 1 column 3441
+Error: invalid JSON
+
+Caused by:
+    invalid type: string "implementer", expected internally tagged enum TaskAssignment at line 1 column 3363

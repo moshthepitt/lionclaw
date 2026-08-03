@@ -1,0 +1,10 @@
+== Agentic reliability eval (1 runs each) ==
+[1] fixes the bug -> verified
+  run 1: PASS (verified, head f75cd28a399f6885171a08afb0faaaca5e31bd5b != base)
+scenario 1 (fix bug): 1/1 verified
+  => SCENARIO 1 PASS
+[2] planning -> approve -> verified
+  run 1: PASS (planned, approved, verified; head c5ece884e4b32ace21956f0dc162bdd34d340d1d)
+scenario 2 (planning -> approve -> verified): 1/1 verified
+  => SCENARIO 2 PASS
+preserved eval work: /tmp/tmp.QXN1SOdPc0

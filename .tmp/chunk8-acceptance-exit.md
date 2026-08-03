@@ -6,7 +6,7 @@ Branch: `lionclaw2-simple-chunk-8-acceptance`
 
 Accepted signed base: `a909832e01734af9eeee40ed4a1d04720fd2983e`
 
-Accepted product HEAD: `9d0e12c1a722249dc065f638987f91c9cc9644b2`
+Accepted product HEAD: `9d0e12c174e0d92aa6001b56960445dcd42c8081`
 
 The branch was created directly from the exact `lionclaw2` head above. Neither the
 planning-material worktree `.worktrees/lionclaw2` nor `main` was used as an
@@ -80,9 +80,11 @@ and bridge remain acceptance artifacts, not LionClaw product code.
   Final state: `attested`, current SHA
   `493168e650272dc2f920ffa084300209db9d62c6`, clean gap review with zero
   blocking/major/minor gaps.
-  - Evidence: `.tmp/chunk8-acceptance/logs/optimization-hardened-failure-report.raw.json`,
+  - Evidence:
+    `.tmp/chunk8-acceptance/logs/optimization-hardened-failure-report.raw.json`,
+    `.tmp/chunk8-acceptance/logs/optimization-metric-repair-decision.raw.log`,
     `.tmp/chunk8-acceptance/logs/optimization-post-repair-report.raw.json`,
-    `.tmp/chunk8-acceptance/logs/optimization-second-repair-drive.raw.log`, and
+    `.tmp/chunk8-acceptance/logs/optimization-gap-repair-decision.raw.log`, and
     `.tmp/chunk8-acceptance/logs/optimization-final-report.raw.json`.
 - The first official external dependent-type-checker result was honestly RED:
   the mission finished with independent proofs, but the unmodified evaluator
@@ -218,7 +220,7 @@ removed credential projection, and cleaned effects:
 
 ## Required Gates
 
-Passed on final product HEAD `9d0e12c1a722249dc065f638987f91c9cc9644b2`:
+Passed on final product HEAD `9d0e12c174e0d92aa6001b56960445dcd42c8081`:
 
 - `cargo fmt -- --check`
 - `cargo check`
@@ -344,7 +346,7 @@ directly and linearly:
   `fix(runtime): name everyday OCI resources`
 - `a62fe51d9c753663fef6ea444d8aedce416905a0` —
   `docs(acceptance): finalize Chunk 8 evidence`
-- `9d0e12c1a722249dc065f638987f91c9cc9644b2` —
+- `9d0e12c174e0d92aa6001b56960445dcd42c8081` —
   `fix(runtime): recover stale everyday resources`
 - `8fe200df7f7657d55919686f8ea813adb10321d1` —
   `docs(acceptance): record review evidence`
