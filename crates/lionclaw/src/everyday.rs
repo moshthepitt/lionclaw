@@ -214,6 +214,7 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
         .await
         .context("runtime auth materialization is invalid")?;
     let profile_key = profile.native_state_key(auth.identity());
+    let resource_name = everyday_resource_name(dirs.role_state().runtime(), &profile_key);
     dirs.role_state()
         .admit_runtime_profile_async(profile_key.clone())
         .await
@@ -265,7 +266,7 @@ pub async fn run(request: EverydayRunRequest) -> Result<EverydayRunOutcome> {
             .execute(ExecutionRequest {
                 plan: plan.clone(),
                 program,
-                resource_name: None,
+                resource_name: Some(resource_name.clone()),
                 runtime_secrets_mount: None,
                 auth_staging_root: Some(auth.staging_root().to_path_buf()),
                 runtime_auth: auth.materialization(),
@@ -666,6 +667,19 @@ fn write_atomic(root: &Path, name: &str, contents: &[u8], mode: u32) -> Result<(
         .with_context(|| format!("publishing '{}'", root.join(name).display()))
 }
 
+fn everyday_resource_name(runtime_state_root: &Path, profile_key: &str) -> String {
+    let mut digest = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut digest, b"lionclaw-everyday-oci-resource\0");
+    sha2::Digest::update(
+        &mut digest,
+        runtime_state_root.as_os_str().as_encoded_bytes(),
+    );
+    sha2::Digest::update(&mut digest, b"\0");
+    sha2::Digest::update(&mut digest, profile_key.as_bytes());
+    let digest = sha2::Digest::finalize(digest);
+    format!("lionclaw-everyday-{}", hex::encode(&digest[..16]))
+}
+
 fn uuid_from_key(key: &str) -> uuid::Uuid {
     let digest = <sha2::Sha256 as sha2::Digest>::digest(key.as_bytes());
     let mut bytes = [0u8; 16];
@@ -685,6 +699,23 @@ mod tests {
         ] {
             assert!(!message.contains(action));
         }
+    }
+
+    #[test]
+    fn resource_owner_is_stable_and_scoped_to_runtime_state_and_profile() {
+        let owner = everyday_resource_name(Path::new("/state/repo-a"), "profile-a");
+        assert_eq!(
+            owner,
+            everyday_resource_name(Path::new("/state/repo-a"), "profile-a")
+        );
+        assert_ne!(
+            owner,
+            everyday_resource_name(Path::new("/state/repo-b"), "profile-a")
+        );
+        assert_ne!(
+            owner,
+            everyday_resource_name(Path::new("/state/repo-a"), "profile-b")
+        );
     }
 
     #[test]

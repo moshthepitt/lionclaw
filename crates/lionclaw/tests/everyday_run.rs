@@ -835,6 +835,12 @@ async fn everyday_run_reaches_validated_profile_auth_and_confinement() {
     let request = &observations.requests[0];
     assert_eq!(request.plan.workspace_access.as_str(), "read-only");
     assert!(request.plan.network.allows("api.fake.example", 443));
+    let resource_name = request
+        .resource_name
+        .as_deref()
+        .expect("destination-scoped everyday network has an OCI resource owner");
+    assert!(resource_name.starts_with("lionclaw-everyday-"));
+    assert_eq!(resource_name.len(), "lionclaw-everyday-".len() + 32);
     assert!(request
         .plan
         .environment
