@@ -1,0 +1,14 @@
+{
+  "command": "diagnostics",
+  "roots": [
+    "/home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-simple-chunk-8-acceptance"
+  ],
+  "files": [
+    "crates/lionclaw/src/selftest.rs"
+  ],
+  "diagnostics": [],
+  "summary": {
+    "total": 0
+  },
+  "warnings": []
+}
