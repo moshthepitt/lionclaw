@@ -21,11 +21,13 @@ trap 'rm -rf "$STAGE" "$TEST_HOME"' EXIT
 ROOT="$STAGE/lionclaw"
 mkdir -p "$ROOT/share/man/man1" "$DIST"
 cp skills/lionclaw/SKILL.md "$ROOT/SKILL.md"
+cp README.md "$ROOT/README.md"
 cp "$BINARY" "$ROOT/lionclaw"
 cp LICENSE crates/lionclaw/LICENSE-zenith "$ROOT/"
 "$ROOT/lionclaw" man > "$ROOT/share/man/man1/lionclaw.1"
 
 test -x "$ROOT/lionclaw"
+test -s "$ROOT/README.md"
 test "$(find "$ROOT" -name SKILL.md -type f | wc -l)" -eq 1
 test -s "$ROOT/share/man/man1/lionclaw.1"
 LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" install
