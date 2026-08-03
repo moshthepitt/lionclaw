@@ -6,7 +6,7 @@ Branch: `lionclaw2-simple-chunk-8-acceptance`
 
 Accepted signed base: `a909832e01734af9eeee40ed4a1d04720fd2983e`
 
-Accepted implementation commit: `91978fd77af0ddc5d4718e4e8071a9296b6aff88`
+Accepted product HEAD: `68554233b3f4c7c87ca0e4127e5cac6a0206f7a4`
 
 The branch was created directly from the exact `lionclaw2` head above. Neither the
 planning-material worktree `.worktrees/lionclaw2` nor `main` was used as an
@@ -17,8 +17,16 @@ implementation base.
 Chunk 8 acceptance passed. The matrix exercised real mission orchestration,
 command proof, independent judgment, gap review, repair, crash/replay behavior,
 destination-scoped authority, child outcomes, and authenticated native runtime
-continuity. Product changes are limited to the acceptance harness and its
-development image.
+continuity. Product changes are limited to the acceptance harness, its
+development image, and one generic runtime fix. Each everyday OCI execution has
+a stable
+resource owner derived from its LionClaw runtime-state root and runtime profile.
+Fresh evaluator jobs therefore do not collide on global Podman proxy/network
+names.
+
+An external unmodified dependent-type-checker task was also exercised through
+an evaluator bridge that invoked only `lionclaw run codex`. Its candidate source
+and bridge remain acceptance artifacts, not LionClaw product code.
 
 ## Implementation
 
@@ -76,6 +84,31 @@ development image.
     `.tmp/chunk8-acceptance/logs/optimization-post-repair-report.raw.json`,
     `.tmp/chunk8-acceptance/logs/optimization-second-repair-drive.raw.log`, and
     `.tmp/chunk8-acceptance/logs/optimization-final-report.raw.json`.
+- The first official external dependent-type-checker result was honestly RED:
+  the mission finished with independent proofs, but the unmodified evaluator
+  accepted only 169/174 valid programs and rejected 81/81 invalid programs.
+  Missing behaviors were higher-universe ordinary recursors, singleton
+  large-elimination, scoped polymorphic inductive self-reference, and dependent
+  let transparency. Evidence:
+  `.tmp/chunk8-acceptance/official-evaluator/official-red-reward.json`.
+- A first repair exposed a separate conventional-packaging defect: the committed
+  candidate redirected Cargo output, so `cargo build --release` produced no
+  binary at `type-checker/target/release/type-checker`. A verified packaging
+  repair removed that product-level redirect before semantic repair continued.
+- Three ordinary LionClaw repair missions used public specification-derived
+  regression tests, nonzero command proofs, and fresh gap reviews. Final mission
+  `m4786ae9e5883` finished `verified` at candidate
+  `5439309f8b471350d5ab5a5fa4639eb41eb6ddf9` with a clean review.
+- The final unmodified evaluator accepted 174/174 valid programs, rejected
+  81/81 invalid programs, and assigned score `0.3503878189040147`. Evidence:
+  `.tmp/chunk8-acceptance/official-evaluator/official-final-reward.json`.
+- The evaluator also exposed global Podman-name collisions between isolated
+  everyday runs. RED:
+  `.tmp/chunk8-acceptance/logs/official-evaluator-everyday-network-red.raw.log`.
+  The generic runtime-state/profile-derived resource owner fixed the collision;
+  focused and full-suite GREEN evidence is in
+  `official-evaluator-everyday-network-green.raw.log` and
+  `official-evaluator-everyday-suite.raw.log`.
 
 ## Acceptance Matrix
 
@@ -143,6 +176,19 @@ development image.
     `environment_digest_change_stales_authoritative_proof_and_reruns_oracle`.
     Evidence for items 13-15:
     `.tmp/chunk8-acceptance/logs/proof-recovery-invariants.raw.log`.
+16. **Unmodified external task through vanilla LionClaw**: passed after honest
+    repair. The external bridge supplied the task instruction unchanged to
+    `lionclaw run codex`, observed normal mission state, and materialized only
+    the verified deliverable. Initial official score was `0.0` at 169/174 valid
+    accepts and 81/81 invalid rejects. Final official score was
+    `0.3503878189040147` at 174/174 and 81/81, with geometric-mean throughput
+    `0.3503878189040147` times the reference. The final candidate, public task
+    metadata, bridge, mission report, and failure/final rewards are archived at
+    `.tmp/chunk8-acceptance/official-evaluator/final-task-and-output.tar.gz`
+    (SHA-256
+    `cbbf622c9d00ef3a3bcee3b706535e237f68543b5cbc9c956a75c563d8d5104a`).
+    Hidden verifier corpus, reference implementation, oracle solution, build
+    outputs, and bytecode are intentionally excluded.
 
 ## Authenticated Native Runtime Continuity
 
@@ -164,39 +210,51 @@ removed credential projection, and cleaned effects:
 
 ## Required Gates
 
-Passed on implementation commit `91978fd77af0ddc5d4718e4e8071a9296b6aff88`:
+Passed on final product HEAD `68554233b3f4c7c87ca0e4127e5cac6a0206f7a4`:
 
 - `cargo fmt -- --check`
 - `cargo check`
 - `cargo test`
+  - 195 unit tests passed in the main library target;
+  - every runnable workspace integration, crate, and doc test passed;
+  - three credential-backed native-continuity tests were ignored by the default
+    suite and were separately run successfully as recorded above.
 - `bash ./scripts/ci.sh`
   - workspace check passed;
   - Clippy passed for all targets/features with warnings denied;
   - rustdoc passed with warnings denied;
   - every runnable workspace test passed;
-  - all nine named Podman mission self-tests passed.
+  - all nine mandatory Podman mission self-tests passed;
+  - the optional external-oracle OCI scenario was skipped because delegated
+    CPU/memory cgroup controllers are unavailable.
 - `git diff --check`
 - `bash -n scripts/mission-eval.sh`
-- Rust CodeIntel diagnostics for changed `selftest.rs`: zero diagnostics and
-  zero warnings.
-- Development image rebuild from the changed Containerfile: passed and tagged
+- Rust CodeIntel diagnostics were collected for both changed Rust files.
+  `selftest.rs` had zero diagnostics. `everyday.rs` reported five
+  `non_snake_case` warnings on Rust enum-pattern tokens named `None`; Cargo
+  check and Clippy accepted the source, so these are recorded analyzer false
+  positives rather than suppressed in code.
+- Development image rebuild from the changed Containerfile passed and produced
   `localhost/lionclaw-runtime-dev:v1`.
 
-Raw output is under `.tmp/chunk8-acceptance/logs/`, including
-`cargo-fmt-check.raw.log`, `cargo-check.raw.log`, `cargo-test.raw.log`,
-`scripts-ci.raw.log`, `codeintel-diagnostics.raw.json`, and
-`dev-image-build.raw.log`.
+Final raw output is under `.tmp/chunk8-acceptance/logs/`, including
+`final-cargo-fmt-check.raw.log`, `final-cargo-check.raw.log`,
+`final-cargo-test.raw.log`, `final-scripts-ci.raw.log`,
+`final-git-diff-check.raw.log`, `final-mission-eval-bash-n.raw.log`,
+`codeintel-diagnostics.raw.json`, and
+`codeintel-everyday-diagnostics.raw.json`.
 
 ## Ignored-Test Rationale
 
-The normal workspace suite reports four source-level ignored tests:
+The normal workspace suite reports four ignored tests in total:
 
 - Real Codex, OpenCode, and Hermes native continuity require explicit fresh
   evidence roots, real credentials, network, and the OCI image. Credentials
   were available, so all three were run explicitly and passed as recorded
   above; they were not left unverified.
-- `production_external_driver_uses_kernel_broker_without_container_credentials`
-  requires delegated CPU and memory cgroup controllers. `scripts/ci.sh`
+- CI also considers
+  `production_external_driver_uses_kernel_broker_without_container_credentials`;
+  it requires delegated CPU and memory cgroup controllers. `scripts/ci.sh`
   detected both controllers unavailable and skipped this one scenario. The ten
   non-OCI external-oracle lifecycle, admission, identity, digest, and crash
   scenarios all passed. No test was skipped because a normal host directory
@@ -204,13 +262,12 @@ The normal workspace suite reports four source-level ignored tests:
 
 ## Product Coupling Scan
 
-The case-insensitive scan covered `crates/*/src/**/*.rs` excluding only the
-explicit diagnostic implementation `crates/lionclaw/src/selftest.rs`. It looked
-for evaluator variables, fixture names, generic method assertion ids, and
-benchmark/eval adapters. Result: zero matches. The self-test intentionally
-embeds its real diagnostic fixtures; no engine, fold, model, runtime, policy,
-or production dispatch branch knows the benchmark/evaluator cases. Evidence:
-`.tmp/chunk8-acceptance/logs/product-coupling-scan.raw.log`.
+The case-insensitive final scan looked for `FrontierSWE`/`Frontier-SWE` and
+`Harbor` across all tracked Rust product source, bundled mission methods and
+prompts, containers, scripts, generated help source, and CI workflows:
+`crates/*/src/**/*.rs`, `mission-types/**`, `containers/**`, `scripts/**`, and
+`.github/workflows/**`. Result: zero matches. No exclusion was used. Evidence:
+`.tmp/chunk8-acceptance/logs/product-coupling-scan-final.raw.log`.
 
 ## Security Impact
 
@@ -233,8 +290,10 @@ or production dispatch branch knows the benchmark/evaluator cases. Evidence:
 
 No public CLI/API, durable event payload, schema, fold, reducer, SQL shape, or
 mission-type contract changed. The evaluator correction only emits the already
-required tagged `TaskAssignment` JSON shape. Existing logs replay exactly as
-before; schema and reducer versions are unchanged.
+required tagged `TaskAssignment` JSON shape. Everyday OCI resource names are
+internal process-boundary identifiers derived from existing runtime state and
+profile identity. Existing logs replay exactly as before; schema and reducer
+versions are unchanged.
 
 ## Residual Risks
 
@@ -245,15 +304,29 @@ before; schema and reducer versions are unchanged.
   real semantic and metric gaps and required explicit repairs before passing;
   the retained failure reports are part of the acceptance evidence rather than
   hidden as flakiness.
+- The external task is correct but slower than its reference implementation:
+  geometric-mean throughput is `0.3503878189040147x`. Chunk 8 required honest,
+  nonzero end-to-end evidence, not benchmark-specific optimization; no product
+  or candidate special case was added to chase score.
 - Preserved `/tmp` roots are local audit artifacts and may be removed only after
   their committed reports/receipts are no longer needed.
 
 ## Repository Integrity
 
-Implementation commit `91978fd77af0ddc5d4718e4e8071a9296b6aff88` is a direct
-child of accepted base `a909832e01734af9eeee40ed4a1d04720fd2983e` and has a
-good signature from `Kelvin Jayanoris <kelvin@jayanoris.com>` using RSA key
-`11001593BC0EB11379D7725896EDA40C1DFDD88A`.
+Three product/evidence commits follow accepted base
+`a909832e01734af9eeee40ed4a1d04720fd2983e` directly and linearly:
+
+- `91978fd77af0ddc5d4718e4e8071a9296b6aff88` —
+  `test(acceptance): harden mission matrix`
+- `7c672f94781342cb8b1e965d02e3634805ec2a27` —
+  `docs(acceptance): record Chunk 8 evidence`
+- `68554233b3f4c7c87ca0e4127e5cac6a0206f7a4` —
+  `fix(runtime): name everyday OCI resources`
+
+All three have good signatures from
+`Kelvin Jayanoris <kelvin@jayanoris.com>` using RSA key
+`11001593BC0EB11379D7725896EDA40C1DFDD88A`. The final evidence-only commit is
+checked after creation because a commit cannot contain its own hash.
 
 No work was pushed, merged, rebased, submitted for review, ported to `main`, or
 used to mutate `main`.

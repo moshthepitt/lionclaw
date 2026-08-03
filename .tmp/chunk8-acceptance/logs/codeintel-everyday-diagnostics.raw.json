@@ -1,0 +1,101 @@
+{
+  "command": "diagnostics",
+  "roots": [
+    "/home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-simple-chunk-8-acceptance"
+  ],
+  "files": [
+    "crates/lionclaw/src/everyday.rs"
+  ],
+  "diagnostics": [
+    {
+      "file": "crates/lionclaw/src/everyday.rs",
+      "range": {
+        "start": {
+          "line": 178,
+          "column": 10
+        },
+        "end": {
+          "line": 178,
+          "column": 14
+        }
+      },
+      "severity": "warning",
+      "code": "non_snake_case",
+      "source": "rust-analyzer",
+      "message": "Variable `None` should have snake_case name, e.g. `none`"
+    },
+    {
+      "file": "crates/lionclaw/src/everyday.rs",
+      "range": {
+        "start": {
+          "line": 178,
+          "column": 16
+        },
+        "end": {
+          "line": 178,
+          "column": 20
+        }
+      },
+      "severity": "warning",
+      "code": "non_snake_case",
+      "source": "rust-analyzer",
+      "message": "Variable `None` should have snake_case name, e.g. `none`"
+    },
+    {
+      "file": "crates/lionclaw/src/everyday.rs",
+      "range": {
+        "start": {
+          "line": 468,
+          "column": 13
+        },
+        "end": {
+          "line": 468,
+          "column": 17
+        }
+      },
+      "severity": "warning",
+      "code": "non_snake_case",
+      "source": "rust-analyzer",
+      "message": "Variable `None` should have snake_case name, e.g. `none`"
+    },
+    {
+      "file": "crates/lionclaw/src/everyday.rs",
+      "range": {
+        "start": {
+          "line": 577,
+          "column": 13
+        },
+        "end": {
+          "line": 577,
+          "column": 17
+        }
+      },
+      "severity": "warning",
+      "code": "non_snake_case",
+      "source": "rust-analyzer",
+      "message": "Variable `None` should have snake_case name, e.g. `none`"
+    },
+    {
+      "file": "crates/lionclaw/src/everyday.rs",
+      "range": {
+        "start": {
+          "line": 578,
+          "column": 13
+        },
+        "end": {
+          "line": 578,
+          "column": 17
+        }
+      },
+      "severity": "warning",
+      "code": "non_snake_case",
+      "source": "rust-analyzer",
+      "message": "Variable `None` should have snake_case name, e.g. `none`"
+    }
+  ],
+  "summary": {
+    "total": 5,
+    "warning": 5
+  },
+  "warnings": []
+}

@@ -1,0 +1,42 @@
+{
+  "task_checksum": "8725dbc2ad987d24dc5f3faeadab5ea027be70546e2e2b24fc1046659a830bd3",
+  "official_instruction_sha256": "de237f9ac80af16e1ae64463e40e5e5277ea246b3ab93458be467baaf5628569",
+  "bridge": "vanilla_eval.agent:VanillaLionClawAgent",
+  "bridge_version": "chunk8-official-v3",
+  "command": "lionclaw run codex",
+  "initial_mission_id": "m114979c4feec",
+  "initial_base_sha": "72c43b01ea7a0b417cef815bf81329ac85179d5e",
+  "initial_deliverable_sha": "2bf7f24b2726829e5a8c4ec34563945a3c859b73",
+  "repair_mission_ids": [
+    "ma266d310b793",
+    "m00a77f93430f",
+    "m4786ae9e5883"
+  ],
+  "final_candidate_sha": "5439309f8b471350d5ab5a5fa4639eb41eb6ddf9",
+  "final_finish": "verified",
+  "final_gap_review": "clean",
+  "final_correctness": {
+    "accepted": "174/174",
+    "rejected": "81/81"
+  },
+  "final_score": 0.3503878189040147,
+  "final_geometric_mean_speedup": 0.3503878189040147,
+  "archive_sha256": "cbbf622c9d00ef3a3bcee3b706535e237f68543b5cbc9c956a75c563d8d5104a",
+  "archive_excludes": [
+    "hidden verifier corpus",
+    "reference implementation",
+    "oracle solution",
+    "generated Cargo targets",
+    "Python bytecode"
+  ],
+  "candidate_commits_oldest_first": [
+    "2bf7f24b2726829e5a8c4ec34563945a3c859b73",
+    "974ca1f23f52dd158665cad99da297a97d3309ed",
+    "19a61186c1b48dd9627737a292498d13b21a0924",
+    "8787bf9fc5a12150085197ac3a6433cd48dcafd3",
+    "b3fe5898cebaa2f4c9eba351fa9e119dce6f9918",
+    "64be63c9352fde90d14536cabb33b92ba21c7a93",
+    "c20dab17074bb667f7b3eecfba394e7c4efcae71",
+    "5439309f8b471350d5ab5a5fa4639eb41eb6ddf9"
+  ]
+}

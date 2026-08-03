@@ -1,0 +1,10 @@
+Tool: repository regex search
+Pattern: (?i)frontier[-_ ]?swe|harbor
+Scope:
+- crates/*/src/**/*.rs (all tracked Rust product source, including prompts and help text)
+- mission-types/** (bundled mission methods and prompts)
+- containers/**
+- scripts/**
+- .github/workflows/** (CI)
+Result: No matches found
+Observed at product HEAD: 68554233b3f4c7c87ca0e4127e5cac6a0206f7a4

@@ -1,0 +1,26 @@
+{
+  "score": 0.0,
+  "reward": 0.0,
+  "subscores": [],
+  "additional_data": {
+    "correctness": {
+      "accept_total": 174,
+      "accept_passed": 169,
+      "accept_rate": 0.9712643678160919,
+      "accept_failures": [
+        "035_inductive_type1.sexp",
+        "149_large_elim_unit.sexp",
+        "150_large_elim_eq.sexp",
+        "166_upoly_inductive.sexp",
+        "181_let_transparency.sexp"
+      ],
+      "reject_total": 81,
+      "reject_passed": 81,
+      "reject_rate": 1.0,
+      "reject_failures": [],
+      "gate_passed": false
+    },
+    "reason": "Correctness gate failed: accept=0.971 (need >=0.99), reject=1.000 (need >=0.95)",
+    "total_time_ms": 3303
+  }
+}

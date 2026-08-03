@@ -1,0 +1,66 @@
+{
+  "score": 0.3503878189040147,
+  "reward": 0.3503878189040147,
+  "subscores": [
+    {
+      "name": "accept_rate",
+      "score": 1.0
+    },
+    {
+      "name": "reject_rate",
+      "score": 1.0
+    },
+    {
+      "name": "throughput_speedup",
+      "score": 0.3503878189040147
+    }
+  ],
+  "additional_data": {
+    "correctness": {
+      "accept_total": 174,
+      "accept_passed": 174,
+      "accept_rate": 1.0,
+      "accept_failures": [],
+      "reject_total": 81,
+      "reject_passed": 81,
+      "reject_rate": 1.0,
+      "reject_failures": [],
+      "gate_passed": true
+    },
+    "benchmark": {
+      "heavy_norm.sexp": {
+        "n_commands": 478,
+        "ref_median_s": 3.5344972445018357,
+        "cand_median_s": 10.768978445998073,
+        "ref_throughput": 135.23847012289042,
+        "cand_throughput": 44.38675426800882,
+        "speedup": 0.3283830640734531,
+        "n_pairs": 15,
+        "cv": 0.03987147140450566
+      },
+      "inductive_elim.sexp": {
+        "n_commands": 543,
+        "ref_median_s": 1.5457123554951977,
+        "cand_median_s": 5.289574026999617,
+        "ref_throughput": 351.29433886555165,
+        "cand_throughput": 102.65476902834908,
+        "speedup": 0.29542476308040977,
+        "n_pairs": 15,
+        "cv": 0.028273615133378473
+      },
+      "small_lemmas.sexp": {
+        "n_commands": 1237,
+        "ref_median_s": 1.4353923304988712,
+        "cand_median_s": 3.214086314495944,
+        "ref_throughput": 861.7852929241166,
+        "cand_throughput": 384.86831993931537,
+        "speedup": 0.44342416028532367,
+        "n_pairs": 15,
+        "cv": 0.0310679194293268
+      },
+      "geometric_mean_speedup": 0.3503878189040147
+    },
+    "reason": "Correctness passed (accept=1.000, reject=1.000). Throughput speedup: 0.350x",
+    "total_time_ms": 1751
+  }
+}

@@ -1,0 +1,1119 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/lionclaw-36b947ba5f058c76)
+
+running 198 tests
+test authority::team_authority_tests::device_grants_reach_the_compiled_plan_without_hardware ... ok
+test authority::team_authority_tests::l19_oracle_without_resource_override_keeps_profile_tmpfs_default ... ok
+test authority::team_authority_tests::oracle_device_declarations_reach_the_compiled_plan_without_hardware ... ok
+test authority::team_authority_tests::proof_floor_rejects_secrets_while_planning_can_receive_them ... ok
+test cli::team_cli_tests::environment_image_refs_must_be_digest_pinned ... ok
+test authority::team_authority_tests::l19_resource_override_below_profile_default_is_refused_at_compile_role_plan ... ok
+test authority::team_authority_tests::l19_oracle_resource_override_above_ceiling_refuses_at_compile_role_plan ... ok
+test authority::team_authority_tests::resource_override_cannot_smuggle_tmpfs_authority_flags ... ok
+test authority::team_authority_tests::l19_role_resource_override_replaces_profile_tmpfs_within_ceiling ... ok
+test authority::team_authority_tests::runtime_profile_destinations_compose_without_becoming_role_grants ... ok
+test config::tests::acp_session_mode_is_runtime_profile_data ... ok
+test config::tests::arbitrary_acp_runtime_is_profile_data ... ok
+test config::tests::external_oracle_driver_auth_is_profile_data ... ok
+test config::tests::invalid_skills_dir_is_rejected_while_loading_configuration ... ok
+test config::tests::native_home_auth_is_runtime_profile_data ... ok
+test everyday::tests::bootstrap_message_contains_no_workflow_action ... ok
+test everyday::tests::outcome_never_equates_nonterminal_runtime_success_with_mission_success ... ok
+test engine::prepared_input_grant_tests::role_launch_receives_only_explicitly_granted_prepared_inputs ... ok
+test config::tests::configured_additional_mounts_are_validated_and_retained ... ok
+test config::tests::external_oracle_drivers_are_profile_installed_and_network_scoped ... ok
+test config::tests::native_resume_is_profile_declared_and_defaults_to_reconstruction ... ok
+test driver_lock::tests::lock_is_exclusive_and_released_on_drop ... ok
+test config::tests::native_home_auth_enforces_the_declared_credential_count_boundary ... ok
+test config::tests::skills_dir_does_not_depend_on_the_host_home ... ok
+test config::tests::native_home_auth_rejects_paths_outside_its_roots ... ok
+test external_oracle_broker::tests::broker_rejects_destinations_outside_grant ... ok
+test config::tests::runtime_model_network_is_part_of_durable_instrument_identity ... ok
+test driver_lock::tests::drop_unlocks_even_when_the_descriptor_was_duplicated ... ok
+test config::tests::nested_runtime_configuration_rejects_unknown_fields ... ok
+test config::tests::native_state_key_tracks_effective_reopen_compatibility ... ok
+test everyday::tests::resource_owner_is_stable_and_scoped_to_runtime_state_and_profile ... ok
+test driver_lock::tests::child_process_holds_lock_fixture ... ok
+test config::tests::built_in_profiles_use_the_same_toml_loader ... ok
+test config::tests::runtime_model_network_is_profile_owned_and_validated ... ok
+test mission_type::environment_tests::prepared_input_is_the_explicit_final_environment_overlay ... ok
+test mission_type::environment_tests::mission_environment_cannot_override_kernel_coordinates ... ok
+test mission_type::frontmatter::tests::minimal_frontmatter_defaults ... ok
+test mission_type::frontmatter::tests::parses_quoted_tmpfs_entries_with_commas ... ok
+test mission_type::frontmatter::tests::parses_full_frontmatter ... ok
+test mission_type::frontmatter::tests::rejects_bad_bool ... ok
+test cli::team_cli_tests::parses_mission_local_skill_add ... ok
+test mission_type::frontmatter::tests::rejects_duplicate_key ... ok
+test mission_type::frontmatter::tests::rejects_empty_body ... ok
+test mission_type::frontmatter::tests::rejects_missing_fence ... ok
+test mission_type::frontmatter::tests::rejects_missing_output ... ok
+test mission_type::frontmatter::tests::rejects_unknown_key ... ok
+test mission_type::frontmatter::tests::timeout_must_fit_the_effect_deadline_representation ... ok
+test mission_type::locator::tests::bare_names_and_paths_are_unambiguous ... ok
+test cli::team_cli_tests::parses_mission_guide_and_environment_commands ... ok
+test config::tests::requested_runtime_selections_must_fit_the_evidence_contract ... ok
+test cli::team_cli_tests::parses_direct_team_runtime_and_guidance_commands ... ok
+
+running 1 test
+test driver_lock::tests::lock_descriptor_is_close_on_exec ... ok
+test mission_type::home::tests::installed_type_discovery_ignores_internal_install_work_directories ... ok
+test mission_type::digest::tests::streamed_files_keep_the_existing_content_identity ... ok
+test mission_type::bounded_tree::tests::tree_digest_distinguishes_raw_path_bytes ... ok
+test external_oracle_broker::tests::broker_rejects_symlink_credentials ... ok
+test mission_type::bounded_tree::tests::admitted_tree_rejects_a_replaced_real_directory ... ok
+test driver_lock::tests::process_death_releases_the_lock_immediately ... ok
+test external_oracle_broker::tests::request_budget_rejects_identity_drift_on_recreation ... ok
+test mission_type::bundled::tests::materialized_bundle_preserves_declared_files ... ok
+test external_oracle_broker::tests::broker_rejects_symlinked_credential_ancestors ... ok
+test mission_type::bounded_tree::tests::admitted_tree_rejects_leaf_indirection_without_blocking ... ok
+test mission_type::skill_install::tests::mission_local_add_is_content_addressed_and_idempotent ... ok
+test mission_type::install::tests::installed_bundle_no_longer_depends_on_its_source ... ok
+test network_proxy::tests::malformed_hosts_do_not_reach_dns ... ok
+test external_oracle_broker::tests::broker_injects_header_without_exposing_credential_to_client ... ok
+test operator_bridge::tests::bridge_refuses_host_local_git_skill_sources ... ok
+test operator_bridge::tests::workspace_files_are_normalized_but_host_paths_and_parent_traversal_are_refused ... ok
+test oracle::tests::external_proof_requires_exact_judged_artifact_digest ... ok
+test oracle::tests::oracle_prepared_input_overrides_domain_cache_location ... ok
+test operator_bridge::tests::bridge_exposes_validated_mission_surface_without_nested_launch_or_custom_types ... ok
+test oracle::tests::shell_syntax_is_a_literal_argument ... ok
+test prompt::team_prompt_tests::guidance_reaches_only_execution_and_planning_shapes ... ok
+test prompt::team_prompt_tests::planning_prompt_exposes_typed_child_mission_assignments ... ok
+test reference_materialization::tests::expansion_limits_accept_the_exact_bound ... ok
+test reference_materialization::tests::labelled_wrapper_cannot_escape_the_aggregate_bound ... ok
+test reference_materialization::tests::reference_and_aggregate_limits_fail_closed ... ok
+test reference_materialization::tests::rejected_completion_never_becomes_historical_reference_authority ... ok
+test resources::team_resource_tests::task_workspace_identity_is_independent_of_role_and_runtime_identity ... ok
+test operator_bridge::tests::projected_executable_is_a_portable_client_not_the_host_binary ... ok
+test runner::control_tests::closed_control_channel_does_not_starve_completion ... ok
+test oracle::tests::external_driver_confinement_is_kernel_fixed_and_credential_free ... ok
+test runner::control_tests::controlled_setup_is_dropped_on_stop_and_ignores_deadline_extensions ... ok
+test oracle::tests::production_oracle_observes_stop_before_checkout_or_runtime_launch ... ok
+test runner::executor::tests::interactive_launch_refusal_is_typed_before_adapter_projection ... ok
+test mission_type::skill_install::tests::failed_add_leaves_a_bundle_without_a_skills_directory_unchanged ... ok
+test runner::control_tests::pending_durable_control_wins_simultaneous_future_completion ... ok
+test runner::handoff::tests::absent_handoff_is_an_ordinary_checkpoint_but_present_invalid_data_is_not ... ok
+test runner::handoff::tests::alternate_runners_use_the_same_closed_output_contract_as_the_wire_parser ... ok
+test runner::handoff::tests::handoff_presence_is_exhaustively_owned_by_output_semantics ... ok
+test runner::handoff::tests::agent_handoffs_cannot_supply_durable_blob_references ... ok
+test runner::handoff::tests::bounded_serialization_stops_without_traversing_a_virtual_huge_value ... ok
+test runner::handoff::tests::interrupted_recovery_distinguishes_absence_from_malformed_evidence ... ok
+test network_proxy::tests::http_proxy_preserves_body_bytes_buffered_with_headers ... ok
+test runner::handoff::tests::ordinary_validate_handoff_rejects_gap_review_fields ... ok
+test runner::handoff::tests::parses_validate_handoff_with_items ... ok
+test runner::handoff::tests::parses_review_handoff_with_gaps_and_nonce ... ok
+test external_oracle_broker::tests::broker_rejects_redirects_and_credential_echoes ... ok
+test network_proxy::tests::http_redirect_to_undeclared_destination_is_rejected ... ok
+test runner::handoff::tests::parses_work_handoff ... ok
+test runner::handoff::tests::rejects_invalid_item_ids ... ok
+test runner::handoff::tests::rejects_missing_schema_and_bad_json ... ok
+test runner::handoff::tests::a_non_regular_handoff_is_rejected_not_followed_or_hung ... ok
+test runner::handoff::tests::review_handoff_rejects_validator_fields_and_requires_a_nonce ... ok
+test runner::handoff::tests::rejects_wrong_schema_for_role ... ok
+test mission_type::skill_install::tests::add_repairs_a_missing_assigned_skill ... ok
+test runner::handoff::tests::rejects_unknown_gap_severity_and_unknown_gap_fields ... ok
+test runner::native_home_auth::tests::identity_is_stable_for_unchanged_credential_bytes ... ok
+test runner::native_home_auth::tests::identity_does_not_retain_credential_text ... ok
+test runner::native_home_auth::tests::declaration_order_does_not_change_identity_or_projection ... ok
+test external_oracle_broker::tests::request_budget_survives_disposable_cleanup_before_outcome_append ... ok
+test runner::native_home_auth::tests::identity_tracks_credential_rotation_at_the_same_source_path ... ok
+test runner::native_home_auth::tests::identity_tracks_optional_credential_presence ... ok
+test runner::native_home_auth::tests::rejects_missing_required_files_and_source_symlinks ... ok
+test runner::native_home_auth::tests::rejects_oversized_credentials_before_staging ... ok
+test runner::native_home_auth::tests::removes_a_stale_optional_staged_credential_when_the_source_disappears ... ok
+test mission_type::skill_install::tests::local_add_is_idempotent_and_remove_cleans_the_last_receipt ... ok
+test runner::native_home_auth::tests::stages_only_declared_files_and_returns_exact_native_home_targets ... ok
+test runner::native_home_auth::tests::rejects_symlinked_directories_inside_the_source ... ok
+test runner::prepared_input::tests::cache_key_rejects_an_oversized_program_before_reading_it ... ok
+test runner::real_runtime_continuity_tests::real_codex_runtime_resumes_across_exact_effect_cleanup ... ignored, requires explicit preserved root, real Codex auth, network, and OCI image
+test runner::real_runtime_continuity_tests::real_hermes_runtime_resumes_across_exact_effect_cleanup ... ignored, requires explicit preserved root, real Hermes auth, network, and OCI image
+test runner::real_runtime_continuity_tests::real_opencode_runtime_resumes_across_exact_effect_cleanup ... ignored, requires explicit preserved root, real OpenCode auth, network, and OCI image
+test runner::prepared_input::tests::cache_key_distinguishes_raw_non_utf8_descendant_names ... ok
+test runner::prepared_input::tests::input_hash_budget_enforces_aggregate_entry_and_depth_limits ... ok
+test store::blobs::tests::bounded_resolution_rejects_declared_overflow_before_reading ... ok
+test runner::prepared_input::tests::cache_key_rejects_oversized_declared_content_without_reading_it_whole ... ok
+test store::blobs::tests::get_rejects_a_malformed_hex_ref_without_panicking ... ok
+test store::blobs::tests::get_rejects_a_forged_declared_length_before_reading ... ok
+test store::blobs::tests::get_rejects_a_nonregular_blob ... ok
+test store::blobs::tests::get_detects_corruption ... ok
+test store::blobs::tests::get_rejects_a_symlinked_blob ... ok
+test store::blobs::tests::put_get_roundtrip_and_idempotent_put ... ok
+test store::tests::state_root_rejects_a_symlink ... ok
+test runner::prepared_input::tests::cache_key_changes_with_declared_content_and_rejects_symlinks ... ok
+test mission_type::skill_install::tests::replacement_requires_force_and_removal_refuses_assigned_skills ... ok
+test store::blobs::tests::externalize_respects_threshold ... ok
+test store::tests::state_root_is_private_and_repairs_existing_permissions ... ok
+test workspace::tests::bounded_git_overflow_kills_and_reaps_the_process ... ok
+test effect_cleanup::tests::cleanup_removes_internal_and_egress_networks ... ok
+test runner::prepared_input::tests::prior_format_cache_is_regenerated_and_v2_cache_is_immutable ... ok
+test external_oracle_broker::tests::request_budget_reservations_are_atomic_across_brokers ... ok
+test runner::handoff::tests::oversized_report_is_rejected_as_invalid_output ... ok
+test runner::handoff::tests::oversized_handoff_is_rejected ... ok
+test operator_bridge::tests::dropping_bridge_kills_and_reaps_an_inflight_host_command ... ok
+test operator_bridge::tests::private_socket_round_trip_forwards_argv_without_a_shell ... ok
+test workspace::tests::bounded_git_deadline_kills_and_reaps_the_process ... ok
+test workspace::tests::checkout_rejects_a_non_commit_revision ... ok
+test runner::handoff::tests::oversized_review_gaps_are_rejected ... ok
+test mission_type::skill_install::tests::git_add_records_the_exact_commit_and_subdirectory ... ok
+test mission_type::skill_install::tests::git_add_accepts_a_skill_at_repository_root ... ok
+test external_oracle_broker::tests::request_budget_survives_submit_and_poll_crash_windows ... ok
+test workspace::tests::commit_materialization_classifies_an_unreadable_loose_object ... ok
+test external_oracle_broker::tests::broker_request_limit_is_shared_across_connections ... ok
+test network_proxy::tests::http_connect_allows_declared_destination_only ... ok
+test network_proxy::tests::socks_uses_same_destination_predicate_and_rejects_dns_bypass ... ok
+test workspace::tests::commit_materialization_rejects_a_nonregular_loose_object ... ok
+test workspace::tests::checkout_transfers_source_objects_into_an_independent_pack ... ok
+test workspace::tests::capture_rejects_symlinked_object_database_descendants ... ok
+test workspace::tests::capture_rejects_a_dirty_worktree ... ok
+test workspace::tests::commit_materialization_rejects_oversized_output_at_the_process_boundary ... ok
+test workspace::tests::capture_rejects_a_clean_head_that_rolls_back_its_assignment_base ... ok
+test workspace::tests::commit_materialization_never_runs_textconv ... ok
+test workspace::tests::commit_materialization_distinguishes_missing_and_corrupt_objects ... ok
+test workspace::tests::commit_materialization_ignores_replacement_refs ... ok
+test workspace::tests::create_branch_pins_a_sha_and_guards_against_clobber ... ok
+test workspace::tests::captured_artifacts_are_bound_to_the_issuing_effect ... ok
+test workspace::tests::observer_index_publication_rejects_a_symlinked_ancestor ... ok
+test workspace::tests::commit_materialization_is_isolated_from_repository_presentation_config ... ok
+test workspace::tests::commit_materialization_is_isolated_from_ambient_attributes ... ok
+test workspace::tests::checkout_dissociates_from_a_source_object_alternate ... ok
+test workspace::tests::capture_never_executes_worker_git_configuration ... ok
+test workspace::tests::checkout_is_a_clean_complete_git_repo_at_the_exact_commit ... ok
+test workspace::tests::diff_shows_changes_and_is_empty_for_an_unchanged_tree ... ok
+test workspace::tests::observer_index_publication_is_atomic ... ok
+test workspace::tests::task_observation_rejects_a_common_directory_pointer ... ok
+test workspace::tests::task_observation_rejects_a_fifo_without_blocking ... ok
+test workspace::tests::disposable_git_observation_has_a_hard_deadline ... ok
+test workspace::tests::task_observation_rejects_a_git_directory_pointer ... ok
+test workspace::tests::capture_supports_a_symbolic_head_stored_in_packed_refs ... ok
+test workspace::tests::task_observation_rejects_oversized_packed_refs ... ok
+test workspace::tests::managed_source_operations_support_a_linked_worktree ... ok
+test workspace::tests::task_observation_rejects_oversized_head_metadata ... ok
+test workspace::tests::task_observation_rejects_symlinked_packed_refs ... ok
+test workspace::tests::task_observation_rejects_an_external_object_alternate ... ok
+test workspace::tests::isolated_observation_and_capture_support_sha256_repositories ... ok
+test workspace::tests::workspace_recreation_rejects_a_symlinked_archive_entry ... ok
+test workspace::tests::capture_records_the_actual_detached_head ... ok
+test external_oracle_broker::tests::request_budget_capacity_covers_every_admitted_driver_invocation ... ok
+test runner::native_home_auth::tests::rejects_aggregate_overflow_and_removes_partial_staging ... ok
+test workspace::tests::replacement_recovers_an_interrupted_swap_before_publishing_the_new_base ... ok
+test workspace::tests::workspace_recreation_recovers_after_archival_before_publication ... ok
+test workspace::tests::workspace_recreation_treats_archived_worker_metadata_as_opaque_evidence ... ok
+test workspace::tests::workspace_recreation_rejects_contradictory_published_state ... ok
+test workspace::tests::workspace_recreation_archives_the_complete_dirty_checkout ... ok
+test workspace::tests::fan_in_checkout_fetches_sibling_candidates_without_moving_head ... ok
+test workspace::tests::task_observer_construction_has_a_small_object_tree_budget ... ok
+test mission_type::skills::tests::large_skill_resources_are_hashed_by_the_streaming_package_path ... ok
+
+test result: ok. 195 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1.84s
+
+     Running unittests src/main.rs (target/debug/deps/lionclaw-53c6198138add7ce)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/advisory_validator.rs (target/debug/deps/advisory_validator-0560637b866dd3d2)
+
+running 7 tests
+test advisory_fail_parks_for_generic_recovery ... ok
+test read_only_validator_artifacts_are_rejected_before_the_fold ... ok
+test advisory_pass_is_attested_never_verified ... ok
+test advisory_receipt_is_stale_after_environment_digest_change ... ok
+test judged_receipt_reopens_after_model_identity_change ... ok
+test replacement_validator_requires_new_receipt_and_retains_prior_evidence ... ok
+test skill_added_reopens_only_receipts_judged_with_that_skill ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/approval.rs (target/debug/deps/approval-58e94dbc9ebe6198)
+
+running 6 tests
+test invalid_command_oracles_append_nothing ... ok
+test universal_abort_needs_no_attention_and_records_only_the_abort_fact ... ok
+test terminal_mission_rejects_every_administrative_mutation_without_appending ... ok
+test stale_oracle_replacement_appends_nothing ... ok
+test pending_joint_proposal_blocks_direct_team_mutation_then_promotes_atomically ... ok
+test every_plan_parks_until_approved_then_proceeds_to_verified ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/bundled_skills.rs (target/debug/deps/bundled_skills-e4600d3b321745ee)
+
+running 2 tests
+test bundled_skill_set_is_non_empty_and_matches_software_dev ... ok
+test every_bundled_skill_has_no_end_node_and_carries_the_handoff_directive ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/child_missions.rs (target/debug/deps/child_missions-3ca8ac3e46079893)
+
+running 12 tests
+test cancellation_before_child_creation_never_leaves_an_active_child ... ok
+test ordinary_cli_reopens_a_child_from_the_kernel_owned_root_snapshot ... ok
+test stopping_parent_effect_aborts_and_quiesces_bound_child ... ok
+test accepting_a_failed_child_supplies_the_downstream_fallback_candidate ... ok
+test report_child_handoff_reaches_the_parent_independent_judge ... ok
+test crash_boundaries_reconnect_exact_child_without_duplicate ... ok
+test report_child_handoff_reaches_an_ordinary_downstream_role ... ok
+test report_dependency_reaches_child_through_ordinary_mission_input ... ok
+test failed_child_parks_on_existing_retry_decision_and_new_attempt_gets_new_id ... ok
+test nested_children_execute_with_deterministic_kernel_lineage ... ok
+test artifact_child_and_parent_abort_use_the_same_normal_task_flow ... ok
+test live_parent_stop_deadline_and_abort_interrupt_the_active_child ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+
+     Running tests/controlled_effects.rs (target/debug/deps/controlled_effects-af3de25042516147)
+
+running 14 tests
+test mission_creation_rejects_deadlines_unrepresentable_at_its_epoch ... ok
+test mission_creation_rejects_unrepresentable_role_deadlines ... ok
+test direct_mission_creation_rejects_an_invalid_execution_policy ... ok
+test mission_creation_rejects_zero_second_role_deadlines ... ok
+test policy_auto_continues_an_artifactless_writer_success ... ok
+test durable_stop_wins_the_outcome_append_race_and_discards_the_candidate ... ok
+test settlement_retains_bounded_blob_backed_oracle_stderr ... ok
+test policy_auto_continues_candidate_and_proof_with_recorded_controls ... ok
+test park_reference_materializes_the_fold_authoritative_failure ... ok
+test stop_parks_exact_generation_and_continue_preserves_assignment ... ok
+test abort_cancels_an_active_oracle_while_the_driver_drains_its_batch ... ok
+test deadline_is_durably_linearized_before_one_adapter_cancellation ... ok
+test role_cancellation_matrix_preserves_exact_durable_settlement_evidence ... ok
+test finite_policy_budget_extends_before_the_initial_deadline ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+     Running tests/conversation_resource_lifecycle.rs (target/debug/deps/conversation_resource_lifecycle-402c50d63885e353)
+
+running 5 tests
+test abort_reloads_state_after_waiting_for_the_driver_lock ... ok
+test accepting_a_replacement_preserves_the_team_owned_conversation ... ok
+test aborting_an_idle_question_reconciles_only_disposable_scratch ... ok
+test successful_settlement_removes_only_the_exact_conversation_scratch ... ok
+test terminal_advance_retries_a_failed_abort_cleanup_without_rerunning_the_role ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/driver_recovery.rs (target/debug/deps/driver_recovery-18b1abdd52031b6c)
+
+running 17 tests
+test ordinary_role_failure_outranks_cleanup_retained_state_finding ... ok
+test retained_role_report_survives_driver_cancellation_and_exact_cleanup ... ok
+test malformed_retained_handoff_recovers_as_typed_invalid_output ... ok
+test completed_writer_turn_without_handoff_recovers_as_same_conversation_checkpoint ... ok
+test unacknowledged_handoff_preserves_the_active_effect_and_resources ... ok
+test durable_abort_outranks_recovered_retained_state_failure ... ok
+test cleanup_failure_is_truthful_and_retried_without_replaying_the_effect ... ok
+test concurrent_advance_reports_running_and_never_double_dispatches ... ok
+test completed_turn_with_oversized_retained_state_recovers_as_typed_failure ... ok
+test accepted_handoff_is_refused_before_recording_over_limit_state ... ok
+test crash_after_accepted_handoff_recovers_limit_and_discards_artifact ... ok
+test persistent_cleanup_failure_never_settles_or_replays_the_effect ... ok
+test cleanup_backstop_discards_artifact_after_noncompliant_post_ack_growth ... ok
+test completed_validator_turn_without_handoff_recovers_as_typed_rework ... ok
+test detached_startup_waits_out_a_short_observer_lock_probe ... ok
+test handoff_rejection_and_ordinary_failure_outrank_retention_backstop ... ok
+test terminal_inflight_cleanup_is_recoverable_through_the_production_cli ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+     Running tests/environment_assignment.rs (target/debug/deps/environment_assignment-e7b3c186ced4da32)
+
+running 5 tests
+test environment_assignment_is_digest_pinned_and_folded_into_history ... ok
+test environment_assignment_rejects_tags_and_inflight_races ... ok
+test environment_use_preflights_and_records_only_verified_digests ... ok
+test environment_digest_change_stales_authoritative_proof_and_reruns_oracle ... ok
+test mission_guide_renders_every_phase ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/eval_deterministic.rs (target/debug/deps/eval_deterministic-b6891046ffb2d670)
+
+running 2 tests
+test moat_refuses_over_privileged_judge_mission_type ... ok
+test advisory_only_mission_type_never_verifies ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/everyday_run.rs (target/debug/deps/everyday_run-1cd1f095d91bf67a)
+
+running 12 tests
+test runtime_state_inside_the_judged_repository_is_rejected ... ok
+test mutable_image_tag_is_resolved_before_native_resume_and_execution ... ok
+test everyday_run_reaches_validated_profile_auth_and_confinement ... ok
+test ordinary_runtime_failure_is_not_retried_or_allowed_to_append_a_decision ... ok
+test runtime_signal_retries_are_bounded_and_cannot_append_a_decision ... ok
+test corrupt_current_mission_binding_fails_before_runtime_execution ... ok
+test durable_binding_preserves_one_exact_live_mission ... ok
+test restart_resumes_native_conversation_and_releases_a_settled_mission ... ok
+test completed_binding_is_preserved_through_apply_then_released ... ok
+test new_selection_releases_an_unapplied_result_without_destroying_it ... ok
+test attached_runtime_drives_full_mission_lifecycle_through_the_projected_bridge ... ok
+test attached_runtime_authors_and_executes_child_mission_through_everyday_run ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+
+     Running tests/external_oracles.rs (target/debug/deps/external_oracles-24b29217ce684267)
+
+running 11 tests
+test production_external_driver_uses_kernel_broker_without_container_credentials ... ignored, requires Podman, the runtime image, and delegated CPU/memory cgroup controllers
+test external_driver_result_must_match_submission_identity ... ok
+test external_driver_result_must_carry_a_valid_artifact_digest ... ok
+test external_driver_result_must_match_recorded_spec_digest ... ok
+test external_submission_is_idempotent_across_crash_before_recording ... ok
+test external_submission_record_survives_crash_after_recording ... ok
+test admitted_polling_lifecycle_has_request_capacity_through_its_last_poll ... ok
+test plan_admission_rejects_external_driver_network_above_mission_ceiling ... ok
+test plan_admission_resolves_external_driver_identity_before_recording ... ok
+test pending_external_oracle_stays_in_resolve_effect_until_polled_complete ... ok
+test post_outcome_crash_retires_request_budget_without_replaying_oracle ... ok
+
+test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/fold_litmus.rs (target/debug/deps/fold_litmus-dfb8be260f1c1a18)
+
+running 7 tests
+test controlled_effect_log_satisfies_every_prefix_and_snapshot_law ... ok
+test iterative_ratification_and_abort_survive_every_prefix_and_snapshot_generation ... ok
+test fold_is_deterministic_incremental_and_serde_stable ... ok
+test snapshot_resume_matches_full_refold ... ok
+test corrupted_snapshot_cursor_is_discarded_before_replay ... ok
+test a_clean_review_mission_satisfies_the_fold_litmus ... ok
+test failure_driven_replanning_survives_every_prefix_and_snapshot_rebuild ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/happy_path.rs (target/debug/deps/happy_path-256306f735740e7b)
+
+running 16 tests
+test direct_engine_creation_rejects_invalid_mission_type_policy ... ok
+test failing_required_oracle_cannot_be_accepted ... ok
+test durable_role_outcomes_bound_adapter_configuration_evidence ... ok
+test already_satisfied_work_verifies_without_advancing_head ... ok
+test replayed_oracle_attempt_cannot_replace_authoritative_receipt ... ok
+test revising_one_of_multiple_proof_failures_replans_with_every_receipt ... ok
+test durable_role_outcomes_preserve_and_report_runtime_usage ... ok
+test mixed_failures_are_fail_closed_and_preserve_every_feedback ... ok
+test passing_oracle_yields_verified_finish ... ok
+test role_prepared_input_refs_are_durable_receipt_evidence ... ok
+test manual_proof_checkpoint_drains_the_whole_oracle_batch ... ok
+test command_retry_is_reoffered_only_for_a_changed_outcome ... ok
+test role_runner_cannot_inject_a_durable_blob_reference ... ok
+test worker_reporting_not_done_parks_with_attention ... ok
+test role_runner_oversized_report_is_a_durable_invalid_output ... ok
+test question_checkpoint_resumes_after_cli_feedback_and_restart_then_completes ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/identity.rs (target/debug/deps/identity-8aaa9abbad50cf70)
+
+running 3 tests
+test the_digest_tracks_recursive_skill_content ... ok
+test the_digest_tracks_role_and_playbook_content ... ok
+test opening_a_mission_whose_type_digest_changed_is_refused ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/message_routing.rs (target/debug/deps/message_routing-2bf4bb0626ea3d53)
+
+running 1 test
+test production_cli_routes_atomically_only_to_explicit_live_conversations ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/mission_type_loading.rs (target/debug/deps/mission_type_loading-08439e6d938b3e36)
+
+running 43 tests
+test a_symlink_anywhere_in_the_bundle_is_rejected ... ok
+test a_skill_package_through_an_escaping_parent_symlink_is_rejected ... ok
+test a_symlinked_skill_package_is_rejected ... ok
+test a_mission_type_with_no_roles_is_rejected ... ok
+test a_path_unsafe_mission_type_name_is_rejected ... ok
+test mission_environment_cannot_replace_kernel_coordinates ... ok
+test mission_type_rejects_resource_declaration_above_ceiling ... ok
+test duplicate_role_skill_references_are_rejected ... ok
+test a_non_utf8_skill_package_name_is_rejected_without_panicking ... ok
+test a_planning_dag_naming_an_execution_role_fails_to_load ... ok
+test a_attested_bar_without_terminal_review_refuses_to_load ... ok
+test manifest_skill_declarations_are_rejected ... ok
+test mission_type_loads_role_resource_declarations_within_ceiling ... ok
+test reserved_mission_lock_path_must_be_a_regular_file ... ok
+test a_terminal_review_naming_a_non_verdict_role_refuses_to_load ... ok
+test a_terminal_review_declaration_loads_and_pins_the_role ... ok
+test mission_bundle_bytes_are_bounded_before_snapshot_copy ... ok
+test a_terminal_review_naming_a_missing_role_refuses_to_load ... ok
+test an_invalid_execution_policy_refuses_to_load ... ok
+test prepared_input_environment_cannot_replace_kernel_coordinates ... ok
+test prepared_inputs_require_safe_keys ... ok
+test role_referencing_a_missing_skill_package_is_rejected ... ok
+test editing_the_terminal_review_declaration_changes_the_digest ... ok
+test prepared_input_declarations_load_as_plain_mission_type_data ... ok
+test skill_description_is_loaded_and_trimmed_into_the_package ... ok
+test skill_description_accepts_exactly_1024_utf8_bytes ... ok
+test review_method_can_produce_a_report_without_mutating_the_judged_product ... ok
+test role_declaring_a_bundled_skill_loads_the_resolved_package ... ok
+test skill_description_rejects_more_than_1024_utf8_bytes ... ok
+test skill_description_is_required ... ok
+test loaded_runtime_files_survive_removal_of_the_source_bundle ... ok
+test skill_control_text_is_bounded_before_whole_file_loading ... ok
+test exactly_five_generic_mission_types_load ... ok
+test the_minimal_type_loads ... ok
+test skill_frontmatter_name_must_match_the_declared_package ... ok
+test software_dev_mission_type_loads ... ok
+test oversized_prepared_input_programs_fail_from_metadata ... ok
+test skill_description_rejects_whitespace_only ... ok
+test mission_digest_seals_runtime_visible_empty_skill_directories ... ok
+test mission_bundle_depth_is_bounded_before_semantic_loading ... ok
+test writable_judge_mission_type_refuses_to_load ... ok
+test mission_bundle_entry_count_is_bounded_before_semantic_loading ... ok
+test mission_control_text_has_one_aggregate_budget ... ok
+
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/operator_skill.rs (target/debug/deps/operator_skill-463bc66a6f97f690)
+
+running 8 tests
+test current_next_is_the_only_action_authority ... ok
+test delegated_ratification_uses_the_same_unbounded_revision_loop ... ok
+test everyday_run_is_the_one_product_entrypoint ... ok
+test ordinary_requests_preserve_human_plan_ratification ... ok
+test no_mission_selects_one_of_exactly_five_generic_methods ... ok
+test the_skill_documents_runtime_loss_controls_and_honest_completion ... ok
+test required_proof_failure_is_never_taught_as_acceptance ... ok
+test generated_help_and_manual_include_the_everyday_exit_contract ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/parallel_writers.rs (target/debug/deps/parallel_writers-9e0fe1808baa07ad)
+
+running 10 tests
+test parallel_writer_completion_order_is_fold_equivalent_and_stale_lineages_are_rejected ... ok
+test judge_turn_batches_run_concurrently_after_work_settles ... ok
+test divergent_artifact_lineage_is_rejected_before_a_read_only_synthesizer_runs ... ok
+From /tmp/.tmpoAJpUX
+ * branch            251af48866325f7a2d036653615d551375908007 -> FETCH_HEAD
+From /tmp/.tmpSyHt2y
+ * branch            251af48866325f7a2d036653615d551375908007 -> FETCH_HEAD
+From /tmp/.tmpWiVejA
+ * branch            251af48866325f7a2d036653615d551375908007 -> FETCH_HEAD
+Merge made by the 'ort' strategy.
+Merge made by the 'ort' strategy.
+ right.txt | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 right.txt
+ right.txt | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 right.txt
+Merge made by the 'ort' strategy.
+ right.txt | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 right.txt
+From /tmp/.tmptv53iy
+ * branch            03b601d88c02e46ef8fb008ca6cd57ea5ca4eff9 -> FETCH_HEAD
+Auto-merging shared.txt
+CONFLICT (add/add): Merge conflict in shared.txt
+Recorded preimage for 'shared.txt'
+Automatic merge failed; fix conflicts and then commit the result.
+test serial_single_writer_repair_flow_keeps_slice8_projection ... ok
+test integration_merge_conflicts_park_the_sink_task ... ok
+test oracle_batches_run_concurrently_after_writer_fan_in ... ok
+test parallel_writers_run_concurrently_and_integrate_at_the_deliverable_head ... ok
+test accepting_a_failed_fan_in_without_a_candidate_does_not_fabricate_a_head ... ok
+test integration_candidate_missing_a_dependency_is_rejected_before_proof ... ok
+From /tmp/.tmpSyHt2y
+ * branch            251af48866325f7a2d036653615d551375908007 -> FETCH_HEAD
+test repairing_a_non_sink_task_reowes_integration_and_proof_at_the_new_head ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests/phase0_liveness.rs (target/debug/deps/phase0_liveness-83d0d4eba3112e25)
+
+running 2 tests
+test every_historical_wedge_seed_has_a_replay_safe_exit ... ok
+test automatic_recovery_is_bounded_and_abort_preserves_retained_evidence ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.17s
+
+     Running tests/planning.rs (target/debug/deps/planning-eb378ed412f344e1)
+
+running 11 tests
+test mission_creation_persists_the_pinned_planning_contract ... ok
+test a_failed_planning_node_is_retryable_not_a_wedge ... ok
+test revise_guidance_preserves_whitespace_verbatim ... ok
+test a_bad_author_proposal_fails_the_node_and_seeds_nothing ... ok
+test aborting_a_plan_proposal_uses_the_universal_abort_fact ... ok
+test revising_a_proposal_rejects_it_and_re_runs_planning ... ok
+test successful_refinement_cycles_do_not_consume_the_recovery_budget ... ok
+test ratification_can_revise_a_to_b_to_c_and_then_approve ... ok
+test planning_proposes_then_approve_seeds_the_contract_and_verifies ... ok
+test replanning_prompt_combines_the_accepted_plan_rejected_candidate_and_guidance ... ok
+test ratification_revisions_are_unbounded_and_keep_only_the_newest_input ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests/production_conversation_flow.rs (target/debug/deps/production_conversation_flow-4092e7b703931665)
+
+running 9 tests
+test production_retained_state_limit_preserves_turn_and_refuses_handoff ... ok
+test production_same_base_revision_reuses_team_owned_planner_before_broadcast ... ok
+test production_park_then_base_move_replaces_and_isolates_stale_conversation ... ok
+test production_conversation_restarts_and_closes_verified ... ok
+test production_validator_and_park_compose_with_exact_awaiting_writer ... ok
+test production_planner_resumes_and_missing_validator_verdict_reworks_exact_conversation ... ok
+test renamed_terminal_gap_verdict_prompt_excludes_all_reference_prose ... ok
+test production_references_are_authoritative_bounded_and_transient ... ok
+test production_delivery_uses_one_exact_immutable_boundary ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.71s
+
+     Running tests/queue_bounds.rs (target/debug/deps/queue_bounds-a75c269fd5e74da2)
+
+running 3 tests
+test queued_input_after_a_running_boundary_resumes_the_same_generation ... ok
+test production_broadcast_is_atomic_when_one_live_conversation_is_full ... ok
+test exact_queue_capacity_is_typed_atomic_replay_safe_and_recoverable ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running tests/read_only_tasks.rs (target/debug/deps/read_only_tasks-c6752810a24ef42b)
+
+running 3 tests
+test bad_report_is_presented_to_the_judge_and_cannot_finish ... ok
+test report_synthesis_accepts_multiple_compatible_read_only_dependencies ... ok
+test assigned_report_task_clears_without_write_or_artifact_authority ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/recovery.rs (target/debug/deps/recovery-d14919021577daef)
+
+running 8 tests
+test an_inert_duplicate_outcome_fails_loudly_without_recovery_replay ... ok
+test invalid_handoff_is_reworked_automatically_with_exact_feedback ... ok
+test wrong_handoff_type_is_recorded_as_invalid_and_reworked ... ok
+test a_scheduled_transient_retry_can_be_stopped_before_runtime_launch ... ok
+test oracle_repair_reopens_the_owner_with_both_evidence_streams ... ok
+test transient_runtime_failure_retries_but_launch_failure_parks_immediately ... ok
+test structured_transient_oracle_failure_uses_the_shared_retry_budget ... ok
+test stopping_one_scheduled_oracle_retry_does_not_interrupt_its_sibling ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.16s
+
+     Running tests/reference_expansion.rs (target/debug/deps/reference_expansion-7ada21f92211e7df)
+
+running 6 tests
+test inbox_binding_rejects_omitted_mission_that_awaits_lead_input - should panic ... ok
+test reachable_commit_expands_only_at_the_typed_role_request_boundary ... ok
+test oversized_authoritative_receipt_is_rejected_with_exact_typed_truth ... ok
+test accepted_commit_object_fault_settles_once_and_does_not_block_later_messages ... ok
+test accepted_receipt_blob_fault_before_dispatch_settles_once ... ok
+test accepted_park_reference_survives_legal_clear_from_durable_history ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.44s
+
+     Running tests/replanning.rs (target/debug/deps/replanning-3c5001d3878ca956)
+
+running 11 tests
+test requirement_and_assertion_ids_are_distinct_types ... ok
+test initial_proposal_must_target_revision_zero ... ok
+test stale_and_immaterial_proposals_append_nothing ... ok
+test covered_requirement_weakening_requires_an_exact_recorded_decision ... ok
+test approval_policy_applies_to_every_revision ... ok
+test complete_revision_retires_omitted_tasks_and_seeds_new_tasks ... ok
+test a_limitation_may_become_covered_but_not_the_reverse ... ok
+test retained_task_ids_are_immutable_and_retired_ids_never_revive ... ok
+test dogfooded_casualty_shapes_have_legal_intent_preserving_revisions ... ok
+test corrected_assertions_visibly_supersede_and_stale_prior_receipts ... ok
+test host_acceptance_obligations_are_reported_and_do_not_become_confined_work ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/resume.rs (target/debug/deps/resume-5d92d939a23a44d0)
+
+running 4 tests
+test inherited_role_request_is_interrupted_without_rerunning_the_llm ... ok
+test snapshot_rebuild_preserves_an_unfinished_request_for_recovery ... ok
+test inherited_oracle_request_is_interrupted_without_rerunning_the_oracle ... ok
+test rerun_after_finish_appends_nothing_and_invokes_nothing ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/runtime_boundary.rs (target/debug/deps/runtime_boundary-cd929cd8810b804d)
+
+running 2 tests
+test production_runtime_construction_does_not_branch_on_product_names ... ok
+test superseded_runtime_contract_has_no_source_residue ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/skill_dispatch.rs (target/debug/deps/skill_dispatch-5a50ad42878f57e4)
+
+running 2 tests
+test role_without_skills_dispatches_an_empty_package_set ... ok
+test engine_resolves_declared_packages_before_role_dispatch ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/skill_prompts.rs (target/debug/deps/skill_prompts-474952e83783bc6a)
+
+running 7 tests
+test a_role_referencing_a_missing_skill_fails_closed_at_mission_creation ... ok
+test planning_prompt_for_unassigned_role_has_no_skill_section ... ok
+test planning_prompt_leaves_assigned_skills_to_native_loading ... ok
+test execution_prompt_for_unassigned_role_has_no_skill_section ... ok
+test execution_prompt_leaves_assigned_skills_to_native_loading ... ok
+test terminal_review_prompt_for_unassigned_role_has_no_skill_section ... ok
+test terminal_review_prompt_leaves_assigned_skills_to_native_loading ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/store_hardening.rs (target/debug/deps/store_hardening-c058dcf6d8fc7377)
+
+running 6 tests
+test an_old_event_schema_is_refused_instead_of_accepted_by_accident ... ok
+test unfinished_request_is_rebuilt_from_the_log_alone ... ok
+test active_writer_snapshot_cannot_forge_a_missing_preparation_event ... ok
+test workspace_recreation_authority_is_store_replay_and_snapshot_tail_safe ... ok
+test forged_missing_verdict_agrees_across_live_replay_and_snapshot_tail ... ok
+test role_request_tuple_is_validated_before_durable_fold_mutation ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/terminal_review.rs (target/debug/deps/terminal_review-8e7a30a74eaeb41b)
+
+running 25 tests
+test a_attested_bar_mission_type_without_a_review_is_refused_at_creation ... ok
+test a_mission_type_naming_an_unknown_or_non_verdict_reviewer_is_refused_at_creation ... ok
+test blocking_gaps_offer_retry_repair_revise_but_never_accept ... ok
+test a_forged_handoff_without_the_nonce_parks_instead_of_sealing ... ok
+test a_mission_type_without_a_review_never_dispatches_one ... ok
+test gap_review_outcomes_bound_alternate_runner_evidence ... ok
+test revising_terminal_gaps_carries_the_review_report_into_planning ... ok
+test gap_review_receives_its_declared_skill_packages ... ok
+test a_clean_review_closes_verified_with_no_park ... ok
+test an_ordinary_validator_handoff_cannot_seal_the_gap_review ... ok
+test gap_review_uses_effect_owned_resources ... ok
+test a_crashed_review_is_interrupted_without_rerunning_the_llm ... ok
+test a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict ... ok
+test the_reviewer_prompt_is_fresh_context_and_contract_blind ... ok
+test rebuild_cursors_does_not_relaunch_a_crashed_review ... ok
+test retried_blocking_review_reopens_after_environment_change ... ok
+test repeated_identical_blocking_review_suppresses_retry_and_rejects_forgery ... ok
+test changed_review_report_offers_a_fresh_retry ... ok
+test a_failed_review_parks_then_retry_re_rolls ... ok
+test changed_reviewer_identity_offers_a_fresh_retry ... ok
+test repairing_a_failed_review_reopens_the_sink_with_receipt_evidence ... ok
+test changed_review_artifact_offers_a_fresh_retry ... ok
+test changed_review_plan_offers_a_fresh_retry_at_the_same_artifact ... ok
+test a_revision_resumes_work_and_re_reviews_at_the_new_head ... ok
+test gap_review_uses_the_shared_role_output_boundary ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+
+     Running unittests src/lib.rs (target/debug/deps/lionclaw_confinement-16a98182e0e48914)
+
+running 64 tests
+test mount_validation::tests::derives_project_metadata_root_from_standard_instance_home ... ok
+test backend::tests::runtime_secrets_mount_name_is_stable_and_prefixed ... ok
+test backend::tests::runtime_secrets_fresh_mount_name_preserves_prefix_and_avoids_reuse ... ok
+test mount_validation::tests::normalizes_absolute_mount_targets ... ok
+test backend::tests::execution_request_debug_redacts_nested_secret_values ... ok
+test oci::tests::absent_device_grants_emit_no_oci_device_arguments ... ok
+test oci::tests::compiled_devices_become_explicit_oci_device_arguments ... ok
+test oci::tests::install_policy_none_keeps_keep_id_identity_args ... ok
+test mount_validation::tests::rejects_reserved_mount_targets ... ok
+test mount_validation::tests::rejects_comma_when_podman_mount_form_is_required ... ok
+test mount_validation::tests::validates_configured_sources_and_duplicates ... ok
+test mount_validation::tests::tmpfs_entries_share_the_normalized_mount_target_contract ... ok
+test oci::tests::install_policy_system_root_posture_uses_root_identity_args ... ok
+test oci::tests::install_policy_user_keeps_keep_id_identity_args ... ok
+test oci::tests::oci_backend_adds_none_network_flag ... ok
+test oci::tests::oci_backend_adds_tty_only_for_attached_invocation ... ok
+test oci::tests::oci_backend_adds_internal_network_and_proxy_env_for_destination_grant ... ok
+test mount_validation::tests::rejects_sources_inside_protected_roots_by_raw_or_canonical_path ... ok
+test oci::tests::oci_backend_builds_internal_network_and_dual_homed_proxy_invocations ... ok
+test oci::tests::oci_backend_emits_channel_send_socket_mount ... ok
+test oci::tests::oci_backend_emits_project_instance_inventory_mount_and_env ... ok
+test oci::tests::oci_backend_does_not_duplicate_configured_lionclaw_metadata_mask ... ok
+test oci::tests::oci_backend_disables_selinux_labeling_for_unix_socket_mounts ... ok
+test oci::tests::oci_backend_mounts_credentials_after_home_with_private_relabeling ... ok
+test oci::tests::oci_backend_keeps_runtime_auth_values_out_of_process_arguments ... ok
+test oci::tests::oci_backend_rejects_bind_mount_paths_with_colon_and_comma ... ok
+test oci::tests::oci_backend_rejects_working_dir_outside_mounts ... ok
+test oci::tests::oci_backend_relabels_session_mounts_private_and_persistent_mounts_shared ... ok
+test oci::tests::oci_backend_rejects_missing_image ... ok
+test oci::tests::oci_backend_rejects_destination_grant_without_effect_resource_name ... ok
+test oci::tests::oci_backend_masks_lionclaw_metadata_under_workspace_mount ... ok
+test oci::tests::oci_backend_projects_one_explicit_effect_name_to_container_and_secret ... ok
+test oci::tests::private_network_probe_rejects_real_network_failures ... ok
+test oci::tests::private_network_probe_accepts_missing_probe_shell_after_network_setup ... ok
+test oci::tests::oci_backend_builds_podman_run_invocation ... ok
+test oci::tests::proxy_readiness_probes_http_and_socks_listeners ... ok
+test plan::tests::execution_preset_rejects_legacy_network_mode ... ok
+test plan::tests::install_policy_effective_execution_plan_debug_redacts_environment_values ... ok
+test process::tests::process_invocation_debug_redacts_environment_and_input_values ... ok
+test plan::tests::podman_confinement_uses_nested_limits_shape ... ok
+test plan::tests::execution_preset_round_trips_without_embedded_name ... ok
+test plan::tests::install_policy_defaults_to_user_and_uses_kebab_case_values ... ok
+test oci::tests::oci_backend_uses_mount_arg_for_colon_paths ... ok
+test plan::tests::runtime_program_spec_debug_redacts_environment_and_stdin_values ... ok
+test oci::tests::proxy_readiness_inspects_container_running_state ... ok
+test runtime_auth::tests::credential_projection_requires_one_canonical_runtime_home_mount ... ok
+test runtime_auth::tests::rejects_projection_count_before_staged_validation_or_mountpoint_creation ... ok
+test process::tests::attached_process_records_signal_exit_status ... ok
+test process::tests::streaming_process_collects_status_after_child_closes_stdin ... ok
+test runtime_auth::tests::materialized_auth_kind_must_match_the_program_contract ... ok
+test runtime_auth::tests::rejects_a_symlinked_staging_root_before_validating_materialized_auth ... ok
+test process::tests::process_line_reader_preserves_partial_line_after_cancelled_read ... ok
+test runtime_auth::tests::validates_and_maps_exact_staged_credentials_under_native_home ... ok
+test runtime_auth::tests::rejects_overlapping_credential_and_nested_plan_targets ... ok
+test runtime_auth::tests::rejects_symlinked_and_non_regular_staged_credentials ... ok
+test runtime_auth::tests::enforces_aggregate_credential_bytes_before_mountpoint_creation ... ok
+test runtime_auth::tests::rejects_symlinked_retained_home_and_credential_mountpoints ... ok
+test process::tests::process_session_wait_collects_status_after_child_closes_stdin ... ok
+test process::tests::process_session_retains_only_bounded_stdout_and_stderr ... ok
+test process::tests::streaming_process_rejects_an_oversized_record_before_enqueue ... ok
+test process::tests::process_session_wait_drains_stdout_written_after_stdin_closes ... ok
+test oci::tests::oci_backend_removes_runtime_secret_after_turn_completion ... ok
+test process::tests::process_session_rejects_an_oversized_unterminated_protocol_line ... ok
+test oci::tests::oci_backend_retries_runtime_secret_cleanup_without_failing_successful_turn ... ok
+
+test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running unittests src/lib.rs (target/debug/deps/lionclaw_durable_fs-1a4ab747a36dbb31)
+
+running 11 tests
+test tests::bounded_read_rejects_oversized_file ... ok
+test tests::metadata_descriptor_keeps_the_opened_type_across_a_path_swap ... ok
+test tests::missing_root_is_absent_for_read_and_remove_but_not_write ... ok
+test tests::root_identity_check_rejects_replacement_as_defense_in_depth ... ok
+test tests::private_file_round_trip_and_exact_remove ... ok
+test tests::symlinked_ancestor_and_leaf_are_rejected ... ok
+test tests::immediate_directory_names_are_bounded_and_authoritative ... ok
+test tests::private_read_and_lock_use_exact_owner_only_regular_files ... ok
+test tests::metadata_accounting_counts_symlinks_without_following_them_and_rejects_special_entries ... ok
+test tests::concurrent_takers_have_exactly_one_winner ... ok
+test tests::metadata_accounting_enforces_each_exact_tree_boundary ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/lionclaw_model-7065803e25c8fd5b)
+
+running 15 tests
+test failure::tests::evidence_projection_is_utf8_safe_and_bounded ... ok
+test failure::tests::evidence_projection_bounds_every_provider_controlled_string ... ok
+test network::tests::destination_canonicalizes_case_and_rejects_ip_literals ... ok
+test plan::output_semantics_tests::reference_policy_is_exhaustive_and_judgment_safe ... ok
+test plan::output_semantics_tests::output_semantics_derive_resource_lifetime_exhaustively ... ok
+test plan::output_semantics_tests::task_output_policy_is_closed_and_write_independent ... ok
+test network::tests::grant_subset_uses_one_destination_predicate ... ok
+test verdict::tests::stop_bar_satisfied_by_truth_table ... ok
+test failure::tests::taxonomy_round_trips_and_unknown_fields_fail_closed ... ok
+test network::tests::union_revalidates_merged_destination_ports ... ok
+test plan_validation::topology_tests::accepts_a_read_only_report_role_for_an_assigned_task ... ok
+test plan_validation::topology_tests::accepts_report_synthesis_shape_with_multiple_dependencies ... ok
+test plan_validation::topology_tests::rejects_multiple_deliverable_sinks ... ok
+test plan_validation::topology_tests::rejects_one_role_on_parallel_tasks_but_allows_a_serial_assignment ... ok
+test network::tests::grant_deserialization_uses_constructor_validation ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/child_missions.rs (target/debug/deps/child_missions-7347a7a4a9dc86bd)
+
+running 11 tests
+test child_secret_authority_must_follow_the_typed_parent_subset ... ok
+test child_authority_network_runtime_depth_deadline_and_resources_are_bounded ... ok
+test descendant_admission_reserves_every_legal_child_attempt ... ok
+test child_request_schema_carries_secret_authority_without_secret_material_fields ... ok
+test next_visibly_derives_stable_child_identity_and_reserves_capacity ... ok
+test artifact_child_settles_through_the_normal_task_candidate ... ok
+test child_subtree_reservation_prevents_parent_local_capacity_multiplication ... ok
+test durable_parent_stop_dominates_a_later_successful_child_receipt ... ok
+test descendant_replan_reserves_only_unspent_attempts_for_retained_tasks ... ok
+test request_bind_receipt_and_cleanup_replay_without_promoting_child_proof ... ok
+test canonical_child_digest_binds_nested_contract_and_enforces_size_bound ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/dependency_wall.rs (target/debug/deps/dependency_wall-97daf9441c142e58)
+
+running 1 test
+test kernel_model_production_dependencies_are_pure_and_allowlisted ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/dynamic_oracles.rs (target/debug/deps/dynamic_oracles-278daf203c827cd9)
+
+running 14 tests
+test command_oracles_may_request_only_destination_scoped_network ... ok
+test declared_shell_executables_are_rejected ... ok
+test workspace_directory_rejects_noncanonical_paths ... ok
+test command_digest_covers_behavior_and_authority ... ok
+test joint_proposal_validates_plan_against_new_oracle_map ... ok
+test unchanged_oracle_map_does_not_turn_a_team_revision_into_an_oracle_change ... ok
+test oracle_replacement_requires_plan_proposal_for_revision_guard ... ok
+test one_approval_event_promotes_plan_and_oracles_together ... ok
+test oracle_replacement_is_stale_when_its_plan_base_revision_is_stale ... ok
+test invalid_team_identity_keeps_the_whole_proposal_pending ... ok
+test pending_external_oracle_does_not_advertise_deadline_extension ... ok
+test unchanged_plan_can_replace_oracles_using_the_plan_revision_guard ... ok
+test old_spec_requests_and_outcomes_are_inert_and_spec_changes_stale_receipts ... ok
+test oracle_attempt_counters_are_scoped_to_spec_digest ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/external_oracles.rs (target/debug/deps/external_oracles-e586dbd9da3eb2c9)
+
+running 4 tests
+test external_oracle_polling_is_bounded_by_timeout ... ok
+test external_oracle_rejects_paths_shells_and_credentials ... ok
+test external_oracle_requires_resolved_driver_authority_within_mission_ceiling ... ok
+test external_oracle_digest_is_bound_to_driver_and_request ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/team_cutover.rs (target/debug/deps/team_cutover-d8314c5191d76301)
+
+running 20 tests
+test a_skipped_team_revision_is_ignored_during_replay ... ok
+test role_instance_identity_survives_assignment_and_team_revisions ... ok
+test over_ceiling_team_configured_event_is_ignored_during_replay ... ok
+test team_role_environment_cannot_override_kernel_coordinates ... ok
+test team_owns_contracts_assignments_and_guidance ... ok
+test role_resource_overrides_are_bounded_by_mission_resource_ceilings ... ok
+test accepted_joint_proposal_promotes_the_plan_and_exact_team_revision ... ok
+test queued_continuation_uses_the_roles_running_serial_task ... ok
+test oracle_dispatch_is_bounded_by_remaining_effect_capacity ... ok
+test sunset_wire_shapes_have_no_planning_or_role_bridges ... ok
+test role_completion_cannot_override_the_team_owned_output_contract ... ok
+test permanent_taskless_role_failure_parks_until_an_explicit_retry ... ok
+test taskless_role_failure_cannot_continue_after_team_cutover ... ok
+test repeated_identical_required_judgment_suppresses_retry ... ok
+test changed_judgment_evidence_offers_a_new_retry ... ok
+test changed_judgment_identity_offers_a_new_retry ... ok
+test attested_closure_waits_for_every_assigned_judge ... ok
+test failed_required_judgment_recovery_retries_or_replans ... ok
+test failed_required_judgment_parks_and_rejects_below_bar_finish ... ok
+test validator_handoff_requires_the_exact_assertion_set_and_consistent_summary ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/lionclaw_runtime_acp-fe7d3688d7698af4)
+
+running 38 tests
+test client::exit_tests::nonzero_exit_preserves_structured_process_evidence ... ok
+test protocol::failure_tests::provider_metadata_without_a_retry_bit_remains_permanent ... ok
+test protocol::failure_tests::retryability_uses_structured_json_rpc_evidence_not_prose ... ok
+test tests::acp_permission_requests_are_denied_by_default ... ok
+test tests::acp_adapter_preserves_typed_launch_refusal ... ok
+test tests::current_mode_update_projects_observed_configuration ... ok
+test tests::malformed_current_mode_update_is_ignored ... ok
+test tests::opencode_acp_fixture_projects_to_canonical_runtime_events ... ok
+test tests::opencode_acp_config_options_fixture_pins_model_and_mode_protocol ... ok
+test tests::acp_terminal_program_uses_native_command_without_protocol_args ... ok
+test tests::advertised_first_class_model_and_mode_are_applied_by_typed_methods ... ok
+test tests::first_class_setter_preserves_intervening_observed_selection ... ok
+test tests::acp_session_start_rejects_oversized_saved_session ... ok
+test tests::acp_session_start_resumes_saved_ready_session ... ok
+test tests::acp_turn_updates_advertised_model_from_runtime_notification ... ok
+test tests::acp_turn_keeps_partial_usage_and_ignores_malformed_fields ... ok
+test tests::acp_turn_captures_reported_runtime_usage ... ok
+test tests::acp_cancel_sends_session_cancel_for_active_prompt ... ok
+test tests::acp_ready_session_without_reopen_capability_uses_canonical_prompt ... ok
+test tests::advertised_current_model_is_recorded_without_requested_model ... ok
+test tests::unadvertised_or_unconfirmed_config_option_is_rejected ... ok
+test tests::reconstructed_reopenable_observation_and_identity_survive_configuration_failure ... ok
+test tests::acp_uses_session_load_when_resume_is_unsupported ... ok
+test tests::acp_new_session_without_reopen_capability_clears_stale_session_id ... ok
+test tests::eof_while_reopening_is_not_a_reopen_rejection ... ok
+test tests::malformed_json_while_reopening_is_not_a_reopen_rejection ... ok
+test tests::empty_first_class_setter_result_is_acknowledged_without_stale_selection ... ok
+test tests::partial_configuration_failure_preserves_requested_and_observed_evidence ... ok
+test tests::retryable_session_load_failure_retains_native_identity ... ok
+test tests::acp_turn_uses_profile_driver_journal ... ok
+test tests::matching_json_rpc_reopen_rejection_is_observed_without_forgetting_identity ... ok
+test tests::requested_mode_drift_from_runtime_notification_fails_with_observed_evidence ... ok
+test tests::retryable_session_resume_failure_retains_native_identity ... ok
+test tests::resumed_observation_and_identity_survive_prompt_failure ... ok
+test tests::transport_error_while_reopening_is_not_a_reopen_rejection ... ok
+test tests::malformed_matching_responses_cannot_trigger_reopen_recovery ... ok
+test tests::acp_turn_projects_runtime_mcp_servers ... ok
+test tests::acp_prefers_session_resume_and_uses_effective_working_directory ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/lionclaw_runtime_api-0ba6deb22099c899)
+
+running 26 tests
+test auth::tests::auth_projection_debug_redacts_environment_values ... ok
+test auth::tests::credential_projection_normalizes_clean_relative_paths ... ok
+test auth::tests::credential_projection_rejects_empty_absolute_and_traversing_paths ... ok
+test event::tests::final_response_assembly_never_exceeds_its_utf8_byte_bound ... ok
+test auth::tests::materialization_debug_redacts_the_profile_identity ... ok
+test driver::tests::profile_driver_is_selected_by_declared_registry_identity ... ok
+test driver::tests::terminal_message_argument_must_be_explicit_and_nonempty ... ok
+test context::tests::host_runtime_state_is_never_an_implicit_runtime_path_projection ... ok
+test state::tests::missing_runtime_root_reads_absent_but_cannot_begin_or_write ... ok
+test state::tests::runtime_profile_key_must_be_a_digest ... ok
+test event::tests::runtime_journal_ingress_is_bounded_and_lossless ... ok
+test state::tests::begin_consumes_readiness_before_loading_the_authorized_identity ... ok
+test state::tests::invalid_recorded_resume_mode_is_not_projected_as_native ... ok
+test state::tests::consumed_readiness_preserves_identity_authority_checks ... ok
+test state::tests::oversized_runtime_state_is_rejected_before_allocation ... ok
+test state::tests::symlinked_runtime_ancestor_is_rejected ... ok
+test state::tests::corrupt_active_profile_content_degrades_to_reconstruction ... ok
+test state::tests::corrupt_marker_content_degrades_to_reconstruction ... ok
+test state::tests::noncommittable_observations_cannot_publish_readiness ... ok
+test state::tests::ready_markers_are_isolated_by_profile_and_operator_projection_tracks_the_active_one ... ok
+test state::tests::unready_attempt_does_not_inspect_stale_identity ... ok
+test state::tests::unready_attempt_restore_publishes_nothing ... ok
+test state::tests::symlinked_runtime_marker_is_an_authority_error ... ok
+test state::tests::settled_transient_attempt_can_restore_the_exact_consumed_readiness ... ok
+test state::tests::recorded_resume_mode_is_truthful_and_replaces_prior_observation ... ok
+test event::tests::canonical_journal_records_bound_provider_controlled_content ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/lionclaw_runtime_codex-941f1b51a43b47ed)
+
+running 84 tests
+test adapter::configuration_tests::app_server_model_evidence_must_match_the_codex_request ... ok
+test app_server::client::exit_tests::signal_exit_preserves_structured_process_evidence ... ok
+test host_auth::tests::applies_rotated_refresh_token_to_existing_auth_store ... ok
+test app_server::protocol::tests::response_error_preserves_scalar_code_without_json_quoting ... ok
+test app_server::protocol::tests::response_retryability_uses_only_structured_provider_evidence ... ok
+test app_server::sink::tests::production_journal_sink_backpressures_a_provider_flood_without_loss ... ok
+test tests::app_server_item_descriptions_render_operator_activity ... ok
+test tests::app_server_text_preserves_streamed_delta_whitespace ... ok
+test tests::applied_model_is_read_from_structured_turn_response ... ok
+test tests::app_server_rejects_oversized_turn_id_from_start_response ... ok
+test tests::codex_active_turn_rejects_oversized_protocol_id ... ok
+test tests::codex_active_turn_rejects_oversized_thread_id ... ok
+test tests::codex_adapter_preserves_typed_launch_refusal ... ok
+test tests::codex_app_server_compaction_uses_context_compaction_contract_fixture ... ok
+test tests::codex_app_server_failed_turn_completion_returns_error ... ok
+test tests::codex_active_turn_rejects_empty_protocol_id ... ok
+test tests::app_server_agent_message_phases_choose_transcript_lane ... ok
+test host_auth::tests::ensures_openai_api_key_from_read_only_codex_home_without_lock_file ... ok
+test tests::app_server_agent_message_items_emit_answer_boundaries ... ok
+test tests::app_server_rejects_oversized_thread_id_from_start_response ... ok
+test host_auth::tests::ensures_fresh_chatgpt_token_from_read_only_codex_home_without_lock_file ... ok
+test tests::codex_app_server_image_generation_default_path_maps_runtime_home_projection ... ok
+test host_auth::tests::codex_auth_staging_rejects_symlinked_staging_root ... ok
+test host_auth::tests::ensures_openai_api_key_auth_is_ready ... ok
+test host_auth::tests::rejects_symlinked_auth_file ... ok
+test host_auth::tests::materialization_keeps_account_identity_stable_across_token_refresh ... ok
+test host_auth::tests::ensures_chatgpt_token_auth_is_ready ... ok
+test tests::codex_app_server_program_escapes_mcp_server_config_overrides ... ok
+test host_auth::tests::chatgpt_account_change_selects_a_fresh_native_profile ... ok
+test host_auth::tests::api_key_mode_ignores_stale_token_principal_and_rotates_with_the_key ... ok
+test host_auth::tests::codex_auth_staging_rejects_symlinked_credential_leaf ... ok
+test tests::codex_app_server_image_generation_relative_saved_path_maps_runtime_home_projection ... ok
+test host_auth::tests::chatgpt_mode_uses_the_selected_account_when_an_api_key_is_co_present ... ok
+test tests::codex_app_server_program_uses_default_stdio_transport ... ok
+test tests::codex_app_server_image_generation_item_emits_runtime_artifact ... ok
+test host_auth::tests::missing_auth_prompts_local_codex_login ... ok
+test tests::codex_app_server_program_projects_mcp_servers_as_config_overrides ... ok
+test tests::codex_app_server_method_image_generation_event_emits_runtime_artifact ... ok
+test tests::codex_app_server_image_generation_saved_path_maps_runtime_home_projection ... ok
+test tests::codex_app_server_retryable_error_notification_does_not_fail_turn ... ok
+test tests::codex_app_server_protocol_rejects_internal_approval_callbacks ... ok
+test host_auth::tests::materialization_rotates_identity_with_the_effective_api_key ... ok
+test host_auth::tests::stages_exact_auth_without_writing_the_persistent_runtime_home ... ok
+test tests::codex_app_server_unmatched_terminal_error_returns_error ... ok
+test tests::codex_app_server_separates_distinct_agent_message_items ... ok
+test tests::codex_cancel_interrupts_active_app_server_turn ... ok
+test tests::codex_app_server_turn_interrupt_uses_contract_fixture ... ok
+test tests::codex_app_server_protocol_streams_turn_and_saves_thread_id ... ok
+test tests::codex_app_server_successful_turn_uses_contract_fixture ... ok
+test tests::codex_default_generated_image_path_uses_runtime_home_projection ... ok
+test tests::codex_driver_requires_profile_auth ... ok
+test tests::codex_app_server_image_generation_unsafe_saved_path_does_not_use_default_artifact ... ok
+test tests::codex_app_server_image_generation_saved_path_maps_runtime_root ... ok
+test tests::codex_app_server_unmatched_terminal_notifications_complete_current_waiter ... ok
+test tests::codex_app_server_protocol_resumes_saved_thread_id ... ok
+test tests::codex_generated_image_path_rejects_runtime_root_traversal ... ok
+test tests::codex_generated_image_path_respects_blocked_runtime_projection ... ok
+test tests::codex_generated_image_path_uses_runtime_home_projection ... ok
+test host_auth::tests::resolves_harden_overly_broad_auth_file_permissions ... ok
+test tests::codex_app_server_turn_journals_project_to_canonical_events ... ok
+test tests::codex_app_server_top_level_image_generation_event_emits_runtime_artifact ... ok
+test tests::codex_terminal_program_uses_lionclaw_context_and_outer_boundary ... ok
+test tests::codex_app_server_response_item_image_generation_emits_runtime_artifact ... ok
+test tests::codex_turn_failure_classification_uses_only_will_retry ... ok
+test tests::completed_turn_error_text_only_flags_failed_turns ... ok
+test tests::codex_terminal_program_resumes_the_native_cli_without_using_protocol_thread_ids ... ok
+test tests::finish_app_server_session_shuts_down_after_protocol_error ... ok
+test tests::missing_or_invalid_thread_file_starts_fresh_codex_thread ... ok
+test tests::app_server_protocol_state_is_bounded_against_unmatched_provider_ids ... ok
+test tests::codex_resume_response_cannot_replace_saved_thread_identity ... ok
+test tests::codex_turn_started_notification_registers_active_cancel_target ... ok
+test tests::codex_thread_start_reports_reconstructed_availability ... ok
+test tests::codex_app_server_image_generation_interim_update_does_not_dedupe_completed_path ... ok
+test tests::saved_thread_file_without_ready_marker_starts_fresh_codex_thread ... ok
+test tests::symlinked_thread_file_is_rejected ... ok
+test tests::different_lionclaw_sessions_do_not_share_codex_thread_ids ... ok
+test tests::native_reopen_recovery_durably_forgets_exact_stale_codex_thread ... ok
+test tests::native_reopen_retryable_rejection_retains_identity ... ok
+test tests::native_reopen_transport_failure_does_not_claim_resume_rejection ... ok
+test tests::codex_session_rejects_oversized_restored_thread_id ... ok
+test host_auth::tests::refreshes_expiring_chatgpt_token_and_rotates_file ... ok
+test tests::codex_turn_failure_state_bounds_provider_codes_before_retention ... ok
+test host_auth::tests::refresh_timeout_fails_fast ... ok
+test host_auth::tests::concurrent_resolves_share_a_single_refresh ... ok
+
+test result: ok. 84 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/lib.rs (target/debug/deps/lionclaw_runtime_mock-489b9190e1d113ac)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lionclaw
+
+running 1 test
+test crates/lionclaw/src/workspace.rs - workspace::CapturedArtifact (line 44) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+   Doc-tests lionclaw_confinement
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lionclaw_durable_fs
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lionclaw_model
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lionclaw_runtime_acp
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lionclaw_runtime_api
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lionclaw_runtime_codex
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lionclaw_runtime_mock
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
