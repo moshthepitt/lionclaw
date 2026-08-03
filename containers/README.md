@@ -26,9 +26,10 @@ podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 
 `containers/dev/Containerfile` layers LionClaw development tooling on top of
 the runtime image. It includes the pinned Rust toolchain from
-`rust-toolchain.toml`, `rustfmt`, `clippy`, `rust-analyzer`, `rust-src`, native build dependencies,
-SQLite development headers, and basic debugging tools. Cargo caches live under
-`/runtime` for writable runtime state.
+`rust-toolchain.toml`, `rustfmt`, `clippy`, `rust-analyzer`, `rust-src`,
+`pytest`, `ruff`, native build dependencies, SQLite development headers, and
+basic debugging tools. Cargo and uv caches live under `/runtime` for writable
+runtime state.
 
 ```bash
 podman build \

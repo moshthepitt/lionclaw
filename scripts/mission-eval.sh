@@ -127,18 +127,34 @@ def add(left, right):
     return left - right
 PY
             cat >"$repo/test_calculator.py" <<'PY'
-import unittest
 from calculator import add
 
 
-class CalculatorTest(unittest.TestCase):
-    def test_adds_positive_and_negative_values(self):
-        self.assertEqual(add(7, -2), 5)
-
-
-if __name__ == "__main__":
-    unittest.main()
+def test_adds_positive_and_negative_values():
+    assert add(7, -2) == 5
 PY
+            ;;
+        javascript)
+            cat >"$repo/calculator.js" <<'JS'
+function add(left, right) {
+    return left - right;
+}
+
+module.exports = { add };
+JS
+            cat >"$repo/calculator.test.js" <<'JS'
+const assert = require("node:assert/strict");
+const test = require("node:test");
+
+const { add } = require("./calculator");
+
+test("adds positive and negative values", () => {
+    assert.equal(add(7, -2), 5);
+});
+JS
+            cat >"$repo/package.json" <<'JSON'
+{"name":"lionclaw-js-acceptance","private":true,"scripts":{"test":"node --test"}}
+JSON
             ;;
         optimization)
             cat >"$repo/dedupe.py" <<'PY'
@@ -169,6 +185,13 @@ class DedupeTest(unittest.TestCase):
     def test_preserves_unhashable_value_support(self):
         result, _ = dedupe([[1], [1], [2]])
         self.assertEqual(result, [[1], [2]])
+
+    def test_preserves_non_reflexive_equality_semantics(self):
+        value = float("nan")
+        result, _ = dedupe([value, value])
+        self.assertEqual(len(result), 2)
+        self.assertIs(result[0], value)
+        self.assertIs(result[1], value)
 
 
 if __name__ == "__main__":
@@ -248,14 +271,16 @@ run_method_mission() {
     mid="$(mission_json start --type "$method" --repo "$repo" --objective "$objective" \
         | python3 -c 'import sys,json;print(json.load(sys.stdin)["mission_id"])')" || return
     mission_json team show --mission-id "$mid" --repo "$repo" >"$repo/team.json" || return
-    python3 - "$repo/team.json" "$repo/plan.json" "$method" "$producer" "$judge" \
+    python3 - "$repo/team.json" "$repo/plan.json" "$method" "$fixture" "$producer" "$judge" \
         "$task_body" <<'PY'
 import json, sys
 
 team = json.load(open(sys.argv[1]))["team"]
-method, producer, judge, task_body = sys.argv[3:]
+method, fixture, producer, judge, task_body = sys.argv[3:]
 team["revision"] = 1
-team["task_assignments"] = {"work": producer}
+team["task_assignments"] = {
+    "work": {"type": "role", "role_instance": producer}
+}
 
 assertions = [{
     "id": "METHOD-RESULT",
@@ -273,16 +298,44 @@ requirements = [{
 }]
 oracles = {}
 
-if method == "software-dev":
-    assertions[0] = {
-        "id": "METHOD-RESULT",
-        "prose": "the Python unit tests pass at the final commit",
+if method == "software-dev" and fixture == "python":
+    assertions = [{
+        "id": "PYTEST-PASSES",
+        "prose": "pytest passes at the final commit",
         "oracle": "python-tests",
-    }
+    }, {
+        "id": "RUFF-PASSES",
+        "prose": "ruff passes at the final commit",
+        "oracle": "python-ruff",
+    }]
     requirements[0]["disposition"]["type"] = "confined_provable"
+    requirements[0]["disposition"]["assertion_ids"] = [
+        "PYTEST-PASSES",
+        "RUFF-PASSES",
+    ]
     oracles["python-tests"] = {
         "type": "command",
-        "argv": ["python3", "-m", "unittest", "-v"],
+        "argv": ["python3", "-m", "pytest", "-q"],
+        "cwd": ".",
+        "timeout_secs": 300,
+    }
+    oracles["python-ruff"] = {
+        "type": "command",
+        "argv": ["ruff", "check", "--no-cache", "."],
+        "cwd": ".",
+        "timeout_secs": 300,
+    }
+elif method == "software-dev" and fixture == "javascript":
+    assertions[0] = {
+        "id": "PACKAGE-TESTS",
+        "prose": "the package-manager test command passes at the final commit",
+        "oracle": "package-tests",
+    }
+    requirements[0]["disposition"]["type"] = "confined_provable"
+    requirements[0]["disposition"]["assertion_ids"] = ["PACKAGE-TESTS"]
+    oracles["package-tests"] = {
+        "type": "command",
+        "argv": ["npm", "test", "--silent"],
         "cwd": ".",
         "timeout_secs": 300,
     }
@@ -344,7 +397,7 @@ PY
     "$BIN" mission decide "$mid" plan_proposal:mission approve --repo "$repo" \
         --justification "eval approves the repository-specific method plan" >/dev/null || return
     if ! drive_to_finish "$mid" "$repo"; then
-        echo "  $method: FAIL (mission did not reach an advertised finish)"
+        echo "  $method/$fixture: FAIL (mission did not reach an advertised finish)"
         return 1
     fi
     status="$MISSION_STATUS"
@@ -353,15 +406,15 @@ PY
     head="$(python3 -c 'import sys,json;print(json.load(sys.stdin).get("current_sha"))' \
         <<<"$status")"
     if [ "$finish" != "$expected_finish" ]; then
-        echo "  $method: FAIL (finish=$finish, expected=$expected_finish)"
+        echo "  $method/$fixture: FAIL (finish=$finish, expected=$expected_finish)"
         return 1
     fi
     if { [ "$head_change" = changed ] && [ "$head" = "$base" ]; } ||
         { [ "$head_change" = unchanged ] && [ "$head" != "$base" ]; }; then
-        echo "  $method: FAIL (head=$head, base=$base, expected=$head_change)"
+        echo "  $method/$fixture: FAIL (head=$head, base=$base, expected=$head_change)"
         return 1
     fi
-    echo "  $method: PASS ($finish, head $head_change)"
+    echo "  $method/$fixture: PASS ($finish, head $head_change)"
 }
 
 # --- Scenario 1: fixes the interval-bug and reaches a verified finish -------
@@ -379,7 +432,9 @@ scenario_fix_bug() {
 import json, sys
 team = json.load(open(sys.argv[1]))["team"]
 team["revision"] = 1
-team["task_assignments"] = {"fix": "implementer"}
+team["task_assignments"] = {
+    "fix": {"type": "role", "role_instance": "implementer"}
+}
 team["judgment_assignments"] = {"TESTS-PASS": ["reviewer"]}
 proposal = {
     "plan": {
@@ -508,15 +563,20 @@ scenario_methods() {
     if [ "$selected" = all ] || [ "$selected" = software-dev ]; then
         run_method_mission \
         software-dev python implementer reviewer \
-        "Fix calculator.add so the Python unit suite passes. Do not change the tests." \
+        "Fix calculator.add so pytest and ruff pass. Do not change the tests." \
         "Correct calculator.add, preserve the tests, and commit the fix." \
+        verified changed || failures=1
+        run_method_mission \
+        software-dev javascript implementer reviewer \
+        "Fix calculator.add so the package-manager test passes. Do not change the tests or package.json." \
+        "Correct calculator.add, preserve the tests and package.json, and commit the fix." \
         verified changed || failures=1
     fi
     if [ "$selected" = all ] || [ "$selected" = optimization ]; then
         run_method_mission \
         optimization optimization optimizer reviewer \
-        "Reduce dedupe probes to one per input on the measured workload while preserving first-seen order, unhashable inputs, and the metric definition. Do not change tests, measure.py, or METRIC.md." \
-        "Implement and commit a coherent dedupe optimization with truthful probe accounting and no input-domain regression. Preserve test_dedupe.py, measure.py, and METRIC.md." \
+        "Reduce dedupe probes to one per input on the measured workload while preserving first-seen order, unhashable inputs, non-reflexive equality semantics, and the metric definition. Do not change tests, measure.py, or METRIC.md." \
+        "Implement and commit a coherent dedupe optimization with truthful probe accounting and no input-domain or equality regression. Preserve test_dedupe.py, measure.py, and METRIC.md." \
         attested changed || failures=1
     fi
     if [ "$selected" = all ] || [ "$selected" = research ]; then

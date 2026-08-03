@@ -246,9 +246,10 @@ fn runtime_checks() -> Vec<(&'static str, RuntimeCheck)> {
         ("prepared-input-feeds-network-off-oracle", || {
             Box::pin(check_prepared_input())
         }),
-        ("dynamic-oracles-run-rust-python-js-without-shell", || {
-            Box::pin(check_dynamic_oracle_languages())
-        }),
+        (
+            "dynamic-oracles-run-rust-pytest-ruff-js-without-shell",
+            || Box::pin(check_dynamic_oracle_languages()),
+        ),
     ]
 }
 
@@ -958,13 +959,29 @@ async fn check_dynamic_oracle_languages() -> Result<()> {
         None,
     )
     .await?;
+    let python_files = [
+        (
+            "python/calculator.py",
+            "def add(left, right):\n    return left + right\n",
+        ),
+        (
+            "python/test_calculator.py",
+            "from calculator import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+        ),
+    ];
     run_dynamic_oracle_fixture(
+        "python-pytest",
+        &python_files,
+        &["python3", "-m", "pytest", "-q"],
         "python",
-        &[(
-            "python/test_math.py",
-            "import unittest\n\nclass MathTest(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(2 + 3, 5)\n",
-        )],
-        &["python3", "-m", "unittest", "discover", "-v"],
+        BTreeMap::from([("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string())]),
+        None,
+    )
+    .await?;
+    run_dynamic_oracle_fixture(
+        "python-ruff",
+        &python_files,
+        &["ruff", "check", "--no-cache", "."],
         "python",
         BTreeMap::from([("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string())]),
         None,

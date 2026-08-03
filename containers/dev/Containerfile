@@ -12,6 +12,8 @@ RUN rustup component add \
 FROM ${UV_IMAGE} AS uv-bin
 
 FROM ${RUNTIME_IMAGE}
+ARG PYTEST_VERSION=8.4.2
+ARG RUFF_VERSION=0.12.12
 
 # Dev inherits runtime CLIs from the runtime image; assert the required packages
 # are present without duplicating the runtime image's version pins. Layer the
@@ -38,6 +40,9 @@ RUN apt-get update \
 COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
 COPY --from=uv-bin /uv /uvx /usr/local/bin/
+RUN uv pip install --system --break-system-packages \
+        "pytest==${PYTEST_VERSION}" \
+        "ruff==${RUFF_VERSION}"
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/runtime/cargo \
@@ -92,6 +97,8 @@ RUN uv python install 3.12 \
             >/dev/null \
     && hermes acp --check \
     && uv --version \
+    && python3 -m pytest --version \
+    && ruff --version \
     && uv python find 3.12 \
     && cargo --version \
     && cargo fmt --version \
