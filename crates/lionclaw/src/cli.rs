@@ -130,6 +130,7 @@ impl MissionTransports {
 #[derive(Parser)]
 #[command(
     name = "lionclaw",
+    version,
     about = "Run real agents under a small trusted core and explicit local boundary",
     long_about = "Run real agents under a small trusted core and explicit local boundary.\n\nThe everyday path is `lionclaw run [runtime]`. It launches or resumes the selected real agent in the target repository while LionClaw retains durable mission truth, exact legal actions, confinement, receipts, and finish authority. The command returns 0 only for a done mission, 1 for a runtime failure, crash, or aborted mission, and 2 when work remains nonterminal."
 )]
@@ -147,16 +148,22 @@ pub enum Command {
     Run(RunArgs),
     /// Install the bundled mission types into `~/.lionclaw` (run once).
     Install(InstallArgs),
-    /// Check the install: podman, git, and each installed mission type + image.
-    Doctor,
+    /// Check local tools, runtime profiles, mission types, and images.
+    #[command(
+        long_about = "Check local tools, runtime profiles, installed mission types, and required images. Returns 0 when every check passes and 1 when any check fails."
+    )]
+    Doctor(DoctorArgs),
     /// Add or remove skills in a mission type bundle.
     #[command(subcommand)]
     Skill(SkillCommand),
     /// Mission engine commands.
     #[command(subcommand)]
     Mission(MissionCommand),
-    /// Render the lionclaw(1) manual page to stdout.
-    Man,
+    /// Render a manual page for LionClaw or a visible command path.
+    #[command(
+        long_about = "Render a manual page for LionClaw or the given visible command path. With no command path, renders lionclaw(1). Unknown, hidden, and non-command paths fail."
+    )]
+    Man(ManArgs),
     #[command(name = "__network-proxy", hide = true)]
     NetworkProxy(NetworkProxyArgs),
     #[command(name = "__network-proxy-health", hide = true)]
@@ -183,6 +190,19 @@ pub struct InstallArgs {
     /// Overwrite mission types already installed.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Args)]
+pub struct DoctorArgs {
+    /// Emit stable machine-readable results.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct ManArgs {
+    /// Visible command path (default: lionclaw).
+    pub command: Vec<String>,
 }
 
 #[derive(Args)]
@@ -772,19 +792,43 @@ pub async fn run_with_transports(
     match cli.command {
         Command::Run(args) => cmd_run(args, &transports).await,
         Command::Install(args) => cmd_install(args).await.map(|()| ExitCode::SUCCESS),
-        Command::Doctor => cmd_doctor().await,
+        Command::Doctor(args) => cmd_doctor(args).await,
         Command::Skill(cmd) => cmd_skill(cmd).await.map(|()| ExitCode::SUCCESS),
         Command::Mission(cmd) => run_mission(cmd, &transports).await,
-        Command::Man => {
-            clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Command::Man(args) => cmd_man(args),
         Command::NetworkProxy(args) => crate::network_proxy::run(args.http, args.socks, args.allow)
             .await
             .map(|()| ExitCode::SUCCESS),
         Command::NetworkProxyHealth(args) => crate::network_proxy::health(args.http, args.socks)
             .await
             .map(|()| ExitCode::SUCCESS),
+    }
+}
+
+fn cmd_man(args: ManArgs) -> Result<std::process::ExitCode> {
+    let mut command = Cli::command();
+    let mut display_name = command.get_name().to_string();
+    for component in &args.command {
+        let parent = display_name.clone();
+        let subcommand = command
+            .find_subcommand(component)
+            .filter(|candidate| !candidate.is_hide_set())
+            .with_context(|| format!("unknown command path '{parent} {component}'"))?;
+        command = subcommand.clone();
+        display_name.push('-');
+        display_name.push_str(component);
+    }
+    let mut manual = Vec::new();
+    clap_mangen::Man::new(command).render(&mut manual)?;
+    write_stdout(&manual)?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+fn write_stdout(bytes: &[u8]) -> Result<()> {
+    match std::io::stdout().write_all(bytes) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -3421,46 +3465,108 @@ async fn cmd_skill(cmd: SkillCommand) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_doctor() -> Result<std::process::ExitCode> {
-    use std::process::ExitCode;
-    let mut ok = true;
-    let mut check = |label: &str, pass: bool, detail: &str| {
-        println!(
-            "{} {label}{}",
-            if pass { "PASS" } else { "FAIL" },
-            if detail.is_empty() {
-                String::new()
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorStatus {
+    Pass,
+    Fail,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub status: DoctorStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct DoctorReport {
+    pub schema: &'static str,
+    pub ok: bool,
+    pub checks: Vec<DoctorCheck>,
+}
+
+impl DoctorReport {
+    const SCHEMA: &'static str = "lionclaw.doctor.v1";
+
+    fn new() -> Self {
+        Self {
+            schema: Self::SCHEMA,
+            ok: true,
+            checks: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, name: impl Into<String>, pass: bool, detail: Option<String>) {
+        self.ok &= pass;
+        self.checks.push(DoctorCheck {
+            name: name.into(),
+            status: if pass {
+                DoctorStatus::Pass
             } else {
-                format!(" — {detail}")
+                DoctorStatus::Fail
+            },
+            detail: detail.filter(|detail| !detail.is_empty()),
+        });
+    }
+
+    pub fn render_human(&self) -> String {
+        let mut output = String::new();
+        for check in &self.checks {
+            output.push_str(match check.status {
+                DoctorStatus::Pass => "PASS ",
+                DoctorStatus::Fail => "FAIL ",
+            });
+            output.push_str(&check.name);
+            if let Some(detail) = &check.detail {
+                output.push_str(" — ");
+                output.push_str(detail);
             }
-        );
-        ok &= pass;
+            output.push('\n');
+        }
+        output
+    }
+}
+
+async fn collect_doctor_report() -> DoctorReport {
+    let mut report = DoctorReport::new();
+    report.push("podman", command_ok("podman", &["--version"]).await, None);
+    report.push("git", command_ok("git", &["--version"]).await, None);
+
+    let home = match Home::from_env() {
+        Ok(home) => home,
+        Err(err) => {
+            report.push("LionClaw home", false, Some(format!("{err:#}")));
+            return report;
+        }
     };
-
-    check("podman", command_ok("podman", &["--version"]).await, "");
-    check("git", command_ok("git", &["--version"]).await, "");
-
-    let home = Home::from_env()?;
     let profiles = match RuntimeProfiles::load(&home) {
         Ok(profiles) => {
-            check(
+            report.push(
                 "runtime profiles",
                 true,
-                &profiles.names().collect::<Vec<_>>().join(", "),
+                Some(profiles.names().collect::<Vec<_>>().join(", ")),
             );
             Some(profiles)
         }
         Err(err) => {
-            check("runtime profiles", false, &format!("{err:#}"));
+            report.push("runtime profiles", false, Some(format!("{err:#}")));
             None
         }
     };
-    let types = home.installed_mission_types()?;
+    let types = match home.installed_mission_types() {
+        Ok(types) => types,
+        Err(err) => {
+            report.push("mission types installed", false, Some(format!("{err:#}")));
+            return report;
+        }
+    };
     if types.is_empty() {
-        check(
+        report.push(
             "mission types installed",
             false,
-            "none — run `lionclaw install`",
+            Some("none — run `lionclaw install`".to_string()),
         );
     }
     for name in &types {
@@ -3468,32 +3574,47 @@ async fn cmd_doctor() -> Result<std::process::ExitCode> {
             Ok(mt) => {
                 if let Some(profiles) = &profiles {
                     if let Err(err) = validate_explicit_role_runtimes(&mt, profiles) {
-                        check(
-                            &format!("mission type '{name}'"),
+                        report.push(
+                            format!("mission type '{name}'"),
                             false,
-                            &format!("{err:#}"),
+                            Some(format!("{err:#}")),
                         );
                         continue;
                     }
                 }
                 let img = command_ok("podman", &["image", "exists", &mt.image]).await;
-                check(
-                    &format!("mission type '{name}'"),
+                report.push(
+                    format!("mission type '{name}'"),
                     img,
-                    &if img {
+                    Some(if img {
                         short_hex(mt.digest())
                     } else {
                         format!("image '{}' not present", mt.image)
-                    },
+                    }),
                 );
             }
-            Err(e) => check(&format!("mission type '{name}'"), false, &e.to_string()),
+            Err(err) => report.push(
+                format!("mission type '{name}'"),
+                false,
+                Some(err.to_string()),
+            ),
         }
     }
-    Ok(if ok {
-        ExitCode::SUCCESS
+    report
+}
+
+async fn cmd_doctor(args: DoctorArgs) -> Result<std::process::ExitCode> {
+    let report = collect_doctor_report().await;
+    let output = if args.json {
+        format!("{}\n", serde_json::to_string(&report)?)
     } else {
-        ExitCode::FAILURE
+        report.render_human()
+    };
+    write_stdout(output.as_bytes())?;
+    Ok(if report.ok {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
     })
 }
 

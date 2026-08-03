@@ -557,7 +557,7 @@ fn normalize_workspace_file(raw: &str) -> Result<String> {
 fn validate_cli(cli: &Cli) -> Result<()> {
     match &cli.command {
         Command::Install(args) if args.mission_types.is_empty() => Ok(()),
-        Command::Doctor | Command::Man => Ok(()),
+        Command::Doctor(_) | Command::Man(_) => Ok(()),
         Command::Mission(command) => validate_mission_command(command),
         Command::Install(_) => bail!("the everyday bridge installs only bundled mission types"),
         Command::Run(_) => bail!("nested `lionclaw run` is not available through the bridge"),

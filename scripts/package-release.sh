@@ -30,16 +30,28 @@ test -x "$ROOT/lionclaw"
 test -s "$ROOT/README.md"
 test "$(find "$ROOT" -name SKILL.md -type f | wc -l)" -eq 1
 test -s "$ROOT/share/man/man1/lionclaw.1"
-LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" install
+test "$("$ROOT/lionclaw" --version)" = "lionclaw $VERSION"
+"$ROOT/lionclaw" --help >/dev/null
+"$ROOT/lionclaw" mission plan show --help >/dev/null
+"$ROOT/lionclaw" man mission plan show >/dev/null
+if DOCTOR_JSON=$(cd "$TEST_HOME" && LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" doctor --json); then
+  echo "doctor unexpectedly passed with a clean home" >&2
+  exit 1
+fi
+if [[ "$DOCTOR_JSON" != *'"schema":"lionclaw.doctor.v1"'* || "$DOCTOR_JSON" != *'"ok":false'* ]]; then
+  echo "doctor did not emit truthful JSON with a clean home" >&2
+  exit 1
+fi
+(cd "$TEST_HOME" && LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" install)
 EXPECTED_TYPES=$'design\noptimization\nresearch\nreview\nsoftware-dev'
-ACTUAL_TYPES=$(LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" mission type list)
+ACTUAL_TYPES=$(cd "$TEST_HOME" && LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" mission type list)
 if [[ "$ACTUAL_TYPES" != "$EXPECTED_TYPES" ]]; then
   echo "clean install has unexpected mission types:" >&2
   printf '%s\n' "$ACTUAL_TYPES" >&2
   exit 1
 fi
 for mission_type in design optimization research review software-dev; do
-  LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" mission type check "$mission_type"
+  (cd "$TEST_HOME" && LIONCLAW_HOME="$TEST_HOME" "$ROOT/lionclaw" mission type check "$mission_type")
 done
 
 tar -C "$STAGE" -czf "$DIST/$ASSET" lionclaw
