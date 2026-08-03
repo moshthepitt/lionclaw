@@ -1,5 +1,5 @@
 Tool: repository regex search
-Pattern: (?i)frontier[-_ ]?swe|harbor
+Pattern: (?i)frontier[-_ ]?swe|harbor|type-checker-v9|accept_total|reject_total|throughput_speedup|compute_reward|reward\.json
 Scope:
 - crates/*/src/**/*.rs (all tracked Rust product source, including prompts and help text)
 - mission-types/** (bundled mission methods and prompts)
@@ -7,4 +7,4 @@ Scope:
 - scripts/**
 - .github/workflows/** (CI)
 Result: No matches found
-Observed at product HEAD: 68554233b3f4c7c87ca0e4127e5cac6a0206f7a4
+Observed at product HEAD: 9d0e12c1a722249dc065f638987f91c9cc9644b2

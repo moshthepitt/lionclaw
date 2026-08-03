@@ -1,0 +1,8 @@
+   Compiling lionclaw v0.8.0 (/home/mosh/mosh/misc/lionclaw/.worktrees/lionclaw2-simple-chunk-8-acceptance/crates/lionclaw)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.27s
+     Running tests/everyday_run.rs (target/debug/deps/everyday_run-922bffac8c2568ab)
+
+running 1 test
+test everyday_run_reaches_validated_profile_auth_and_confinement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.03s
