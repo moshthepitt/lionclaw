@@ -43,8 +43,25 @@ if DOCTOR_JSON=$(cd "$TEST_HOME" && LIONCLAW_HOME="$TEST_HOME" "$PACKAGE_ROOT/li
   echo "doctor unexpectedly passed with a clean home" >&2
   exit 1
 fi
-if [[ "$DOCTOR_JSON" != *'"schema":"lionclaw.doctor.v1"'* || "$DOCTOR_JSON" != *'"ok":false'* ]]; then
-  echo "doctor did not emit truthful JSON with a clean home" >&2
+if ! jq -e '
+  type == "object" and
+  (keys | sort) == ["checks", "ok", "schema"] and
+  .schema == "lionclaw.doctor.v1" and
+  (.ok | type) == "boolean" and
+  (.checks | type) == "array" and
+  (.checks | length) > 0 and
+  all(.checks[];
+    type == "object" and
+    (has("name") and has("status")) and
+    ([keys[] | select(. != "name" and . != "status" and . != "detail")] | length) == 0 and
+    (.name | type == "string" and length > 0) and
+    (.status == "pass" or .status == "fail") and
+    ((has("detail") | not) or (.detail | type == "string" and length > 0))
+  ) and
+  (.ok == (.checks | all(.status == "pass"))) and
+  (.ok == false)
+' >/dev/null <<<"$DOCTOR_JSON"; then
+  echo "doctor did not emit a truthful typed JSON report with a clean home" >&2
   exit 1
 fi
 (cd "$TEST_HOME" && LIONCLAW_HOME="$TEST_HOME" "$PACKAGE_ROOT/lionclaw" install)
