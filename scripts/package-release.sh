@@ -36,10 +36,11 @@ test -s "$PACKAGE_ROOT/README.md"
 test "$(find "$PACKAGE_ROOT" -name SKILL.md -type f | wc -l)" -eq 1
 test -s "$PACKAGE_ROOT/share/man/man1/lionclaw.1"
 test "$("$PACKAGE_ROOT/lionclaw" --version)" = "lionclaw $VERSION"
-(cd "$TEST_HOME" && "$PACKAGE_ROOT/lionclaw" --help >/dev/null)
-(cd "$TEST_HOME" && "$PACKAGE_ROOT/lionclaw" mission plan show --help >/dev/null)
-(cd "$TEST_HOME" && "$PACKAGE_ROOT/lionclaw" man mission plan show >/dev/null)
-if DOCTOR_JSON=$(cd "$TEST_HOME" && LIONCLAW_HOME="$TEST_HOME" "$PACKAGE_ROOT/lionclaw" doctor --json); then
+(cd "$PACKAGE_ROOT" && ./lionclaw --help >/dev/null)
+(cd "$PACKAGE_ROOT" && ./lionclaw run codex --help >/dev/null)
+(cd "$PACKAGE_ROOT" && ./lionclaw mission plan show --help >/dev/null)
+(cd "$PACKAGE_ROOT" && ./lionclaw man mission plan show >/dev/null)
+if DOCTOR_JSON=$(cd "$PACKAGE_ROOT" && env -u CODEX_HOME HOME="$TEST_HOME" LIONCLAW_HOME="$TEST_HOME" ./lionclaw doctor --json); then
   echo "doctor unexpectedly passed with a clean home" >&2
   exit 1
 fi
@@ -53,10 +54,12 @@ if ! jq -e '
   all(.checks[];
     type == "object" and
     (has("name") and has("status")) and
-    ([keys[] | select(. != "name" and . != "status" and . != "detail")] | length) == 0 and
+    ([keys[] | select(. != "name" and . != "status" and . != "detail" and . != "retryable" and . != "repair")] | length) == 0 and
     (.name | type == "string" and length > 0) and
     (.status == "pass" or .status == "fail") and
-    ((has("detail") | not) or (.detail | type == "string" and length > 0))
+    (.retryable | type == "boolean") and
+    ((has("detail") | not) or (.detail | type == "string" and length > 0)) and
+    (if .status == "fail" then (.repair | type == "string" and length > 0) else (has("repair") | not) end)
   ) and
   (.ok == (.checks | all(.status == "pass"))) and
   (.ok == false)
@@ -79,4 +82,5 @@ done
 (
   cd "$DIST"
   sha256sum "$ASSET" > SHA256SUMS
+  sha256sum -c SHA256SUMS
 )

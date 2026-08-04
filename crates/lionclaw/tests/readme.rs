@@ -13,16 +13,17 @@ fn first_viewport_contains_only_the_five_discovery_elements() {
     assert!(viewport.contains("lionclaw-*-linux-x86_64.tar.gz"));
     assert!(viewport.contains("sha256sum -c"));
     assert!(viewport.contains("normal skill installation mechanism"));
-    assert!(viewport.contains("lionclaw doctor"));
-    assert!(viewport.contains("lionclaw run codex"));
+    assert!(viewport.contains("From the extracted `lionclaw/` directory"));
+    assert!(viewport.contains("\n./lionclaw doctor\n"));
+    assert!(viewport.contains("\n./lionclaw run codex\n"));
 
     assert!(!viewport.contains("mission --help"));
     assert!(!viewport.contains("mission type --help"));
     assert!(!viewport.contains("run --help"));
 
     assert_eq!(README.matches("\n---\n").count(), 1);
-    assert_eq!(viewport.matches("```text").count(), 2);
-    assert_eq!(viewport.matches("```\n").count(), 2);
+    assert_eq!(viewport.matches("```text").count(), 1);
+    assert_eq!(viewport.matches("```\n").count(), 1);
 
     assert_eq!(
         advanced.trim(),

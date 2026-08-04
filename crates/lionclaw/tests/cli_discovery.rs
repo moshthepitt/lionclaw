@@ -29,24 +29,35 @@ fn doctor_renderers_share_the_typed_result() {
                 name: "git".to_string(),
                 status: DoctorStatus::Pass,
                 detail: None,
+                retryable: false,
+                repair: None,
             },
             DoctorCheck {
                 name: "runtime profiles".to_string(),
                 status: DoctorStatus::Fail,
                 detail: Some("invalid configuration".to_string()),
+                retryable: false,
+                repair: Some("fix the runtime configuration".to_string()),
             },
         ],
     };
 
     assert_eq!(
         report.render_human(),
-        "PASS git\nFAIL runtime profiles — invalid configuration\n"
+        concat!(
+            "PASS git\n",
+            "FAIL runtime profiles — invalid configuration\n",
+            "  retryable: no\n",
+            "  repair: fix the runtime configuration\n",
+        )
     );
     let json = serde_json::to_value(&report).unwrap();
     assert_eq!(json["schema"], "lionclaw.doctor.v1");
     assert!(!json["ok"].as_bool().unwrap());
     assert_eq!(json["checks"][0]["status"], "pass");
     assert_eq!(json["checks"][1]["status"], "fail");
+    assert_eq!(json["checks"][1]["retryable"], false);
+    assert_eq!(json["checks"][1]["repair"], "fix the runtime configuration");
 }
 
 #[test]
@@ -64,6 +75,18 @@ fn clean_home_doctor_json_is_parseable_and_truthfully_fails() {
     assert_eq!(report["schema"], "lionclaw.doctor.v1");
     assert!(!report["ok"].as_bool().unwrap());
     let checks = report["checks"].as_array().unwrap();
+    assert!(checks.iter().all(|check| check["retryable"].is_boolean()));
+    assert!(checks
+        .iter()
+        .filter(|check| check["status"] == "fail")
+        .all(|check| check["repair"]
+            .as_str()
+            .is_some_and(|repair| !repair.is_empty())));
+    assert!(checks.iter().any(|check| {
+        check["name"] == "lionclaw binary"
+            && check["status"] == "pass"
+            && check["detail"] == format!("lionclaw {}", env!("CARGO_PKG_VERSION"))
+    }));
     assert!(checks
         .iter()
         .any(|check| { check["name"] == "mission types installed" && check["status"] == "fail" }));
@@ -73,6 +96,60 @@ fn clean_home_doctor_json_is_parseable_and_truthfully_fails() {
     for secret_name in ["token", "api_key", "password", "credential"] {
         assert!(!rendered.contains(secret_name));
     }
+}
+
+#[test]
+fn doctor_reports_selected_runtime_auth_readiness_without_exposing_it() {
+    let lionclaw_home = tempfile::tempdir().unwrap();
+    let user_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        lionclaw_home.path().join("runtimes.toml"),
+        "[runtimes.test]\n\
+         driver = \"acp\"\n\
+         command = \"test\"\n\
+         auth = { kind = \"native-home\", source = \"~/.test-auth\", target = \".test-auth\", required-files = [\"auth.json\"] }\n",
+    )
+    .unwrap();
+
+    let run = || {
+        lionclaw()
+            .args(["doctor", "test", "--json"])
+            .env("HOME", user_home.path())
+            .env_remove("CODEX_HOME")
+            .env("LIONCLAW_HOME", lionclaw_home.path())
+            .output()
+            .unwrap()
+    };
+    let missing = run();
+    assert_eq!(missing.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    let auth = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "runtime 'test' authentication")
+        .unwrap();
+    assert_eq!(auth["status"], "fail");
+    assert_eq!(auth["retryable"], false);
+    assert!(auth["repair"].as_str().unwrap().contains("authenticate"));
+
+    std::fs::create_dir(user_home.path().join(".test-auth")).unwrap();
+    std::fs::write(
+        user_home.path().join(".test-auth/auth.json"),
+        "TOP_SECRET_SENTINEL",
+    )
+    .unwrap();
+    let ready = run();
+    let rendered = String::from_utf8(ready.stdout).unwrap();
+    assert!(!rendered.contains("TOP_SECRET_SENTINEL"));
+    let report: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let auth = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "runtime 'test' authentication")
+        .unwrap();
+    assert_eq!(auth["status"], "pass");
 }
 
 #[test]

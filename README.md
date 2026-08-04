@@ -10,12 +10,11 @@ Download the latest `lionclaw-*-linux-x86_64.tar.gz` and `SHA256SUMS` from the
 archive with `sha256sum -c`, then install the extracted `lionclaw/` directory
 through your agent harness's normal skill installation mechanism.
 
-```text
-lionclaw doctor
-```
+From the extracted `lionclaw/` directory, run its adjacent executable:
 
 ```text
-lionclaw run codex
+./lionclaw doctor
+./lionclaw run codex
 ```
 
 ---

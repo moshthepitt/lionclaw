@@ -194,6 +194,9 @@ pub struct InstallArgs {
 
 #[derive(Args)]
 pub struct DoctorArgs {
+    /// Runtime profile whose launch authentication should be checked.
+    #[arg(default_value = "codex")]
+    pub runtime: String,
     /// Emit stable machine-readable results.
     #[arg(long)]
     pub json: bool,
@@ -792,7 +795,7 @@ pub async fn run_with_transports(
     match cli.command {
         Command::Run(args) => cmd_run(args, &transports).await,
         Command::Install(args) => cmd_install(args).await.map(|()| ExitCode::SUCCESS),
-        Command::Doctor(args) => cmd_doctor(args).await,
+        Command::Doctor(args) => cmd_doctor(args, &transports).await,
         Command::Skill(cmd) => cmd_skill(cmd).await.map(|()| ExitCode::SUCCESS),
         Command::Mission(cmd) => run_mission(cmd, &transports).await,
         Command::Man(args) => cmd_man(args),
@@ -3482,6 +3485,36 @@ pub struct DoctorCheck {
     pub status: DoctorStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair: Option<String>,
+}
+
+impl DoctorCheck {
+    fn pass(name: impl Into<String>, detail: Option<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: DoctorStatus::Pass,
+            detail: detail.filter(|detail| !detail.is_empty()),
+            retryable: false,
+            repair: None,
+        }
+    }
+
+    fn fail(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        retryable: bool,
+        repair: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: DoctorStatus::Fail,
+            detail: Some(detail.into()),
+            retryable,
+            repair: Some(repair.into()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -3502,17 +3535,9 @@ impl DoctorReport {
         }
     }
 
-    fn push(&mut self, name: impl Into<String>, pass: bool, detail: Option<String>) {
-        self.ok &= pass;
-        self.checks.push(DoctorCheck {
-            name: name.into(),
-            status: if pass {
-                DoctorStatus::Pass
-            } else {
-                DoctorStatus::Fail
-            },
-            detail: detail.filter(|detail| !detail.is_empty()),
-        });
+    fn push(&mut self, check: DoctorCheck) {
+        self.ok &= check.status == DoctorStatus::Pass;
+        self.checks.push(check);
     }
 
     pub fn render_human(&self) -> String {
@@ -3528,98 +3553,284 @@ impl DoctorReport {
                 output.push_str(detail);
             }
             output.push('\n');
+            if check.status == DoctorStatus::Fail {
+                output.push_str("  retryable: ");
+                output.push_str(if check.retryable { "yes" } else { "no" });
+                output.push('\n');
+                if let Some(repair) = &check.repair {
+                    output.push_str("  repair: ");
+                    output.push_str(repair);
+                    output.push('\n');
+                }
+            }
         }
         output
     }
 }
 
-async fn collect_doctor_report() -> DoctorReport {
+async fn collect_doctor_report(args: &DoctorArgs, transports: &MissionTransports) -> DoctorReport {
     let mut report = DoctorReport::new();
-    report.push("podman", command_ok("podman", &["--version"]).await, None);
-    report.push("git", command_ok("git", &["--version"]).await, None);
+    report.push(DoctorCheck::pass(
+        "lionclaw binary",
+        Some(format!("lionclaw {}", env!("CARGO_PKG_VERSION"))),
+    ));
+    let podman_ready = push_tool_check(
+        &mut report,
+        "podman",
+        "install Podman, then rerun `lionclaw doctor`",
+    )
+    .await;
+    push_tool_check(
+        &mut report,
+        "git",
+        "install Git, then rerun `lionclaw doctor`",
+    )
+    .await;
 
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(err) => {
-            report.push("LionClaw home", false, Some(format!("{err:#}")));
+            report.push(DoctorCheck::fail(
+                "LionClaw home",
+                format!("{err:#}"),
+                false,
+                "set LIONCLAW_HOME to a usable directory, then rerun `lionclaw doctor`",
+            ));
             return report;
         }
     };
     let runtimes_file = home.runtimes_file();
-    let profiles = match RuntimeProfiles::load(&home) {
+    let profiles = match transports.profiles() {
         Ok(profiles) => {
-            report.push(
+            report.push(DoctorCheck::pass(
                 "runtime profiles",
-                true,
                 Some(profiles.names().collect::<Vec<_>>().join(", ")),
-            );
+            ));
             Some(profiles)
         }
         Err(_) => {
-            report.push(
+            report.push(DoctorCheck::fail(
                 "runtime profiles",
+                format!("could not load configuration '{}'", runtimes_file.display()),
                 false,
-                Some(format!(
-                    "could not load configuration '{}'",
+                format!(
+                    "fix '{}', then rerun `lionclaw doctor`",
                     runtimes_file.display()
-                )),
-            );
+                ),
+            ));
             None
         }
     };
+    if let Some(profiles) = &profiles {
+        match profiles.get(&args.runtime) {
+            Ok(profile) => {
+                if validate_runtime_profile(&profile, transports).is_ok() {
+                    report.push(DoctorCheck::pass(
+                        format!("runtime '{}'", args.runtime),
+                        Some(format!("driver '{}'", profile.driver)),
+                    ));
+                    report.push(probe_runtime_auth(&profile, profiles, transports).await);
+                } else {
+                    report.push(DoctorCheck::fail(
+                        format!("runtime '{}'", args.runtime),
+                        "driver or authentication configuration is invalid",
+                        false,
+                        format!(
+                            "fix runtime '{}' in '{}', then rerun `lionclaw doctor {}`",
+                            args.runtime,
+                            runtimes_file.display(),
+                            args.runtime
+                        ),
+                    ));
+                }
+            }
+            Err(_) => report.push(DoctorCheck::fail(
+                format!("runtime '{}'", args.runtime),
+                format!(
+                    "not configured; available runtimes: {}",
+                    profiles.names().collect::<Vec<_>>().join(", ")
+                ),
+                false,
+                "choose a configured runtime and rerun `lionclaw doctor <runtime>`",
+            )),
+        }
+    }
     let types = match home.installed_mission_types() {
         Ok(types) => types,
         Err(err) => {
-            report.push("mission types installed", false, Some(format!("{err:#}")));
+            report.push(DoctorCheck::fail(
+                "mission types installed",
+                format!("{err:#}"),
+                false,
+                "repair the LionClaw home, then rerun `lionclaw install`",
+            ));
             return report;
         }
     };
     if types.is_empty() {
-        report.push(
+        report.push(DoctorCheck::fail(
             "mission types installed",
+            "none installed",
             false,
-            Some("none — run `lionclaw install`".to_string()),
-        );
+            "run `lionclaw install`, then rerun `lionclaw doctor`",
+        ));
     }
+    let mut images = BTreeSet::new();
     for name in &types {
         match load_mission_type(&home.mission_type_dir(name), &AuthorityCeiling::default()) {
             Ok(mt) => {
                 if let Some(profiles) = &profiles {
-                    if let Err(err) = validate_explicit_role_runtimes(&mt, profiles) {
-                        report.push(
+                    if validate_explicit_role_runtimes(&mt, profiles).is_err() {
+                        report.push(DoctorCheck::fail(
                             format!("mission type '{name}'"),
+                            "references an unavailable runtime profile",
                             false,
-                            Some(format!("{err:#}")),
-                        );
+                            format!(
+                                "fix the installed bundle or '{}', then rerun `lionclaw doctor`",
+                                runtimes_file.display()
+                            ),
+                        ));
                         continue;
                     }
                 }
-                let img = command_ok("podman", &["image", "exists", &mt.image]).await;
-                report.push(
+                images.insert(mt.image.clone());
+                report.push(DoctorCheck::pass(
                     format!("mission type '{name}'"),
-                    img,
-                    Some(if img {
-                        short_hex(mt.digest())
-                    } else {
-                        format!("image '{}' not present", mt.image)
-                    }),
-                );
+                    Some(short_hex(mt.digest())),
+                ));
             }
-            Err(_) => report.push(
+            Err(_) => report.push(DoctorCheck::fail(
                 format!("mission type '{name}'"),
-                false,
-                Some(format!(
+                format!(
                     "could not load installed bundle '{}'",
                     home.mission_type_dir(name).display()
-                )),
-            ),
+                ),
+                false,
+                "run `lionclaw install --force`, then rerun `lionclaw doctor`",
+            )),
+        }
+    }
+    for image in images {
+        if !podman_ready {
+            report.push(DoctorCheck::fail(
+                format!("runtime image '{image}'"),
+                "cannot inspect the image because Podman is unavailable",
+                false,
+                "install Podman, then rerun `lionclaw doctor`",
+            ));
+        } else if command_ok("podman", &["image", "exists", &image]).await {
+            report.push(DoctorCheck::pass(
+                format!("runtime image '{image}'"),
+                Some("present".to_string()),
+            ));
+        } else {
+            report.push(DoctorCheck::fail(
+                format!("runtime image '{image}'"),
+                "not present in Podman",
+                false,
+                format!("provide image '{image}' to Podman, then rerun `lionclaw doctor`"),
+            ));
         }
     }
     report
 }
 
-async fn cmd_doctor(args: DoctorArgs) -> Result<std::process::ExitCode> {
-    let report = collect_doctor_report().await;
+async fn probe_runtime_auth(
+    profile: &MissionRuntimeProfile,
+    profiles: &RuntimeProfiles,
+    transports: &MissionTransports,
+) -> DoctorCheck {
+    let name = format!("runtime '{}' authentication", profile.name);
+    let Some(auth) = &profile.auth else {
+        return DoctorCheck::pass(name, Some("not required".to_string()));
+    };
+    let staging = match tempfile::tempdir() {
+        Ok(staging) => staging,
+        Err(_) => {
+            return DoctorCheck::fail(
+                name,
+                "could not create a private authentication probe directory",
+                true,
+                "fix the host temporary directory, then rerun `lionclaw doctor`",
+            )
+        }
+    };
+    let staging_root = staging.path().join("auth");
+    if std::fs::create_dir(&staging_root).is_err() {
+        return DoctorCheck::fail(
+            name,
+            "could not create a private authentication probe directory",
+            true,
+            "fix the host temporary directory, then rerun `lionclaw doctor`",
+        );
+    }
+    let runner = match &transports.runtime {
+        Some((drivers, providers)) => OciRoleRunner::with_registries(
+            profiles.clone(),
+            AuthorityCeiling::default(),
+            drivers.clone(),
+            providers.clone(),
+        ),
+        None => OciRoleRunner::new(profiles.clone(), AuthorityCeiling::default()),
+    };
+    match runner
+        .materialize_runtime_auth(profile, &profile.model_network, staging_root)
+        .await
+    {
+        Ok(_) => DoctorCheck::pass(name, Some(format!("{} auth is ready", auth.kind()))),
+        Err(_) => DoctorCheck::fail(
+            name,
+            format!("{} auth is not ready", auth.kind()),
+            false,
+            format!(
+                "authenticate runtime '{}' with host CLI '{}', then rerun `lionclaw doctor {}`",
+                profile.name, profile.command, profile.name
+            ),
+        ),
+    }
+}
+
+async fn push_tool_check(report: &mut DoctorReport, program: &str, repair: &str) -> bool {
+    match command_version(program).await {
+        Ok(version) => {
+            report.push(DoctorCheck::pass(program, Some(version)));
+            true
+        }
+        Err(detail) => {
+            report.push(DoctorCheck::fail(program, detail, false, repair));
+            false
+        }
+    }
+}
+
+async fn command_version(program: &str) -> std::result::Result<String, String> {
+    let output = tokio::process::Command::new(program)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                format!("{program} was not found on PATH")
+            } else {
+                format!("could not execute `{program} --version`")
+            }
+        })?;
+    if !output.status.success() {
+        return Err(format!("`{program} --version` did not succeed"));
+    }
+    let first_line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.chars().take(256).collect::<String>())
+        .unwrap_or_else(|| format!("`{program} --version` succeeded"));
+    Ok(first_line)
+}
+
+async fn cmd_doctor(
+    args: DoctorArgs,
+    transports: &MissionTransports,
+) -> Result<std::process::ExitCode> {
+    let report = collect_doctor_report(&args, transports).await;
     let output = if args.json {
         format!("{}\n", serde_json::to_string(&report)?)
     } else {
