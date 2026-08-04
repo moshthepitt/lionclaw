@@ -76,6 +76,60 @@ fn clean_home_doctor_json_is_parseable_and_truthfully_fails() {
 }
 
 #[test]
+fn doctor_json_does_not_echo_invalid_configuration_source() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("runtimes.toml"),
+        "[runtimes.test]\n\
+         driver = \"acp\"\n\
+         command = \"test\"\n\
+         environment = { API_KEY = \"TOP_SECRET_SENTINEL\", bad = }\n",
+    )
+    .unwrap();
+    let bundle = home.path().join("mission-types/broken");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(
+        bundle.join("mission.toml"),
+        "[mission-type]\nname = \"broken\"\nimage = \"BUNDLE_SECRET_SENTINEL\"\nbad =\n",
+    )
+    .unwrap();
+
+    let output = lionclaw()
+        .args(["doctor", "--json"])
+        .env("LIONCLAW_HOME", home.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+
+    let rendered = String::from_utf8(output.stdout).unwrap();
+    assert!(!rendered.contains("TOP_SECRET_SENTINEL"));
+    assert!(!rendered.contains("BUNDLE_SECRET_SENTINEL"));
+    let report: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let runtime_check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "runtime profiles")
+        .unwrap();
+    assert_eq!(runtime_check["status"], "fail");
+    assert!(runtime_check["detail"]
+        .as_str()
+        .unwrap()
+        .contains("could not load"));
+    let bundle_check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "mission type 'broken'")
+        .unwrap();
+    assert_eq!(bundle_check["status"], "fail");
+    assert!(bundle_check["detail"]
+        .as_str()
+        .unwrap()
+        .contains("could not load"));
+}
+
+#[test]
 fn man_uses_the_visible_clap_command_tree() {
     let root = lionclaw().arg("man").output().unwrap();
     assert!(root.status.success());
@@ -89,6 +143,12 @@ fn man_uses_the_visible_clap_command_tree() {
         .unwrap();
     assert!(nested.status.success());
     let nested = String::from_utf8(nested.stdout).unwrap();
+    assert!(nested.contains(".TH lionclaw-mission-plan-show 1"));
+    assert!(nested.contains(&format!("\"lionclaw {}\"", env!("CARGO_PKG_VERSION"))));
+    assert!(
+        nested.contains("lionclaw\\-mission\\-plan\\-show \\- Show the current or pending plan")
+    );
+    assert!(nested.contains("\\fBlionclaw mission plan show\\fR"));
     assert!(nested.contains("current or pending plan"));
 
     for path in [

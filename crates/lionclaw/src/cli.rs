@@ -807,19 +807,23 @@ pub async fn run_with_transports(
 
 fn cmd_man(args: ManArgs) -> Result<std::process::ExitCode> {
     let mut command = Cli::command();
-    let mut display_name = command.get_name().to_string();
+    let mut command_path = vec![command.get_name().to_string()];
     for component in &args.command {
-        let parent = display_name.clone();
+        let parent = command_path.join(" ");
         let subcommand = command
             .find_subcommand(component)
             .filter(|candidate| !candidate.is_hide_set())
             .with_context(|| format!("unknown command path '{parent} {component}'"))?;
         command = subcommand.clone();
-        display_name.push('-');
-        display_name.push_str(component);
+        command_path.push(component.clone());
     }
+    command = command
+        .display_name(command_path.join("-"))
+        .bin_name(command_path.join(" "));
     let mut manual = Vec::new();
-    clap_mangen::Man::new(command).render(&mut manual)?;
+    clap_mangen::Man::new(command)
+        .source(format!("lionclaw {}", env!("CARGO_PKG_VERSION")))
+        .render(&mut manual)?;
     write_stdout(&manual)?;
     Ok(std::process::ExitCode::SUCCESS)
 }
@@ -3541,6 +3545,7 @@ async fn collect_doctor_report() -> DoctorReport {
             return report;
         }
     };
+    let runtimes_file = home.runtimes_file();
     let profiles = match RuntimeProfiles::load(&home) {
         Ok(profiles) => {
             report.push(
@@ -3550,8 +3555,15 @@ async fn collect_doctor_report() -> DoctorReport {
             );
             Some(profiles)
         }
-        Err(err) => {
-            report.push("runtime profiles", false, Some(format!("{err:#}")));
+        Err(_) => {
+            report.push(
+                "runtime profiles",
+                false,
+                Some(format!(
+                    "could not load configuration '{}'",
+                    runtimes_file.display()
+                )),
+            );
             None
         }
     };
@@ -3593,10 +3605,13 @@ async fn collect_doctor_report() -> DoctorReport {
                     }),
                 );
             }
-            Err(err) => report.push(
+            Err(_) => report.push(
                 format!("mission type '{name}'"),
                 false,
-                Some(err.to_string()),
+                Some(format!(
+                    "could not load installed bundle '{}'",
+                    home.mission_type_dir(name).display()
+                )),
             ),
         }
     }
