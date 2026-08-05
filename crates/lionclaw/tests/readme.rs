@@ -13,9 +13,10 @@ fn first_viewport_contains_only_the_five_discovery_elements() {
     assert!(viewport.contains("lionclaw-*-linux-x86_64.tar.gz"));
     assert!(viewport.contains("sha256sum -c"));
     assert!(viewport.contains("normal skill installation mechanism"));
-    assert!(viewport.contains("From the extracted `lionclaw/` directory"));
-    assert!(viewport.contains("\n./lionclaw doctor\n"));
-    assert!(viewport.contains("\n./lionclaw run codex\n"));
+    assert!(viewport.contains("From the Git repository you want the agent to work in"));
+    assert!(viewport.contains("executable\nadjacent to the installed skill"));
+    assert!(viewport.contains("\n/path/to/lionclaw/lionclaw doctor\n"));
+    assert!(viewport.contains("\n/path/to/lionclaw/lionclaw run codex\n"));
 
     assert!(!viewport.contains("mission --help"));
     assert!(!viewport.contains("mission type --help"));

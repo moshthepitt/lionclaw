@@ -3574,12 +3574,6 @@ async fn collect_doctor_report(args: &DoctorArgs, transports: &MissionTransports
         "lionclaw binary",
         Some(format!("lionclaw {}", env!("CARGO_PKG_VERSION"))),
     ));
-    let podman_ready = push_tool_check(
-        &mut report,
-        "podman",
-        "install Podman, then rerun `lionclaw doctor`",
-    )
-    .await;
     push_tool_check(
         &mut report,
         "git",
@@ -3621,15 +3615,18 @@ async fn collect_doctor_report(args: &DoctorArgs, transports: &MissionTransports
             None
         }
     };
+    let mut selected_engine = None;
     if let Some(profiles) = &profiles {
         match profiles.get(&args.runtime) {
             Ok(profile) => {
                 if validate_runtime_profile(&profile, transports).is_ok() {
+                    selected_engine = Some(profile.confinement.oci().engine.clone());
                     report.push(DoctorCheck::pass(
                         format!("runtime '{}'", args.runtime),
                         Some(format!("driver '{}'", profile.driver)),
                     ));
                     report.push(probe_runtime_auth(&profile, profiles, transports).await);
+                    report.push(probe_runtime_image(&profile).await);
                 } else {
                     report.push(DoctorCheck::fail(
                         format!("runtime '{}'", args.runtime),
@@ -3680,14 +3677,29 @@ async fn collect_doctor_report(args: &DoctorArgs, transports: &MissionTransports
         match load_mission_type(&home.mission_type_dir(name), &AuthorityCeiling::default()) {
             Ok(mt) => {
                 if let Some(profiles) = &profiles {
-                    if validate_explicit_role_runtimes(&mt, profiles).is_err() {
+                    let runtime_validation = if selected_engine.is_some() {
+                        validate_team_runtimes(
+                            &mt.default_team,
+                            &args.runtime,
+                            profiles,
+                            transports,
+                        )
+                        .map(|_| ())
+                    } else {
+                        validate_explicit_role_runtimes(&mt, profiles)
+                    };
+                    if runtime_validation.is_err() {
                         report.push(DoctorCheck::fail(
                             format!("mission type '{name}'"),
-                            "references an unavailable runtime profile",
+                            format!(
+                                "runtime assignments are unavailable or incompatible with selected runtime '{}'",
+                                args.runtime
+                            ),
                             false,
                             format!(
-                                "fix the installed bundle or '{}', then rerun `lionclaw doctor`",
-                                runtimes_file.display()
+                                "fix the installed bundle or '{}', then rerun `lionclaw doctor {}`",
+                                runtimes_file.display(),
+                                args.runtime
                             ),
                         ));
                         continue;
@@ -3710,26 +3722,17 @@ async fn collect_doctor_report(args: &DoctorArgs, transports: &MissionTransports
             )),
         }
     }
-    for image in images {
-        if !podman_ready {
-            report.push(DoctorCheck::fail(
-                format!("runtime image '{image}'"),
-                "cannot inspect the image because Podman is unavailable",
-                false,
-                "install Podman, then rerun `lionclaw doctor`",
-            ));
-        } else if command_ok("podman", &["image", "exists", &image]).await {
-            report.push(DoctorCheck::pass(
-                format!("runtime image '{image}'"),
-                Some("present".to_string()),
-            ));
-        } else {
-            report.push(DoctorCheck::fail(
-                format!("runtime image '{image}'"),
-                "not present in Podman",
-                false,
-                format!("provide image '{image}' to Podman, then rerun `lionclaw doctor`"),
-            ));
+    if let Some(engine) = selected_engine {
+        for image in images {
+            report.push(
+                probe_oci_image(
+                    format!("runtime image '{image}'"),
+                    &engine,
+                    &image,
+                    &args.runtime,
+                )
+                .await,
+            );
         }
     }
     report
@@ -3744,26 +3747,6 @@ async fn probe_runtime_auth(
     let Some(auth) = &profile.auth else {
         return DoctorCheck::pass(name, Some("not required".to_string()));
     };
-    let staging = match tempfile::tempdir() {
-        Ok(staging) => staging,
-        Err(_) => {
-            return DoctorCheck::fail(
-                name,
-                "could not create a private authentication probe directory",
-                true,
-                "fix the host temporary directory, then rerun `lionclaw doctor`",
-            )
-        }
-    };
-    let staging_root = staging.path().join("auth");
-    if std::fs::create_dir(&staging_root).is_err() {
-        return DoctorCheck::fail(
-            name,
-            "could not create a private authentication probe directory",
-            true,
-            "fix the host temporary directory, then rerun `lionclaw doctor`",
-        );
-    }
     let runner = match &transports.runtime {
         Some((drivers, providers)) => OciRoleRunner::with_registries(
             profiles.clone(),
@@ -3773,19 +3756,136 @@ async fn probe_runtime_auth(
         ),
         None => OciRoleRunner::new(profiles.clone(), AuthorityCeiling::default()),
     };
-    match runner
-        .materialize_runtime_auth(profile, &profile.model_network, staging_root)
-        .await
-    {
-        Ok(_) => DoctorCheck::pass(name, Some(format!("{} auth is ready", auth.kind()))),
-        Err(_) => DoctorCheck::fail(
+    match runner.runtime_auth_readiness(profile).await {
+        Ok(Some(lionclaw_runtime_api::RuntimeAuthReadiness::Ready)) => {
+            DoctorCheck::pass(name, Some(format!("{} auth is ready", auth.kind())))
+        }
+        Ok(Some(lionclaw_runtime_api::RuntimeAuthReadiness::NeedsOperatorAction(problem))) => {
+            runtime_auth_failure(name, profile, auth.kind(), problem, false)
+        }
+        Ok(Some(lionclaw_runtime_api::RuntimeAuthReadiness::Retryable(problem))) => {
+            runtime_auth_failure(name, profile, auth.kind(), problem, true)
+        }
+        Ok(None) | Err(_) => DoctorCheck::fail(
             name,
-            format!("{} auth is not ready", auth.kind()),
+            "authentication readiness configuration is invalid",
             false,
             format!(
-                "authenticate runtime '{}' with host CLI '{}', then rerun `lionclaw doctor {}`",
-                profile.name, profile.command, profile.name
+                "fix runtime '{}' in the runtime configuration, then rerun `lionclaw doctor {}`",
+                profile.name, profile.name
             ),
+        ),
+    }
+}
+
+fn runtime_auth_failure(
+    name: String,
+    profile: &MissionRuntimeProfile,
+    kind: &str,
+    problem: lionclaw_runtime_api::RuntimeAuthProblem,
+    retryable: bool,
+) -> DoctorCheck {
+    use lionclaw_runtime_api::RuntimeAuthProblem;
+
+    let detail = match problem {
+        RuntimeAuthProblem::ModelNetworkDenied => {
+            format!("{kind} auth cannot launch because model-provider network is denied")
+        }
+        RuntimeAuthProblem::CredentialsMissing => {
+            format!("{kind} host credentials are missing")
+        }
+        RuntimeAuthProblem::CredentialsInvalid => {
+            format!("{kind} host credentials are invalid")
+        }
+        RuntimeAuthProblem::CredentialsUnrefreshable => {
+            format!("{kind} host credentials cannot be refreshed")
+        }
+        RuntimeAuthProblem::CredentialStoreUnavailable => {
+            format!("{kind} host credential store is unavailable or unsafe")
+        }
+        RuntimeAuthProblem::InspectionFailed => {
+            format!("{kind} auth inspection was interrupted")
+        }
+    };
+    let repair = match problem {
+        RuntimeAuthProblem::ModelNetworkDenied => format!(
+            "grant model-provider destinations in runtime profile '{}', then rerun `lionclaw doctor {}`",
+            profile.name, profile.name
+        ),
+        RuntimeAuthProblem::CredentialsMissing
+        | RuntimeAuthProblem::CredentialsUnrefreshable => format!(
+            "authenticate with host CLI '{}', then rerun `lionclaw doctor {}`",
+            profile.command, profile.name
+        ),
+        RuntimeAuthProblem::CredentialsInvalid
+        | RuntimeAuthProblem::CredentialStoreUnavailable => format!(
+            "repair or replace host credentials for CLI '{}', then rerun `lionclaw doctor {}`",
+            profile.command, profile.name
+        ),
+        RuntimeAuthProblem::InspectionFailed => {
+            format!("rerun `lionclaw doctor {}`", profile.name)
+        }
+    };
+    DoctorCheck::fail(name, detail, retryable, repair)
+}
+
+async fn probe_runtime_image(profile: &MissionRuntimeProfile) -> DoctorCheck {
+    let confinement = profile.confinement.oci();
+    let name = format!("runtime '{}' image", profile.name);
+    let Some(image) = confinement.image.as_deref() else {
+        return DoctorCheck::fail(
+            name,
+            "runtime profile has no image",
+            false,
+            format!(
+                "configure an image in runtime profile '{}', then rerun `lionclaw doctor {}`",
+                profile.name, profile.name
+            ),
+        );
+    };
+    probe_oci_image(name, &confinement.engine, image, &profile.name).await
+}
+
+async fn probe_oci_image(name: String, engine: &str, image: &str, runtime: &str) -> DoctorCheck {
+    match lionclaw_confinement::inspect_oci_image(engine, image).await {
+        lionclaw_confinement::OciImageReadiness::Ready { identity } => DoctorCheck::pass(
+            name,
+            Some(format!(
+                "'{image}' is present in '{engine}' as {}",
+                short_hex(&identity)
+            )),
+        ),
+        lionclaw_confinement::OciImageReadiness::Missing => DoctorCheck::fail(
+            name,
+            format!("'{image}' is not available through '{engine}'"),
+            false,
+            format!(
+                "provide image '{image}' to '{engine}', then rerun `lionclaw doctor {runtime}`"
+            ),
+        ),
+        lionclaw_confinement::OciImageReadiness::EngineUnavailable => DoctorCheck::fail(
+            name,
+            format!("OCI engine '{engine}' could not inspect image '{image}'"),
+            false,
+            format!(
+                "repair or install OCI engine '{engine}', then rerun `lionclaw doctor {runtime}`"
+            ),
+        ),
+        lionclaw_confinement::OciImageReadiness::InspectionFailed => DoctorCheck::fail(
+            name,
+            format!(
+                "OCI image '{image}' is present through engine '{engine}', but its stable identity could not be inspected"
+            ),
+            false,
+            format!(
+                "inspect or rebuild image '{image}' with '{engine}', then rerun `lionclaw doctor {runtime}`"
+            ),
+        ),
+        lionclaw_confinement::OciImageReadiness::Retryable => DoctorCheck::fail(
+            name,
+            format!("OCI engine '{engine}' timed out while inspecting image '{image}'"),
+            true,
+            format!("rerun `lionclaw doctor {runtime}`"),
         ),
     }
 }
@@ -3842,17 +3942,6 @@ async fn cmd_doctor(
     } else {
         std::process::ExitCode::FAILURE
     })
-}
-
-async fn command_ok(program: &str, args: &[&str]) -> bool {
-    tokio::process::Command::new(program)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 async fn cmd_type(cmd: TypeCommand) -> Result<std::process::ExitCode> {

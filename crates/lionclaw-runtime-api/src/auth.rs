@@ -247,9 +247,38 @@ fn normalized_relative_path(path: PathBuf, label: &str) -> Result<PathBuf, Strin
     Ok(normalized)
 }
 
+/// Immutable launch facts available to an authentication readiness probe.
+pub struct RuntimeAuthReadinessRequest<'a> {
+    pub runtime_id: &'a str,
+    pub network: &'a NetworkGrant,
+    pub host_context: &'a RuntimeAuthContext,
+}
+
+/// A bounded, provider-neutral explanation for authentication readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeAuthProblem {
+    ModelNetworkDenied,
+    CredentialsMissing,
+    CredentialsInvalid,
+    CredentialsUnrefreshable,
+    CredentialStoreUnavailable,
+    InspectionFailed,
+}
+
+/// Read-only authentication readiness and the evidence category behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeAuthReadiness {
+    Ready,
+    NeedsOperatorAction(RuntimeAuthProblem),
+    Retryable(RuntimeAuthProblem),
+}
+
 #[async_trait]
 pub trait RuntimeAuthProvider: Send + Sync {
     fn kind(&self) -> &'static str;
+
+    /// Inspect launch prerequisites without refreshing, staging, or writing auth.
+    async fn readiness(&self, input: RuntimeAuthReadinessRequest<'_>) -> RuntimeAuthReadiness;
 
     async fn prepare(
         &self,

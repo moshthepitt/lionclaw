@@ -10,11 +10,12 @@ Download the latest `lionclaw-*-linux-x86_64.tar.gz` and `SHA256SUMS` from the
 archive with `sha256sum -c`, then install the extracted `lionclaw/` directory
 through your agent harness's normal skill installation mechanism.
 
-From the extracted `lionclaw/` directory, run its adjacent executable:
+From the Git repository you want the agent to work in, run the executable
+adjacent to the installed skill (replace `/path/to/lionclaw`):
 
 ```text
-./lionclaw doctor
-./lionclaw run codex
+/path/to/lionclaw/lionclaw doctor
+/path/to/lionclaw/lionclaw run codex
 ```
 
 ---

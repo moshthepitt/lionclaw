@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use lionclaw_durable_fs::RootedDirectory;
 use lionclaw_runtime_api::{
     RuntimeAuthIdentity, RuntimeAuthKind, RuntimeAuthMaterialization, RuntimeAuthPreparation,
-    RuntimeAuthProjection, RuntimeAuthProvider, RuntimeCredentialProjection,
+    RuntimeAuthProblem, RuntimeAuthProjection, RuntimeAuthProvider, RuntimeAuthReadiness,
+    RuntimeAuthReadinessRequest, RuntimeCredentialProjection,
     MAX_RUNTIME_CREDENTIAL_AGGREGATE_BYTES, MAX_RUNTIME_CREDENTIAL_BYTES,
 };
 use sha2::{Digest, Sha256};
@@ -38,12 +39,32 @@ impl NativeHomeAuthProvider {
             .await
             .context("failed to join native-home credential materialization task")?
     }
+
+    async fn check_readiness(&self) -> RuntimeAuthReadiness {
+        let config = self.config.clone();
+        match tokio::task::spawn_blocking(move || {
+            let declarations = canonical_declarations(&config);
+            load_native_home(&config, &declarations)
+        })
+        .await
+        {
+            Ok(Ok(_)) => RuntimeAuthReadiness::Ready,
+            Ok(Err(_)) => RuntimeAuthReadiness::NeedsOperatorAction(
+                RuntimeAuthProblem::CredentialStoreUnavailable,
+            ),
+            Err(_) => RuntimeAuthReadiness::Retryable(RuntimeAuthProblem::InspectionFailed),
+        }
+    }
 }
 
 #[async_trait]
 impl RuntimeAuthProvider for NativeHomeAuthProvider {
     fn kind(&self) -> &'static str {
         NATIVE_HOME_AUTH_KIND
+    }
+
+    async fn readiness(&self, _input: RuntimeAuthReadinessRequest<'_>) -> RuntimeAuthReadiness {
+        self.check_readiness().await
     }
 
     async fn prepare(
@@ -66,7 +87,8 @@ fn materialize_native_home(
 ) -> Result<RuntimeAuthMaterialization> {
     let staged_files = RootedDirectory::new(staging_root, staging_root)?;
     let declarations = canonical_declarations(config);
-    let result = (|| {
+    let result: Result<RuntimeAuthMaterialization> = (|| {
+        let loaded = load_native_home(config, &declarations)?;
         let mut digest = Sha256::new();
         digest_field(
             &mut digest,
@@ -74,24 +96,22 @@ fn materialize_native_home(
             b"lionclaw-native-home-auth-identity-v1",
         );
         digest_field(&mut digest, b"source", config.source.as_os_str().as_bytes());
-        let mut aggregate_bytes = 0_usize;
         let mut credentials = Vec::new();
 
-        for (index, (relative, required)) in declarations.iter().enumerate() {
+        for (index, credential) in loaded.iter().enumerate() {
+            let relative = &credential.relative;
             digest_field(
                 &mut digest,
                 b"declaration",
-                if *required { b"required" } else { b"optional" },
+                if credential.required {
+                    b"required"
+                } else {
+                    b"optional"
+                },
             );
             digest_field(&mut digest, b"path", relative.as_os_str().as_bytes());
             let staged_name = format!("native-home-credential-{index:04}");
-            let Some(source) = open_regular_file_beneath(
-                &config.source,
-                relative,
-                *required,
-                "native-home credential",
-            )?
-            else {
+            let Some(contents) = &credential.contents else {
                 digest_field(&mut digest, b"presence", b"absent");
                 staged_files.remove_file(
                     OsStr::new(&staged_name),
@@ -99,27 +119,12 @@ fn materialize_native_home(
                 )?;
                 continue;
             };
-            let contents = read_open_file_bounded(
-                source,
-                &config.source.join(relative),
-                MAX_RUNTIME_CREDENTIAL_BYTES,
-                "native-home credential",
-            )?;
-            aggregate_bytes = aggregate_bytes
-                .checked_add(contents.len())
-                .ok_or_else(|| anyhow!("native-home credential aggregate size overflow"))?;
-            if aggregate_bytes > MAX_RUNTIME_CREDENTIAL_AGGREGATE_BYTES {
-                bail!(
-                    "native-home credentials exceed the {} byte aggregate limit",
-                    MAX_RUNTIME_CREDENTIAL_AGGREGATE_BYTES
-                );
-            }
 
             digest_field(&mut digest, b"presence", b"present");
-            digest_field(&mut digest, b"content", &contents);
+            digest_field(&mut digest, b"content", contents);
             staged_files.write_private_atomic(
                 OsStr::new(&staged_name),
-                &contents,
+                contents,
                 MAX_RUNTIME_CREDENTIAL_BYTES,
                 "staged native-home credential",
             )?;
@@ -153,6 +158,55 @@ fn materialize_native_home(
             Err(error)
         }
     }
+}
+
+struct LoadedNativeHomeCredential {
+    relative: PathBuf,
+    required: bool,
+    contents: Option<Vec<u8>>,
+}
+
+fn load_native_home(
+    config: &NativeHomeAuthConfig,
+    declarations: &[(PathBuf, bool)],
+) -> Result<Vec<LoadedNativeHomeCredential>> {
+    let mut aggregate_bytes = 0_usize;
+    declarations
+        .iter()
+        .map(|(relative, required)| {
+            let contents = open_regular_file_beneath(
+                &config.source,
+                relative,
+                *required,
+                "native-home credential",
+            )?
+            .map(|source| {
+                read_open_file_bounded(
+                    source,
+                    &config.source.join(relative),
+                    MAX_RUNTIME_CREDENTIAL_BYTES,
+                    "native-home credential",
+                )
+            })
+            .transpose()?;
+            if let Some(contents) = &contents {
+                aggregate_bytes = aggregate_bytes
+                    .checked_add(contents.len())
+                    .ok_or_else(|| anyhow!("native-home credential aggregate size overflow"))?;
+                if aggregate_bytes > MAX_RUNTIME_CREDENTIAL_AGGREGATE_BYTES {
+                    bail!(
+                        "native-home credentials exceed the {} byte aggregate limit",
+                        MAX_RUNTIME_CREDENTIAL_AGGREGATE_BYTES
+                    );
+                }
+            }
+            Ok(LoadedNativeHomeCredential {
+                relative: relative.clone(),
+                required: *required,
+                contents,
+            })
+        })
+        .collect()
 }
 
 fn canonical_declarations(config: &NativeHomeAuthConfig) -> Vec<(PathBuf, bool)> {
@@ -195,7 +249,10 @@ fn digest_field(digest: &mut Sha256, label: &[u8], value: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lionclaw_runtime_api::{NetworkGrant, RuntimeAuthContext, RuntimeAuthPreparation};
+    use lionclaw_runtime_api::{
+        NetworkGrant, RuntimeAuthContext, RuntimeAuthPreparation, RuntimeAuthReadiness,
+        RuntimeAuthReadinessRequest,
+    };
     use std::path::PathBuf;
 
     fn config(source: PathBuf) -> NativeHomeAuthConfig {
@@ -226,6 +283,41 @@ mod tests {
             })
             .await
             .expect("materialize native-home auth")
+    }
+
+    #[tokio::test]
+    async fn readiness_validates_required_credentials_without_staging() {
+        let source = tempfile::tempdir().expect("source");
+        let provider = NativeHomeAuthProvider::new(config(source.path().to_path_buf()));
+
+        assert_eq!(
+            provider
+                .readiness(RuntimeAuthReadinessRequest {
+                    runtime_id: "native",
+                    network: &NetworkGrant::Deny,
+                    host_context: &RuntimeAuthContext::default(),
+                })
+                .await,
+            RuntimeAuthReadiness::NeedsOperatorAction(
+                RuntimeAuthProblem::CredentialStoreUnavailable
+            )
+        );
+        std::fs::write(source.path().join("config.toml"), b"ready").unwrap();
+        assert_eq!(
+            provider
+                .readiness(RuntimeAuthReadinessRequest {
+                    runtime_id: "native",
+                    network: &NetworkGrant::Deny,
+                    host_context: &RuntimeAuthContext::default(),
+                })
+                .await,
+            RuntimeAuthReadiness::Ready
+        );
+        assert_eq!(
+            std::fs::read_dir(source.path()).unwrap().count(),
+            1,
+            "readiness must not create staged files"
+        );
     }
 
     #[tokio::test]

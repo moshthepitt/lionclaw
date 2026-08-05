@@ -13,6 +13,62 @@ pub const PROCESS_CAPTURE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 pub const PROCESS_LINE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const PROCESS_TRUNCATION_MARKER: &[u8] = b"\n...[truncated]";
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BoundedProcessFailure {
+    #[error("bounded subprocess failed")]
+    Failed(#[source] anyhow::Error),
+    #[error("bounded subprocess timed out")]
+    TimedOut,
+}
+
+#[cfg(unix)]
+struct BoundedProcessGroup(Option<u32>);
+
+#[cfg(unix)]
+impl BoundedProcessGroup {
+    fn for_child(child: &Child) -> Self {
+        Self(child.id())
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        let Some(pid) = self
+            .0
+            .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
+        else {
+            self.0 = None;
+            return Ok(());
+        };
+        match rustix::process::kill_process_group(pid, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {
+                self.0 = None;
+                Ok(())
+            }
+            Err(error) => Err(error).context("killing bounded subprocess group"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BoundedProcessGroup {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
+
+#[cfg(not(unix))]
+struct BoundedProcessGroup;
+
+#[cfg(not(unix))]
+impl BoundedProcessGroup {
+    fn for_child(_child: &Child) -> Self {
+        Self
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 struct BoundedCapture {
     bytes: Vec<u8>,
     truncated: bool,
@@ -75,20 +131,7 @@ pub async fn run_process_streaming(
     invocation: &ProcessInvocation,
     stream: Option<&RuntimeProgramStdoutSender>,
 ) -> Result<ProcessOutput> {
-    let mut command = Command::new(&invocation.executable);
-    command.args(&invocation.args);
-
-    if let Some(working_dir) = invocation.working_dir.as_deref() {
-        command.current_dir(working_dir);
-    }
-    if !invocation.environment.is_empty() {
-        command.envs(
-            invocation
-                .environment
-                .iter()
-                .map(|(key, value)| (key, value)),
-        );
-    }
+    let mut command = command_for_invocation(invocation);
     command.kill_on_drop(true);
     command
         .stdin(Stdio::piped())
@@ -145,21 +188,146 @@ pub async fn run_process_streaming(
     })
 }
 
-pub async fn run_process_attached(invocation: &ProcessInvocation) -> Result<ProcessOutput> {
-    let mut command = Command::new(&invocation.executable);
-    command.args(&invocation.args);
+pub(crate) async fn run_process_bounded_with_timeout(
+    invocation: &ProcessInvocation,
+    timeout_duration: Duration,
+) -> std::result::Result<ProcessOutput, BoundedProcessFailure> {
+    let mut command = command_for_invocation(invocation);
+    isolate_bounded_process_group(&mut command);
+    command.kill_on_drop(true);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-    if let Some(working_dir) = invocation.working_dir.as_deref() {
-        command.current_dir(working_dir);
+    let mut child = spawn_with_retry(&mut command, &invocation.executable)
+        .await
+        .map_err(BoundedProcessFailure::Failed)?;
+    let mut process_group = BoundedProcessGroup::for_child(&child);
+    let stdin = child.stdin.take();
+    let stdout = child
+        .stdout
+        .take()
+        .context("bounded subprocess stdout was not captured")
+        .map_err(BoundedProcessFailure::Failed)?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("bounded subprocess stderr was not captured")
+        .map_err(BoundedProcessFailure::Failed)?;
+    let mut stdout_task = spawn_bounded_reader(stdout, "bounded subprocess stdout");
+    let mut stderr_task = spawn_bounded_reader(stderr, "bounded subprocess stderr");
+
+    let operation = async {
+        if let Some(stdin) = stdin {
+            write_input_and_close_stdin(stdin, invocation.input.as_bytes()).await?;
+        }
+        let status = child
+            .wait()
+            .await
+            .context("failed to wait for bounded subprocess")?;
+        terminate_bounded_process_group(&mut child, &mut process_group).await?;
+        let (stdout, stderr) = collect_bounded_readers(&mut stdout_task, &mut stderr_task).await?;
+        Ok::<_, anyhow::Error>(ProcessOutput {
+            stdout,
+            stderr,
+            exit_code: status.code(),
+            exit_signal: exit_signal(&status),
+        })
+    };
+
+    match tokio::time::timeout(timeout_duration, operation).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            finish_bounded_process_cleanup(
+                &mut child,
+                &mut process_group,
+                &mut stdout_task,
+                &mut stderr_task,
+            )
+            .await
+            .map_err(BoundedProcessFailure::Failed)?;
+            Err(BoundedProcessFailure::Failed(error))
+        }
+        Err(_) => {
+            finish_bounded_process_cleanup(
+                &mut child,
+                &mut process_group,
+                &mut stdout_task,
+                &mut stderr_task,
+            )
+            .await
+            .map_err(BoundedProcessFailure::Failed)?;
+            Err(BoundedProcessFailure::TimedOut)
+        }
     }
-    if !invocation.environment.is_empty() {
-        command.envs(
-            invocation
-                .environment
-                .iter()
-                .map(|(key, value)| (key, value)),
-        );
-    }
+}
+
+async fn collect_bounded_readers(
+    stdout_task: &mut tokio::task::JoinHandle<Result<Vec<u8>>>,
+    stderr_task: &mut tokio::task::JoinHandle<Result<Vec<u8>>>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (stdout, stderr) = tokio::join!(stdout_task, stderr_task);
+    Ok((
+        stdout.context("stdout reader task failed")??,
+        stderr.context("stderr reader task failed")??,
+    ))
+}
+
+async fn finish_bounded_process_cleanup(
+    child: &mut Child,
+    process_group: &mut BoundedProcessGroup,
+    stdout_task: &mut tokio::task::JoinHandle<Result<Vec<u8>>>,
+    stderr_task: &mut tokio::task::JoinHandle<Result<Vec<u8>>>,
+) -> Result<()> {
+    let termination = terminate_bounded_process_group(child, process_group).await;
+    stdout_task.abort();
+    stderr_task.abort();
+    let _ = tokio::join!(stdout_task, stderr_task);
+    termination?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn isolate_bounded_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_bounded_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+async fn terminate_bounded_process_group(
+    child: &mut Child,
+    process_group: &mut BoundedProcessGroup,
+) -> Result<()> {
+    let group_result = process_group.terminate();
+    let _ = child.start_kill();
+    let wait_result = child
+        .wait()
+        .await
+        .context("failed to reap bounded subprocess");
+    group_result?;
+    wait_result?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn terminate_bounded_process_group(
+    child: &mut Child,
+    process_group: &mut BoundedProcessGroup,
+) -> Result<()> {
+    process_group.terminate()?;
+    let _ = child.start_kill();
+    child
+        .wait()
+        .await
+        .context("failed to reap bounded subprocess")?;
+    Ok(())
+}
+
+pub async fn run_process_attached(invocation: &ProcessInvocation) -> Result<ProcessOutput> {
+    let mut command = command_for_invocation(invocation);
     command.kill_on_drop(true);
     command
         .stdin(Stdio::inherit())
@@ -320,20 +488,7 @@ fn set_signal_handler(signal: Signal, handler: SigHandler) -> Result<SigHandler>
 }
 
 pub async fn spawn_process_session(invocation: &ProcessInvocation) -> Result<ProcessSession> {
-    let mut command = Command::new(&invocation.executable);
-    command.args(&invocation.args);
-
-    if let Some(working_dir) = invocation.working_dir.as_deref() {
-        command.current_dir(working_dir);
-    }
-    if !invocation.environment.is_empty() {
-        command.envs(
-            invocation
-                .environment
-                .iter()
-                .map(|(key, value)| (key, value)),
-        );
-    }
+    let mut command = command_for_invocation(invocation);
     command.kill_on_drop(true);
     command
         .stdin(Stdio::piped())
@@ -372,6 +527,21 @@ pub async fn spawn_process_session(invocation: &ProcessInvocation) -> Result<Pro
         stderr_task: spawn_stderr_reader(stderr),
         captured_stdout: BoundedCapture::new(),
     })
+}
+
+fn command_for_invocation(invocation: &ProcessInvocation) -> Command {
+    let mut command = Command::new(&invocation.executable);
+    command.args(&invocation.args);
+    if let Some(working_dir) = invocation.working_dir.as_deref() {
+        command.current_dir(working_dir);
+    }
+    command.envs(
+        invocation
+            .environment
+            .iter()
+            .map(|(key, value)| (key, value)),
+    );
+    command
 }
 
 async fn read_next_process_line<R>(
@@ -538,12 +708,65 @@ async fn spawn_with_retry(
 #[cfg(test)]
 mod tests {
     use super::{
-        read_next_process_line, run_process_attached, run_process_streaming, spawn_process_session,
-        BoundedCapture, ProcessInvocation,
+        read_next_process_line, run_process_attached, run_process_bounded_with_timeout,
+        run_process_streaming, spawn_process_session, BoundedCapture, ProcessInvocation,
     };
     use lionclaw_runtime_api::RUNTIME_PROGRAM_STDOUT_LINE_LIMIT;
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
     use tokio::sync::mpsc;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelling_a_bounded_process_reaps_its_descendants() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let invocation = ProcessInvocation {
+            executable: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "sleep 30 & child=$!; printf '%s' \"$child\" > \"$PID_FILE\"; wait \"$child\""
+                    .to_string(),
+            ],
+            working_dir: None,
+            environment: vec![(
+                "PID_FILE".to_string(),
+                descendant_pid.to_string_lossy().into_owned(),
+            )],
+            input: String::new(),
+        };
+        let task = tokio::spawn(async move {
+            run_process_bounded_with_timeout(&invocation, Duration::from_secs(60)).await
+        });
+
+        for _ in 0..100 {
+            if descendant_pid.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid = std::fs::read_to_string(&descendant_pid)
+            .expect("descendant pid")
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+        task.abort();
+        assert!(task
+            .await
+            .expect_err("bounded task must be cancelled")
+            .is_cancelled());
+
+        let proc_entry = std::path::PathBuf::from(format!("/proc/{pid}"));
+        for _ in 0..50 {
+            if !proc_entry.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+        panic!("cancelling bounded process left descendant {pid} alive");
+    }
 
     #[test]
     fn process_invocation_debug_redacts_environment_and_input_values() {

@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
 use clap::CommandFactory;
@@ -131,7 +132,10 @@ fn doctor_reports_selected_runtime_auth_readiness_without_exposing_it() {
         .unwrap();
     assert_eq!(auth["status"], "fail");
     assert_eq!(auth["retryable"], false);
-    assert!(auth["repair"].as_str().unwrap().contains("authenticate"));
+    assert!(auth["repair"]
+        .as_str()
+        .unwrap()
+        .contains("repair or replace"));
 
     std::fs::create_dir(user_home.path().join(".test-auth")).unwrap();
     std::fs::write(
@@ -150,6 +154,354 @@ fn doctor_reports_selected_runtime_auth_readiness_without_exposing_it() {
         .find(|check| check["name"] == "runtime 'test' authentication")
         .unwrap();
     assert_eq!(auth["status"], "pass");
+}
+
+#[test]
+fn doctor_does_not_refresh_or_rewrite_codex_auth() {
+    let lionclaw_home = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        lionclaw_home.path().join("runtimes.toml"),
+        "[runtimes.codex]\n\
+         driver = \"codex\"\n\
+         command = \"codex\"\n\
+         auth = \"codex\"\n\
+         model-network = { mode = \"allow\", destinations = [{ host = \"api.openai.com\", ports = [443] }] }\n",
+    )
+    .unwrap();
+    let auth_path = codex_home.path().join("auth.json");
+    let auth = br#"{
+      "last_refresh": "2000-01-01T00:00:00Z",
+      "tokens": {
+        "access_token": "expired-token",
+        "refresh_token": "TOP_SECRET_REFRESH_SENTINEL"
+      }
+    }"#;
+    std::fs::write(&auth_path, auth).unwrap();
+
+    let output = lionclaw()
+        .args(["doctor", "codex", "--json"])
+        .env("CODEX_HOME", codex_home.path())
+        .env("LIONCLAW_HOME", lionclaw_home.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let readiness = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "runtime 'codex' authentication")
+        .unwrap();
+
+    assert_eq!(readiness["status"], "pass");
+    assert_eq!(std::fs::read(&auth_path).unwrap(), auth);
+    assert!(!String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("TOP_SECRET_REFRESH_SENTINEL"));
+}
+
+#[test]
+fn doctor_rejects_codex_auth_when_the_profile_denies_model_network() {
+    let lionclaw_home = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        lionclaw_home.path().join("runtimes.toml"),
+        "[runtimes.codex]\n\
+         driver = \"codex\"\n\
+         command = \"codex\"\n\
+         auth = \"codex\"\n\
+         model-network = { mode = \"deny\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        codex_home.path().join("auth.json"),
+        r#"{"OPENAI_API_KEY":"TOP_SECRET_API_KEY"}"#,
+    )
+    .unwrap();
+
+    let output = lionclaw()
+        .args(["doctor", "codex", "--json"])
+        .env("CODEX_HOME", codex_home.path())
+        .env("LIONCLAW_HOME", lionclaw_home.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let auth = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "runtime 'codex' authentication")
+        .unwrap();
+
+    assert_eq!(auth["status"], "fail");
+    assert_eq!(auth["retryable"], false);
+    assert!(auth["detail"].as_str().unwrap().contains("network"));
+    assert!(auth["repair"].as_str().unwrap().contains("runtime profile"));
+    assert!(!String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("TOP_SECRET_API_KEY"));
+}
+
+#[test]
+fn doctor_reports_malformed_codex_auth_as_invalid_credentials() {
+    let lionclaw_home = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        lionclaw_home.path().join("runtimes.toml"),
+        "[runtimes.codex]\n\
+         driver = \"codex\"\n\
+         command = \"codex\"\n\
+         auth = \"codex\"\n\
+         model-network = { mode = \"allow\", destinations = [{ host = \"api.openai.com\", ports = [443] }] }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        codex_home.path().join("auth.json"),
+        "{ malformed TOP_SECRET_AUTH_SENTINEL",
+    )
+    .unwrap();
+
+    let output = lionclaw()
+        .args(["doctor", "codex", "--json"])
+        .env("CODEX_HOME", codex_home.path())
+        .env("LIONCLAW_HOME", lionclaw_home.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let auth = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "runtime 'codex' authentication")
+        .unwrap();
+
+    assert_eq!(auth["status"], "fail");
+    assert_eq!(auth["retryable"], false);
+    assert!(auth["detail"].as_str().unwrap().contains("invalid"));
+    assert!(auth["repair"].as_str().unwrap().contains("codex"));
+    assert!(!String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("TOP_SECRET_AUTH_SENTINEL"));
+}
+
+#[test]
+fn doctor_checks_the_selected_runtime_profiles_configured_engine_and_image() {
+    let lionclaw_home = tempfile::tempdir().unwrap();
+    let engine_dir = tempfile::tempdir().unwrap();
+    let engine = engine_dir.path().join("configured-engine");
+    std::fs::write(
+        &engine,
+        "#!/bin/sh\n[ \"$1 $2 $3\" = \"image exists selected-runtime:missing\" ] && exit 1\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        lionclaw_home.path().join("runtimes.toml"),
+        format!(
+            "[runtimes.test]\n\
+             driver = \"acp\"\n\
+             command = \"test\"\n\
+             confinement = {{ backend = \"podman\", engine = {:?}, image = \"selected-runtime:missing\" }}\n",
+            engine.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let output = lionclaw()
+        .args(["doctor", "test", "--json"])
+        .env("LIONCLAW_HOME", lionclaw_home.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let image = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "runtime 'test' image")
+        .expect("selected runtime image check");
+
+    assert_eq!(image["status"], "fail");
+    assert_eq!(image["retryable"], false);
+    assert!(image["repair"]
+        .as_str()
+        .unwrap()
+        .contains("selected-runtime:missing"));
+}
+
+#[test]
+fn doctor_distinguishes_an_unavailable_engine_from_a_missing_image() {
+    let lionclaw_home = tempfile::tempdir().unwrap();
+    let missing_engine = lionclaw_home.path().join("missing-engine");
+    std::fs::write(
+        lionclaw_home.path().join("runtimes.toml"),
+        format!(
+            "[runtimes.test]\n\
+             driver = \"acp\"\n\
+             command = \"test\"\n\
+             confinement = {{ backend = \"podman\", engine = {:?}, image = \"selected-runtime:present\" }}\n",
+            missing_engine.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let output = lionclaw()
+        .args(["doctor", "test", "--json"])
+        .env("LIONCLAW_HOME", lionclaw_home.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let image = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "runtime 'test' image")
+        .expect("selected runtime image check");
+
+    assert_eq!(image["status"], "fail");
+    assert_eq!(image["retryable"], false);
+    assert!(image["detail"].as_str().unwrap().contains("engine"));
+    assert!(image["repair"].as_str().unwrap().contains("engine"));
+    assert!(!image["repair"].as_str().unwrap().contains("provide image"));
+}
+
+#[test]
+fn doctor_reports_a_present_image_that_cannot_be_inspected() {
+    let lionclaw_home = tempfile::tempdir().unwrap();
+    let engine = lionclaw_home.path().join("broken-engine");
+    std::fs::write(
+        &engine,
+        "#!/bin/sh\n\
+         if [ \"$1 $2\" = \"image exists\" ]; then exit 0; fi\n\
+         if [ \"$1 $2\" = \"image inspect\" ]; then exit 42; fi\n\
+         exit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        lionclaw_home.path().join("runtimes.toml"),
+        format!(
+            "[runtimes.test]\n\
+             driver = \"acp\"\n\
+             command = \"test\"\n\
+             confinement = {{ backend = \"podman\", engine = {:?}, image = \"broken:image\" }}\n",
+            engine.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let output = lionclaw()
+        .args(["doctor", "test", "--json"])
+        .env("LIONCLAW_HOME", lionclaw_home.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let image = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "runtime 'test' image")
+        .expect("selected runtime image check");
+
+    assert_eq!(image["status"], "fail");
+    assert_eq!(image["retryable"], false);
+    assert!(image["detail"].as_str().unwrap().contains("identity"));
+    assert!(image["repair"].as_str().unwrap().contains("rebuild"));
+    assert!(!image["repair"].as_str().unwrap().contains("install"));
+}
+
+#[test]
+fn doctor_rejects_a_selected_runtime_profile_without_an_image() {
+    let lionclaw_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        lionclaw_home.path().join("runtimes.toml"),
+        "[runtimes.test]\n\
+         driver = \"acp\"\n\
+         command = \"test\"\n",
+    )
+    .unwrap();
+
+    let output = lionclaw()
+        .args(["doctor", "test", "--json"])
+        .env("LIONCLAW_HOME", lionclaw_home.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let image = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "runtime 'test' image")
+        .expect("selected runtime image check");
+
+    assert_eq!(image["status"], "fail");
+    assert_eq!(image["retryable"], false);
+    assert!(image["detail"].as_str().unwrap().contains("no image"));
+    assert!(image["repair"]
+        .as_str()
+        .unwrap()
+        .contains("runtime profile"));
+}
+
+#[test]
+fn doctor_rejects_a_mission_team_that_uses_multiple_oci_engines() {
+    let lionclaw_home = tempfile::tempdir().unwrap();
+    let install = lionclaw()
+        .arg("install")
+        .env("LIONCLAW_HOME", lionclaw_home.path())
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+
+    let implementer = lionclaw_home
+        .path()
+        .join("mission-types/software-dev/roles/implementer.md");
+    let role = std::fs::read_to_string(&implementer).unwrap();
+    std::fs::write(
+        &implementer,
+        role.replacen("runtime: codex", "runtime: alternate", 1),
+    )
+    .unwrap();
+    std::fs::write(
+        lionclaw_home.path().join("runtimes.toml"),
+        "[runtimes.test]\n\
+         driver = \"acp\"\n\
+         command = \"test\"\n\
+         confinement = { backend = \"podman\", engine = \"/bin/true\", image = \"runtime:test\" }\n\
+         \n\
+         [runtimes.codex]\n\
+         driver = \"acp\"\n\
+         command = \"test\"\n\
+         confinement = { backend = \"podman\", engine = \"/bin/true\", image = \"runtime:test\" }\n\
+         \n\
+         [runtimes.alternate]\n\
+         driver = \"acp\"\n\
+         command = \"test\"\n\
+         confinement = { backend = \"podman\", engine = \"/bin/false\", image = \"runtime:test\" }\n",
+    )
+    .unwrap();
+
+    let output = lionclaw()
+        .args(["doctor", "test", "--json"])
+        .env("LIONCLAW_HOME", lionclaw_home.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mission_type = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "mission type 'software-dev'")
+        .expect("software-dev mission type check");
+
+    assert_eq!(mission_type["status"], "fail");
+    assert!(mission_type["detail"]
+        .as_str()
+        .unwrap()
+        .contains("incompatible"));
+    assert!(mission_type["repair"]
+        .as_str()
+        .unwrap()
+        .contains("runtimes.toml"));
 }
 
 #[test]

@@ -140,6 +140,13 @@ impl RuntimeAuthProvider for FakeAuth {
         "fake-auth"
     }
 
+    async fn readiness(
+        &self,
+        _input: lionclaw_runtime_api::RuntimeAuthReadinessRequest<'_>,
+    ) -> lionclaw_runtime_api::RuntimeAuthReadiness {
+        lionclaw_runtime_api::RuntimeAuthReadiness::Ready
+    }
+
     async fn prepare(
         &self,
         input: RuntimeAuthPreparation<'_>,

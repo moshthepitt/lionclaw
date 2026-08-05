@@ -16,8 +16,9 @@ DIST=$4
 ASSET="lionclaw-v${VERSION}-${TARGET}.tar.gz"
 STAGE=$(mktemp -d)
 TEST_HOME=$(mktemp -d)
+TEST_REPO=$(mktemp -d)
 VERIFY=$(mktemp -d)
-trap 'rm -rf "$STAGE" "$TEST_HOME" "$VERIFY"' EXIT
+trap 'rm -rf "$STAGE" "$TEST_HOME" "$TEST_REPO" "$VERIFY"' EXIT
 
 ROOT="$STAGE/lionclaw"
 mkdir -p "$ROOT/share/man/man1" "$DIST"
@@ -78,6 +79,23 @@ fi
 for mission_type in design optimization research review software-dev; do
   (cd "$TEST_HOME" && LIONCLAW_HOME="$TEST_HOME" "$PACKAGE_ROOT/lionclaw" mission type check "$mission_type")
 done
+
+git -C "$TEST_REPO" init -q
+cat > "$TEST_HOME/runtimes.toml" <<'EOF'
+[runtimes.codex]
+driver = "acp"
+command = "test"
+skills-dir = ".agents/skills"
+EOF
+if RUN_OUTPUT=$(cd "$TEST_REPO" && LIONCLAW_HOME="$TEST_HOME" "$PACKAGE_ROOT/lionclaw" run codex 2>&1); then
+  echo "run unexpectedly passed without a configured OCI image" >&2
+  exit 1
+fi
+if ! grep -F "everyday runtime profile has no confinement image" >/dev/null <<<"$RUN_OUTPUT"; then
+  echo "packaged everyday path did not reach runtime preflight from a target repository:" >&2
+  printf '%s\n' "$RUN_OUTPUT" >&2
+  exit 1
+fi
 
 (
   cd "$DIST"

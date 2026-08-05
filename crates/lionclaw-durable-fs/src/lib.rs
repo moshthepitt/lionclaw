@@ -193,6 +193,29 @@ impl RootedDirectory {
         }
     }
 
+    /// Read one regular file and its metadata without changing the file.
+    pub fn read_bounded_with_metadata(
+        &self,
+        file_name: &OsStr,
+        limit: usize,
+        label: &str,
+    ) -> Result<Option<(Vec<u8>, Metadata)>> {
+        ensure_file_name(file_name, label)?;
+        let Some(parent) = self.open_existing()? else {
+            return Ok(None);
+        };
+        let Some(file) = open_regular_file(&parent, &self.path, file_name, label)? else {
+            return Ok(None);
+        };
+        let (contents, metadata) =
+            read_open_file_bounded_with_metadata(file, &self.path, file_name, limit, label)?;
+        match contents {
+            BoundedRead::Contents(contents) => Ok(Some((contents, metadata))),
+            BoundedRead::TooLarge => Err(file_too_large(&self.path, file_name, label, limit)),
+            BoundedRead::Missing => unreachable!("an open file cannot become missing"),
+        }
+    }
+
     /// Read one owner-only regular file and return metadata from the same
     /// descriptor used for the bounded read.
     pub fn read_private_bounded_with_metadata(
@@ -1202,6 +1225,18 @@ mod tests {
         let secret = directory.path().join("secret");
         std::fs::write(&secret, b"private").unwrap();
         std::fs::set_permissions(&secret, Permissions::from_mode(0o644)).unwrap();
+
+        let (contents, metadata) = directory
+            .read_bounded_with_metadata(OsStr::new("secret"), 32, "secret")
+            .unwrap()
+            .unwrap();
+        assert_eq!(contents, b"private");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "ordinary bounded reads must not harden the source file"
+        );
 
         let (contents, metadata) = directory
             .read_private_bounded_with_metadata(OsStr::new("secret"), 32, "secret")

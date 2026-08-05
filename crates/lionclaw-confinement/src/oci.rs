@@ -11,10 +11,7 @@ use async_trait::async_trait;
 use rustix::process::{getgid, getuid};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
-use tokio::{
-    runtime::Handle,
-    time::{sleep, timeout},
-};
+use tokio::{runtime::Handle, time::sleep};
 use tracing::warn;
 
 use super::{
@@ -25,11 +22,10 @@ use super::{
     mount_validation::{podman_bind_mount_argument, PodmanBindMountArgumentForm},
     plan::{
         map_host_path_into_runtime_mount, ConfinementBackend, MountAccess, MountSpec, NetworkGrant,
-        RuntimeAuthKind,
     },
     process::{
-        run_process_attached, run_process_streaming, spawn_process_session, ProcessInvocation,
-        ProcessSession,
+        run_process_attached, run_process_bounded_with_timeout, run_process_streaming,
+        spawn_process_session, BoundedProcessFailure, ProcessInvocation, ProcessSession,
     },
     runtime_auth::{prepare_runtime_auth, PreparedCredentialMount, PreparedRuntimeAuth},
     OciConfinementConfig, RuntimeTmpfsEntry,
@@ -38,6 +34,16 @@ use crate::RuntimeSecretsMount;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
+
+/// Bounded readiness of one image through the configured OCI engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OciImageReadiness {
+    Ready { identity: String },
+    Missing,
+    EngineUnavailable,
+    InspectionFailed,
+    Retryable,
+}
 
 pub struct OciExecutionSession {
     process: ProcessSession,
@@ -68,6 +74,23 @@ impl OciExecutionSession {
 }
 
 const OCI_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, thiserror::Error)]
+enum OciPreflightFailure {
+    #[error("failed to {action} using OCI engine '{engine}'")]
+    EngineUnavailable {
+        action: String,
+        engine: String,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("timed out after {seconds}s while attempting to {action} using OCI engine '{engine}'")]
+    TimedOut {
+        seconds: f32,
+        action: String,
+        engine: String,
+    },
+}
 
 // LionClaw bind-mounts local workspace and runtime state into confined OCI
 // containers. On SELinux hosts those mounts are unreadable by default unless
@@ -218,28 +241,6 @@ fn finish_oci_execution(
     result
 }
 
-pub async fn validate_oci_launch_prerequisites(
-    runtime_id: &str,
-    confinement: &OciConfinementConfig,
-    _required_auth: Option<RuntimeAuthKind>,
-) -> Result<()> {
-    let image = confinement.image.as_deref().ok_or_else(|| {
-        anyhow!("runtime '{runtime_id}' requires a Podman runtime image in its confinement config")
-    })?;
-
-    // The runtime image is operator-managed, so launch preflight requires it to
-    // exist locally instead of pulling an arbitrary mutable reference behind the
-    // user's back.
-    ensure_oci_image_exists(
-        &confinement.engine,
-        image,
-        format!("configured runtime image '{image}' for runtime '{runtime_id}'"),
-    )
-    .await?;
-
-    Ok(())
-}
-
 pub async fn validate_oci_private_network_prerequisites(
     runtime_id: &str,
     confinement: &OciConfinementConfig,
@@ -279,7 +280,45 @@ pub async fn validate_oci_private_network_prerequisites(
     )
 }
 
+pub async fn inspect_oci_image(engine: &str, image: &str) -> OciImageReadiness {
+    match resolve_oci_image_compatibility_identity_unchecked(engine, image).await {
+        Ok(identity) => OciImageReadiness::Ready { identity },
+        Err(inspect_error) if preflight_timed_out(&inspect_error) => OciImageReadiness::Retryable,
+        Err(_) => match run_oci_image_probe(engine, image).await {
+            Ok(OciImageProbeResult::Missing) => OciImageReadiness::Missing,
+            Ok(OciImageProbeResult::Present | OciImageProbeResult::Indeterminate) => {
+                OciImageReadiness::InspectionFailed
+            }
+            Err(OciPreflightFailure::TimedOut { .. }) => OciImageReadiness::Retryable,
+            Err(OciPreflightFailure::EngineUnavailable { .. }) => {
+                OciImageReadiness::EngineUnavailable
+            }
+        },
+    }
+}
+
 pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str) -> Result<String> {
+    match inspect_oci_image(engine, image).await {
+        OciImageReadiness::Ready { identity } => Ok(identity),
+        OciImageReadiness::Missing => {
+            bail!("OCI image '{image}' is not available locally through engine '{engine}'")
+        }
+        OciImageReadiness::EngineUnavailable => {
+            bail!("OCI engine '{engine}' could not inspect image '{image}'")
+        }
+        OciImageReadiness::InspectionFailed => {
+            bail!("OCI image '{image}' is present through engine '{engine}', but its stable identity could not be inspected")
+        }
+        OciImageReadiness::Retryable => {
+            bail!("OCI engine '{engine}' timed out while inspecting image '{image}'")
+        }
+    }
+}
+
+async fn resolve_oci_image_compatibility_identity_unchecked(
+    engine: &str,
+    image: &str,
+) -> Result<String> {
     let output = run_oci_preflight_command(
         &ProcessInvocation {
             executable: engine.to_string(),
@@ -513,22 +552,24 @@ fn append_bind_mount_identity_args(args: &mut Vec<String>, root_in_userns: bool)
     }
 }
 
-async fn ensure_oci_image_exists(engine: &str, image: &str, description: String) -> Result<()> {
-    match run_oci_image_probe(engine, image).await? {
-        OciImageProbeResult::Present => Ok(()),
-        OciImageProbeResult::Missing => bail!(
-            "{description} is not available locally; build or pull it before running LionClaw"
-        ),
-    }
+fn preflight_timed_out(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<OciPreflightFailure>(),
+        Some(OciPreflightFailure::TimedOut { .. })
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OciImageProbeResult {
     Present,
     Missing,
+    Indeterminate,
 }
 
-async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeResult> {
+async fn run_oci_image_probe(
+    engine: &str,
+    image: &str,
+) -> std::result::Result<OciImageProbeResult, OciPreflightFailure> {
     let output = run_oci_preflight_command(
         &ProcessInvocation {
             executable: engine.to_string(),
@@ -545,17 +586,7 @@ async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeR
     match output.exit_code {
         Some(0) => Ok(OciImageProbeResult::Present),
         Some(1) if output.stderr.is_empty() => Ok(OciImageProbeResult::Missing),
-        _ => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stderr.is_empty() {
-                bail!(
-                    "failed to inspect OCI image '{}'; OCI engine exited with {}",
-                    image,
-                    output.status_description()
-                );
-            }
-            bail!("failed to inspect OCI image '{image}': {stderr}");
-        }
+        _ => Ok(OciImageProbeResult::Indeterminate),
     }
 }
 
@@ -563,20 +594,19 @@ async fn run_oci_preflight_command(
     invocation: &ProcessInvocation,
     action: &str,
     timeout_duration: Duration,
-) -> Result<super::process::ProcessOutput> {
-    match timeout(timeout_duration, run_process_streaming(invocation, None)).await {
-        Ok(result) => result.with_context(|| {
-            format!(
-                "failed to {} using OCI engine '{}'",
-                action, invocation.executable
-            )
+) -> std::result::Result<super::process::ProcessOutput, OciPreflightFailure> {
+    match run_process_bounded_with_timeout(invocation, timeout_duration).await {
+        Ok(output) => Ok(output),
+        Err(BoundedProcessFailure::Failed(source)) => Err(OciPreflightFailure::EngineUnavailable {
+            action: action.to_string(),
+            engine: invocation.executable.clone(),
+            source,
         }),
-        Err(_) => bail!(
-            "timed out after {}s while attempting to {} using OCI engine '{}'",
-            timeout_duration.as_secs_f32(),
-            action,
-            invocation.executable
-        ),
+        Err(BoundedProcessFailure::TimedOut) => Err(OciPreflightFailure::TimedOut {
+            seconds: timeout_duration.as_secs_f32(),
+            action: action.to_string(),
+            engine: invocation.executable.clone(),
+        }),
     }
 }
 
@@ -1460,12 +1490,12 @@ fn network_proxy_environment(network: &PreparedOciNetwork) -> Vec<(String, Strin
 mod tests {
     #[cfg(unix)]
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
-    use std::{collections::BTreeSet, fs};
+    use std::{collections::BTreeSet, fs, path::Path};
 
     use super::{
-        build_oci_attached_process_invocation, build_oci_process_invocation,
+        build_oci_attached_process_invocation, build_oci_process_invocation, inspect_oci_image,
         prepare_oci_process_launch, prepare_oci_process_launch_with_runtime_auth,
-        private_network_probe_reached_process_exec, OciExecutionBackend,
+        private_network_probe_reached_process_exec, OciExecutionBackend, OciImageReadiness,
     };
     use crate::backend::{ExecutionBackend, RUNTIME_SECRETS_NAME_PREFIX};
     use crate::runtime_auth::PreparedRuntimeAuth;
@@ -1485,6 +1515,145 @@ mod tests {
     use rustix::process::{getgid, getuid};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("write executable");
+        let mut permissions = fs::metadata(path)
+            .expect("executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod executable");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oci_image_readiness_uses_one_bounded_engine_contract() {
+        let temp_dir = tempdir().expect("tempdir");
+        let engine = temp_dir.path().join("oci-engine");
+        write_executable(
+            &engine,
+            r#"#!/usr/bin/env bash
+set -eu
+case "$1 $2" in
+  "image exists")
+    [ "$3" = "available:image" ]
+    ;;
+  "image inspect")
+    [ "$5" = "available:image" ]
+    printf '%s\n' 'sha256:0123456789abcdef'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"#,
+        );
+
+        assert_eq!(
+            inspect_oci_image(engine.to_str().expect("engine path"), "available:image").await,
+            OciImageReadiness::Ready {
+                identity: "sha256:0123456789abcdef".to_string(),
+            }
+        );
+        assert_eq!(
+            inspect_oci_image(engine.to_str().expect("engine path"), "missing:image").await,
+            OciImageReadiness::Missing
+        );
+        assert_eq!(
+            inspect_oci_image(
+                temp_dir
+                    .path()
+                    .join("absent-engine")
+                    .to_str()
+                    .expect("engine path"),
+                "available:image",
+            )
+            .await,
+            OciImageReadiness::EngineUnavailable
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn oci_image_readiness_reaps_descendants_after_an_inspection_failure() {
+        let temp_dir = tempdir().expect("tempdir");
+        let engine = temp_dir.path().join("oci-engine");
+        let descendant_pid = temp_dir.path().join("descendant.pid");
+        write_executable(
+            &engine,
+            &format!(
+                r#"#!/usr/bin/env bash
+set -eu
+case "$1 $2" in
+  "image inspect")
+    sleep 30 &
+    child=$!
+    printf '%s' "$child" > '{}'
+    exit 42
+    ;;
+  "image exists")
+    exit 0
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"#,
+                descendant_pid.display()
+            ),
+        );
+
+        assert_eq!(
+            inspect_oci_image(engine.to_str().expect("engine path"), "broken:image").await,
+            OciImageReadiness::InspectionFailed
+        );
+
+        assert_descendant_stopped(&descendant_pid).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn oci_image_readiness_bounds_a_stalled_engine_and_its_descendants() {
+        let temp_dir = tempdir().expect("tempdir");
+        let engine = temp_dir.path().join("oci-engine");
+        let descendant_pid = temp_dir.path().join("descendant.pid");
+        write_executable(
+            &engine,
+            &format!(
+                r#"#!/usr/bin/env bash
+sleep 30 &
+child=$!
+printf '%s' "$child" > '{}'
+wait "$child"
+"#,
+                descendant_pid.display()
+            ),
+        );
+
+        assert_eq!(
+            inspect_oci_image(engine.to_str().expect("engine path"), "available:image").await,
+            OciImageReadiness::Retryable
+        );
+
+        assert_descendant_stopped(&descendant_pid).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_descendant_stopped(pid_file: &Path) {
+        let pid = fs::read_to_string(pid_file)
+            .expect("descendant pid")
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+        let proc_entry = std::path::PathBuf::from(format!("/proc/{pid}"));
+        for _ in 0..50 {
+            if !proc_entry.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("completed OCI preflight left descendant process {pid} alive");
+    }
 
     #[test]
     fn oci_backend_masks_lionclaw_metadata_under_workspace_mount() {
@@ -2348,12 +2517,7 @@ esac
 "#,
             log_path = log_path.display()
         );
-        fs::write(&engine_path, script).expect("write engine");
-        let mut permissions = fs::metadata(&engine_path)
-            .expect("engine metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&engine_path, permissions).expect("chmod engine");
+        write_executable(&engine_path, &script);
 
         let request = ExecutionRequest {
             plan: EffectiveExecutionPlan {
@@ -2443,12 +2607,7 @@ esac
 "#,
             log_path = log_path.display()
         );
-        fs::write(&engine_path, script).expect("write engine");
-        let mut permissions = fs::metadata(&engine_path)
-            .expect("engine metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&engine_path, permissions).expect("chmod engine");
+        write_executable(&engine_path, &script);
 
         let request = ExecutionRequest {
             plan: EffectiveExecutionPlan {

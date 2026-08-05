@@ -47,7 +47,8 @@ pub use adapter::{
 };
 pub use auth::{
     RuntimeAuthContext, RuntimeAuthIdentity, RuntimeAuthKind, RuntimeAuthMaterialization,
-    RuntimeAuthPreparation, RuntimeAuthProjection, RuntimeAuthProvider, RuntimeAuthRegistry,
+    RuntimeAuthPreparation, RuntimeAuthProblem, RuntimeAuthProjection, RuntimeAuthProvider,
+    RuntimeAuthReadiness, RuntimeAuthReadinessRequest, RuntimeAuthRegistry,
     RuntimeCredentialProjection, MAX_RUNTIME_CREDENTIAL_AGGREGATE_BYTES,
     MAX_RUNTIME_CREDENTIAL_BYTES, MAX_RUNTIME_CREDENTIAL_PROJECTIONS,
 };

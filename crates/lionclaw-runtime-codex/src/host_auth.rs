@@ -14,8 +14,9 @@ use chrono::{DateTime, Duration, Utc};
 use lionclaw_runtime_api::NetworkGrant;
 use lionclaw_runtime_api::{
     RuntimeAuthContext, RuntimeAuthIdentity, RuntimeAuthKind, RuntimeAuthMaterialization,
-    RuntimeAuthPreparation, RuntimeAuthProjection, RuntimeAuthProvider,
-    RuntimeCredentialProjection, MAX_RUNTIME_CREDENTIAL_BYTES,
+    RuntimeAuthPreparation, RuntimeAuthProblem, RuntimeAuthProjection, RuntimeAuthProvider,
+    RuntimeAuthReadiness, RuntimeAuthReadinessRequest, RuntimeCredentialProjection,
+    MAX_RUNTIME_CREDENTIAL_BYTES,
 };
 use reqwest::StatusCode;
 use rustix::fs::{flock, FlockOperation};
@@ -46,6 +47,61 @@ impl RuntimeAuthProvider for CodexRuntimeAuthProvider {
         crate::CODEX_RUNTIME_AUTH_KIND
     }
 
+    async fn readiness(&self, input: RuntimeAuthReadinessRequest<'_>) -> RuntimeAuthReadiness {
+        if input.network.is_denied() {
+            return RuntimeAuthReadiness::NeedsOperatorAction(
+                RuntimeAuthProblem::ModelNetworkDenied,
+            );
+        }
+        let store = match CodexAuthStore::resolve(codex_home_override(input.host_context)) {
+            Ok(store) => store,
+            Err(_) => {
+                return RuntimeAuthReadiness::NeedsOperatorAction(
+                    RuntimeAuthProblem::CredentialStoreUnavailable,
+                )
+            }
+        };
+        let (auth, modified_at) = match store.inspect().await {
+            CodexAuthInspection::Available(auth, modified_at) => (*auth, modified_at),
+            CodexAuthInspection::Missing => {
+                return RuntimeAuthReadiness::NeedsOperatorAction(
+                    RuntimeAuthProblem::CredentialsMissing,
+                )
+            }
+            CodexAuthInspection::Invalid => {
+                return RuntimeAuthReadiness::NeedsOperatorAction(
+                    RuntimeAuthProblem::CredentialsInvalid,
+                )
+            }
+            CodexAuthInspection::Unavailable => {
+                return RuntimeAuthReadiness::NeedsOperatorAction(
+                    RuntimeAuthProblem::CredentialStoreUnavailable,
+                )
+            }
+            CodexAuthInspection::Interrupted => {
+                return RuntimeAuthReadiness::Retryable(RuntimeAuthProblem::InspectionFailed)
+            }
+        };
+        match codex_auth_needs_refresh(&store, &auth, modified_at) {
+            Ok(false) => RuntimeAuthReadiness::Ready,
+            Ok(true)
+                if auth
+                    .tokens
+                    .as_ref()
+                    .and_then(|tokens| nonempty(tokens.refresh_token.as_deref()))
+                    .is_some() =>
+            {
+                RuntimeAuthReadiness::Ready
+            }
+            Ok(true) => RuntimeAuthReadiness::NeedsOperatorAction(
+                RuntimeAuthProblem::CredentialsUnrefreshable,
+            ),
+            Err(_) => {
+                RuntimeAuthReadiness::NeedsOperatorAction(RuntimeAuthProblem::CredentialsInvalid)
+            }
+        }
+    }
+
     async fn prepare(
         &self,
         input: RuntimeAuthPreparation<'_>,
@@ -72,6 +128,14 @@ struct CodexAuthStore {
 
 struct CodexAuthStoreLock {
     _file: std::fs::File,
+}
+
+enum CodexAuthInspection {
+    Available(Box<CodexAuthFile>, Option<DateTime<Utc>>),
+    Missing,
+    Invalid,
+    Unavailable,
+    Interrupted,
 }
 
 impl CodexAuthStore {
@@ -103,24 +167,42 @@ impl CodexAuthStore {
         let files = self.files.clone();
         let auth_path = self.auth_path();
         tokio::task::spawn_blocking(move || {
-            let Some((raw, metadata)) = files.read_private_bounded_with_metadata(
-                OsStr::new(CODEX_AUTH_FILE_NAME),
-                MAX_RUNTIME_CREDENTIAL_BYTES,
-                "host Codex auth",
-            )?
-            else {
-                bail!(
-                    "no usable host Codex auth found at '{}'; sign in locally with `codex login`",
-                    auth_path.display()
-                );
-            };
-            let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
-            let auth = serde_json::from_slice::<CodexAuthFile>(&raw)
-                .with_context(|| format!("failed to parse {}", auth_path.display()))?;
-            Ok((auth, modified_at))
+            parse_codex_auth(
+                files.read_private_bounded_with_metadata(
+                    OsStr::new(CODEX_AUTH_FILE_NAME),
+                    MAX_RUNTIME_CREDENTIAL_BYTES,
+                    "host Codex auth",
+                )?,
+                &auth_path,
+            )
         })
         .await
         .context("failed to join Codex auth read task")?
+    }
+
+    async fn inspect(&self) -> CodexAuthInspection {
+        let files = self.files.clone();
+        let auth_path = self.auth_path();
+        match tokio::task::spawn_blocking(move || {
+            files.read_bounded_with_metadata(
+                OsStr::new(CODEX_AUTH_FILE_NAME),
+                MAX_RUNTIME_CREDENTIAL_BYTES,
+                "host Codex auth",
+            )
+        })
+        .await
+        {
+            Err(_) => CodexAuthInspection::Interrupted,
+            Ok(Err(_)) => CodexAuthInspection::Unavailable,
+            Ok(Ok(None)) => CodexAuthInspection::Missing,
+            Ok(Ok(Some((raw, metadata)))) => match decode_codex_auth(&raw, &auth_path) {
+                Ok(auth) => CodexAuthInspection::Available(
+                    Box::new(auth),
+                    metadata.modified().ok().map(DateTime::<Utc>::from),
+                ),
+                Err(_) => CodexAuthInspection::Invalid,
+            },
+        }
     }
 
     async fn write(&self, auth: &CodexAuthFile) -> Result<()> {
@@ -142,6 +224,25 @@ impl CodexAuthStore {
     fn auth_path(&self) -> PathBuf {
         self.home.join(CODEX_AUTH_FILE_NAME)
     }
+}
+
+fn parse_codex_auth(
+    read: Option<(Vec<u8>, std::fs::Metadata)>,
+    auth_path: &Path,
+) -> Result<(CodexAuthFile, Option<DateTime<Utc>>)> {
+    let Some((raw, metadata)) = read else {
+        bail!(
+            "no usable host Codex auth found at '{}'; sign in locally with `codex login`",
+            auth_path.display()
+        );
+    };
+    let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
+    let auth = decode_codex_auth(&raw, auth_path)?;
+    Ok((auth, modified_at))
+}
+
+fn decode_codex_auth(raw: &[u8], auth_path: &Path) -> Result<CodexAuthFile> {
+    serde_json::from_slice(raw).with_context(|| format!("failed to parse {}", auth_path.display()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +663,85 @@ mod tests {
                 host_context: &context,
             })
             .await
+    }
+
+    async fn auth_readiness(codex_home: &Path) -> RuntimeAuthReadiness {
+        let context = RuntimeAuthContext::new()
+            .with_home_override(crate::CODEX_RUNTIME_AUTH_KIND, codex_home);
+        let network = NetworkGrant::allow_single("api.openai.com", 443).unwrap();
+        CodexRuntimeAuthProvider
+            .readiness(RuntimeAuthReadinessRequest {
+                runtime_id: "codex",
+                network: &network,
+                host_context: &context,
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn readiness_accepts_refreshable_auth_without_refreshing_or_writing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let codex_home = root.path().join(".codex");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "tokens": {
+                    "access_token": fake_jwt(Utc::now() - Duration::minutes(5)),
+                    "refresh_token": "refresh-token"
+                }
+            }),
+        )
+        .await;
+        let auth_path = codex_home.join(CODEX_AUTH_FILE_NAME);
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o644))
+            .expect("set broad test permissions");
+        let before = tokio::fs::read(&auth_path)
+            .await
+            .expect("auth before probe");
+        let mode_before = std::fs::metadata(&auth_path)
+            .expect("metadata before probe")
+            .permissions()
+            .mode();
+
+        assert_eq!(
+            auth_readiness(&codex_home).await,
+            RuntimeAuthReadiness::Ready
+        );
+        assert_eq!(
+            tokio::fs::read(&auth_path).await.expect("auth after probe"),
+            before,
+            "readiness must not refresh or rewrite host auth"
+        );
+        assert_eq!(
+            std::fs::metadata(&auth_path)
+                .expect("metadata after probe")
+                .permissions()
+                .mode(),
+            mode_before,
+            "readiness must not chmod host auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_operator_action_for_unrefreshable_auth() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let codex_home = root.path().join(".codex");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "tokens": {
+                    "access_token": fake_jwt(Utc::now() - Duration::minutes(5))
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            auth_readiness(&codex_home).await,
+            RuntimeAuthReadiness::NeedsOperatorAction(RuntimeAuthProblem::CredentialsUnrefreshable)
+        );
     }
 
     #[tokio::test]

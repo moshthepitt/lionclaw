@@ -12,10 +12,11 @@ use lionclaw_confinement::WORKSPACE_MOUNT_TARGET;
 use lionclaw_runtime_acp::AcpRuntimeDriver;
 use lionclaw_runtime_api::{
     RuntimeAdapter, RuntimeAuthContext, RuntimeAuthMaterialization, RuntimeAuthPreparation,
-    RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider,
-    RuntimeDriverRegistry, RuntimeNativeReopenRecovery, RuntimeNativeSessionObservation,
-    RuntimeResume, RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
-    RuntimeUsage, TurnExecution, TurnInput, TypedFailure, TypedFailureEvidence,
+    RuntimeAuthProvider, RuntimeAuthReadiness, RuntimeAuthReadinessRequest, RuntimeAuthRegistry,
+    RuntimeDriverConfig, RuntimeDriverProvider, RuntimeDriverRegistry, RuntimeNativeReopenRecovery,
+    RuntimeNativeSessionObservation, RuntimeResume, RuntimeSessionHandle, RuntimeSessionReady,
+    RuntimeSessionStartInput, RuntimeUsage, TurnExecution, TurnInput, TypedFailure,
+    TypedFailureEvidence,
 };
 use lionclaw_runtime_codex::{CodexRuntimeAuthProvider, CodexRuntimeDriver};
 use tokio::sync::Mutex;
@@ -153,6 +154,33 @@ impl OciRoleRunner {
                 ]))
             }
         }
+    }
+
+    pub(crate) async fn runtime_auth_readiness(
+        &self,
+        profile: &MissionRuntimeProfile,
+    ) -> anyhow::Result<Option<RuntimeAuthReadiness>> {
+        let Some(auth) = &profile.auth else {
+            return Ok(None);
+        };
+        let provider = self
+            .auth_registry(profile)?
+            .get_kind(auth.kind())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "validated runtime auth registry lost provider '{}'",
+                    auth.kind()
+                )
+            })?;
+        Ok(Some(
+            provider
+                .readiness(RuntimeAuthReadinessRequest {
+                    runtime_id: &profile.name,
+                    network: &profile.model_network,
+                    host_context: &RuntimeAuthContext::default(),
+                })
+                .await,
+        ))
     }
 
     pub(crate) async fn materialize_runtime_auth(

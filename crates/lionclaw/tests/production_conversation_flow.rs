@@ -128,6 +128,19 @@ impl RuntimeAuthProvider for TestCodexAuth {
         "codex"
     }
 
+    async fn readiness(
+        &self,
+        _input: lionclaw_runtime_api::RuntimeAuthReadinessRequest<'_>,
+    ) -> lionclaw_runtime_api::RuntimeAuthReadiness {
+        if self.refuse {
+            lionclaw_runtime_api::RuntimeAuthReadiness::NeedsOperatorAction(
+                lionclaw_runtime_api::RuntimeAuthProblem::CredentialsMissing,
+            )
+        } else {
+            lionclaw_runtime_api::RuntimeAuthReadiness::Ready
+        }
+    }
+
     async fn prepare(
         &self,
         _input: RuntimeAuthPreparation<'_>,
