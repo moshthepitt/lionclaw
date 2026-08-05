@@ -1,12 +1,34 @@
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Stdio};
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use clap::CommandFactory;
 use lionclaw::cli::{Cli, DoctorCheck, DoctorReport, DoctorStatus};
 
 fn lionclaw() -> Command {
     Command::new(env!("CARGO_BIN_EXE_lionclaw"))
+}
+
+fn output_with_wall_timeout(mut command: Command) -> Output {
+    command
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    for _ in 0..100 {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    let _ = child.wait();
+    panic!("command exceeded 10-second test deadline");
 }
 
 #[test]
@@ -97,6 +119,77 @@ fn clean_home_doctor_json_is_parseable_and_truthfully_fails() {
     for secret_name in ["token", "api_key", "password", "credential"] {
         assert!(!rendered.contains(secret_name));
     }
+}
+
+#[test]
+fn doctor_bounds_a_hanging_tool_probe() {
+    let home = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let git = tools.path().join("git");
+    std::fs::write(&git, "#!/bin/sh\n/bin/sleep 30\n").unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        tools.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut command = lionclaw();
+    command
+        .args(["doctor", "--json"])
+        .env("PATH", path)
+        .env("LIONCLAW_HOME", home.path());
+    let output = output_with_wall_timeout(command);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let git = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "git")
+        .unwrap();
+    assert_eq!(git["status"], "fail");
+    assert_eq!(git["retryable"], false);
+    assert!(git["detail"].as_str().unwrap().contains("timed out"));
+    assert!(git["repair"].as_str().unwrap().contains("git --version"));
+}
+
+#[test]
+fn doctor_bounds_a_noisy_tool_probe() {
+    let home = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let git = tools.path().join("git");
+    std::fs::write(
+        &git,
+        "#!/bin/sh\nprintf 'git version bounded\\n'\n/bin/head -c 9437184 /dev/zero\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        tools.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = lionclaw()
+        .args(["doctor", "--json"])
+        .env("PATH", path)
+        .env("LIONCLAW_HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.len() < 64 * 1024);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let git = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "git")
+        .unwrap();
+    assert_eq!(git["status"], "pass");
+    assert_eq!(git["detail"], "git version bounded");
 }
 
 #[test]

@@ -3896,27 +3896,82 @@ async fn push_tool_check(report: &mut DoctorReport, program: &str, repair: &str)
             report.push(DoctorCheck::pass(program, Some(version)));
             true
         }
-        Err(detail) => {
-            report.push(DoctorCheck::fail(program, detail, false, repair));
+        Err(failure) => {
+            report.push(DoctorCheck::fail(
+                program,
+                failure.detail(program),
+                false,
+                failure.repair(program, repair),
+            ));
             false
         }
     }
 }
 
-async fn command_version(program: &str) -> std::result::Result<String, String> {
-    let output = tokio::process::Command::new(program)
-        .arg("--version")
-        .output()
-        .await
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                format!("{program} was not found on PATH")
-            } else {
-                format!("could not execute `{program} --version`")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolProbeFailure {
+    Missing,
+    TimedOut,
+    ExecutionFailed,
+    Unsuccessful,
+}
+
+impl ToolProbeFailure {
+    fn detail(self, program: &str) -> String {
+        match self {
+            Self::Missing => format!("{program} was not found on PATH"),
+            Self::TimedOut => format!("`{program} --version` timed out"),
+            Self::ExecutionFailed => format!("could not execute `{program} --version`"),
+            Self::Unsuccessful => format!("`{program} --version` did not succeed"),
+        }
+    }
+
+    fn repair(self, program: &str, missing_repair: &str) -> String {
+        match self {
+            Self::Missing => missing_repair.to_string(),
+            Self::TimedOut => format!(
+                "ensure `{program} --version` completes within 5 seconds, then rerun `lionclaw doctor`"
+            ),
+            Self::ExecutionFailed | Self::Unsuccessful => format!(
+                "repair `{program} --version` so it exits successfully, then rerun `lionclaw doctor`"
+            ),
+        }
+    }
+}
+
+async fn command_version(program: &str) -> std::result::Result<String, ToolProbeFailure> {
+    const TOOL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let invocation = lionclaw_confinement::process::ProcessInvocation {
+        executable: program.to_string(),
+        args: vec!["--version".to_string()],
+        working_dir: None,
+        environment: Vec::new(),
+        input: String::new(),
+    };
+    let output =
+        match lionclaw_confinement::process::run_process_bounded(&invocation, TOOL_PROBE_TIMEOUT)
+            .await
+        {
+            Ok(output) => output,
+            Err(lionclaw_confinement::process::BoundedProcessFailure::TimedOut) => {
+                return Err(ToolProbeFailure::TimedOut)
             }
-        })?;
-    if !output.status.success() {
-        return Err(format!("`{program} --version` did not succeed"));
+            Err(lionclaw_confinement::process::BoundedProcessFailure::Failed(source)) => {
+                let missing = source.chain().any(|error| {
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                });
+                return Err(if missing {
+                    ToolProbeFailure::Missing
+                } else {
+                    ToolProbeFailure::ExecutionFailed
+                });
+            }
+        };
+    if !output.success() {
+        return Err(ToolProbeFailure::Unsuccessful);
     }
     let first_line = String::from_utf8_lossy(&output.stdout)
         .lines()

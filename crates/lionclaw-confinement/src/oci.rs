@@ -24,8 +24,8 @@ use super::{
         map_host_path_into_runtime_mount, ConfinementBackend, MountAccess, MountSpec, NetworkGrant,
     },
     process::{
-        run_process_attached, run_process_bounded_with_timeout, run_process_streaming,
-        spawn_process_session, BoundedProcessFailure, ProcessInvocation, ProcessSession,
+        run_process_attached, run_process_bounded, run_process_streaming, spawn_process_session,
+        BoundedProcessFailure, ProcessInvocation, ProcessSession,
     },
     runtime_auth::{prepare_runtime_auth, PreparedCredentialMount, PreparedRuntimeAuth},
     OciConfinementConfig, RuntimeTmpfsEntry,
@@ -595,7 +595,7 @@ async fn run_oci_preflight_command(
     action: &str,
     timeout_duration: Duration,
 ) -> std::result::Result<super::process::ProcessOutput, OciPreflightFailure> {
-    match run_process_bounded_with_timeout(invocation, timeout_duration).await {
+    match run_process_bounded(invocation, timeout_duration).await {
         Ok(output) => Ok(output),
         Err(BoundedProcessFailure::Failed(source)) => Err(OciPreflightFailure::EngineUnavailable {
             action: action.to_string(),

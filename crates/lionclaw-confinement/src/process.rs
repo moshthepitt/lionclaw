@@ -14,7 +14,7 @@ pub const PROCESS_LINE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const PROCESS_TRUNCATION_MARKER: &[u8] = b"\n...[truncated]";
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BoundedProcessFailure {
+pub enum BoundedProcessFailure {
     #[error("bounded subprocess failed")]
     Failed(#[source] anyhow::Error),
     #[error("bounded subprocess timed out")]
@@ -188,7 +188,8 @@ pub async fn run_process_streaming(
     })
 }
 
-pub(crate) async fn run_process_bounded_with_timeout(
+/// Run a subprocess with bounded output, wall time, and descendant lifetime.
+pub async fn run_process_bounded(
     invocation: &ProcessInvocation,
     timeout_duration: Duration,
 ) -> std::result::Result<ProcessOutput, BoundedProcessFailure> {
@@ -708,8 +709,8 @@ async fn spawn_with_retry(
 #[cfg(test)]
 mod tests {
     use super::{
-        read_next_process_line, run_process_attached, run_process_bounded_with_timeout,
-        run_process_streaming, spawn_process_session, BoundedCapture, ProcessInvocation,
+        read_next_process_line, run_process_attached, run_process_bounded, run_process_streaming,
+        spawn_process_session, BoundedCapture, ProcessInvocation,
     };
     use lionclaw_runtime_api::RUNTIME_PROGRAM_STDOUT_LINE_LIMIT;
     use std::time::Duration;
@@ -735,9 +736,10 @@ mod tests {
             )],
             input: String::new(),
         };
-        let task = tokio::spawn(async move {
-            run_process_bounded_with_timeout(&invocation, Duration::from_secs(60)).await
-        });
+        let task =
+            tokio::spawn(
+                async move { run_process_bounded(&invocation, Duration::from_secs(60)).await },
+            );
 
         for _ in 0..100 {
             if descendant_pid.exists() {
