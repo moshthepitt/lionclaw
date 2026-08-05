@@ -150,7 +150,7 @@ fn doctor_bounds_a_hanging_tool_probe() {
         .find(|check| check["name"] == "git")
         .unwrap();
     assert_eq!(git["status"], "fail");
-    assert_eq!(git["retryable"], false);
+    assert_eq!(git["retryable"], true);
     assert!(git["detail"].as_str().unwrap().contains("timed out"));
     assert!(git["repair"].as_str().unwrap().contains("git --version"));
 }

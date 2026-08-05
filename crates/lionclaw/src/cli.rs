@@ -3900,7 +3900,7 @@ async fn push_tool_check(report: &mut DoctorReport, program: &str, repair: &str)
             report.push(DoctorCheck::fail(
                 program,
                 failure.detail(program),
-                false,
+                failure.retryable(),
                 failure.repair(program, repair),
             ));
             false
@@ -3917,6 +3917,10 @@ enum ToolProbeFailure {
 }
 
 impl ToolProbeFailure {
+    fn retryable(self) -> bool {
+        self == Self::TimedOut
+    }
+
     fn detail(self, program: &str) -> String {
         match self {
             Self::Missing => format!("{program} was not found on PATH"),
